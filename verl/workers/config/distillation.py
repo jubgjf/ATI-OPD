@@ -26,6 +26,7 @@ from .rollout import RolloutConfig
 __all__ = [
     "DistillationLossConfig",
     "DistillationInterventionConfig",
+    "DistillationDiagnosticsConfig",
     "DistillationTeacherModelConfig",
     "DistillationConfig",
 ]
@@ -170,6 +171,43 @@ class DistillationInterventionConfig(BaseConfig):
 
 
 @dataclass
+class DistillationDiagnosticsConfig(BaseConfig):
+    """Runtime diagnostics for analyzing OPD behavior on long responses."""
+
+    enabled: bool = False
+    position_bin_size: int = 512
+    log_interval: int = 1
+    heatmap_interval: int = 10
+    heatmap_history_steps: int = 80
+    log_wandb_heatmap: bool = True
+    high_gap_threshold: float = 1.0
+    collect_intervention_metrics: bool = True
+    collect_topk_overlap: bool = False
+    topk: int = 16
+
+    def __post_init__(self):
+        if self.position_bin_size <= 0:
+            raise ValueError("diagnostics.position_bin_size must be positive.")
+        if self.log_interval <= 0:
+            raise ValueError("diagnostics.log_interval must be positive.")
+        if self.heatmap_interval <= 0:
+            raise ValueError("diagnostics.heatmap_interval must be positive.")
+        if self.heatmap_history_steps <= 0:
+            raise ValueError("diagnostics.heatmap_history_steps must be positive.")
+        if not math.isfinite(self.high_gap_threshold) or self.high_gap_threshold < 0:
+            raise ValueError(
+                f"diagnostics.high_gap_threshold must be finite and non-negative, got {self.high_gap_threshold!r}."
+            )
+        if self.topk <= 0:
+            raise ValueError("diagnostics.topk must be positive.")
+        if self.collect_topk_overlap:
+            raise NotImplementedError(
+                "Top-k overlap diagnostics are not implemented for the sampled-token OPD path yet. "
+                "Set distillation.diagnostics.collect_topk_overlap=false."
+            )
+
+
+@dataclass
 class DistillationTeacherModelConfig(BaseConfig):
     """Configuration for on-policy distillation teacher.
 
@@ -311,6 +349,7 @@ class DistillationConfig(BaseConfig):
     teacher_key: str = "data_source"
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
     intervention: DistillationInterventionConfig = field(default_factory=DistillationInterventionConfig)
+    diagnostics: DistillationDiagnosticsConfig = field(default_factory=DistillationDiagnosticsConfig)
 
     def __post_init__(self):
         if not self.enabled:

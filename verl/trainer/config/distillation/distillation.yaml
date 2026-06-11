@@ -77,6 +77,25 @@ intervention:
   teacher_top_k: -1
   log_examples_per_worker: 2
 
+# Diagnostics for analyzing OPD behavior on long responses. These metrics use
+# tensors already produced by the training loop whenever possible, so the default
+# path is low overhead.
+diagnostics:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.DistillationDiagnosticsConfig
+
+  enabled: false
+  position_bin_size: 512
+  log_interval: 1
+  heatmap_interval: 10
+  heatmap_history_steps: 80
+  log_wandb_heatmap: true
+  high_gap_threshold: 1.0
+  collect_intervention_metrics: true
+  collect_topk_overlap: false
+  topk: 16
+
 
 # Number of GPUs per node in the distillation teacher resource pool
 n_gpus_per_node: 8

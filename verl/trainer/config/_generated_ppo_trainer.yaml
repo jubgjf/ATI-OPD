@@ -809,6 +809,18 @@ distillation:
     teacher_top_p: 1.0
     teacher_top_k: -1
     log_examples_per_worker: 2
+  diagnostics:
+    _target_: verl.workers.config.DistillationDiagnosticsConfig
+    enabled: false
+    position_bin_size: 512
+    log_interval: 1
+    heatmap_interval: 10
+    heatmap_history_steps: 80
+    log_wandb_heatmap: true
+    high_gap_threshold: 1.0
+    collect_intervention_metrics: true
+    collect_topk_overlap: false
+    topk: 16
   n_gpus_per_node: 8
   nnodes: 0
   teacher_models:
