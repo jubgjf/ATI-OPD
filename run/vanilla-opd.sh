@@ -127,6 +127,10 @@ test_freq=10
 
 mkdir -p ${default_local_dir}
 
+export WANDB_MODE=${WANDB_MODE:-offline}
+export WANDB_DIR=${WANDB_DIR:-/opt/huawei/dataset/jnguan/mtp-outputs/DMPD/wandb}
+mkdir -p ${WANDB_DIR}
+
 ### 启动分布式网络配置
 export NODE_RANK=${VC_TASK_INDEX}
 export MASTER_ADDR="${MA_VJ_NAME}-${MA_TASK_NAME}-0.${MA_VJ_NAME}"
