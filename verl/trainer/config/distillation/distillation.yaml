@@ -54,6 +54,29 @@ distillation_loss:
   # Upper bound for PPO clipping ratio.
   clip_ratio_high: 0.2
 
+# Teacher intervention config. When enabled, the student first completes a
+# normal rollout; only segments whose teacher/student gap crosses the threshold
+# are repaired by a short teacher generation followed by student suffix
+# regeneration.
+intervention:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.DistillationInterventionConfig
+
+  enabled: false
+  segment_method: fixed_tokens
+  student_segment_length: 128
+  teacher_segment_length: 128
+  gap_metric: k3
+  gap_aggregation: mean
+  gap_threshold: 1.0
+  max_interventions_per_sample: 4
+  train_on_teacher_segments: false
+  teacher_temperature: 0.7
+  teacher_top_p: 1.0
+  teacher_top_k: -1
+  log_examples_per_worker: 2
+
 
 # Number of GPUs per node in the distillation teacher resource pool
 n_gpus_per_node: 8

@@ -65,6 +65,7 @@ from verl.utils.tokenizer import (
     normalize_token_ids,
 )
 from verl.workers.config import (
+    DistillationInterventionConfig,
     HFModelConfig,
     RolloutConfig,
 )
@@ -74,6 +75,152 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+
+
+def _compute_intervention_gap(
+    student_logprobs: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    metric: str,
+) -> torch.Tensor:
+    """Compute per-token teacher/student gap for intervention gating."""
+    student_logprobs = student_logprobs.float()
+    teacher_logprobs = teacher_logprobs.float()
+    if metric in ("kl", "k1"):
+        return student_logprobs - teacher_logprobs
+    if metric == "abs":
+        return (student_logprobs - teacher_logprobs).abs()
+    if metric in ("mse", "k2"):
+        return 0.5 * (student_logprobs - teacher_logprobs).square()
+    if metric in ("low_var_kl", "k3"):
+        kl = (teacher_logprobs - student_logprobs).clamp(min=-20, max=20)
+        ratio = torch.exp(kl)
+        return (ratio - kl - 1).clamp(min=-10, max=10)
+    raise NotImplementedError(f"Unsupported teacher intervention gap metric: {metric}")
+
+
+def _teacher_response_logprobs(
+    teacher_logprobs: torch.Tensor,
+    prompt_len: int,
+    response_len: int,
+) -> torch.Tensor:
+    """Slice teacher prompt_logprobs so they align with response tokens."""
+    if response_len == 0:
+        return torch.empty(0, dtype=teacher_logprobs.dtype)
+    if prompt_len <= 0:
+        raise ValueError("Teacher intervention requires a non-empty prompt.")
+    if teacher_logprobs.ndim != 2 or teacher_logprobs.shape[1] != 1:
+        raise RuntimeError(
+            "Teacher intervention scoring expects sampled-token prompt logprobs with shape "
+            f"[sequence_len, 1], but got teacher_logprobs.shape={tuple(teacher_logprobs.shape)}. "
+            "This path calls the teacher with prompt_logprobs=0; check the teacher backend response."
+        )
+    required_len = prompt_len + response_len
+    if teacher_logprobs.shape[0] < required_len:
+        raise RuntimeError(
+            "Teacher intervention scoring returned too few prompt logprobs: "
+            f"teacher_logprobs.shape={tuple(teacher_logprobs.shape)}, prompt_len={prompt_len}, "
+            f"response_len={response_len}, required_sequence_len={required_len}. "
+            "If this is a local vLLM Metal run, vllm_metal currently does not populate prompt_logprobs."
+        )
+    sampled_logprobs = teacher_logprobs[:, 0]
+    response_logprobs = sampled_logprobs[prompt_len - 1 : prompt_len + response_len - 1]
+    if response_logprobs.numel() != response_len:
+        raise RuntimeError(
+            "Teacher intervention scoring failed to align teacher logprobs with response tokens: "
+            f"got {response_logprobs.numel()} values for response_len={response_len}."
+        )
+    if not torch.isfinite(response_logprobs.float()).all():
+        raise RuntimeError("Teacher intervention scoring produced NaN/Inf response logprobs.")
+    return response_logprobs
+
+
+def _select_intervention_segment(
+    gaps: torch.Tensor,
+    response_mask: list[int],
+    intervention_config: DistillationInterventionConfig,
+) -> Optional[tuple[int, int, float]]:
+    """Return the first fixed-token segment whose aggregate gap crosses the threshold."""
+    segment_len = intervention_config.student_segment_length
+    if segment_len <= 0:
+        raise ValueError(f"student_segment_length must be positive, got {segment_len}.")
+    if len(response_mask) != gaps.numel():
+        raise RuntimeError(
+            "Teacher intervention gap mask is not aligned with gap values: "
+            f"len(response_mask)={len(response_mask)}, num_gaps={gaps.numel()}."
+        )
+    invalid_mask_values = sorted({mask for mask in response_mask if mask not in (0, 1)})
+    if invalid_mask_values:
+        raise ValueError(f"Teacher intervention response_mask contains non-binary values: {invalid_mask_values}.")
+    if not torch.isfinite(gaps.float()).all():
+        raise RuntimeError("Teacher intervention gap computation produced NaN/Inf values.")
+    response_mask_tensor = torch.tensor(response_mask, dtype=torch.bool)
+    for start in range(0, gaps.numel(), segment_len):
+        end = min(start + segment_len, gaps.numel())
+        segment_mask = response_mask_tensor[start:end]
+        if not segment_mask.any():
+            continue
+        segment_gaps = gaps[start:end][segment_mask]
+        if intervention_config.gap_aggregation == "max":
+            score = segment_gaps.max().item()
+        else:
+            score = segment_gaps.mean().item()
+        if score > intervention_config.gap_threshold:
+            return start, end, score
+    return None
+
+
+def _validate_intervention_state(
+    *,
+    context: str,
+    response_ids: list[int],
+    response_mask: list[int],
+    response_logprobs: Optional[list[float]],
+    gap_mask: list[int],
+    response_length_limit: int,
+) -> None:
+    if len(response_ids) > response_length_limit:
+        raise RuntimeError(
+            f"Teacher intervention state {context} exceeded rollout response length: "
+            f"len(response_ids)={len(response_ids)}, response_length_limit={response_length_limit}."
+        )
+    if len(response_mask) != len(response_ids):
+        raise RuntimeError(
+            f"Teacher intervention state {context} has misaligned response_mask: "
+            f"len(response_mask)={len(response_mask)}, len(response_ids)={len(response_ids)}."
+        )
+    if len(gap_mask) != len(response_ids):
+        raise RuntimeError(
+            f"Teacher intervention state {context} has misaligned gap_mask: "
+            f"len(gap_mask)={len(gap_mask)}, len(response_ids)={len(response_ids)}."
+        )
+    invalid_response_mask = sorted({mask for mask in response_mask if mask not in (0, 1)})
+    if invalid_response_mask:
+        raise ValueError(
+            f"Teacher intervention state {context} has non-binary response_mask values: {invalid_response_mask}."
+        )
+    invalid_gap_mask = sorted({mask for mask in gap_mask if mask not in (0, 1)})
+    if invalid_gap_mask:
+        raise ValueError(f"Teacher intervention state {context} has non-binary gap_mask values: {invalid_gap_mask}.")
+    if response_logprobs is not None:
+        if len(response_logprobs) != len(response_ids):
+            raise RuntimeError(
+                f"Teacher intervention state {context} has misaligned response_logprobs: "
+                f"len(response_logprobs)={len(response_logprobs)}, len(response_ids)={len(response_ids)}."
+            )
+        if response_logprobs and not torch.isfinite(torch.tensor(response_logprobs, dtype=torch.float32)).all():
+            raise RuntimeError(f"Teacher intervention state {context} has NaN/Inf response_logprobs.")
+
+
+def _require_consistent_optional_field(inputs: list["_InternalAgentLoopOutput"], field_name: str) -> bool:
+    present = [getattr(input_item, field_name) is not None for input_item in inputs]
+    if any(present) and not all(present):
+        bad_indices = [idx for idx, is_present in enumerate(present) if not is_present]
+        raise RuntimeError(
+            f"Inconsistent optional field {field_name!r} across agent loop outputs; missing at batch indices "
+            f"{bad_indices}. This usually means only some samples produced that tensor. "
+            "Keep the field present for every sample in the batch, or disable the feature that produces mixed outputs."
+        )
+    return all(present)
 
 
 class AgentLoopMetrics(BaseModel):
@@ -400,6 +547,9 @@ class AgentLoopWorker:
 
         # Online policy distillation
         self.distillation_enabled = is_distillation_enabled(config.distillation)
+        self.teacher_intervention_enabled = False
+        self.teacher_intervention_config = None
+        self._teacher_intervention_logged_samples = 0
         if self.distillation_enabled:
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 
@@ -408,6 +558,9 @@ class AgentLoopWorker:
                 config=config,
                 teacher_client=teacher_client,
             )
+            self.distillation_config = self.teacher_server_manager.distillation_config
+            self.teacher_intervention_config = self.distillation_config.intervention
+            self.teacher_intervention_enabled = self.teacher_intervention_config.enabled
 
         # Load tools once per worker; each trajectory just reuses self.tools.
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
@@ -475,7 +628,7 @@ class AgentLoopWorker:
             top_p=config.top_p,
             top_k=config.top_k,
             repetition_penalty=1.0,
-            logprobs=config.calculate_log_probs,
+            logprobs=config.calculate_log_probs or (self.teacher_intervention_enabled and not validate),
         )
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
@@ -574,11 +727,29 @@ class AgentLoopWorker:
                 tools=ToolListWrap(self.tools),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+            return await self._agent_loop_postprocess(
+                output,
+                trajectory["validate"],
+                sampling_params=sampling_params,
+                **kwargs,
+            )
 
-    async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
+    async def _agent_loop_postprocess(
+        self,
+        output,
+        validate,
+        sampling_params: Optional[dict[str, Any]] = None,
+        **kwargs,
+    ) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        if getattr(self, "teacher_intervention_enabled", False):
+            await self._maybe_repair_with_teacher(
+                output,
+                validate=validate,
+                sampling_params=sampling_params,
+                sample_kwargs=kwargs,
+            )
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -867,6 +1038,254 @@ class AgentLoopWorker:
                 final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
             final_output.metrics.compute_score = timing["compute_score"]
 
+    def _teacher_routing_key(self, sample_kwargs: Optional[dict[str, Any]]) -> Optional[str]:
+        routing_key = None
+        if sample_kwargs is not None:
+            routing_value = sample_kwargs.get(self.teacher_key)
+            if routing_value is not None:
+                # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
+                routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+        return routing_key
+
+    async def _score_sequence_for_intervention(
+        self,
+        *,
+        request_id: str,
+        prompt_ids: list[int],
+        response_ids: list[int],
+        output: AgentLoopOutput,
+        routing_key: Optional[str],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return await self.teacher_server_manager.compute_teacher_logprobs_single(
+            sequence_ids=prompt_ids + response_ids,
+            multi_modal_data=output.multi_modal_data,
+            mm_processor_kwargs=output.mm_processor_kwargs,
+            routing_key=routing_key,
+            request_id=request_id,
+            prompt_logprobs=0,
+        )
+
+    async def _generate_student_suffix(
+        self,
+        *,
+        request_id: str,
+        prefix_ids: list[int],
+        max_tokens: int,
+        sampling_params: Optional[dict[str, Any]],
+        output: AgentLoopOutput,
+    ) -> tuple[list[int], list[float]]:
+        if max_tokens <= 0:
+            return [], []
+        repair_sampling_params = dict(sampling_params or {})
+        repair_sampling_params["max_tokens"] = max_tokens
+        repair_sampling_params["logprobs"] = True
+        multi_modal_data = output.multi_modal_data or {}
+        student_output = await self.llm_client.generate(
+            request_id=request_id,
+            prompt_ids=prefix_ids,
+            sampling_params=repair_sampling_params,
+            image_data=multi_modal_data.get("images"),
+            video_data=multi_modal_data.get("videos"),
+            audio_data=multi_modal_data.get("audios"),
+            mm_processor_kwargs=output.mm_processor_kwargs,
+        )
+        suffix_ids = student_output.token_ids[:max_tokens]
+        suffix_logprobs = (student_output.log_probs or [])[: len(suffix_ids)]
+        if len(suffix_logprobs) != len(suffix_ids):
+            raise RuntimeError(
+                "Teacher intervention requires student suffix token logprobs for re-scoring, but the "
+                f"student server returned len(token_ids)={len(suffix_ids)} and "
+                f"len(log_probs)={len(suffix_logprobs)} for request_id={request_id!r}. "
+                "Check that rollout sampling_params['logprobs'] is enabled and the rollout backend returns "
+                "one logprob per generated token."
+            )
+        if suffix_logprobs and not torch.isfinite(torch.tensor(suffix_logprobs, dtype=torch.float32)).all():
+            raise RuntimeError(f"Student suffix generation returned NaN/Inf logprobs for request_id={request_id!r}.")
+        return suffix_ids, suffix_logprobs
+
+    async def _maybe_repair_with_teacher(
+        self,
+        output: AgentLoopOutput,
+        *,
+        validate: bool,
+        sampling_params: Optional[dict[str, Any]],
+        sample_kwargs: Optional[dict[str, Any]],
+    ) -> None:
+        """Repair high-gap response segments with teacher generation before padding/training."""
+        if not self.teacher_intervention_enabled or validate:
+            return
+
+        intervention_config: DistillationInterventionConfig = self.teacher_intervention_config
+        response_ids = list(output.response_ids[: self.rollout_config.response_length])
+        if len(output.response_mask) < len(response_ids):
+            raise RuntimeError(
+                "Teacher intervention requires response_mask to cover every response token, but got "
+                f"len(response_mask)={len(output.response_mask)} and len(response_ids)={len(response_ids)}."
+            )
+        response_mask = list(output.response_mask[: len(response_ids)])
+        if not response_ids:
+            return
+        if any(mask != 1 for mask in response_mask):
+            first_zero = next(idx for idx, mask in enumerate(response_mask) if mask != 1)
+            raise NotImplementedError(
+                "Teacher intervention currently supports only pure single-turn student-generated responses. "
+                f"Found response_mask[{first_zero}]={response_mask[first_zero]!r}; this usually indicates a "
+                "tool/multi-turn response or pre-existing non-trainable span. Disable "
+                "distillation.intervention.enabled for this agent loop, or add explicit support for segmented "
+                "multi-turn repair."
+            )
+        if output.response_logprobs is None:
+            raise RuntimeError(
+                "Teacher intervention is enabled but the student rollout did not return response_logprobs. "
+                "AgentLoopWorker.generate_sequences should set sampling_params['logprobs']=True when "
+                "intervention is enabled; check custom agent loops or rollout backends that may drop log_probs."
+            )
+
+        response_logprobs = list(output.response_logprobs[: len(response_ids)])
+        gap_mask = list(response_mask)
+        if len(response_logprobs) < len(response_ids):
+            raise RuntimeError(
+                "Teacher intervention requires one student logprob per response token, but got "
+                f"len(response_logprobs)={len(response_logprobs)} and len(response_ids)={len(response_ids)}."
+            )
+        _validate_intervention_state(
+            context="before scoring",
+            response_ids=response_ids,
+            response_mask=response_mask,
+            response_logprobs=response_logprobs,
+            gap_mask=gap_mask,
+            response_length_limit=self.rollout_config.response_length,
+        )
+
+        prompt_ids = list(output.prompt_ids)
+        if not prompt_ids:
+            raise RuntimeError("Teacher intervention requires a non-empty prompt_ids list.")
+        routing_key = self._teacher_routing_key(sample_kwargs)
+        base_request_id = output.extra_fields.get("rollout_request_id") or uuid4().hex
+        interventions: list[dict[str, Any]] = []
+        cached_teacher_ids, cached_teacher_logprobs = None, None
+
+        for attempt in range(intervention_config.max_interventions_per_sample + 1):
+            teacher_ids, teacher_logprobs = await self._score_sequence_for_intervention(
+                request_id=f"{base_request_id}:teacher-score:{attempt}",
+                prompt_ids=prompt_ids,
+                response_ids=response_ids,
+                output=output,
+                routing_key=routing_key,
+            )
+            cached_teacher_ids, cached_teacher_logprobs = teacher_ids, teacher_logprobs
+            teacher_response_logprobs = _teacher_response_logprobs(
+                teacher_logprobs=teacher_logprobs,
+                prompt_len=len(prompt_ids),
+                response_len=len(response_ids),
+            )
+            student_response_logprobs = torch.tensor(response_logprobs[: len(response_ids)], dtype=torch.float32)
+            if teacher_response_logprobs.shape != student_response_logprobs.shape:
+                raise ValueError(
+                    "Teacher intervention scoring produced misaligned logprobs: "
+                    f"{teacher_response_logprobs.shape=} vs {student_response_logprobs.shape=}, "
+                    f"prompt_len={len(prompt_ids)}, response_len={len(response_ids)}, attempt={attempt}."
+                )
+            gaps = _compute_intervention_gap(
+                student_logprobs=student_response_logprobs,
+                teacher_logprobs=teacher_response_logprobs,
+                metric=intervention_config.gap_metric,
+            )
+            bad_segment = _select_intervention_segment(gaps, gap_mask, intervention_config)
+            if bad_segment is None or len(interventions) >= intervention_config.max_interventions_per_sample:
+                break
+
+            start, end, score = bad_segment
+            prefix_response_ids = response_ids[:start]
+            prefix_response_mask = response_mask[:start]
+            prefix_response_logprobs = response_logprobs[:start]
+            prefix_gap_mask = gap_mask[:start]
+            teacher_max_tokens = min(
+                intervention_config.teacher_segment_length,
+                self.rollout_config.response_length - len(prefix_response_ids),
+            )
+            if teacher_max_tokens <= 0:
+                break
+
+            teacher_segment_ids = await self.teacher_server_manager.generate_teacher_segment_single(
+                prefix_ids=prompt_ids + prefix_response_ids,
+                max_tokens=teacher_max_tokens,
+                multi_modal_data=output.multi_modal_data,
+                mm_processor_kwargs=output.mm_processor_kwargs,
+                routing_key=routing_key,
+                request_id=f"{base_request_id}:teacher-generate:{attempt}",
+            )
+            if len(teacher_segment_ids) > teacher_max_tokens:
+                raise RuntimeError(
+                    "Teacher intervention generation returned more tokens than requested: "
+                    f"len(teacher_segment_ids)={len(teacher_segment_ids)}, teacher_max_tokens={teacher_max_tokens}. "
+                    "The rollout backend should return generated tokens only and respect sampling max_tokens."
+                )
+            if not teacher_segment_ids:
+                break
+
+            teacher_segment_mask_value = 1 if intervention_config.train_on_teacher_segments else 0
+            teacher_segment_mask = [teacher_segment_mask_value] * len(teacher_segment_ids)
+            teacher_segment_logprobs = [0.0] * len(teacher_segment_ids)
+            teacher_stopped = len(teacher_segment_ids) < teacher_max_tokens
+            remaining_tokens = self.rollout_config.response_length - len(prefix_response_ids) - len(teacher_segment_ids)
+            if teacher_stopped:
+                remaining_tokens = 0
+            student_suffix_ids, student_suffix_logprobs = await self._generate_student_suffix(
+                request_id=base_request_id,
+                prefix_ids=prompt_ids + prefix_response_ids + teacher_segment_ids,
+                max_tokens=remaining_tokens,
+                sampling_params=sampling_params,
+                output=output,
+            )
+            response_ids = prefix_response_ids + teacher_segment_ids + student_suffix_ids
+            response_mask = prefix_response_mask + teacher_segment_mask + [1] * len(student_suffix_ids)
+            response_logprobs = prefix_response_logprobs + teacher_segment_logprobs + student_suffix_logprobs
+            gap_mask = prefix_gap_mask + [0] * len(teacher_segment_ids) + [1] * len(student_suffix_ids)
+            _validate_intervention_state(
+                context=f"after repair attempt {attempt}",
+                response_ids=response_ids,
+                response_mask=response_mask,
+                response_logprobs=response_logprobs,
+                gap_mask=gap_mask,
+                response_length_limit=self.rollout_config.response_length,
+            )
+            cached_teacher_ids, cached_teacher_logprobs = None, None
+            interventions.append(
+                {
+                    "attempt": attempt,
+                    "start": start,
+                    "end": end,
+                    "score": score,
+                    "teacher_tokens": len(teacher_segment_ids),
+                    "student_suffix_tokens": len(student_suffix_ids),
+                }
+            )
+
+        output.response_ids = response_ids[: self.rollout_config.response_length]
+        output.response_mask = response_mask[: len(output.response_ids)]
+        output.response_logprobs = (
+            None
+            if interventions and intervention_config.train_on_teacher_segments
+            else response_logprobs[: len(output.response_ids)]
+        )
+        _validate_intervention_state(
+            context="final",
+            response_ids=output.response_ids,
+            response_mask=output.response_mask,
+            response_logprobs=output.response_logprobs,
+            gap_mask=gap_mask[: len(output.response_ids)],
+            response_length_limit=self.rollout_config.response_length,
+        )
+        output.extra_fields["teacher_intervention_count"] = len(interventions)
+        output.extra_fields["teacher_interventions"] = interventions
+        if cached_teacher_ids is not None and cached_teacher_logprobs is not None:
+            output.extra_fields["teacher_ids"] = cached_teacher_ids
+            output.extra_fields["teacher_logprobs"] = cached_teacher_logprobs
+        if interventions and self._teacher_intervention_logged_samples < intervention_config.log_examples_per_worker:
+            logger.info("Teacher interventions applied: %s", interventions)
+            self._teacher_intervention_logged_samples += 1
+
     async def _compute_teacher_logprobs(
         self,
         output: AgentLoopOutput,
@@ -877,17 +1296,27 @@ class AgentLoopWorker:
     ) -> None:
         """Compute teacher logprobs for single sample."""
         if self.distillation_enabled and not validate:
-            routing_key = None
-            if sample_kwargs is not None:
-                routing_value = sample_kwargs.get(self.teacher_key)
-                if routing_value is not None:
-                    # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
-                    routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+            expected_width = (
+                self.distillation_config.distillation_loss.topk
+                if self.distillation_config.distillation_loss.loss_settings.use_topk
+                else 1
+            )
+            existing_ids = output.extra_fields.get("teacher_ids")
+            existing_logprobs = output.extra_fields.get("teacher_logprobs")
+            if (
+                existing_ids is not None
+                and existing_logprobs is not None
+                and existing_ids.shape[0] == existing_logprobs.shape[0] == len(prompt_ids) + len(response_ids)
+                and existing_logprobs.shape[-1] == expected_width
+            ):
+                return
+            routing_key = self._teacher_routing_key(sample_kwargs)
             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 routing_key=routing_key,
+                request_id=output.extra_fields.get("rollout_request_id"),
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
@@ -907,11 +1336,20 @@ class AgentLoopWorker:
         input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
         position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
         optional_outputs = {}
-        if inputs[0].response_logprobs is not None:
+        has_response_logprobs = _require_consistent_optional_field(inputs, "response_logprobs")
+        has_routed_experts = _require_consistent_optional_field(inputs, "routed_experts")
+        has_teacher_logprobs = _require_consistent_optional_field(inputs, "teacher_logprobs")
+        has_teacher_ids = _require_consistent_optional_field(inputs, "teacher_ids")
+        if has_teacher_logprobs != has_teacher_ids:
+            raise RuntimeError(
+                "Inconsistent teacher scoring fields across agent loop outputs: teacher_logprobs and teacher_ids "
+                "must both be present or both be absent for every sample."
+            )
+        if has_response_logprobs:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
-        if inputs[0].routed_experts is not None:
+        if has_routed_experts:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
-        if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
+        if has_teacher_logprobs and has_teacher_ids:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
         batch = TensorDict(

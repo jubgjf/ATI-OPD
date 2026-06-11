@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import warnings
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import numpy as np
@@ -30,7 +31,9 @@ from verl.experimental.agent_loop.agent_loop import (
     _InternalAgentLoopOutput,
 )
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
+from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 from verl.utils.dataset.rl_dataset import RLHFDataset
+from verl.workers.config import DistillationInterventionConfig
 from verl.workers.rollout.replica import TokenOutput
 
 
@@ -70,6 +73,7 @@ class _FakeServerManager:
 
 class _FakeTokenizer:
     padding_side = "right"
+    pad_token_id = 0
 
     def apply_chat_template(
         self,
@@ -305,3 +309,262 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
     torch.testing.assert_close(internal.routed_experts[:, 2:6], expected)
     assert torch.count_nonzero(internal.routed_experts[:, :2]) == 0
     assert torch.count_nonzero(internal.routed_experts[:, 6:]) == 0
+
+
+class _FakeInterventionTeacherManager:
+    def __init__(self):
+        self.scored_sequences: list[list[int]] = []
+        self.generated_prefixes: list[list[int]] = []
+
+    async def compute_teacher_logprobs_single(
+        self,
+        sequence_ids: list[int],
+        multi_modal_data: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        routing_key: Optional[str] = None,
+        request_id: Optional[str] = None,
+        prompt_logprobs: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del multi_modal_data, mm_processor_kwargs, routing_key, request_id
+        assert prompt_logprobs == 0
+        self.scored_sequences.append(list(sequence_ids))
+        teacher_ids = torch.zeros(len(sequence_ids), 1, dtype=torch.int32)
+        teacher_logprobs = torch.full((len(sequence_ids), 1), -0.1, dtype=torch.float32)
+
+        # prompt_len=2. The first scoring sees response [1, 2, 3, 4, 5, 6].
+        # Response token j aligns to teacher_logprobs[prompt_len + j - 1].
+        response = sequence_ids[2:]
+        if response[:6] == [1, 2, 3, 4, 5, 6]:
+            teacher_logprobs[3, 0] = -5.0
+            teacher_logprobs[4, 0] = -5.0
+        return teacher_ids, teacher_logprobs
+
+    async def generate_teacher_segment_single(
+        self,
+        prefix_ids: list[int],
+        max_tokens: int,
+        multi_modal_data: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        routing_key: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> list[int]:
+        del max_tokens, multi_modal_data, mm_processor_kwargs, routing_key, request_id
+        self.generated_prefixes.append(list(prefix_ids))
+        return [30, 31]
+
+
+class _FakeRepairStudentClient:
+    def __init__(self):
+        self.calls: list[dict[str, Any]] = []
+
+    async def generate(
+        self,
+        request_id: str,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    ) -> TokenOutput:
+        del image_data, video_data, audio_data, mm_processor_kwargs
+        self.calls.append(
+            {"request_id": request_id, "prompt_ids": list(prompt_ids), "sampling_params": sampling_params}
+        )
+        return TokenOutput(token_ids=[40, 41], log_probs=[-0.2, -0.2])
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_postprocess_repairs_high_gap_segment_on_cpu():
+    class _DummyWorker:
+        _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
+        _compute_position_ids = AgentLoopWorker._compute_position_ids
+        _get_mm_processor_kwargs = AgentLoopWorker._get_mm_processor_kwargs
+        _compute_score = AgentLoopWorker._compute_score
+        _teacher_routing_key = AgentLoopWorker._teacher_routing_key
+        _score_sequence_for_intervention = AgentLoopWorker._score_sequence_for_intervention
+        _generate_student_suffix = AgentLoopWorker._generate_student_suffix
+        _maybe_repair_with_teacher = AgentLoopWorker._maybe_repair_with_teacher
+        _compute_teacher_logprobs = AgentLoopWorker._compute_teacher_logprobs
+        distillation_enabled = True
+        teacher_key = "data_source"
+
+        def __init__(self):
+            self.tokenizer = _FakeTokenizer()
+            self.rollout_config = OmegaConf.create({"prompt_length": 4, "response_length": 8})
+            self.processor = None
+            self.mm_processor_kwargs = {}
+            self.reward_loop_worker_handles = None
+            self.teacher_intervention_enabled = True
+            self.teacher_intervention_config = DistillationInterventionConfig(
+                enabled=True,
+                student_segment_length=2,
+                teacher_segment_length=2,
+                gap_metric="abs",
+                gap_threshold=1.0,
+                max_interventions_per_sample=1,
+                train_on_teacher_segments=False,
+                log_examples_per_worker=0,
+            )
+            self.teacher_server_manager = _FakeInterventionTeacherManager()
+            self.llm_client = _FakeRepairStudentClient()
+            self.distillation_config = SimpleNamespace(
+                distillation_loss=SimpleNamespace(topk=64, loss_settings=SimpleNamespace(use_topk=False))
+            )
+            self._teacher_intervention_logged_samples = 0
+
+    worker = _DummyWorker()
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "sample-1"},
+    )
+
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "top_p": 0.95, "logprobs": True},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        data_source="openai/gsm8k",
+    )
+
+    torch.testing.assert_close(
+        internal.response_ids[0],
+        torch.tensor([1, 2, 30, 31, 40, 41, 0, 0], dtype=torch.long),
+    )
+    torch.testing.assert_close(
+        internal.response_mask[0],
+        torch.tensor([1, 1, 0, 0, 1, 1, 0, 0], dtype=torch.long),
+    )
+    assert internal.teacher_logprobs is not None
+    assert worker.teacher_server_manager.scored_sequences == [
+        [101, 102, 1, 2, 3, 4, 5, 6],
+        [101, 102, 1, 2, 30, 31, 40, 41],
+    ]
+    assert worker.teacher_server_manager.generated_prefixes == [[101, 102, 1, 2]]
+    assert worker.llm_client.calls == [
+        {
+            "request_id": "sample-1",
+            "prompt_ids": [101, 102, 1, 2, 30, 31],
+            "sampling_params": {"temperature": 0.8, "top_p": 0.95, "logprobs": True, "max_tokens": 4},
+        }
+    ]
+    assert internal.extra_fields["teacher_intervention_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_teacher_manager_rejects_missing_prompt_logprobs_on_cpu():
+    class _BadTeacherClient:
+        async def generate(
+            self,
+            request_id: str,
+            *,
+            prompt_ids: list[int],
+            sampling_params: dict[str, Any],
+            image_data: Optional[list[Any]] = None,
+            video_data: Optional[list[Any]] = None,
+            audio_data: Optional[list[Any]] = None,
+            mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        ) -> TokenOutput:
+            del request_id, prompt_ids, sampling_params, image_data, video_data, audio_data, mm_processor_kwargs
+            return TokenOutput(token_ids=[1], extra_fields={})
+
+    manager = object.__new__(AsyncTeacherLLMServerManager)
+    manager.distillation_loss_config = SimpleNamespace(
+        topk=64,
+        loss_settings=SimpleNamespace(use_topk=False),
+    )
+    manager.teacher_key = "data_source"
+    manager.teacher_model_configs = {
+        "teacher": SimpleNamespace(inference=SimpleNamespace(temperature=1.0)),
+    }
+    manager.teacher_client = {"teacher": _BadTeacherClient()}
+
+    with pytest.raises(RuntimeError, match="required prompt scoring fields"):
+        await manager.compute_teacher_logprobs_single(
+            sequence_ids=[101, 102, 1, 2],
+            routing_key="teacher",
+            request_id="bad-teacher-score",
+            prompt_logprobs=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_teacher_intervention_requires_student_logprobs_on_cpu():
+    class _DummyWorker:
+        _teacher_routing_key = AgentLoopWorker._teacher_routing_key
+        _maybe_repair_with_teacher = AgentLoopWorker._maybe_repair_with_teacher
+        teacher_key = "data_source"
+
+        def __init__(self):
+            self.rollout_config = OmegaConf.create({"response_length": 8})
+            self.teacher_intervention_enabled = True
+            self.teacher_intervention_config = DistillationInterventionConfig(
+                enabled=True,
+                student_segment_length=2,
+                teacher_segment_length=2,
+                gap_metric="abs",
+                gap_threshold=1.0,
+                max_interventions_per_sample=1,
+                log_examples_per_worker=0,
+            )
+            self.teacher_server_manager = _FakeInterventionTeacherManager()
+            self.llm_client = _FakeRepairStudentClient()
+            self._teacher_intervention_logged_samples = 0
+
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4],
+        response_mask=[1, 1, 1, 1],
+        response_logprobs=None,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "missing-logprobs"},
+    )
+
+    with pytest.raises(RuntimeError, match="student rollout did not return response_logprobs"):
+        await AgentLoopWorker._maybe_repair_with_teacher(
+            _DummyWorker(),
+            output,
+            validate=False,
+            sampling_params={"temperature": 0.8},
+            sample_kwargs={"data_source": "openai/gsm8k"},
+        )
+
+
+def test_agent_loop_postprocess_rejects_mixed_optional_response_logprobs_on_cpu():
+    metrics = AgentLoopMetrics()
+    internal_a = _to_internal(
+        output_prompt_ids=[101, 102],
+        output_response_ids=[1, 2],
+        output_response_mask=[1, 1],
+        metrics=metrics,
+        extra_fields={},
+        num_turns=2,
+        prompt_len=4,
+        response_len=4,
+    )
+    internal_b = _to_internal(
+        output_prompt_ids=[101, 102],
+        output_response_ids=[3, 4],
+        output_response_mask=[1, 1],
+        metrics=metrics,
+        extra_fields={},
+        num_turns=2,
+        prompt_len=4,
+        response_len=4,
+    )
+    internal_a.response_logprobs = torch.zeros((1, 4), dtype=torch.float32)
+
+    dummy_worker = type(
+        "_DummyWorker",
+        (),
+        {"reward_loop_worker_handles": None, "distillation_enabled": False},
+    )()
+
+    with pytest.raises(RuntimeError, match="Inconsistent optional field 'response_logprobs'"):
+        AgentLoopWorker._postprocess(dummy_worker, inputs=[internal_a, internal_b])

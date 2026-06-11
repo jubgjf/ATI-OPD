@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -22,7 +23,12 @@ from verl.utils.config import omega_conf_to_dataclass
 
 from .rollout import RolloutConfig
 
-__all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
+__all__ = [
+    "DistillationLossConfig",
+    "DistillationInterventionConfig",
+    "DistillationTeacherModelConfig",
+    "DistillationConfig",
+]
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -110,6 +116,57 @@ class DistillationLossConfig(BaseConfig):
                 "Directly backpropagating k1 loss is incorrect since gradient of k1 loss"
                 " wrt model weights does not depend on teacher log probabilities."
             )
+
+
+@dataclass
+class DistillationInterventionConfig(BaseConfig):
+    """Configuration for teacher intervention during student rollout.
+
+    The default implementation is compute-friendly: it lets the student finish
+    a full rollout first, scores fixed token segments, and only repairs samples
+    whose teacher/student gap crosses the threshold.
+    """
+
+    enabled: bool = False
+    segment_method: str = "fixed_tokens"
+    student_segment_length: int = 128
+    teacher_segment_length: int = 128
+    gap_metric: str = "k3"
+    gap_aggregation: str = "mean"
+    gap_threshold: float = 1.0
+    max_interventions_per_sample: int = 4
+    train_on_teacher_segments: bool = False
+    teacher_temperature: float = 0.7
+    teacher_top_p: float = 1.0
+    teacher_top_k: int = -1
+    log_examples_per_worker: int = 2
+
+    def __post_init__(self):
+        if self.segment_method != "fixed_tokens":
+            raise NotImplementedError(
+                f"Only fixed_tokens teacher intervention segments are currently supported, "
+                f"but got {self.segment_method!r}."
+            )
+        if self.student_segment_length <= 0:
+            raise ValueError("student_segment_length must be positive.")
+        if self.teacher_segment_length <= 0:
+            raise ValueError("teacher_segment_length must be positive.")
+        if self.max_interventions_per_sample < 0:
+            raise ValueError("max_interventions_per_sample must be non-negative.")
+        if self.gap_aggregation not in {"mean", "max"}:
+            raise ValueError(f"Unsupported gap_aggregation: {self.gap_aggregation!r}.")
+        if self.gap_metric not in {"kl", "k1", "abs", "mse", "k2", "low_var_kl", "k3"}:
+            raise ValueError(f"Unsupported gap_metric: {self.gap_metric!r}.")
+        if not math.isfinite(self.gap_threshold):
+            raise ValueError(f"gap_threshold must be finite, got {self.gap_threshold!r}.")
+        if not math.isfinite(self.teacher_temperature) or self.teacher_temperature < 0:
+            raise ValueError(f"teacher_temperature must be finite and non-negative, got {self.teacher_temperature!r}.")
+        if not math.isfinite(self.teacher_top_p) or not 0 < self.teacher_top_p <= 1:
+            raise ValueError(f"teacher_top_p must be in (0, 1], got {self.teacher_top_p!r}.")
+        if self.teacher_top_k < -1:
+            raise ValueError(f"teacher_top_k must be -1 or non-negative, got {self.teacher_top_k!r}.")
+        if self.log_examples_per_worker < 0:
+            raise ValueError("log_examples_per_worker must be non-negative.")
 
 
 @dataclass
@@ -253,6 +310,7 @@ class DistillationConfig(BaseConfig):
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
     teacher_key: str = "data_source"
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
+    intervention: DistillationInterventionConfig = field(default_factory=DistillationInterventionConfig)
 
     def __post_init__(self):
         if not self.enabled:

@@ -56,9 +56,10 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
         # 3. generate sequences
         metrics = {}
+        rollout_request_id = uuid4().hex
         with simple_timer("generate_sequences", metrics):
             output: TokenOutput = await self.server_manager.generate(
-                request_id=uuid4().hex,
+                request_id=rollout_request_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=images,
@@ -69,6 +70,8 @@ class SingleTurnAgentLoop(AgentLoopBase):
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
         response_mask = [1] * len(output.token_ids)
+        extra_fields = dict(output.extra_fields)
+        extra_fields["rollout_request_id"] = rollout_request_id
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -84,7 +87,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
             mm_processor_kwargs=mm_processor_kwargs,
             num_turns=2,
             metrics=metrics,
-            extra_fields=output.extra_fields,
+            extra_fields=extra_fields,
         )
 
         # keeping the schema consistent with tool_agent_loop
