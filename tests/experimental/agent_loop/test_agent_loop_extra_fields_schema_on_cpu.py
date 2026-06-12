@@ -458,6 +458,93 @@ async def test_agent_loop_postprocess_repairs_high_gap_segment_on_cpu():
 
 
 @pytest.mark.asyncio
+async def test_teacher_intervention_train_teacher_segments_drops_rollout_logprobs_batch_wide_on_cpu():
+    class _DummyWorker:
+        _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
+        _compute_position_ids = AgentLoopWorker._compute_position_ids
+        _get_mm_processor_kwargs = AgentLoopWorker._get_mm_processor_kwargs
+        _compute_score = AgentLoopWorker._compute_score
+        _teacher_routing_key = AgentLoopWorker._teacher_routing_key
+        _score_sequence_for_intervention = AgentLoopWorker._score_sequence_for_intervention
+        _generate_student_suffix = AgentLoopWorker._generate_student_suffix
+        _maybe_repair_with_teacher = AgentLoopWorker._maybe_repair_with_teacher
+        _compute_teacher_logprobs = AgentLoopWorker._compute_teacher_logprobs
+        distillation_enabled = True
+        teacher_key = "data_source"
+
+        def __init__(self):
+            self.tokenizer = _FakeTokenizer()
+            self.rollout_config = OmegaConf.create({"prompt_length": 4, "response_length": 8})
+            self.processor = None
+            self.mm_processor_kwargs = {}
+            self.reward_loop_worker_handles = None
+            self.teacher_intervention_enabled = True
+            self.teacher_intervention_config = DistillationInterventionConfig(
+                enabled=True,
+                student_segment_length=2,
+                teacher_segment_length=2,
+                gap_metric="abs",
+                gap_threshold=1.0,
+                max_interventions_per_sample=1,
+                train_on_teacher_segments=True,
+                log_examples_per_worker=0,
+            )
+            self.teacher_server_manager = _FakeInterventionTeacherManager()
+            self.llm_client = _FakeRepairStudentClient()
+            self.distillation_config = SimpleNamespace(
+                distillation_loss=SimpleNamespace(topk=64, loss_settings=SimpleNamespace(use_topk=False))
+            )
+            self._teacher_intervention_logged_samples = 0
+
+    worker = _DummyWorker()
+    intervened = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "intervened"},
+    )
+    untouched = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[7, 8, 9, 10],
+        response_mask=[1, 1, 1, 1],
+        response_logprobs=[-0.1] * 4,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "untouched"},
+    )
+
+    internal_intervened = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        intervened,
+        validate=False,
+        sampling_params={"temperature": 0.8, "top_p": 0.95, "logprobs": True},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        data_source="openai/gsm8k",
+    )
+    internal_untouched = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        untouched,
+        validate=False,
+        sampling_params={"temperature": 0.8, "top_p": 0.95, "logprobs": True},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        data_source="openai/gsm8k",
+    )
+
+    assert internal_intervened.response_logprobs is None
+    assert internal_untouched.response_logprobs is None
+    assert internal_intervened.extra_fields["teacher_intervention_count"] == 1
+    assert internal_untouched.extra_fields["teacher_intervention_count"] == 0
+    torch.testing.assert_close(
+        internal_intervened.response_mask[0],
+        torch.tensor([1, 1, 1, 1, 1, 1, 0, 0], dtype=torch.long),
+    )
+
+    merged = AgentLoopWorker._postprocess(worker, inputs=[internal_intervened, internal_untouched])
+    assert "rollout_log_probs" not in merged.batch.keys()
+
+
+@pytest.mark.asyncio
 async def test_teacher_manager_rejects_missing_prompt_logprobs_on_cpu():
     class _BadTeacherClient:
         async def generate(

@@ -750,6 +750,18 @@ class AgentLoopWorker:
                 sampling_params=sampling_params,
                 sample_kwargs=kwargs,
             )
+            if (
+                not validate
+                and self.teacher_intervention_config is not None
+                and self.teacher_intervention_config.train_on_teacher_segments
+            ):
+                # The intervention path needs rollout logprobs to score gaps, but
+                # after teacher tokens are inserted there is no valid rollout
+                # policy logprob for every trainable token. Drop this optional
+                # field for every sample so the trainer recomputes old_log_probs
+                # from the actor over the final sequence instead of receiving a
+                # mixed per-sample schema.
+                output.response_logprobs = None
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -1264,11 +1276,7 @@ class AgentLoopWorker:
 
         output.response_ids = response_ids[: self.rollout_config.response_length]
         output.response_mask = response_mask[: len(output.response_ids)]
-        output.response_logprobs = (
-            None
-            if interventions and intervention_config.train_on_teacher_segments
-            else response_logprobs[: len(output.response_ids)]
-        )
+        output.response_logprobs = response_logprobs[: len(output.response_ids)]
         _validate_intervention_state(
             context="final",
             response_ids=output.response_ids,
