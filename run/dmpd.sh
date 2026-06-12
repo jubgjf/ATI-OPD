@@ -17,6 +17,8 @@ python -c "import acl;print(acl.get_soc_name())"
 echo ============================
 
 sudo yum install jemalloc jq tmux -y
+ls -l /usr/lib64/libjemalloc.so.2
+export LD_PRELOAD=/usr/lib64/libjemalloc.so.2:${LD_PRELOAD}
 echo ============================
 
 . /home/ma-user/anaconda3/etc/profile.d/conda.sh
