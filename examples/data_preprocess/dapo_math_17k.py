@@ -27,8 +27,6 @@ from typing import Any
 
 import datasets
 
-from verl.utils.hdfs_io import copy, makedirs
-
 DATA_SOURCE = "BytedTsinghua-SIA/DAPO-Math-17k"
 DEFAULT_LOCAL_DATASET_PATH = os.environ.get("DAPO_MATH_17K_LOCAL_PATH", "~/data/DAPO-Math-17k")
 
@@ -223,5 +221,7 @@ if __name__ == "__main__":
     print(f"Saved DAPO-Math test split to {test_path} ({len(test_dataset)} rows)", flush=True)
 
     if args.hdfs_dir is not None:
+        from verl.utils.hdfs_io import copy, makedirs
+
         makedirs(args.hdfs_dir)
         copy(src=str(local_save_path), dst=args.hdfs_dir)
