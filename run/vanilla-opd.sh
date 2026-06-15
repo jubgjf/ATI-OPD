@@ -74,8 +74,8 @@ export VLLM_USE_V1=1
 STUDENT_MODEL=$DATASET_DIR/models/Qwen/Qwen3-8B
 TEACHER_MODEL=$DATASET_DIR/models/Qwen/Qwen3-32B
 
-dapo_math_train=$DATASET_DIR/datasets/BytedTsinghua-SIA/DAPO-Math-17k-verl/train.parquet
-dapo_math_valid=$DATASET_DIR/datasets/BytedTsinghua-SIA/DAPO-Math-17k-verl/test.parquet
+dapo_math_train=$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl/train.parquet
+dapo_math_valid=$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl/test.parquet
 
 train_files="['$dapo_math_train']"
 valid_files="['$dapo_math_valid']"

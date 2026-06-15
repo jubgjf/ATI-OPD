@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Preprocess the local DAPO-Math-17k dataset to verl single-turn RL parquet format.
+Preprocess the local open-r1 DAPO-Math-17k-Processed dataset to verl RL parquet format.
 
-The HF dataset already follows verl's RL schema. This script validates the
-schema, adds split metadata, and creates a deterministic train/test split
-because DAPO-Math-17k only ships a train split.
+The open-r1 dataset is a deduplicated version of BytedTsinghua-SIA/DAPO-Math-17k.
+It ships one train split with three configs (all/cn/en). This script validates
+the schema, restores verl's chat-message prompt format, and creates a
+deterministic train/test split when no test split is present.
 """
 
 import argparse
@@ -27,8 +28,10 @@ from typing import Any
 
 import datasets
 
-DATA_SOURCE = "BytedTsinghua-SIA/DAPO-Math-17k"
-DEFAULT_LOCAL_DATASET_PATH = os.environ.get("DAPO_MATH_17K_LOCAL_PATH", "~/data/DAPO-Math-17k")
+DATA_SOURCE = "open-r1/DAPO-Math-17k-Processed"
+REWARD_DATA_SOURCE = "math_dapo"
+DEFAULT_CONFIG_NAME = os.environ.get("DAPO_MATH_17K_CONFIG", "all")
+DEFAULT_LOCAL_DATASET_PATH = os.environ.get("DAPO_MATH_17K_LOCAL_PATH", "~/data/DAPO-Math-17k-Processed")
 
 
 def _expand_path(path: str) -> Path:
@@ -82,15 +85,56 @@ def normalize_reward_model(reward_model: Any, idx: int) -> dict[str, Any]:
     return dict(reward_model)
 
 
-def _load_parquet_files(path: Path) -> datasets.DatasetDict:
+def normalize_extra_info(extra_info: Any, idx: int) -> dict[str, Any]:
+    if extra_info is None:
+        return {}
+    extra_info = _loads_json_field(extra_info, "extra_info", idx)
+    if not isinstance(extra_info, dict):
+        raise ValueError(f"DAPO-Math row {idx} has unsupported extra_info type: {type(extra_info).__name__}.")
+    return dict(extra_info)
+
+
+def _build_reward_model_from_answer(example: dict[str, Any], idx: int) -> dict[str, Any]:
+    reward_model = example.get("reward_model")
+    if reward_model is not None:
+        return normalize_reward_model(reward_model, idx)
+
+    for field_name in ("solution", "answer", "ground_truth", "final_answer"):
+        answer = example.get(field_name)
+        if answer is not None and str(answer).strip():
+            return {"style": "rule", "ground_truth": str(answer)}
+
+    raise ValueError(
+        f"DAPO-Math row {idx} must contain reward_model.ground_truth or one of "
+        "solution/answer/ground_truth/final_answer."
+    )
+
+
+def _select_prompt_value(example: dict[str, Any], idx: int) -> Any:
+    # open-r1 keeps the original DAPO chat prompt in source_prompt. The prompt
+    # column is a raw problem string intended for TRL-style trainers.
+    for field_name in ("source_prompt", "prompt", "problem", "question"):
+        prompt = example.get(field_name)
+        if prompt is not None:
+            return prompt
+
+    raise ValueError(f"DAPO-Math row {idx} must contain source_prompt, prompt, problem, or question.")
+
+
+def _load_parquet_files(path: Path, config_name: str) -> datasets.DatasetDict:
     if path.is_file():
         parquet_files = [str(path)]
     else:
-        preferred_file = path / "data" / "dapo-math-17k.parquet"
-        if preferred_file.exists():
-            parquet_files = [str(preferred_file)]
-        else:
-            parquet_files = sorted(str(p) for p in path.rglob("*.parquet"))
+        preferred_files = [
+            path / config_name / "train-00000-of-00001.parquet",
+            path / config_name / "train" / "0000.parquet",
+            path / "data" / "dapo-math-17k.parquet",
+        ]
+        parquet_files = [str(p) for p in preferred_files if p.exists()]
+        if not parquet_files:
+            all_parquet_files = sorted(path.rglob("*.parquet"))
+            matched_config_files = [p for p in all_parquet_files if config_name in p.parts]
+            parquet_files = [str(p) for p in (matched_config_files or all_parquet_files)]
 
     if not parquet_files:
         raise FileNotFoundError(f"No parquet files found under local DAPO dataset path: {path}")
@@ -98,12 +142,19 @@ def _load_parquet_files(path: Path) -> datasets.DatasetDict:
     return datasets.load_dataset("parquet", data_files={"train": parquet_files})
 
 
-def load_dapo_dataset(local_dataset_path: str, download: bool = False) -> datasets.DatasetDict:
+def load_dapo_dataset(
+    local_dataset_path: str,
+    download: bool = False,
+    config_name: str = DEFAULT_CONFIG_NAME,
+) -> datasets.DatasetDict:
     """Load DAPO-Math-17k from local files by default.
 
     Use ``--download`` to explicitly fall back to Hugging Face. If network
     access is needed on the cluster, set ``HF_ENDPOINT=https://hf-mirror.com``.
     """
+    if config_name not in {"all", "cn", "en"}:
+        raise ValueError(f"config_name must be one of all/cn/en for {DATA_SOURCE}, got {config_name!r}.")
+
     dataset_path = _expand_path(local_dataset_path)
     if dataset_path.exists():
         if (dataset_path / "dataset_dict.json").exists() or (dataset_path / "state.json").exists():
@@ -111,21 +162,21 @@ def load_dapo_dataset(local_dataset_path: str, download: bool = False) -> datase
             return loaded if isinstance(loaded, datasets.DatasetDict) else datasets.DatasetDict({"train": loaded})
 
         if dataset_path.is_file() or any(dataset_path.rglob("*.parquet")):
-            return _load_parquet_files(dataset_path)
+            return _load_parquet_files(dataset_path, config_name=config_name)
 
         try:
-            return datasets.load_dataset(str(dataset_path), "default")
+            return datasets.load_dataset(str(dataset_path), config_name)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to load local DAPO dataset from {dataset_path}. Expected a Hugging Face dataset directory, "
-                "a dataset saved with save_to_disk, or parquet files such as data/dapo-math-17k.parquet."
+                "a dataset saved with save_to_disk, or parquet files such as all/train-00000-of-00001.parquet."
             ) from exc
 
     if download:
         hf_endpoint = os.environ.get("HF_ENDPOINT")
         if hf_endpoint:
             print(f"HF_ENDPOINT={hf_endpoint}", flush=True)
-        return datasets.load_dataset(DATA_SOURCE, "default")
+        return datasets.load_dataset(DATA_SOURCE, config_name)
 
     raise FileNotFoundError(
         f"Local DAPO dataset path does not exist: {dataset_path}. Download it first, or rerun with --download. "
@@ -135,27 +186,37 @@ def load_dapo_dataset(local_dataset_path: str, download: bool = False) -> datase
 
 def validate_and_tag_dataset(dataset: datasets.Dataset, split: str) -> datasets.Dataset:
     def process_fn(example: dict[str, Any], idx: int) -> dict[str, Any]:
-        data_source = example.get("data_source")
-        if data_source != "math_dapo":
-            raise ValueError(f"DAPO-Math row {idx} has unsupported data_source={data_source!r}; expected 'math_dapo'.")
+        source_data_source = example.get("data_source")
+        if source_data_source not in (None, REWARD_DATA_SOURCE):
+            raise ValueError(
+                f"DAPO-Math row {idx} has unsupported data_source={source_data_source!r}; "
+                f"expected {REWARD_DATA_SOURCE!r} or a missing value."
+            )
 
-        prompt = normalize_prompt(example.get("prompt"), idx)
-        reward_model = normalize_reward_model(example.get("reward_model"), idx)
+        prompt = normalize_prompt(_select_prompt_value(example, idx), idx)
+        reward_model = _build_reward_model_from_answer(example, idx)
 
-        extra_info = dict(example.get("extra_info") or {})
+        extra_info = normalize_extra_info(example.get("extra_info"), idx)
         extra_info.setdefault("index", str(idx))
         extra_info["split"] = split
         extra_info["source_dataset"] = DATA_SOURCE
+        if source_data_source is not None:
+            extra_info["source_data_source"] = source_data_source
 
         return {
-            "data_source": data_source,
+            "data_source": REWARD_DATA_SOURCE,
             "prompt": prompt,
-            "ability": example.get("ability", "MATH"),
+            "ability": example.get("ability") or "MATH",
             "reward_model": reward_model,
             "extra_info": extra_info,
         }
 
-    return dataset.map(function=process_fn, with_indices=True, desc=f"Validating {split} split")
+    return dataset.map(
+        function=process_fn,
+        with_indices=True,
+        remove_columns=dataset.column_names,
+        desc=f"Validating {split} split",
+    )
 
 
 def build_train_test_split(
@@ -194,11 +255,13 @@ def write_dataset_info(
     train_dataset: datasets.Dataset,
     test_dataset: datasets.Dataset,
     local_dataset_path: str,
+    config_name: str,
     test_size: float,
     seed: int,
 ) -> None:
     info = {
         "source": DATA_SOURCE,
+        "config_name": config_name,
         "local_dataset_path": str(_expand_path(local_dataset_path)),
         "train_rows": len(train_dataset),
         "test_rows": len(test_dataset),
@@ -217,12 +280,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--local_dataset_path",
         default=DEFAULT_LOCAL_DATASET_PATH,
-        help="Path to an already downloaded DAPO-Math-17k dataset directory or parquet file.",
+        help="Path to an already downloaded open-r1/DAPO-Math-17k-Processed dataset directory or parquet file.",
     )
     parser.add_argument(
         "--local_save_dir",
-        default="~/data/dapo-math-17k-verl",
+        default="~/data/dapo-math-17k-processed-verl",
         help="The save directory for the preprocessed train/test parquet files.",
+    )
+    parser.add_argument(
+        "--config_name",
+        default=DEFAULT_CONFIG_NAME,
+        choices=("all", "cn", "en"),
+        help="Dataset config to preprocess. Use 'all' for the deduplicated 17.4k full set.",
     )
     parser.add_argument("--test_size", type=float, default=0.2, help="Held-out fraction when no test split exists.")
     parser.add_argument("--seed", type=int, default=42, help="Seed for deterministic train/test splitting.")
@@ -243,7 +312,7 @@ if __name__ == "__main__":
     local_save_path = _expand_path(local_save_dir)
     local_save_path.mkdir(parents=True, exist_ok=True)
 
-    dataset = load_dapo_dataset(args.local_dataset_path, download=args.download)
+    dataset = load_dapo_dataset(args.local_dataset_path, download=args.download, config_name=args.config_name)
     train_dataset, test_dataset = build_train_test_split(dataset, test_size=args.test_size, seed=args.seed)
 
     train_path = local_save_path / "train.parquet"
@@ -251,7 +320,15 @@ if __name__ == "__main__":
     train_dataset.to_parquet(str(train_path))
     test_dataset.to_parquet(str(test_path))
     write_examples(local_save_path, train_dataset, test_dataset)
-    write_dataset_info(local_save_path, train_dataset, test_dataset, args.local_dataset_path, args.test_size, args.seed)
+    write_dataset_info(
+        local_save_path,
+        train_dataset,
+        test_dataset,
+        args.local_dataset_path,
+        args.config_name,
+        args.test_size,
+        args.seed,
+    )
 
     print(f"Saved DAPO-Math train split to {train_path} ({len(train_dataset)} rows)", flush=True)
     print(f"Saved DAPO-Math test split to {test_path} ({len(test_dataset)} rows)", flush=True)

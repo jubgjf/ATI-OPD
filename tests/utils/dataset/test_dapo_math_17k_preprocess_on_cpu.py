@@ -18,6 +18,8 @@ import datasets
 import pytest
 
 from examples.data_preprocess.dapo_math_17k import (
+    DATA_SOURCE,
+    normalize_extra_info,
     normalize_prompt,
     normalize_reward_model,
     validate_and_tag_dataset,
@@ -46,12 +48,21 @@ def test_normalize_reward_model_accepts_dict_and_json_on_cpu():
     assert normalize_reward_model(json.dumps(expected), idx=0) == expected
 
 
+def test_normalize_extra_info_accepts_dict_json_and_none_on_cpu():
+    expected = {"index": "abc"}
+
+    assert normalize_extra_info(expected, idx=0) == expected
+    assert normalize_extra_info(json.dumps(expected), idx=0) == expected
+    assert normalize_extra_info(None, idx=0) == {}
+
+
 def test_validate_and_tag_dataset_outputs_verl_rl_schema_on_cpu():
     dataset = datasets.Dataset.from_list(
         [
             {
                 "data_source": "math_dapo",
-                "prompt": json.dumps({"role": "user", "content": "What is 6*7?"}),
+                "prompt": "What is 6*7?",
+                "source_prompt": [{"role": "user", "content": "Solve step by step. What is 6*7?"}],
                 "ability": "MATH",
                 "reward_model": json.dumps({"style": "rule", "ground_truth": "42"}),
                 "extra_info": {"original_index": 7},
@@ -62,7 +73,32 @@ def test_validate_and_tag_dataset_outputs_verl_rl_schema_on_cpu():
     processed = validate_and_tag_dataset(dataset, split="train")
     row = processed[0]
 
-    assert row["prompt"] == [{"role": "user", "content": "What is 6*7?"}]
+    assert set(processed.column_names) == {"data_source", "prompt", "ability", "reward_model", "extra_info"}
+    assert row["data_source"] == "math_dapo"
+    assert row["prompt"] == [{"role": "user", "content": "Solve step by step. What is 6*7?"}]
     assert row["reward_model"] == {"style": "rule", "ground_truth": "42"}
     assert row["extra_info"]["split"] == "train"
-    assert row["extra_info"]["source_dataset"] == "BytedTsinghua-SIA/DAPO-Math-17k"
+    assert row["extra_info"]["source_dataset"] == DATA_SOURCE
+    assert row["extra_info"]["source_data_source"] == "math_dapo"
+
+
+def test_validate_and_tag_dataset_accepts_problem_and_solution_fallback_on_cpu():
+    dataset = datasets.Dataset.from_list(
+        [
+            {
+                "problem": "What is 0?",
+                "solution": 0,
+                "extra_info": json.dumps({"original_index": "zero-answer"}),
+            }
+        ]
+    )
+
+    processed = validate_and_tag_dataset(dataset, split="test")
+    row = processed[0]
+
+    assert set(processed.column_names) == {"data_source", "prompt", "ability", "reward_model", "extra_info"}
+    assert row["data_source"] == "math_dapo"
+    assert row["prompt"] == [{"role": "user", "content": "What is 0?"}]
+    assert row["reward_model"] == {"style": "rule", "ground_truth": "0"}
+    assert row["extra_info"]["original_index"] == "zero-answer"
+    assert row["extra_info"]["source_dataset"] == DATA_SOURCE
