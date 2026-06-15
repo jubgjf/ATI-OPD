@@ -35,6 +35,53 @@ def _expand_path(path: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(path)))
 
 
+def _loads_json_field(value: Any, field_name: str, idx: int) -> Any:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError(f"DAPO-Math row {idx} has an empty {field_name} field.")
+    if not stripped.startswith(("{", "[")):
+        return value
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"DAPO-Math row {idx} has invalid JSON in {field_name}: {value[:200]!r}") from exc
+
+
+def normalize_prompt(prompt: Any, idx: int) -> list[dict[str, str]]:
+    """Normalize DAPO prompt variants to verl's single-turn chat-message schema."""
+    prompt = _loads_json_field(prompt, "prompt", idx)
+    if isinstance(prompt, str):
+        messages = [{"role": "user", "content": prompt}]
+    elif isinstance(prompt, dict):
+        messages = [prompt]
+    elif isinstance(prompt, list):
+        messages = prompt
+    else:
+        raise ValueError(f"DAPO-Math row {idx} has unsupported prompt type: {type(prompt).__name__}.")
+
+    if len(messages) != 1:
+        raise ValueError(f"DAPO-Math row {idx} must contain a single-turn prompt, got {len(messages)} messages.")
+    message = messages[0]
+    if not isinstance(message, dict):
+        raise ValueError(f"DAPO-Math row {idx} prompt message must be a dict, got {type(message).__name__}.")
+    role = message.get("role", "user")
+    content = message.get("content")
+    if role != "user" or not isinstance(content, str) or not content.strip():
+        raise ValueError(f"DAPO-Math row {idx} has invalid prompt message: {message!r}.")
+    return [{"role": "user", "content": content}]
+
+
+def normalize_reward_model(reward_model: Any, idx: int) -> dict[str, Any]:
+    reward_model = _loads_json_field(reward_model, "reward_model", idx)
+    if not isinstance(reward_model, dict):
+        raise ValueError(f"DAPO-Math row {idx} has unsupported reward_model type: {type(reward_model).__name__}.")
+    if not str(reward_model.get("ground_truth", "")).strip():
+        raise ValueError(f"DAPO-Math row {idx} must contain reward_model.ground_truth.")
+    return dict(reward_model)
+
+
 def _load_parquet_files(path: Path) -> datasets.DatasetDict:
     if path.is_file():
         parquet_files = [str(path)]
@@ -92,19 +139,8 @@ def validate_and_tag_dataset(dataset: datasets.Dataset, split: str) -> datasets.
         if data_source != "math_dapo":
             raise ValueError(f"DAPO-Math row {idx} has unsupported data_source={data_source!r}; expected 'math_dapo'.")
 
-        prompt = example.get("prompt")
-        if not isinstance(prompt, list) or len(prompt) != 1:
-            raise ValueError(f"DAPO-Math row {idx} must contain a single-turn prompt list, got {type(prompt)=}.")
-        message = prompt[0]
-        valid_message = (
-            isinstance(message, dict) and message.get("role") == "user" and isinstance(message.get("content"), str)
-        )
-        if not valid_message:
-            raise ValueError(f"DAPO-Math row {idx} has invalid prompt message: {message!r}.")
-
-        reward_model = example.get("reward_model")
-        if not isinstance(reward_model, dict) or not str(reward_model.get("ground_truth", "")).strip():
-            raise ValueError(f"DAPO-Math row {idx} must contain reward_model.ground_truth.")
+        prompt = normalize_prompt(example.get("prompt"), idx)
+        reward_model = normalize_reward_model(example.get("reward_model"), idx)
 
         extra_info = dict(example.get("extra_info") or {})
         extra_info.setdefault("index", str(idx))
