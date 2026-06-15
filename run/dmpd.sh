@@ -3,8 +3,9 @@
 
 set -x
 
+HOME=${HOME:-/home/ma-user}
 DATASET_DIR=/opt/huawei/dataset/jnguan
-BASE_DIR=/home/ma-user
+WORKSPACE=$DATASET_DIR/code/DMPD
 
 npu-smi info
 echo ============================
@@ -21,25 +22,25 @@ ls -l /usr/lib64/libjemalloc.so.2
 export LD_PRELOAD=/usr/lib64/libjemalloc.so.2:${LD_PRELOAD}
 echo ============================
 
-. /home/ma-user/anaconda3/etc/profile.d/conda.sh
-mkdir -p /home/ma-user/anaconda3/envs/verl
-tar -xf /opt/huawei/dataset/jnguan/libs/verl-conda-env.tar.gz -C /home/ma-user/anaconda3/envs/verl
+. $HOME/anaconda3/etc/profile.d/conda.sh
+mkdir -p $HOME/anaconda3/envs/verl
+tar -xf $DATASET_DIR/libs/verl-conda-env.tar.gz -C $HOME/anaconda3/envs/verl
 conda env list
 conda activate verl
 echo ============================
 
-cp -r "${DATASET_DIR}/libs/vllm" "${BASE_DIR}/vllm-src"
-cp -r "${DATASET_DIR}/libs/vllm-ascend" "${BASE_DIR}/vllm-ascend-src"
-cd "${BASE_DIR}/vllm-src" || exit
+cp -r "${DATASET_DIR}/libs/vllm" "${HOME}/vllm-src"
+cp -r "${DATASET_DIR}/libs/vllm-ascend" "${HOME}/vllm-ascend-src"
+cd "${HOME}/vllm-src" || exit
 git checkout v0.11.0
 VLLM_TARGET_DEVICE=empty pip install -v -e .
-cd "${BASE_DIR}/vllm-ascend-src" || exit
+cd "${HOME}/vllm-ascend-src" || exit
 git checkout v0.11.0
 git submodule update
 pip install -v -e .
 echo ============================
 
-cd /opt/huawei/algorithm/code/DMPD
+cd $WORKSPACE
 pip install -r requirements-npu.txt
 pip install -e .
 echo ============================
@@ -70,24 +71,32 @@ export HCCL_DETERMINISTIC="true"
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export VLLM_USE_V1=1
 
-STUDENT_MODEL=/opt/huawei/dataset/jnguan/models/Qwen/Qwen3-8B
-TEACHER_MODEL=/opt/huawei/dataset/jnguan/models/Qwen/Qwen3-32B
+STUDENT_MODEL=$DATASET_DIR/models/Qwen/Qwen3-8B
+TEACHER_MODEL=$DATASET_DIR/models/Qwen/Qwen3-32B
 
-gsm8k_train=/opt/huawei/dataset/jnguan/datasets/openai/gsm8k-verl/train.parquet
-gsm8k_test=/opt/huawei/dataset/jnguan/datasets/openai/gsm8k-verl/test.parquet
+dapo_math_train=$DATASET_DIR/datasets/BytedTsinghua-SIA/DAPO-Math-17k-verl/train.parquet
+dapo_math_valid=$DATASET_DIR/datasets/BytedTsinghua-SIA/DAPO-Math-17k-verl/test.parquet
 
-train_files="['$gsm8k_train']"
-val_files="['$gsm8k_test']"
+train_files="['$dapo_math_train']"
+valid_files="['$dapo_math_valid']"
 
 # 训练基本参数
-max_prompt_length=1024
-max_response_length=2048
+max_prompt_length=2048
+max_response_length=8192
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
+rollout_max_num_batched_tokens=$max_num_tokens
+teacher_max_num_batched_tokens=$max_num_tokens
+rollout_max_num_seqs=256
+teacher_max_num_seqs=256
 
 actor_lr=1e-6
 train_batch_size=128
 ppo_mini_batch_size=128
 ppo_max_token_len_per_gpu=12288
+train_max_samples=-1
+val_max_samples=4096
+val_batch_size=256
+data_seed=-42
 
 # 分布式与并行参数
 NNODES=${NNODES:-4}
@@ -122,15 +131,16 @@ project_name="DMPD"
 experiment_timestamp=${EXPERIMENT_TIMESTAMP:-$(date +"%Y%m%d-%H%M%S")}
 experiment_base_name=${EXPERIMENT_NAME:-"dmpd"}
 experiment_name=${EXPERIMENT_FULL_NAME:-"${experiment_base_name}-${experiment_timestamp}"}
-default_local_dir=/opt/huawei/dataset/jnguan/checkpoints/DMPD/${experiment_name}
+default_local_dir=$WORKSPACE/outputs/${experiment_name}
 total_epochs=3
-save_freq=100
+save_freq=200
 test_freq=10
 
 mkdir -p ${default_local_dir}
 
-export WANDB_MODE=${WANDB_MODE:-offline}
-export WANDB_DIR=${WANDB_DIR:-/opt/huawei/dataset/jnguan/mtp-outputs/DMPD/wandb}
+export WANDB_MODE=offline
+export WANDB_DIR=$WORKSPACE
+export WANDB_START_METHOD=thread
 mkdir -p ${WANDB_DIR}
 
 ### 启动分布式网络配置
@@ -224,13 +234,17 @@ if [ "$NODE_RANK" -eq 0 ]; then
         algorithm.adv_estimator=grpo \
         algorithm.use_kl_in_reward=False \
         data.train_files="$train_files" \
-        data.val_files="$val_files" \
+        data.val_files="$valid_files" \
         data.train_batch_size=$train_batch_size \
+        data.val_batch_size=$val_batch_size \
+        data.train_max_samples=$train_max_samples \
+        data.val_max_samples=$val_max_samples \
         data.max_prompt_length=$max_prompt_length \
         data.max_response_length=$max_response_length \
         data.filter_overlong_prompts=True \
         data.truncation='error' \
         data.shuffle=False \
+        data.seed=${data_seed} \
         actor_rollout_ref.model.path="$STUDENT_MODEL" \
         actor_rollout_ref.model.use_remove_padding=True \
         actor_rollout_ref.model.enable_gradient_checkpointing=True \
@@ -248,8 +262,11 @@ if [ "$NODE_RANK" -eq 0 ]; then
         actor_rollout_ref.rollout.gpu_memory_utilization=${rollout_gpu_mem_util} \
         actor_rollout_ref.rollout.n=1 \
         actor_rollout_ref.rollout.max_model_len=${max_num_tokens} \
+        actor_rollout_ref.rollout.max_num_batched_tokens=${rollout_max_num_batched_tokens} \
+        actor_rollout_ref.rollout.max_num_seqs=${rollout_max_num_seqs} \
         actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
         actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len_per_gpu} \
+        reward.reward_manager.name=naive \
         trainer.balance_batch=True \
         trainer.logger='["console","wandb"]' \
         trainer.project_name=${project_name} \
@@ -270,6 +287,8 @@ if [ "$NODE_RANK" -eq 0 ]; then
         distillation.teacher_models.teacher_model.inference.name=vllm \
         distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=${teacher_gpu_mem_util} \
         distillation.teacher_models.teacher_model.inference.max_model_len=${max_num_tokens} \
+        distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=${teacher_max_num_batched_tokens} \
+        distillation.teacher_models.teacher_model.inference.max_num_seqs=${teacher_max_num_seqs} \
         distillation.distillation_loss.loss_mode=${distillation_loss_mode} \
         distillation.distillation_loss.topk=${distillation_topk} \
         distillation.distillation_loss.use_task_rewards=False \

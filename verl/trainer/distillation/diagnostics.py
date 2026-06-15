@@ -137,6 +137,57 @@ def binary_auc(scores: torch.Tensor, labels: torch.Tensor) -> Optional[float]:
     return float(auc.item())
 
 
+def extract_sampled_response_logprobs(
+    *,
+    sequence_logprobs: torch.Tensor,
+    response_mask: torch.Tensor,
+    prompt_width: int,
+    context: str = "sequence_logprobs",
+) -> torch.Tensor | None:
+    """Extract response-token sampled logprobs from padded prompt+response prompt scoring output.
+
+    Returns None when the tensor contains top-k logprobs instead of one sampled-token logprob per position.
+    """
+    if sequence_logprobs.ndim not in (2, 3):
+        raise RuntimeError(
+            f"{context} must have rank 2 or 3 for OPD diagnostics, got shape={tuple(sequence_logprobs.shape)}."
+        )
+    if sequence_logprobs.shape[0] != response_mask.shape[0]:
+        raise RuntimeError(
+            f"{context} batch-size mismatch for OPD diagnostics: "
+            f"sequence_logprobs.shape={tuple(sequence_logprobs.shape)}, "
+            f"response_mask.shape={tuple(response_mask.shape)}."
+        )
+    if sequence_logprobs.ndim == 3 and sequence_logprobs.shape[-1] != 1:
+        return None
+
+    if sequence_logprobs.shape[:2] == response_mask.shape:
+        response_logprobs = sequence_logprobs
+    else:
+        if prompt_width <= 0:
+            raise RuntimeError("OPD diagnostics require a positive padded prompt width.")
+        response_width = response_mask.shape[1]
+        start = prompt_width - 1
+        end = start + response_width
+        if sequence_logprobs.shape[1] < end:
+            raise RuntimeError(
+                f"Cannot align {context} with response tokens for OPD diagnostics: "
+                f"sequence_logprobs.shape={tuple(sequence_logprobs.shape)}, prompt_width={prompt_width}, "
+                f"response_width={response_width}, expected at least {end} scored positions."
+            )
+        response_logprobs = sequence_logprobs[:, start:end]
+
+    if response_logprobs.ndim == 3:
+        response_logprobs = response_logprobs.squeeze(-1)
+    if response_logprobs.shape != response_mask.shape:
+        raise RuntimeError(
+            f"OPD diagnostics produced misaligned {context}: "
+            f"response_logprobs.shape={tuple(response_logprobs.shape)}, "
+            f"response_mask.shape={tuple(response_mask.shape)}."
+        )
+    return response_logprobs
+
+
 def compute_opd_diagnostics_metrics(
     *,
     student_logprobs: torch.Tensor,
@@ -217,9 +268,52 @@ def compute_entropy_heatmap_row(
     bin_size: int,
 ) -> np.ndarray:
     """Return one heatmap row: mean entropy per response-position bin."""
-    if entropy.shape != response_mask.shape:
-        raise ValueError(f"entropy and response_mask must align, got {entropy.shape=} and {response_mask.shape=}.")
-    values = _to_cpu_float(entropy)
+    return compute_value_heatmap_row(
+        values=entropy,
+        response_mask=response_mask,
+        bin_size=bin_size,
+        value_name="entropy",
+    )
+
+
+def compute_gap_heatmap_row(
+    *,
+    student_logprobs: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    response_mask: torch.Tensor,
+    bin_size: int,
+) -> np.ndarray:
+    """Return one heatmap row: mean sampled-token teacher/student absolute gap per response-position bin."""
+    if teacher_logprobs.ndim == 3 and teacher_logprobs.shape[-1] == 1:
+        teacher_logprobs = teacher_logprobs.squeeze(-1)
+    if student_logprobs.shape != teacher_logprobs.shape:
+        raise ValueError(
+            "student_logprobs and teacher_logprobs must align for gap heatmap, "
+            f"got {student_logprobs.shape=} and {teacher_logprobs.shape=}."
+        )
+    return compute_value_heatmap_row(
+        values=(teacher_logprobs - student_logprobs).abs(),
+        response_mask=response_mask,
+        bin_size=bin_size,
+        value_name="gap_abs",
+    )
+
+
+def compute_value_heatmap_row(
+    *,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    bin_size: int,
+    value_name: str,
+) -> np.ndarray:
+    """Return one heatmap row: mean value per response-position bin."""
+    if bin_size <= 0:
+        raise ValueError(f"bin_size must be positive, got {bin_size}.")
+    if values.shape != response_mask.shape:
+        raise ValueError(
+            f"{value_name} and response_mask must align, got values.shape={values.shape} and {response_mask.shape=}."
+        )
+    values = _to_cpu_float(values)
     mask = response_mask.detach().bool().cpu()
     row = []
     for start in range(0, values.shape[1], bin_size):
@@ -293,10 +387,28 @@ class OpdDiagnosticsTracker:
         self.steps = deque(maxlen=self.history_steps)
 
     def add_entropy_row(self, step: int, row: np.ndarray) -> None:
+        self.add_row(step, row)
+
+    def add_gap_row(self, step: int, row: np.ndarray) -> None:
+        self.add_row(step, row)
+
+    def add_row(self, step: int, row: np.ndarray) -> None:
         self.steps.append(step)
         self.rows.append(row)
 
     def render_entropy_heatmap(self):
+        return self.render_heatmap(
+            title="Student Entropy by Response Position",
+            colorbar_label="Mean entropy",
+        )
+
+    def render_gap_heatmap(self):
+        return self.render_heatmap(
+            title="Teacher-Student Absolute Gap by Response Position",
+            colorbar_label="Mean absolute logprob gap",
+        )
+
+    def render_heatmap(self, *, title: str, colorbar_label: str):
         if not self.rows:
             return None
 
@@ -315,7 +427,7 @@ class OpdDiagnosticsTracker:
 
         fig, ax = plt.subplots(figsize=(max(6.0, width * 0.8), max(3.0, len(self.rows) * 0.18)))
         image = ax.imshow(heatmap, aspect="auto", interpolation="nearest", origin="lower")
-        ax.set_title("Student Entropy by Response Position")
+        ax.set_title(title)
         ax.set_xlabel("Response token position bin")
         ax.set_ylabel("Training step")
         ax.set_xticks(range(width))
@@ -326,6 +438,6 @@ class OpdDiagnosticsTracker:
             tick_positions = np.linspace(0, len(step_values) - 1, tick_count, dtype=int)
             ax.set_yticks(tick_positions)
             ax.set_yticklabels([str(step_values[i]) for i in tick_positions])
-        fig.colorbar(image, ax=ax, label="Mean entropy")
+        fig.colorbar(image, ax=ax, label=colorbar_label)
         fig.tight_layout()
         return fig

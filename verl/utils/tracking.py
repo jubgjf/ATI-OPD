@@ -67,6 +67,7 @@ class Tracking:
                 assert backend in self.supported_backend, f"{backend} is not supported"
 
         self.logger = {}
+        self._finished = False
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import os
@@ -183,21 +184,24 @@ class Tracking:
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
+    def finish(self, exit_code=0):
+        if getattr(self, "_finished", False):
+            return
+        self._finished = True
+        for backend, logger_instance in list(getattr(self, "logger", {}).items()):
+            try:
+                if backend in {"wandb", "vemlp_wandb"}:
+                    logger_instance.finish(exit_code=exit_code)
+                elif backend != "mlflow" and hasattr(logger_instance, "finish"):
+                    logger_instance.finish()
+            except Exception as exc:
+                logger.warning("Ignoring tracking backend shutdown error for %s: %s", backend, exc)
+
     def __del__(self):
-        if "wandb" in self.logger:
-            self.logger["wandb"].finish(exit_code=0)
-        if "swanlab" in self.logger:
-            self.logger["swanlab"].finish()
-        if "vemlp_wandb" in self.logger:
-            self.logger["vemlp_wandb"].finish(exit_code=0)
-        if "tensorboard" in self.logger:
-            self.logger["tensorboard"].finish()
-        if "clearml" in self.logger:
-            self.logger["clearml"].finish()
-        if "trackio" in self.logger:
-            self.logger["trackio"].finish()
-        if "file" in self.logger:
-            self.logger["file"].finish()
+        try:
+            self.finish()
+        except Exception:
+            pass
 
 
 class ClearMLLogger:

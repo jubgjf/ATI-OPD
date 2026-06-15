@@ -71,6 +71,7 @@ from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.distillation.diagnostics import (
     OpdDiagnosticsTracker,
     compute_entropy_heatmap_row,
+    compute_gap_heatmap_row,
     compute_intervention_metrics,
     compute_opd_diagnostics_metrics,
 )
@@ -504,6 +505,7 @@ class PPOTrainer:
         self.use_teacher_policy = need_teacher_policy(self.config)
         self.replay_buffer = ReplayBuffer()
         self.opd_diagnostics_tracker: OpdDiagnosticsTracker | None = None
+        self.opd_gap_tracker: OpdDiagnosticsTracker | None = None
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
@@ -1515,6 +1517,46 @@ class PPOTrainer:
         finally:
             plt.close(fig)
 
+    def _maybe_log_opd_gap_heatmap(
+        self,
+        global_steps: int,
+        student_logprobs: torch.Tensor,
+        teacher_logprobs: torch.Tensor | None,
+        response_mask: torch.Tensor,
+    ) -> None:
+        diagnostics_config = self._distillation_diagnostics_config()
+        if diagnostics_config is None or not diagnostics_config.log_wandb_heatmap:
+            return
+        if teacher_logprobs is None or (teacher_logprobs.ndim == 3 and teacher_logprobs.shape[-1] != 1):
+            return
+        if global_steps % diagnostics_config.heatmap_interval != 0:
+            return
+        if getattr(self, "logger", None) is None or "wandb" not in getattr(self.logger, "logger", {}):
+            return
+        if self.opd_gap_tracker is None:
+            self.opd_gap_tracker = OpdDiagnosticsTracker(
+                history_steps=diagnostics_config.heatmap_history_steps,
+                bin_size=diagnostics_config.position_bin_size,
+            )
+        row = compute_gap_heatmap_row(
+            student_logprobs=student_logprobs,
+            teacher_logprobs=teacher_logprobs,
+            response_mask=response_mask,
+            bin_size=diagnostics_config.position_bin_size,
+        )
+        self.opd_gap_tracker.add_gap_row(global_steps, row)
+        fig = self.opd_gap_tracker.render_gap_heatmap()
+        if fig is None:
+            return
+        import matplotlib.pyplot as plt
+
+        try:
+            import wandb
+
+            self.logger.log({"opd/gap_abs_heatmap": wandb.Image(fig)}, step=global_steps, backend=["wandb"])
+        finally:
+            plt.close(fig)
+
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
         # 1. collect necessary fields from TransferQueue for computing metrics
         non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
@@ -1579,6 +1621,9 @@ class PPOTrainer:
             if teacher_for_metrics is not None and non_padding_mask.any():
                 index = torch.as_tensor(non_padding_mask, dtype=torch.bool, device=teacher_for_metrics.device)
                 teacher_for_metrics = teacher_for_metrics[index]
+            gap_available = teacher_for_metrics is not None and (
+                teacher_for_metrics.ndim != 3 or teacher_for_metrics.shape[-1] == 1
+            )
             metrics.update(
                 compute_opd_diagnostics_metrics(
                     student_logprobs=diagnostics_batch["old_log_probs"],
@@ -1590,6 +1635,7 @@ class PPOTrainer:
                     high_gap_threshold=diagnostics_config.high_gap_threshold,
                 )
             )
+            metrics["opd/gap_abs/available"] = 1.0 if gap_available else 0.0
             if diagnostics_config.collect_intervention_metrics:
                 if non_padding_mask.any():
                     intervention_counts = self._filter_list_by_mask(intervention_counts, non_padding_mask)
@@ -1604,6 +1650,12 @@ class PPOTrainer:
             self._maybe_log_opd_entropy_heatmap(
                 global_steps=global_steps,
                 entropy=diagnostics_batch["entropy"],
+                response_mask=diagnostics_batch["response_mask"],
+            )
+            self._maybe_log_opd_gap_heatmap(
+                global_steps=global_steps,
+                student_logprobs=diagnostics_batch["old_log_probs"],
+                teacher_logprobs=teacher_for_metrics,
                 response_mask=diagnostics_batch["response_mask"],
             )
 
@@ -1641,6 +1693,7 @@ class PPOTrainer:
             pprint(f"Initial validation metrics: {val_metrics}")
             self.logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                self.logger.finish()
                 return
 
         current_epoch = self.global_steps // len(self.train_dataloader)
@@ -1707,6 +1760,7 @@ class PPOTrainer:
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
+                    self.logger.finish()
                     return
 
     def step(self, batch_dict: dict, metrics: dict, timing_raw: dict) -> KVBatchMeta:

@@ -21,8 +21,10 @@ from verl.trainer.distillation.diagnostics import (
     binary_auc,
     compute_binned_token_means,
     compute_entropy_heatmap_row,
+    compute_gap_heatmap_row,
     compute_intervention_metrics,
     compute_opd_diagnostics_metrics,
+    extract_sampled_response_logprobs,
 )
 
 
@@ -82,6 +84,64 @@ def test_compute_entropy_heatmap_row_and_tracker_on_cpu():
     fig = tracker.render_entropy_heatmap()
     if fig is not None:
         fig.clear()
+
+
+def test_compute_gap_heatmap_row_and_tracker_on_cpu():
+    student_logprobs = torch.tensor([[-1.0, -1.0, -1.0, -1.0]])
+    teacher_logprobs = torch.tensor([[[-1.0], [-2.0], [-3.0], [-5.0]]])
+    response_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
+
+    row = compute_gap_heatmap_row(
+        student_logprobs=student_logprobs,
+        teacher_logprobs=teacher_logprobs,
+        response_mask=response_mask,
+        bin_size=2,
+    )
+    np.testing.assert_allclose(row, np.array([0.5, 2.0], dtype=np.float32))
+
+    tracker = OpdDiagnosticsTracker(history_steps=2, bin_size=2)
+    tracker.add_gap_row(1, row)
+    fig = tracker.render_gap_heatmap()
+    if fig is not None:
+        fig.clear()
+
+
+def test_extract_sampled_response_logprobs_from_padded_teacher_scoring_on_cpu():
+    response_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.bool)
+    sequence_logprobs = torch.tensor([[0.0, -0.1, -1.0, -2.0, -3.0, 0.0]]).unsqueeze(-1)
+
+    response_logprobs = extract_sampled_response_logprobs(
+        sequence_logprobs=sequence_logprobs,
+        response_mask=response_mask,
+        prompt_width=3,
+        context="teacher_logprobs",
+    )
+
+    assert response_logprobs is not None
+    torch.testing.assert_close(response_logprobs, torch.tensor([[-1.0, -2.0, -3.0, 0.0]]))
+
+
+def test_extract_sampled_response_logprobs_skips_topk_and_errors_on_short_sequence_on_cpu():
+    response_mask = torch.tensor([[1, 1]], dtype=torch.bool)
+    topk_logprobs = torch.zeros((1, 4, 2))
+
+    assert (
+        extract_sampled_response_logprobs(
+            sequence_logprobs=topk_logprobs,
+            response_mask=response_mask,
+            prompt_width=2,
+            context="teacher_logprobs",
+        )
+        is None
+    )
+
+    with pytest.raises(RuntimeError, match="Cannot align teacher_logprobs"):
+        extract_sampled_response_logprobs(
+            sequence_logprobs=torch.zeros((1, 3, 1)),
+            response_mask=response_mask,
+            prompt_width=3,
+            context="teacher_logprobs",
+        )
 
 
 def test_compute_intervention_metrics_on_cpu():

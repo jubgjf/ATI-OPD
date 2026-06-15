@@ -37,6 +37,14 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
+from verl.trainer.distillation.diagnostics import (
+    OpdDiagnosticsTracker,
+    compute_entropy_heatmap_row,
+    compute_gap_heatmap_row,
+    compute_intervention_metrics,
+    compute_opd_diagnostics_metrics,
+    extract_sampled_response_logprobs,
+)
 from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
@@ -295,10 +303,13 @@ class RayPPOTrainer:
         self.use_critic = need_critic(self.config)
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
+        self.distillation_config: DistillationConfig | None = None
         self.validation_generations_logger = ValidationGenerationsLogger(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
+        self.opd_entropy_tracker: OpdDiagnosticsTracker | None = None
+        self.opd_gap_tracker: OpdDiagnosticsTracker | None = None
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
@@ -1244,6 +1255,171 @@ class RayPPOTrainer:
 
         return actor_output
 
+    def _distillation_diagnostics_config(self):
+        if self.distillation_config is None:
+            return None
+        diagnostics_config = getattr(self.distillation_config, "diagnostics", None)
+        if diagnostics_config is None or not diagnostics_config.enabled:
+            return None
+        return diagnostics_config
+
+    def _extract_teacher_response_logprobs_for_diagnostics(self, batch: DataProto) -> torch.Tensor | None:
+        teacher_logprobs = batch.batch.get("teacher_logprobs", None)
+        if teacher_logprobs is None:
+            return None
+        return extract_sampled_response_logprobs(
+            sequence_logprobs=teacher_logprobs,
+            response_mask=batch.batch["response_mask"],
+            prompt_width=batch.batch["prompts"].shape[1],
+            context="teacher_logprobs",
+        )
+
+    @staticmethod
+    def _non_tensor_to_list(value) -> list[Any]:
+        if value is None:
+            return []
+        if hasattr(value, "tolist"):
+            return value.tolist()
+        return list(value)
+
+    def _maybe_log_opd_heatmaps(
+        self,
+        *,
+        global_steps: int,
+        entropy: torch.Tensor | None,
+        student_logprobs: torch.Tensor,
+        teacher_logprobs: torch.Tensor | None,
+        response_mask: torch.Tensor,
+    ) -> None:
+        diagnostics_config = self._distillation_diagnostics_config()
+        if diagnostics_config is None or not diagnostics_config.log_wandb_heatmap:
+            return
+        if global_steps % diagnostics_config.heatmap_interval != 0:
+            return
+        if getattr(self, "logger", None) is None or "wandb" not in getattr(self.logger, "logger", {}):
+            return
+
+        import matplotlib.pyplot as plt
+        import wandb
+
+        if entropy is not None:
+            if self.opd_entropy_tracker is None:
+                self.opd_entropy_tracker = OpdDiagnosticsTracker(
+                    history_steps=diagnostics_config.heatmap_history_steps,
+                    bin_size=diagnostics_config.position_bin_size,
+                )
+            entropy_row = compute_entropy_heatmap_row(
+                entropy=entropy,
+                response_mask=response_mask,
+                bin_size=diagnostics_config.position_bin_size,
+            )
+            self.opd_entropy_tracker.add_entropy_row(global_steps, entropy_row)
+            fig = self.opd_entropy_tracker.render_entropy_heatmap()
+            if fig is not None:
+                try:
+                    self.logger.log({"opd/entropy_heatmap": wandb.Image(fig)}, step=global_steps, backend=["wandb"])
+                finally:
+                    plt.close(fig)
+
+        if teacher_logprobs is not None:
+            if self.opd_gap_tracker is None:
+                self.opd_gap_tracker = OpdDiagnosticsTracker(
+                    history_steps=diagnostics_config.heatmap_history_steps,
+                    bin_size=diagnostics_config.position_bin_size,
+                )
+            gap_row = compute_gap_heatmap_row(
+                student_logprobs=student_logprobs,
+                teacher_logprobs=teacher_logprobs,
+                response_mask=response_mask,
+                bin_size=diagnostics_config.position_bin_size,
+            )
+            self.opd_gap_tracker.add_gap_row(global_steps, gap_row)
+            fig = self.opd_gap_tracker.render_gap_heatmap()
+            if fig is not None:
+                try:
+                    self.logger.log({"opd/gap_abs_heatmap": wandb.Image(fig)}, step=global_steps, backend=["wandb"])
+                finally:
+                    plt.close(fig)
+
+    def _compute_opd_diagnostics_metrics(
+        self,
+        *,
+        batch: DataProto,
+        entropy: torch.Tensor | None,
+        global_steps: int,
+    ) -> dict[str, float]:
+        diagnostics_config = self._distillation_diagnostics_config()
+        if (
+            diagnostics_config is None
+            or not is_distillation_enabled(self.config.get("distillation"))
+            or global_steps % diagnostics_config.log_interval != 0
+        ):
+            return {}
+
+        required_keys = {"old_log_probs", "response_mask"}
+        missing_keys = required_keys - set(batch.batch.keys())
+        if missing_keys:
+            raise RuntimeError(f"OPD diagnostics missing required batch tensors: {sorted(missing_keys)}.")
+
+        response_mask = batch.batch["response_mask"]
+        student_logprobs = batch.batch["old_log_probs"]
+        if student_logprobs.shape != response_mask.shape:
+            raise RuntimeError(
+                "OPD diagnostics expected old_log_probs and response_mask to align, "
+                f"got old_log_probs.shape={tuple(student_logprobs.shape)} and "
+                f"response_mask.shape={tuple(response_mask.shape)}."
+            )
+        if entropy is not None and entropy.shape != response_mask.shape:
+            raise RuntimeError(
+                "OPD diagnostics expected entropy and response_mask to align, "
+                f"got entropy.shape={tuple(entropy.shape)} and response_mask.shape={tuple(response_mask.shape)}."
+            )
+
+        teacher_response_logprobs = self._extract_teacher_response_logprobs_for_diagnostics(batch)
+        metrics = compute_opd_diagnostics_metrics(
+            student_logprobs=student_logprobs,
+            teacher_logprobs=teacher_response_logprobs,
+            entropy=entropy,
+            response_mask=response_mask,
+            rm_scores=batch.batch.get("rm_scores", None),
+            bin_size=diagnostics_config.position_bin_size,
+            high_gap_threshold=diagnostics_config.high_gap_threshold,
+        )
+        metrics["opd/gap_abs/available"] = 1.0 if teacher_response_logprobs is not None else 0.0
+
+        if diagnostics_config.collect_intervention_metrics:
+            intervention_config = getattr(self.distillation_config, "intervention", None)
+            intervention_enabled = intervention_config is not None and intervention_config.enabled
+            has_intervention_fields = (
+                "teacher_intervention_count" in batch.non_tensor_batch
+                and "teacher_interventions" in batch.non_tensor_batch
+            )
+            if intervention_enabled and not has_intervention_fields:
+                raise RuntimeError(
+                    "OPD intervention diagnostics are enabled, but rollout output did not include "
+                    "'teacher_intervention_count' and 'teacher_interventions'. Check that the DMPD agent-loop "
+                    "intervention path is active for every training sample."
+                )
+            if has_intervention_fields:
+                metrics.update(
+                    compute_intervention_metrics(
+                        intervention_counts=self._non_tensor_to_list(
+                            batch.non_tensor_batch["teacher_intervention_count"]
+                        ),
+                        interventions=self._non_tensor_to_list(batch.non_tensor_batch["teacher_interventions"]),
+                        response_mask=response_mask,
+                    )
+                )
+
+        self._maybe_log_opd_heatmaps(
+            global_steps=global_steps,
+            entropy=entropy,
+            student_logprobs=student_logprobs,
+            teacher_logprobs=teacher_response_logprobs,
+            response_mask=response_mask,
+        )
+        return metrics
+
     def _update_critic(self, batch: DataProto) -> DataProto:
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to no-padding
@@ -1288,6 +1464,7 @@ class RayPPOTrainer:
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+        self.logger = logger
 
         self.global_steps = 0
 
@@ -1305,6 +1482,7 @@ class RayPPOTrainer:
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                logger.finish()
                 return
 
         if self.config.actor_rollout_ref.rollout.skip.get("enable", False):
@@ -1333,6 +1511,7 @@ class RayPPOTrainer:
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
                 timing_raw = {}
+                opd_entropy = None
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -1450,6 +1629,7 @@ class RayPPOTrainer:
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
+                            opd_entropy = entropys.detach()
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
                             entropy_agg = agg_loss(
@@ -1509,6 +1689,14 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        metrics.update(
+                            self._compute_opd_diagnostics_metrics(
+                                batch=batch,
+                                entropy=opd_entropy,
+                                global_steps=self.global_steps,
+                            )
+                        )
 
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)
@@ -1656,6 +1844,7 @@ class RayPPOTrainer:
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
+                    logger.finish()
                     return
 
                 # this is experimental and may be changed/removed in the future
