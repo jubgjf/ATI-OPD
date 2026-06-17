@@ -46,6 +46,7 @@ from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
 from verl.experimental.agent_loop.utils import resolve_config_path
+from verl.experimental.teacher_loop.teacher_manager import TeacherLogprobScoringResult
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
 from verl.trainer.distillation import is_distillation_enabled
@@ -132,6 +133,54 @@ def _teacher_response_logprobs(
     if not torch.isfinite(response_logprobs.float()).all():
         raise RuntimeError("Teacher intervention scoring produced NaN/Inf response logprobs.")
     return response_logprobs
+
+
+def _coerce_teacher_logprob_scoring_result(result: Any) -> TeacherLogprobScoringResult:
+    if isinstance(result, TeacherLogprobScoringResult):
+        return result
+    if isinstance(result, tuple) and len(result) == 2:
+        teacher_ids, teacher_logprobs = result
+        return TeacherLogprobScoringResult(ids=teacher_ids, logprobs=teacher_logprobs)
+    raise TypeError(
+        "Teacher logprob scoring must return TeacherLogprobScoringResult or a legacy "
+        f"(teacher_ids, teacher_logprobs) tuple, got {type(result).__name__}."
+    )
+
+
+def _response_relative_nonfinite_positions(
+    result: TeacherLogprobScoringResult,
+    *,
+    prompt_len: int,
+    response_len: int,
+) -> list[int]:
+    if prompt_len <= 0:
+        raise ValueError("Teacher logprob diagnostics require a non-empty prompt.")
+    response_start = prompt_len - 1
+    response_end = response_start + response_len
+    positions = []
+    for sequence_position in result.nonfinite_sequence_positions or []:
+        if response_start <= sequence_position < response_end:
+            positions.append(int(sequence_position - response_start))
+    return positions
+
+
+def _store_teacher_scoring_result(
+    output: "AgentLoopOutput",
+    result: TeacherLogprobScoringResult,
+    *,
+    prompt_len: int,
+    response_len: int,
+) -> None:
+    nonfinite_positions = _response_relative_nonfinite_positions(
+        result,
+        prompt_len=prompt_len,
+        response_len=response_len,
+    )
+    output.extra_fields["teacher_ids"] = result.ids
+    output.extra_fields["teacher_logprobs"] = result.logprobs
+    output.extra_fields["teacher_logprob_nonfinite_count"] = len(nonfinite_positions)
+    output.extra_fields["teacher_logprob_nonfinite_positions"] = nonfinite_positions
+    output.extra_fields["teacher_logprob_nonfinite_replacement"] = result.replacement_value
 
 
 def _select_intervention_segment(
@@ -1067,8 +1116,8 @@ class AgentLoopWorker:
         response_ids: list[int],
         output: AgentLoopOutput,
         routing_key: Optional[str],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return await self.teacher_server_manager.compute_teacher_logprobs_single(
+    ) -> TeacherLogprobScoringResult:
+        result = await self.teacher_server_manager.compute_teacher_logprobs_single(
             sequence_ids=prompt_ids + response_ids,
             multi_modal_data=output.multi_modal_data,
             mm_processor_kwargs=output.mm_processor_kwargs,
@@ -1076,6 +1125,7 @@ class AgentLoopWorker:
             request_id=request_id,
             prompt_logprobs=0,
         )
+        return _coerce_teacher_logprob_scoring_result(result)
 
     async def _generate_student_suffix(
         self,
@@ -1175,19 +1225,19 @@ class AgentLoopWorker:
         routing_key = self._teacher_routing_key(sample_kwargs)
         base_request_id = output.extra_fields.get("rollout_request_id") or uuid4().hex
         interventions: list[dict[str, Any]] = []
-        cached_teacher_ids, cached_teacher_logprobs = None, None
+        cached_teacher_result = None
 
         for attempt in range(intervention_config.max_interventions_per_sample + 1):
-            teacher_ids, teacher_logprobs = await self._score_sequence_for_intervention(
+            teacher_result = await self._score_sequence_for_intervention(
                 request_id=f"{base_request_id}:teacher-score:{attempt}",
                 prompt_ids=prompt_ids,
                 response_ids=response_ids,
                 output=output,
                 routing_key=routing_key,
             )
-            cached_teacher_ids, cached_teacher_logprobs = teacher_ids, teacher_logprobs
+            cached_teacher_result = teacher_result
             teacher_response_logprobs = _teacher_response_logprobs(
-                teacher_logprobs=teacher_logprobs,
+                teacher_logprobs=teacher_result.logprobs,
                 prompt_len=len(prompt_ids),
                 response_len=len(response_ids),
             )
@@ -1262,7 +1312,7 @@ class AgentLoopWorker:
                 gap_mask=gap_mask,
                 response_length_limit=self.rollout_config.response_length,
             )
-            cached_teacher_ids, cached_teacher_logprobs = None, None
+            cached_teacher_result = None
             interventions.append(
                 {
                     "attempt": attempt,
@@ -1287,9 +1337,13 @@ class AgentLoopWorker:
         )
         output.extra_fields["teacher_intervention_count"] = len(interventions)
         output.extra_fields["teacher_interventions"] = interventions
-        if cached_teacher_ids is not None and cached_teacher_logprobs is not None:
-            output.extra_fields["teacher_ids"] = cached_teacher_ids
-            output.extra_fields["teacher_logprobs"] = cached_teacher_logprobs
+        if cached_teacher_result is not None:
+            _store_teacher_scoring_result(
+                output,
+                cached_teacher_result,
+                prompt_len=len(prompt_ids),
+                response_len=len(output.response_ids),
+            )
         if interventions and self._teacher_intervention_logged_samples < intervention_config.log_examples_per_worker:
             logger.info("Teacher interventions applied: %s", interventions)
             self._teacher_intervention_logged_samples += 1
@@ -1317,17 +1371,23 @@ class AgentLoopWorker:
                 and existing_ids.shape[0] == existing_logprobs.shape[0] == len(prompt_ids) + len(response_ids)
                 and existing_logprobs.shape[-1] == expected_width
             ):
+                output.extra_fields.setdefault("teacher_logprob_nonfinite_count", 0)
+                output.extra_fields.setdefault("teacher_logprob_nonfinite_positions", [])
                 return
             routing_key = self._teacher_routing_key(sample_kwargs)
-            teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
+            teacher_result = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 routing_key=routing_key,
                 request_id=output.extra_fields.get("rollout_request_id"),
             )
-            output.extra_fields["teacher_ids"] = teacher_ids
-            output.extra_fields["teacher_logprobs"] = teacher_logprobs
+            _store_teacher_scoring_result(
+                output,
+                _coerce_teacher_logprob_scoring_result(teacher_result),
+                prompt_len=len(prompt_ids),
+                response_len=len(response_ids),
+            )
 
     def _postprocess(
         self,

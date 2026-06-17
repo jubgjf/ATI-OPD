@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
+from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -26,6 +29,30 @@ from verl.workers.config import (
     DistillationTeacherModelConfig,
 )
 from verl.workers.rollout.llm_server import LLMServerClient
+
+logger = logging.getLogger(__name__)
+MAX_NONFINITE_LOGPROB_WARNINGS = 10
+DEFAULT_NONFINITE_LOGPROB_REPLACEMENT = -100.0
+
+
+@dataclass
+class TeacherLogprobScoringResult:
+    """Teacher prompt-scoring output plus sanitization diagnostics."""
+
+    ids: torch.Tensor
+    logprobs: torch.Tensor
+    nonfinite_count: int = 0
+    nonfinite_sequence_positions: list[int] | None = None
+    replacement_value: float = DEFAULT_NONFINITE_LOGPROB_REPLACEMENT
+
+    def __iter__(self) -> Iterator[torch.Tensor]:
+        # Backward-compatible unpacking for older call sites/tests that expect (ids, logprobs).
+        yield self.ids
+        yield self.logprobs
+
+    def __post_init__(self):
+        if self.nonfinite_sequence_positions is None:
+            self.nonfinite_sequence_positions = []
 
 
 def _get_teacher_sampling_params(
@@ -103,6 +130,38 @@ def _pad_teacher_outputs(
     )
 
 
+def _finite_logprob_replacement(distillation_loss_config: DistillationLossConfig) -> float:
+    replacement = getattr(distillation_loss_config, "log_prob_min_clamp", None)
+    if replacement is None:
+        replacement = DEFAULT_NONFINITE_LOGPROB_REPLACEMENT
+    replacement = float(replacement)
+    if not torch.isfinite(torch.tensor(replacement, dtype=torch.float32)):
+        raise ValueError(f"distillation_loss.log_prob_min_clamp must be finite, got {replacement!r}.")
+    if replacement > 0:
+        raise ValueError(
+            f"distillation_loss.log_prob_min_clamp must be <= 0 for log probabilities, got {replacement!r}."
+        )
+    return replacement
+
+
+def _sanitize_nonfinite_teacher_logprobs(
+    teacher_logprobs: torch.Tensor,
+    *,
+    replacement: float,
+) -> tuple[torch.Tensor, list[int]]:
+    finite_mask = torch.isfinite(teacher_logprobs.float())
+    nonfinite_row_mask = (~finite_mask).any(dim=1)
+    nonfinite_sequence_positions = [int(pos) for pos in torch.nonzero(nonfinite_row_mask, as_tuple=False).flatten()]
+    if not nonfinite_sequence_positions:
+        return teacher_logprobs, []
+
+    sanitized = teacher_logprobs.float().clone()
+    posinf_mask = torch.isposinf(sanitized)
+    sanitized[~finite_mask] = replacement
+    sanitized[posinf_mask] = 0.0
+    return sanitized.to(dtype=teacher_logprobs.dtype), nonfinite_sequence_positions
+
+
 class AsyncTeacherLLMServerManager:
     """Teacher-specific async client used for distillation logprob computation."""
 
@@ -116,6 +175,7 @@ class AsyncTeacherLLMServerManager:
         self.teacher_key: str = self.distillation_config.teacher_key
 
         self.teacher_model_configs: dict[str, DistillationTeacherModelConfig] = self.distillation_config.teacher_models
+        self._nonfinite_teacher_logprob_warnings = 0
         expected = set(self.teacher_model_configs)
         if set(teacher_client.keys()) != expected:
             raise ValueError(
@@ -148,7 +208,7 @@ class AsyncTeacherLLMServerManager:
         routing_key: Optional[str] = None,
         request_id: Optional[str] = None,
         prompt_logprobs: Optional[int] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> TeacherLogprobScoringResult:
         """Compute teacher log probabilities for a single unpadded sequence."""
         if not sequence_ids:
             raise ValueError("compute_teacher_logprobs_single received an empty sequence.")
@@ -218,12 +278,44 @@ class AsyncTeacherLLMServerManager:
                 f"expected width={expected_width}, teacher_ids.shape={tuple(teacher_ids.shape)}, "
                 f"teacher_logprobs.shape={tuple(teacher_logprobs.shape)}, sampling_params={sampling_params}."
             )
-        if not torch.isfinite(teacher_logprobs.float()).all():
+        replacement_value = _finite_logprob_replacement(self.distillation_loss_config)
+        teacher_logprobs, nonfinite_sequence_positions = _sanitize_nonfinite_teacher_logprobs(
+            teacher_logprobs,
+            replacement=replacement_value,
+        )
+        nonfinite_count = len(nonfinite_sequence_positions)
+        if nonfinite_count:
+            warning_count = getattr(self, "_nonfinite_teacher_logprob_warnings", 0)
+            if warning_count < MAX_NONFINITE_LOGPROB_WARNINGS:
+                logger.warning(
+                    "Teacher logprob scoring returned NaN/Inf values at %d sequence positions for "
+                    "teacher=%r, request_id=%r, "
+                    "sequence_len=%d; replaced them with finite logprobs. "
+                    "This usually means the teacher backend returned -inf for extremely unlikely tokens.",
+                    nonfinite_count,
+                    teacher_key,
+                    resolved_request_id,
+                    len(sequence_ids),
+                )
+                self._nonfinite_teacher_logprob_warnings = warning_count + 1
+            if not torch.isfinite(teacher_logprobs.float()).all():
+                raise RuntimeError(
+                    "Teacher logprob sanitization failed to produce finite values for "
+                    f"teacher={teacher_key!r}, request_id={resolved_request_id!r}."
+                )
+        if teacher_logprobs.max().item() > 1e-6:
             raise RuntimeError(
-                "Teacher logprob scoring returned NaN/Inf values for "
-                f"teacher={teacher_key!r}, request_id={resolved_request_id!r}."
+                "Teacher logprob scoring returned positive log probabilities after sanitization for "
+                f"teacher={teacher_key!r}, request_id={resolved_request_id!r}, "
+                f"max_logprob={teacher_logprobs.max().item():.6f}."
             )
-        return teacher_ids, teacher_logprobs
+        return TeacherLogprobScoringResult(
+            ids=teacher_ids,
+            logprobs=teacher_logprobs,
+            nonfinite_count=nonfinite_count,
+            nonfinite_sequence_positions=nonfinite_sequence_positions,
+            replacement_value=replacement_value,
+        )
 
     async def generate_teacher_segment_single(
         self,

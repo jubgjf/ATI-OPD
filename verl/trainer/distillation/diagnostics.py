@@ -84,6 +84,168 @@ def compute_binned_token_means(
     return metrics
 
 
+def compute_binned_event_rates(
+    event_mask: torch.Tensor,
+    response_mask: torch.Tensor,
+    *,
+    bin_size: int,
+    prefix: str,
+) -> dict[str, float]:
+    """Compute position-binned event rates for [batch, response_len] boolean tensors."""
+    if bin_size <= 0:
+        raise ValueError(f"bin_size must be positive, got {bin_size}.")
+    if event_mask.shape != response_mask.shape:
+        raise ValueError(
+            "event_mask and response_mask must have the same shape, "
+            f"got {event_mask.shape=} and {response_mask.shape=}."
+        )
+
+    event_mask = event_mask.detach().bool().cpu()
+    response_mask = response_mask.detach().bool().cpu()
+    metrics: dict[str, float] = {}
+    response_len = response_mask.shape[1]
+    for start in range(0, response_len, bin_size):
+        end = min(start + bin_size, response_len)
+        valid = response_mask[:, start:end]
+        denom = int(valid.sum().item())
+        if denom == 0:
+            continue
+        count = int((event_mask[:, start:end] & valid).sum().item())
+        metrics[_bin_key(prefix, start, end)] = count / denom
+    return metrics
+
+
+def _event_metric_key(prefix: str, separator: str, suffix: str) -> str:
+    return f"{prefix}{separator}{suffix}"
+
+
+def _normalize_position_list(value: Any, *, context: str, sample_idx: int) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().tolist()
+    elif isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, int | np.integer):
+        return [int(value)]
+    if not isinstance(value, list | tuple):
+        raise TypeError(
+            f"{context} positions for sample {sample_idx} must be a list/tuple of integers, got {type(value).__name__}."
+        )
+
+    positions = []
+    for raw_position in value:
+        if raw_position is None:
+            continue
+        if isinstance(raw_position, float | np.floating) and not np.isfinite(raw_position):
+            raise ValueError(f"{context} positions for sample {sample_idx} contain non-finite value {raw_position!r}.")
+        positions.append(int(raw_position))
+    return positions
+
+
+def positions_to_event_mask(
+    event_positions: Optional[list[Any]],
+    response_mask: torch.Tensor,
+    *,
+    context: str,
+) -> torch.Tensor:
+    """Convert per-sample response-relative positions to a boolean event mask."""
+    response_mask_cpu = response_mask.detach().bool().cpu()
+    event_mask = torch.zeros_like(response_mask_cpu, dtype=torch.bool)
+    if event_positions is None:
+        return event_mask
+    if hasattr(event_positions, "tolist"):
+        event_positions = event_positions.tolist()
+    else:
+        event_positions = list(event_positions)
+    if len(event_positions) == 0:
+        return event_mask
+    if len(event_positions) != response_mask_cpu.shape[0]:
+        raise ValueError(
+            f"{context} positions batch-size mismatch: got {len(event_positions)} samples, "
+            f"expected {response_mask_cpu.shape[0]} from response_mask.shape={tuple(response_mask_cpu.shape)}."
+        )
+
+    response_width = response_mask_cpu.shape[1]
+    for sample_idx, sample_positions in enumerate(event_positions):
+        for position in _normalize_position_list(sample_positions, context=context, sample_idx=sample_idx):
+            if position < 0 or position >= response_width:
+                raise ValueError(
+                    f"{context} position {position} for sample {sample_idx} is outside response width {response_width}."
+                )
+            event_mask[sample_idx, position] = True
+    return event_mask & response_mask_cpu
+
+
+def compute_event_position_metrics(
+    *,
+    event_mask: torch.Tensor,
+    response_mask: torch.Tensor,
+    metric_prefix: str,
+    suffix_separator: str,
+    token_fraction_suffix: str,
+    bin_prefix: str,
+    bin_size: int,
+) -> dict[str, float]:
+    """Aggregate event frequency and location metrics."""
+    if event_mask.shape != response_mask.shape:
+        raise ValueError(
+            f"event_mask and response_mask must align, got {event_mask.shape=} and {response_mask.shape=}."
+        )
+    if suffix_separator not in {"/", "_"}:
+        raise ValueError(f"suffix_separator must be '/' or '_', got {suffix_separator!r}.")
+
+    event_mask = event_mask.detach().bool().cpu()
+    response_mask = response_mask.detach().bool().cpu()
+    event_mask = event_mask & response_mask
+    valid_lengths = response_mask.sum(dim=1)
+    event_counts = event_mask.sum(dim=1)
+    total_valid_tokens = int(response_mask.sum().item())
+    total_events = int(event_counts.sum().item())
+    batch_size = int(response_mask.shape[0])
+
+    metrics = {
+        _event_metric_key(metric_prefix, suffix_separator, token_fraction_suffix): total_events
+        / max(total_valid_tokens, 1),
+        _event_metric_key(metric_prefix, suffix_separator, "sample_fraction"): float((event_counts > 0).float().mean())
+        if batch_size
+        else 0.0,
+        _event_metric_key(metric_prefix, suffix_separator, "count_mean"): float(event_counts.float().mean().item())
+        if batch_size
+        else 0.0,
+        _event_metric_key(metric_prefix, suffix_separator, "count_max"): float(event_counts.max().item())
+        if batch_size
+        else 0.0,
+    }
+
+    first_positions = []
+    first_position_fracs = []
+    for sample_idx in range(batch_size):
+        sample_positions = torch.nonzero(event_mask[sample_idx], as_tuple=False).flatten()
+        if sample_positions.numel() == 0:
+            continue
+        first_position = int(sample_positions[0].item())
+        first_positions.append(first_position)
+        first_position_fracs.append(first_position / max(int(valid_lengths[sample_idx].item()), 1))
+    if first_positions:
+        metrics[_event_metric_key(metric_prefix, suffix_separator, "first_position_mean")] = float(
+            np.mean(first_positions)
+        )
+        metrics[_event_metric_key(metric_prefix, suffix_separator, "first_position_frac_mean")] = float(
+            np.mean(first_position_fracs)
+        )
+
+    metrics.update(
+        compute_binned_event_rates(
+            event_mask=event_mask,
+            response_mask=response_mask,
+            bin_size=bin_size,
+            prefix=bin_prefix,
+        )
+    )
+    return metrics
+
+
 def _head_tail_metrics(
     values: torch.Tensor,
     mask: torch.Tensor,
@@ -194,6 +356,7 @@ def compute_opd_diagnostics_metrics(
     response_mask: torch.Tensor,
     bin_size: int,
     teacher_logprobs: Optional[torch.Tensor] = None,
+    teacher_logprob_nonfinite_positions: Optional[list[Any]] = None,
     entropy: Optional[torch.Tensor] = None,
     rm_scores: Optional[torch.Tensor] = None,
     high_gap_threshold: float = 1.0,
@@ -212,6 +375,24 @@ def compute_opd_diagnostics_metrics(
     response_len_max = float(response_lens.max().item()) if response_lens.numel() else None
     _put_if_present(metrics, "opd/response_len/max", response_len_max)
 
+    if teacher_logprob_nonfinite_positions is not None:
+        nonfinite_event_mask = positions_to_event_mask(
+            teacher_logprob_nonfinite_positions,
+            response_mask,
+            context="teacher_logprob_nonfinite",
+        )
+        metrics.update(
+            compute_event_position_metrics(
+                event_mask=nonfinite_event_mask,
+                response_mask=response_mask,
+                metric_prefix="opd/teacher_logprob_nonfinite",
+                suffix_separator="/",
+                token_fraction_suffix="response_token_fraction",
+                bin_prefix="opd/teacher_logprob_nonfinite_bin",
+                bin_size=bin_size,
+            )
+        )
+
     if teacher_logprobs is not None:
         if teacher_logprobs.ndim == 3 and teacher_logprobs.shape[-1] == 1:
             teacher_logprobs = teacher_logprobs.squeeze(-1)
@@ -228,8 +409,18 @@ def compute_opd_diagnostics_metrics(
             abs_gap_max = float(abs_gap_values.max().item()) if abs_gap_values.numel() else None
             _put_if_present(metrics, "opd/gap_abs/max", abs_gap_max)
             if abs_gap_values.numel():
-                high_gap_fraction = (abs_gap_values > high_gap_threshold).float().mean()
-                metrics["opd/gap_abs/high_fraction"] = float(high_gap_fraction.item())
+                high_gap_mask = (abs_gap > high_gap_threshold) & response_mask & torch.isfinite(abs_gap.float())
+                high_gap_metrics = compute_event_position_metrics(
+                    event_mask=high_gap_mask,
+                    response_mask=response_mask,
+                    metric_prefix="opd/gap_abs/high",
+                    suffix_separator="_",
+                    token_fraction_suffix="token_fraction",
+                    bin_prefix="opd/gap_abs/high_bin",
+                    bin_size=bin_size,
+                )
+                metrics.update(high_gap_metrics)
+                metrics["opd/gap_abs/high_fraction"] = high_gap_metrics["opd/gap_abs/high_token_fraction"]
             metrics.update(
                 compute_binned_token_means(abs_gap, response_mask, bin_size=bin_size, prefix="opd/gap_abs_bin")
             )
@@ -296,6 +487,72 @@ def compute_gap_heatmap_row(
         response_mask=response_mask,
         bin_size=bin_size,
         value_name="gap_abs",
+    )
+
+
+def compute_gap_high_heatmap_row(
+    *,
+    student_logprobs: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    response_mask: torch.Tensor,
+    bin_size: int,
+    high_gap_threshold: float,
+) -> np.ndarray:
+    """Return one heatmap row: high-gap token rate per response-position bin."""
+    if teacher_logprobs.ndim == 3 and teacher_logprobs.shape[-1] == 1:
+        teacher_logprobs = teacher_logprobs.squeeze(-1)
+    if student_logprobs.shape != teacher_logprobs.shape:
+        raise ValueError(
+            "student_logprobs and teacher_logprobs must align for high-gap heatmap, "
+            f"got {student_logprobs.shape=} and {teacher_logprobs.shape=}."
+        )
+    event_mask = (teacher_logprobs.float() - student_logprobs.float()).abs() > high_gap_threshold
+    return compute_event_heatmap_row(
+        event_mask=event_mask,
+        response_mask=response_mask,
+        bin_size=bin_size,
+        event_name="gap_abs_high",
+    )
+
+
+def compute_teacher_logprob_nonfinite_heatmap_row(
+    *,
+    teacher_logprob_nonfinite_positions: Optional[list[Any]],
+    response_mask: torch.Tensor,
+    bin_size: int,
+) -> np.ndarray:
+    """Return one heatmap row: nonfinite teacher scoring event rate per response-position bin."""
+    event_mask = positions_to_event_mask(
+        teacher_logprob_nonfinite_positions,
+        response_mask,
+        context="teacher_logprob_nonfinite",
+    )
+    return compute_event_heatmap_row(
+        event_mask=event_mask,
+        response_mask=response_mask,
+        bin_size=bin_size,
+        event_name="teacher_logprob_nonfinite",
+    )
+
+
+def compute_event_heatmap_row(
+    *,
+    event_mask: torch.Tensor,
+    response_mask: torch.Tensor,
+    bin_size: int,
+    event_name: str,
+) -> np.ndarray:
+    """Return one heatmap row: event rate per response-position bin."""
+    if event_mask.shape != response_mask.shape:
+        raise ValueError(
+            f"{event_name} and response_mask must align, got event_mask.shape={event_mask.shape} "
+            f"and {response_mask.shape=}."
+        )
+    return compute_value_heatmap_row(
+        values=event_mask.detach().float(),
+        response_mask=response_mask,
+        bin_size=bin_size,
+        value_name=event_name,
     )
 
 
@@ -392,6 +649,12 @@ class OpdDiagnosticsTracker:
     def add_gap_row(self, step: int, row: np.ndarray) -> None:
         self.add_row(step, row)
 
+    def add_gap_high_row(self, step: int, row: np.ndarray) -> None:
+        self.add_row(step, row)
+
+    def add_teacher_logprob_nonfinite_row(self, step: int, row: np.ndarray) -> None:
+        self.add_row(step, row)
+
     def add_row(self, step: int, row: np.ndarray) -> None:
         self.steps.append(step)
         self.rows.append(row)
@@ -406,6 +669,18 @@ class OpdDiagnosticsTracker:
         return self.render_heatmap(
             title="Teacher-Student Absolute Gap by Response Position",
             colorbar_label="Mean absolute logprob gap",
+        )
+
+    def render_gap_high_heatmap(self):
+        return self.render_heatmap(
+            title="High Teacher-Student Gap Rate by Response Position",
+            colorbar_label="High-gap token rate",
+        )
+
+    def render_teacher_logprob_nonfinite_heatmap(self):
+        return self.render_heatmap(
+            title="Nonfinite Teacher Logprob Rate by Response Position",
+            colorbar_label="Nonfinite teacher logprob rate",
         )
 
     def render_heatmap(self, *, title: str, colorbar_label: str):

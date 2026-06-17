@@ -15,6 +15,8 @@
 import os
 from pathlib import Path
 
+import pytest
+
 import verl.utils.fs as fs
 
 
@@ -92,3 +94,10 @@ def test_always_recopy_flag(tmp_path, monkeypatch):
     # Subsequent normal call (always_recopy=False)
     fs.copy_to_local(hdfs_path, cache_dir=test_cache)
     assert copy_call_count == 2  # Should not increment
+
+
+def test_copy_to_local_rejects_empty_source_path():
+    with pytest.raises(ValueError, match="empty source path"):
+        fs.copy_to_local("")
+    with pytest.raises(ValueError, match="empty source path"):
+        fs.copy_local_path_from_hdfs("  ")

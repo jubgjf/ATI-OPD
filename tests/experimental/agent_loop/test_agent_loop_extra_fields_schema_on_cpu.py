@@ -31,7 +31,7 @@ from verl.experimental.agent_loop.agent_loop import (
     _InternalAgentLoopOutput,
 )
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
-from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
+from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager, TeacherLogprobScoringResult
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.workers.config import DistillationInterventionConfig
 from verl.workers.rollout.replica import TokenOutput
@@ -324,7 +324,7 @@ class _FakeInterventionTeacherManager:
         routing_key: Optional[str] = None,
         request_id: Optional[str] = None,
         prompt_logprobs: Optional[int] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> TeacherLogprobScoringResult:
         del multi_modal_data, mm_processor_kwargs, routing_key, request_id
         assert prompt_logprobs == 0
         self.scored_sequences.append(list(sequence_ids))
@@ -337,7 +337,14 @@ class _FakeInterventionTeacherManager:
         if response[:6] == [1, 2, 3, 4, 5, 6]:
             teacher_logprobs[3, 0] = -5.0
             teacher_logprobs[4, 0] = -5.0
-        return teacher_ids, teacher_logprobs
+        call_idx = len(self.scored_sequences) - 1
+        return TeacherLogprobScoringResult(
+            ids=teacher_ids,
+            logprobs=teacher_logprobs,
+            nonfinite_count=1,
+            nonfinite_sequence_positions=[3 if call_idx == 0 else 5],
+            replacement_value=-10.0,
+        )
 
     async def generate_teacher_segment_single(
         self,
@@ -455,6 +462,8 @@ async def test_agent_loop_postprocess_repairs_high_gap_segment_on_cpu():
         }
     ]
     assert internal.extra_fields["teacher_intervention_count"] == 1
+    assert internal.extra_fields["teacher_logprob_nonfinite_count"] == 1
+    assert internal.extra_fields["teacher_logprob_nonfinite_positions"] == [4]
 
 
 @pytest.mark.asyncio
@@ -579,6 +588,65 @@ async def test_teacher_manager_rejects_missing_prompt_logprobs_on_cpu():
             request_id="bad-teacher-score",
             prompt_logprobs=0,
         )
+
+
+@pytest.mark.asyncio
+async def test_teacher_manager_sanitizes_nonfinite_prompt_logprobs_on_cpu(caplog):
+    class _NonfiniteTeacherClient:
+        async def generate(
+            self,
+            request_id: str,
+            *,
+            prompt_ids: list[int],
+            sampling_params: dict[str, Any],
+            image_data: Optional[list[Any]] = None,
+            video_data: Optional[list[Any]] = None,
+            audio_data: Optional[list[Any]] = None,
+            mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        ) -> TokenOutput:
+            del request_id, image_data, video_data, audio_data, mm_processor_kwargs
+            assert prompt_ids == [101, 102, 1, 2]
+            assert sampling_params["prompt_logprobs"] == 0
+            return TokenOutput(
+                token_ids=[1],
+                extra_fields={
+                    "prompt_ids": [[101], [102], [1], [2]],
+                    "prompt_logprobs": [[-0.1], [float("-inf")], [float("nan")], [float("inf")]],
+                },
+            )
+
+    manager = object.__new__(AsyncTeacherLLMServerManager)
+    manager.distillation_loss_config = SimpleNamespace(
+        topk=64,
+        log_prob_min_clamp=-10.0,
+        loss_settings=SimpleNamespace(use_topk=False),
+    )
+    manager.teacher_key = "data_source"
+    manager.teacher_model_configs = {
+        "teacher": SimpleNamespace(inference=SimpleNamespace(temperature=1.0)),
+    }
+    manager.teacher_client = {"teacher": _NonfiniteTeacherClient()}
+    manager._nonfinite_teacher_logprob_warnings = 0
+
+    with caplog.at_level("WARNING"):
+        result = await manager.compute_teacher_logprobs_single(
+            sequence_ids=[101, 102, 1, 2],
+            routing_key="teacher",
+            request_id="nonfinite-teacher-score",
+            prompt_logprobs=0,
+        )
+
+    teacher_ids, teacher_logprobs = result.ids, result.logprobs
+    torch.testing.assert_close(teacher_ids[:, 0], torch.tensor([101, 102, 1, 2], dtype=torch.int32))
+    assert torch.isfinite(teacher_logprobs).all()
+    torch.testing.assert_close(
+        teacher_logprobs[:, 0],
+        torch.tensor([-0.1, -10.0, -10.0, 0.0], dtype=teacher_logprobs.dtype),
+    )
+    assert result.nonfinite_count == 3
+    assert result.nonfinite_sequence_positions == [1, 2, 3]
+    assert result.replacement_value == -10.0
+    assert "returned NaN/Inf values at 3 sequence positions" in caplog.text
 
 
 @pytest.mark.asyncio

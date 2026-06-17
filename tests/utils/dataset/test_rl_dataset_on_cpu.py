@@ -33,6 +33,12 @@ def get_gsm8k_data():
     return local_path
 
 
+def test_rl_dataset_rejects_empty_data_file_path():
+    config = OmegaConf.create({"prompt_key": "prompt", "max_prompt_length": 256})
+    with pytest.raises(ValueError, match="empty data file path"):
+        RLHFDataset(data_files=[""], tokenizer=None, config=config)
+
+
 def test_rl_dataset():
     tokenizer = hf_tokenizer(os.path.expanduser("~/models/deepseek-ai/deepseek-coder-1.3b-instruct"))
     local_path = get_gsm8k_data()

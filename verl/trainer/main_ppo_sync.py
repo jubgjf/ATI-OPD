@@ -72,8 +72,10 @@ from verl.trainer.distillation.diagnostics import (
     OpdDiagnosticsTracker,
     compute_entropy_heatmap_row,
     compute_gap_heatmap_row,
+    compute_gap_high_heatmap_row,
     compute_intervention_metrics,
     compute_opd_diagnostics_metrics,
+    compute_teacher_logprob_nonfinite_heatmap_row,
 )
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler, run_ppo
 from verl.trainer.ppo import core_algos
@@ -406,6 +408,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             extra_fields = field.get("extra_fields", {})
             field["teacher_intervention_count"] = extra_fields.get("teacher_intervention_count", 0)
             field["teacher_interventions"] = extra_fields.get("teacher_interventions", [])
+            field["teacher_logprob_nonfinite_count"] = extra_fields.get("teacher_logprob_nonfinite_count", 0)
+            field["teacher_logprob_nonfinite_positions"] = extra_fields.get("teacher_logprob_nonfinite_positions", [])
             # do not store raw image/video
             field.pop("multi_modal_data", None)
             # TODO: uniform response_mask and loss_mask
@@ -506,6 +510,8 @@ class PPOTrainer:
         self.replay_buffer = ReplayBuffer()
         self.opd_diagnostics_tracker: OpdDiagnosticsTracker | None = None
         self.opd_gap_tracker: OpdDiagnosticsTracker | None = None
+        self.opd_gap_high_tracker: OpdDiagnosticsTracker | None = None
+        self.opd_teacher_logprob_nonfinite_tracker: OpdDiagnosticsTracker | None = None
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
@@ -1522,6 +1528,7 @@ class PPOTrainer:
         global_steps: int,
         student_logprobs: torch.Tensor,
         teacher_logprobs: torch.Tensor | None,
+        teacher_logprob_nonfinite_positions: list[Any] | None,
         response_mask: torch.Tensor,
     ) -> None:
         diagnostics_config = self._distillation_diagnostics_config()
@@ -1557,6 +1564,54 @@ class PPOTrainer:
         finally:
             plt.close(fig)
 
+        if self.opd_gap_high_tracker is None:
+            self.opd_gap_high_tracker = OpdDiagnosticsTracker(
+                history_steps=diagnostics_config.heatmap_history_steps,
+                bin_size=diagnostics_config.position_bin_size,
+            )
+        row = compute_gap_high_heatmap_row(
+            student_logprobs=student_logprobs,
+            teacher_logprobs=teacher_logprobs,
+            response_mask=response_mask,
+            bin_size=diagnostics_config.position_bin_size,
+            high_gap_threshold=diagnostics_config.high_gap_threshold,
+        )
+        self.opd_gap_high_tracker.add_gap_high_row(global_steps, row)
+        fig = self.opd_gap_high_tracker.render_gap_high_heatmap()
+        if fig is not None:
+            try:
+                import wandb
+
+                self.logger.log({"opd/gap_abs_high_heatmap": wandb.Image(fig)}, step=global_steps, backend=["wandb"])
+            finally:
+                plt.close(fig)
+
+        if teacher_logprob_nonfinite_positions is None:
+            return
+        if self.opd_teacher_logprob_nonfinite_tracker is None:
+            self.opd_teacher_logprob_nonfinite_tracker = OpdDiagnosticsTracker(
+                history_steps=diagnostics_config.heatmap_history_steps,
+                bin_size=diagnostics_config.position_bin_size,
+            )
+        row = compute_teacher_logprob_nonfinite_heatmap_row(
+            teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
+            response_mask=response_mask,
+            bin_size=diagnostics_config.position_bin_size,
+        )
+        self.opd_teacher_logprob_nonfinite_tracker.add_teacher_logprob_nonfinite_row(global_steps, row)
+        fig = self.opd_teacher_logprob_nonfinite_tracker.render_teacher_logprob_nonfinite_heatmap()
+        if fig is not None:
+            try:
+                import wandb
+
+                self.logger.log(
+                    {"opd/teacher_logprob_nonfinite_heatmap": wandb.Image(fig)},
+                    step=global_steps,
+                    backend=["wandb"],
+                )
+            finally:
+                plt.close(fig)
+
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
         # 1. collect necessary fields from TransferQueue for computing metrics
         non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
@@ -1579,6 +1634,7 @@ class PPOTrainer:
         )
         if diagnostics_enabled:
             fields.extend(["old_log_probs", "entropy", "teacher_logprobs"])
+            fields.extend(["teacher_logprob_nonfinite_count", "teacher_logprob_nonfinite_positions"])
             if diagnostics_config.collect_intervention_metrics:
                 fields.extend(["teacher_intervention_count", "teacher_interventions"])
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
@@ -1587,12 +1643,19 @@ class PPOTrainer:
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
         teacher_response_logprobs = None
+        teacher_logprob_nonfinite_positions = None
         intervention_counts = []
         intervention_items = []
         if diagnostics_enabled:
             teacher_response_logprobs = self._extract_teacher_response_logprobs(data)
             if "teacher_logprobs" in data.keys():
                 data.pop("teacher_logprobs")
+            if "teacher_logprob_nonfinite_positions" in data.keys():
+                teacher_logprob_nonfinite_positions = self._non_tensor_to_list(
+                    data.pop("teacher_logprob_nonfinite_positions")
+                )
+            if "teacher_logprob_nonfinite_count" in data.keys():
+                data.pop("teacher_logprob_nonfinite_count")
             if diagnostics_config.collect_intervention_metrics:
                 if "teacher_intervention_count" in data.keys():
                     intervention_counts = self._non_tensor_to_list(data.pop("teacher_intervention_count"))
@@ -1621,6 +1684,10 @@ class PPOTrainer:
             if teacher_for_metrics is not None and non_padding_mask.any():
                 index = torch.as_tensor(non_padding_mask, dtype=torch.bool, device=teacher_for_metrics.device)
                 teacher_for_metrics = teacher_for_metrics[index]
+            if teacher_logprob_nonfinite_positions is not None and non_padding_mask.any():
+                teacher_logprob_nonfinite_positions = self._filter_list_by_mask(
+                    teacher_logprob_nonfinite_positions, non_padding_mask
+                )
             gap_available = teacher_for_metrics is not None and (
                 teacher_for_metrics.ndim != 3 or teacher_for_metrics.shape[-1] == 1
             )
@@ -1628,6 +1695,7 @@ class PPOTrainer:
                 compute_opd_diagnostics_metrics(
                     student_logprobs=diagnostics_batch["old_log_probs"],
                     teacher_logprobs=teacher_for_metrics,
+                    teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
                     entropy=diagnostics_batch["entropy"],
                     response_mask=diagnostics_batch["response_mask"],
                     rm_scores=diagnostics_batch.get("rm_scores", None),
@@ -1656,6 +1724,7 @@ class PPOTrainer:
                 global_steps=global_steps,
                 student_logprobs=diagnostics_batch["old_log_probs"],
                 teacher_logprobs=teacher_for_metrics,
+                teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
                 response_mask=diagnostics_batch["response_mask"],
             )
 

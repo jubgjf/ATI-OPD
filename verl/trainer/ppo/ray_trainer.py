@@ -41,8 +41,10 @@ from verl.trainer.distillation.diagnostics import (
     OpdDiagnosticsTracker,
     compute_entropy_heatmap_row,
     compute_gap_heatmap_row,
+    compute_gap_high_heatmap_row,
     compute_intervention_metrics,
     compute_opd_diagnostics_metrics,
+    compute_teacher_logprob_nonfinite_heatmap_row,
     extract_sampled_response_logprobs,
 )
 from verl.trainer.distillation.losses import is_distillation_enabled
@@ -310,6 +312,8 @@ class RayPPOTrainer:
         )
         self.opd_entropy_tracker: OpdDiagnosticsTracker | None = None
         self.opd_gap_tracker: OpdDiagnosticsTracker | None = None
+        self.opd_gap_high_tracker: OpdDiagnosticsTracker | None = None
+        self.opd_teacher_logprob_nonfinite_tracker: OpdDiagnosticsTracker | None = None
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
@@ -1289,6 +1293,7 @@ class RayPPOTrainer:
         entropy: torch.Tensor | None,
         student_logprobs: torch.Tensor,
         teacher_logprobs: torch.Tensor | None,
+        teacher_logprob_nonfinite_positions: list[Any] | None,
         response_mask: torch.Tensor,
     ) -> None:
         diagnostics_config = self._distillation_diagnostics_config()
@@ -1341,6 +1346,51 @@ class RayPPOTrainer:
                 finally:
                     plt.close(fig)
 
+            if self.opd_gap_high_tracker is None:
+                self.opd_gap_high_tracker = OpdDiagnosticsTracker(
+                    history_steps=diagnostics_config.heatmap_history_steps,
+                    bin_size=diagnostics_config.position_bin_size,
+                )
+            gap_high_row = compute_gap_high_heatmap_row(
+                student_logprobs=student_logprobs,
+                teacher_logprobs=teacher_logprobs,
+                response_mask=response_mask,
+                bin_size=diagnostics_config.position_bin_size,
+                high_gap_threshold=diagnostics_config.high_gap_threshold,
+            )
+            self.opd_gap_high_tracker.add_gap_high_row(global_steps, gap_high_row)
+            fig = self.opd_gap_high_tracker.render_gap_high_heatmap()
+            if fig is not None:
+                try:
+                    self.logger.log(
+                        {"opd/gap_abs_high_heatmap": wandb.Image(fig)}, step=global_steps, backend=["wandb"]
+                    )
+                finally:
+                    plt.close(fig)
+
+        if teacher_logprob_nonfinite_positions is not None:
+            if self.opd_teacher_logprob_nonfinite_tracker is None:
+                self.opd_teacher_logprob_nonfinite_tracker = OpdDiagnosticsTracker(
+                    history_steps=diagnostics_config.heatmap_history_steps,
+                    bin_size=diagnostics_config.position_bin_size,
+                )
+            nonfinite_row = compute_teacher_logprob_nonfinite_heatmap_row(
+                teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
+                response_mask=response_mask,
+                bin_size=diagnostics_config.position_bin_size,
+            )
+            self.opd_teacher_logprob_nonfinite_tracker.add_teacher_logprob_nonfinite_row(global_steps, nonfinite_row)
+            fig = self.opd_teacher_logprob_nonfinite_tracker.render_teacher_logprob_nonfinite_heatmap()
+            if fig is not None:
+                try:
+                    self.logger.log(
+                        {"opd/teacher_logprob_nonfinite_heatmap": wandb.Image(fig)},
+                        step=global_steps,
+                        backend=["wandb"],
+                    )
+                finally:
+                    plt.close(fig)
+
     def _compute_opd_diagnostics_metrics(
         self,
         *,
@@ -1376,9 +1426,15 @@ class RayPPOTrainer:
             )
 
         teacher_response_logprobs = self._extract_teacher_response_logprobs_for_diagnostics(batch)
+        teacher_logprob_nonfinite_positions = None
+        if "teacher_logprob_nonfinite_positions" in batch.non_tensor_batch:
+            teacher_logprob_nonfinite_positions = self._non_tensor_to_list(
+                batch.non_tensor_batch["teacher_logprob_nonfinite_positions"]
+            )
         metrics = compute_opd_diagnostics_metrics(
             student_logprobs=student_logprobs,
             teacher_logprobs=teacher_response_logprobs,
+            teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
             entropy=entropy,
             response_mask=response_mask,
             rm_scores=batch.batch.get("rm_scores", None),
@@ -1416,6 +1472,7 @@ class RayPPOTrainer:
             entropy=entropy,
             student_logprobs=student_logprobs,
             teacher_logprobs=teacher_response_logprobs,
+            teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
             response_mask=response_mask,
         )
         return metrics

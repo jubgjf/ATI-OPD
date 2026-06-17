@@ -95,6 +95,14 @@ class RLHFDataset(Dataset):
     ):
         if not isinstance(data_files, list | ListConfig):
             data_files = [data_files]
+        if not data_files:
+            raise ValueError("RLHFDataset requires at least one data file path, but data_files is empty.")
+        for i, data_file in enumerate(data_files):
+            if not isinstance(data_file, str) or not data_file.strip():
+                raise ValueError(
+                    f"RLHFDataset received an empty data file path at index {i}. "
+                    "Check data.train_files/data.val_files; a shell variable may have expanded to an empty string."
+                )
 
         self.data_files = copy.deepcopy(data_files)
         self.original_data_files = copy.deepcopy(data_files)  # use for resume

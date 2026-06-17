@@ -208,6 +208,12 @@ def copy_to_local(
     Returns:
         str: Local filesystem path to copied resource
     """
+    if not isinstance(src, str) or not src.strip():
+        raise ValueError(
+            "copy_to_local received an empty source path. Check data.train_files/data.val_files or model paths; "
+            "a shell variable may have expanded to an empty string."
+        )
+
     # Save to a local path for persistence.
     local_path = copy_local_path_from_hdfs(src, cache_dir, filelock, verbose, always_recopy)
 
@@ -234,6 +240,12 @@ def copy_local_path_from_hdfs(
 ) -> str:
     """Deprecated. Please use copy_to_local instead."""
     from filelock import FileLock
+
+    if not isinstance(src, str) or not src.strip():
+        raise ValueError(
+            "copy_local_path_from_hdfs received an empty source path. Check data.train_files/data.val_files or "
+            "model paths; a shell variable may have expanded to an empty string."
+        )
 
     assert src[-1] != "/", f"Make sure the last char in src is not / because it will cause error. Got {src}"
 

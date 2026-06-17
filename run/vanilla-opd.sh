@@ -22,22 +22,12 @@ ls -l /usr/lib64/libjemalloc.so.2
 export LD_PRELOAD=/usr/lib64/libjemalloc.so.2:${LD_PRELOAD}
 echo ============================
 
+tar -xf $DATASET_DIR/libs/vllm-build.tar.gz -C $HOME
 . $HOME/anaconda3/etc/profile.d/conda.sh
 mkdir -p $HOME/anaconda3/envs/verl
-tar -xf $DATASET_DIR/libs/verl-conda-env.tar.gz -C $HOME/anaconda3/envs/verl
+tar -xf $DATASET_DIR/libs/verl-conda-env-20260617.tar.gz -C $HOME/anaconda3/envs/verl
 conda env list
 conda activate verl
-echo ============================
-
-cp -r "${DATASET_DIR}/libs/vllm" "${HOME}/vllm-src"
-cp -r "${DATASET_DIR}/libs/vllm-ascend" "${HOME}/vllm-ascend-src"
-cd "${HOME}/vllm-src" || exit
-git checkout v0.11.0
-VLLM_TARGET_DEVICE=empty pip install -v -e .
-cd "${HOME}/vllm-ascend-src" || exit
-git checkout v0.11.0
-git submodule update
-pip install -v -e .
 echo ============================
 
 cd $WORKSPACE
@@ -45,31 +35,19 @@ pip install -r requirements-npu.txt
 pip install -e .
 echo ============================
 
-ma_vj_name=`echo ${MA_VJ_NAME} | sed 's:ma-job:modelarts-job:g'`
-task_name="worker-${VC_TASK_INDEX}"
-task_plog_path=${MA_LOG_DIR}/${ma_vj_name}/${task_name}
-mkdir -p ${task_plog_path}
-export ASCEND_PROCESS_LOG_PATH=${ASCEND_PROCESS_LOG_PATH}/${VC_TASK_INDEX}
-echo "plog path: ${ASCEND_PROCESS_LOG_PATH}"
-
-MASTER_ADDR="${MA_VJ_NAME}-${MA_TASK_NAME}-${VC_TASK_INDEX}.${MA_VJ_NAME}"
-MASTER_PORT=${PORT}
-MA_CURRENT_INSTANCE_NAME="$MA_CURRENT_INSTANCE_NAME"
-
 export HCCL_EXEC_TIMEOUT=3600
 export HCCL_LOG_LEVEL=0
 export HCCL_CONNECT_TIMEOUT=3600
 export HCCL_BUFFSIZE=2000
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ASCEND_ENABLE_NZ=0
-export HCCL_ASYNC_ERROR_HANDLING=0  # 关闭 watchdog，防止通信超时被误杀
-ulimit -n 65536                     # 句柄上限提升到 65536
-
+export HCCL_ASYNC_ERROR_HANDLING=0
 export CLOSE_MATMUL_K_SHIFT=1
 export ATB_MATMUL_SHUFFLE_K_ENABLE=0
 export HCCL_DETERMINISTIC="true"
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export VLLM_USE_V1=1
+ulimit -n 65536
 
 STUDENT_MODEL=$DATASET_DIR/models/Qwen/Qwen3-8B
 TEACHER_MODEL=$DATASET_DIR/models/Qwen/Qwen3-32B
@@ -80,32 +58,36 @@ dapo_math_valid=$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl/test.
 train_files="['$dapo_math_train']"
 valid_files="['$dapo_math_valid']"
 
+# 分布式与并行参数
+NNODES=$VC_WORKER_NUM
+STUDENT_NNODES=$(( $VC_WORKER_NUM / 2))
+TEACHER_NNODES=$(( $VC_WORKER_NUM / 2))
+STUDENT_NGPUS_PER_NODE=8
+TEACHER_NGPUS_PER_NODE=8
+student_tp=8
+student_gpu_mem_util=0.6
+teacher_tp=8
+teacher_gpu_mem_util=0.6
+sp_size=8
+TEACHER_REPLICAS=$(( $TEACHER_NNODES * $TEACHER_NGPUS_PER_NODE / $teacher_tp ))
+
 # 训练基本参数
-max_prompt_length=2048
-max_response_length=8192
+max_prompt_length=$(( 2 * 1024 ))
+max_response_length=$(( 18 * 1024 ))
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
-rollout_max_num_batched_tokens=$max_num_tokens
-teacher_max_num_batched_tokens=$max_num_tokens
-rollout_max_num_seqs=256
-teacher_max_num_seqs=256
+rollout_max_num_batched_tokens=2048
+teacher_max_num_batched_tokens=2048
+rollout_max_num_seqs=128
+teacher_max_num_seqs=128
 
 actor_lr=1e-6
-train_batch_size=128
-ppo_mini_batch_size=128
-ppo_max_token_len_per_gpu=12288
+train_batch_size=64
+ppo_mini_batch_size=64
+ppo_max_token_len_per_gpu=$(( ((max_num_tokens + sp_size - 1) / sp_size + 127) / 128 * 128 ))  # align to 128
 train_max_samples=-1
 val_max_samples=4096
 val_batch_size=256
 data_seed=-42
-
-# 分布式与并行参数
-NNODES=${NNODES:-4}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
-TEACHER_WORLD_SIZE=${TEACHER_WORLD_SIZE:-4}
-rollout_tp=${ROLLOUT_TP:-2}
-rollout_gpu_mem_util=0.9
-teacher_tp=${TEACHER_TP:-2}
-teacher_gpu_mem_util=0.9
 
 # 蒸馏参数
 distillation_loss_mode=k1
@@ -136,8 +118,6 @@ total_epochs=3
 save_freq=200
 test_freq=10
 
-mkdir -p ${default_local_dir}
-
 export WANDB_MODE=offline
 export WANDB_DIR=$WORKSPACE
 export WANDB_START_METHOD=thread
@@ -146,7 +126,6 @@ mkdir -p ${WANDB_DIR}
 ### 启动分布式网络配置
 export NODE_RANK=${VC_TASK_INDEX}
 export MASTER_ADDR="${MA_VJ_NAME}-${MA_TASK_NAME}-0.${MA_VJ_NAME}"
-export MASTER_PORT=${PORT}
 export TMPDIR="/cache/ray_tmp"
 mkdir -p /cache/ray_tmp
 
@@ -174,7 +153,6 @@ export HCCL_SOCKET_IFNAME=eth0
 export GLOO_SOCKET_IFNAME=eth0
 export TP_SOCKET_IFNAME=eth0
 export ASCEND_GLOBAL_LOG_LEVEL=3
-export ASCEND_PROCESS_LOG_PATH=${default_local_dir}/ascend_logs
 export HYDRA_FULL_ERROR=1
 export RAY_gcs_server_rpc_server_thread_num=32
 export RAY_gcs_server_request_timeout_seconds=600
@@ -182,15 +160,8 @@ export RAY_timeout_ms=600000
 export RAY_worker_register_timeout_seconds=600
 export RAY_USAGE_STATS_ENABLED=0
 
-mkdir -p ${default_local_dir}/ascend_logs
-
-cp /opt/huawei/dataset/jnguan/code/dotnetrc $HOME/.netrc
-
-
 if [ "$NODE_RANK" -eq 0 ]; then
     # ---------- 主节点 (Head Node) ----------
-    echo "【防守型策略】主节点休眠 300 秒，等待所有节点物理环境就绪..."
-    sleep 300
     
     echo "Starting Ray HEAD node on $CURRENT_IP..."
     # 显式绑定 node-ip-address 为 MA_CURRENT_IP
@@ -242,7 +213,7 @@ if [ "$NODE_RANK" -eq 0 ]; then
         data.max_prompt_length=$max_prompt_length \
         data.max_response_length=$max_response_length \
         data.filter_overlong_prompts=True \
-        data.truncation='error' \
+        data.truncation='left' \
         data.shuffle=False \
         data.seed=${data_seed} \
         actor_rollout_ref.model.path="$STUDENT_MODEL" \
@@ -253,13 +224,14 @@ if [ "$NODE_RANK" -eq 0 ]; then
         actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size} \
         actor_rollout_ref.actor.use_dynamic_bsz=True \
         actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu} \
+        actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
         actor_rollout_ref.actor.fsdp_config.param_offload=True \
         actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
         actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
         actor_rollout_ref.ref.fsdp_config.forward_prefetch=True \
         actor_rollout_ref.rollout.name=vllm \
-        actor_rollout_ref.rollout.tensor_model_parallel_size=${rollout_tp} \
-        actor_rollout_ref.rollout.gpu_memory_utilization=${rollout_gpu_mem_util} \
+        actor_rollout_ref.rollout.tensor_model_parallel_size=${student_tp} \
+        actor_rollout_ref.rollout.gpu_memory_utilization=${student_gpu_mem_util} \
         actor_rollout_ref.rollout.n=1 \
         actor_rollout_ref.rollout.max_model_len=${max_num_tokens} \
         actor_rollout_ref.rollout.max_num_batched_tokens=${rollout_max_num_batched_tokens} \
@@ -271,8 +243,8 @@ if [ "$NODE_RANK" -eq 0 ]; then
         trainer.logger='["console","wandb"]' \
         trainer.project_name=${project_name} \
         trainer.experiment_name=${experiment_name} \
-        trainer.n_gpus_per_node=${NGPUS_PER_NODE} \
-        trainer.nnodes=${NNODES} \
+        trainer.n_gpus_per_node=${STUDENT_NGPUS_PER_NODE} \
+        trainer.nnodes=${STUDENT_NNODES} \
         trainer.device=npu \
         trainer.default_local_dir=${default_local_dir} \
         trainer.val_before_train=False \
@@ -280,9 +252,10 @@ if [ "$NODE_RANK" -eq 0 ]; then
         trainer.test_freq=${test_freq} \
         trainer.total_epochs=${total_epochs} \
         distillation.enabled=True \
-        distillation.n_gpus_per_node=${TEACHER_WORLD_SIZE} \
-        distillation.nnodes=${NNODES} \
+        distillation.n_gpus_per_node=${TEACHER_NGPUS_PER_NODE} \
+        distillation.nnodes=${TEACHER_NNODES} \
         distillation.teacher_models.teacher_model.model_path="$TEACHER_MODEL" \
+        distillation.teacher_models.teacher_model.num_replicas="$TEACHER_REPLICAS" \
         distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=${teacher_tp} \
         distillation.teacher_models.teacher_model.inference.name=vllm \
         distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=${teacher_gpu_mem_util} \
@@ -316,9 +289,6 @@ if [ "$NODE_RANK" -eq 0 ]; then
     
 else
     # ---------- 从节点 (Worker Node) ----------
-    RANDOM_DELAY=$((RANDOM % 15 + 1))
-    echo "Waiting $RANDOM_DELAY seconds to stagger worker starts..."
-    sleep $RANDOM_DELAY
     echo "Starting Ray WORKER node connecting to $MASTER_ADDR..."
     
     while true; do
