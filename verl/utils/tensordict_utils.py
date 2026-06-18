@@ -182,6 +182,65 @@ def nested_tensor_from_tensor_list(tensors: list[torch.Tensor], ragged_idx: int 
     return nested_tensor
 
 
+def safe_unbind_jagged_nested_tensor(tensor: torch.Tensor, *, context: str) -> list[torch.Tensor]:
+    """Unbind a jagged NestedTensor and repair recoverable offset/value mismatches."""
+    try:
+        return list(tensor.unbind())
+    except RuntimeError as exc:
+        if not (isinstance(tensor, torch.Tensor) and tensor.is_nested and tensor.layout == torch.jagged):
+            raise
+
+        offsets = tensor.offsets()
+        values = tensor.values()
+        if offsets.ndim != 1 or offsets.numel() == 0:
+            raise RuntimeError(
+                f"Cannot unbind jagged NestedTensor for {context}: expected 1-D non-empty offsets, "
+                f"got offsets.shape={tuple(offsets.shape)}."
+            ) from exc
+
+        offsets_cpu = offsets.detach().cpu()
+        if (offsets_cpu[1:] < offsets_cpu[:-1]).any().item():
+            raise RuntimeError(
+                f"Cannot unbind jagged NestedTensor for {context}: offsets must be non-decreasing, "
+                f"got first_offsets={offsets_cpu[:8].tolist()}, last_offsets={offsets_cpu[-8:].tolist()}, "
+                f"values.shape={tuple(values.shape)}."
+            ) from exc
+
+        start = int(offsets_cpu[0].item())
+        end = int(offsets_cpu[-1].item())
+        local_numel = end - start
+        values_numel = int(values.shape[0])
+        if start < 0:
+            raise RuntimeError(
+                f"Cannot unbind jagged NestedTensor for {context}: offsets must be non-negative, "
+                f"got start={start}, end={end}, values.shape={tuple(values.shape)}."
+            ) from exc
+
+        if values_numel == local_numel:
+            local_values = values
+            local_offsets = offsets - start
+        elif values_numel >= end:
+            # TensorDict/NestedTensor slicing can preserve global offsets while values still contain
+            # the original storage. Slice the active range and rebase offsets before splitting.
+            local_values = values[start:end]
+            local_offsets = offsets - start
+        else:
+            raise RuntimeError(
+                f"Cannot unbind jagged NestedTensor for {context}: values are shorter than the offsets range. "
+                f"values.shape={tuple(values.shape)}, values_numel={values_numel}, "
+                f"offset_start={start}, offset_end={end}, expected_local_numel={local_numel}. "
+                "This usually means model output length no longer matches the unpadded input sequence lengths."
+            ) from exc
+
+        lengths = local_offsets.diff().detach().cpu().tolist()
+        if sum(lengths) != int(local_values.shape[0]):
+            raise RuntimeError(
+                f"Cannot repair jagged NestedTensor for {context}: split lengths sum to {sum(lengths)} but "
+                f"local_values.shape={tuple(local_values.shape)}, offset_start={start}, offset_end={end}."
+            ) from exc
+        return list(torch.split(local_values, lengths, dim=0))
+
+
 def concat_nested_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
     """Concatenate multiple nested tensors along the batch dimension.
 
