@@ -325,8 +325,37 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
         return
 
     prompt_logprobs_ls, prompt_ids_ls = [], []
+    sampled_prompt_logprobs_ls, sampled_prompt_ids_ls = [], []
     # NOTE: logprob of first prompt token is None.
-    for logprobs_dict in output.prompt_logprobs[1:]:
+    prompt_token_ids = getattr(output, "prompt_token_ids", None)
+    prompt_logprobs = getattr(output, "prompt_logprobs", None)
+    if prompt_logprobs is None:
+        raise RuntimeError("vLLM did not return prompt_logprobs despite prompt_logprobs being requested.")
+    if prompt_token_ids is not None and len(prompt_logprobs) != len(prompt_token_ids):
+        raise RuntimeError(
+            "vLLM prompt_logprobs length does not cover prompt_token_ids: "
+            f"len(prompt_logprobs)={len(prompt_logprobs)}, len(prompt_token_ids)={len(prompt_token_ids)}. "
+            "This usually means the active vLLM backend did not return prompt scoring for the request."
+        )
+    for position, logprobs_dict in enumerate(prompt_logprobs[1:], start=1):
+        if not logprobs_dict:
+            raise RuntimeError(f"vLLM prompt_logprobs was empty at prompt position {position}.")
+        sampled_token_id = int(prompt_token_ids[position]) if prompt_token_ids is not None else None
+        sampled_token_logprob = None
+        for token_id_str, token_logprob in logprobs_dict.items():
+            if sampled_token_id is not None and int(token_id_str) == sampled_token_id:
+                sampled_token_logprob = token_logprob.logprob
+                break
+        if sampled_token_id is None:
+            first_token_id_str, first_token_logprob = next(iter(logprobs_dict.items()))
+            sampled_token_id = int(first_token_id_str)
+            sampled_token_logprob = first_token_logprob.logprob
+        if sampled_token_logprob is None:
+            raise RuntimeError(
+                f"vLLM prompt_logprobs did not include sampled prompt token {sampled_token_id} at position {position}."
+            )
+        sampled_prompt_ids_ls.append([sampled_token_id])
+        sampled_prompt_logprobs_ls.append([sampled_token_logprob])
         if num_prompt_logprobs == 0:
             token_id_str = list(logprobs_dict.keys())[0]
             logprob = logprobs_dict[token_id_str].logprob
@@ -350,6 +379,10 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
     # NOTE: pad a dummy prompt logprob for last prompt token.
     prompt_logprobs_ls.append([0.0] * max(num_prompt_logprobs, 1))
     prompt_ids_ls.append([0] * max(num_prompt_logprobs, 1))
+    sampled_prompt_logprobs_ls.append([0.0])
+    sampled_prompt_ids_ls.append([0])
 
     result_dict["prompt_ids"] = prompt_ids_ls
     result_dict["prompt_logprobs"] = prompt_logprobs_ls
+    result_dict["sampled_prompt_ids"] = sampled_prompt_ids_ls
+    result_dict["sampled_prompt_logprobs"] = sampled_prompt_logprobs_ls

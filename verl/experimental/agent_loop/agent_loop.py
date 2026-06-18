@@ -32,6 +32,7 @@ import logging
 import os
 import random
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -46,7 +47,11 @@ from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
 from verl.experimental.agent_loop.utils import resolve_config_path
-from verl.experimental.teacher_loop.teacher_manager import TeacherLogprobScoringResult
+from verl.experimental.teacher_loop.teacher_manager import (
+    DEFAULT_NONFINITE_LOGPROB_REPLACEMENT,
+    TeacherGenerationResult,
+    TeacherLogprobScoringResult,
+)
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
 from verl.trainer.distillation import is_distillation_enabled
@@ -78,6 +83,23 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
+@dataclass
+class _StudentSuffixGenerationResult:
+    token_ids: list[int]
+    logprobs: list[float]
+    stop_reason: Optional[str] = None
+    finish_reason: Optional[str] = None
+    terminal: bool = False
+    eos_truncated: bool = False
+
+
+@dataclass
+class _ThinkingBlockState:
+    valid: bool = True
+    open: bool = False
+    reason: Optional[str] = None
+
+
 def _compute_intervention_gap(
     student_logprobs: torch.Tensor,
     teacher_logprobs: torch.Tensor,
@@ -87,7 +109,7 @@ def _compute_intervention_gap(
     student_logprobs = student_logprobs.float()
     teacher_logprobs = teacher_logprobs.float()
     if metric in ("kl", "k1"):
-        return student_logprobs - teacher_logprobs
+        return teacher_logprobs - student_logprobs
     if metric == "abs":
         return (student_logprobs - teacher_logprobs).abs()
     if metric in ("mse", "k2"):
@@ -113,7 +135,7 @@ def _teacher_response_logprobs(
         raise RuntimeError(
             "Teacher intervention scoring expects sampled-token prompt logprobs with shape "
             f"[sequence_len, 1], but got teacher_logprobs.shape={tuple(teacher_logprobs.shape)}. "
-            "This path calls the teacher with prompt_logprobs=0; check the teacher backend response."
+            "Check that the teacher backend returns sampled_prompt_logprobs when top-k scoring is requested."
         )
     required_len = prompt_len + response_len
     if teacher_logprobs.shape[0] < required_len:
@@ -135,6 +157,12 @@ def _teacher_response_logprobs(
     return response_logprobs
 
 
+def _teacher_gap_logprobs(result: TeacherLogprobScoringResult) -> torch.Tensor:
+    if result.sampled_logprobs is not None:
+        return result.sampled_logprobs
+    return result.logprobs
+
+
 def _coerce_teacher_logprob_scoring_result(result: Any) -> TeacherLogprobScoringResult:
     if isinstance(result, TeacherLogprobScoringResult):
         return result
@@ -145,6 +173,244 @@ def _coerce_teacher_logprob_scoring_result(result: Any) -> TeacherLogprobScoring
         "Teacher logprob scoring must return TeacherLogprobScoringResult or a legacy "
         f"(teacher_ids, teacher_logprobs) tuple, got {type(result).__name__}."
     )
+
+
+def _coerce_teacher_generation_result(result: Any) -> TeacherGenerationResult:
+    if isinstance(result, TeacherGenerationResult):
+        return result
+    if isinstance(result, list):
+        return TeacherGenerationResult(token_ids=list(result))
+    if hasattr(result, "token_ids"):
+        extra_fields = getattr(result, "extra_fields", None) or {}
+        return TeacherGenerationResult(
+            token_ids=list(result.token_ids),
+            stop_reason=getattr(result, "stop_reason", None),
+            finish_reason=extra_fields.get("finish_reason"),
+        )
+    raise TypeError(
+        "Teacher segment generation must return TeacherGenerationResult or a legacy token id list, "
+        f"got {type(result).__name__}."
+    )
+
+
+def _normalize_finish_reason(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        value = value.get("type") or value.get("reason") or value
+    return str(value).strip().lower()
+
+
+def _is_abort_reason(value: Any) -> bool:
+    return _normalize_finish_reason(value) in {"abort", "aborted", "cancelled", "canceled"}
+
+
+def _is_length_reason(value: Any) -> bool:
+    return _normalize_finish_reason(value) in {"length", "max_tokens", "max_new_tokens"}
+
+
+def _is_stop_reason(value: Any) -> bool:
+    return _normalize_finish_reason(value) in {"stop", "eos", "end", "stop_sequence"}
+
+
+def _generation_was_aborted(*, stop_reason: Any, finish_reason: Any) -> bool:
+    return _is_abort_reason(stop_reason) or _is_abort_reason(finish_reason)
+
+
+def _tokenizer_eos_token_ids(tokenizer: Any) -> set[int]:
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is None:
+        return set()
+    if isinstance(eos_token_id, int):
+        return {eos_token_id}
+    if isinstance(eos_token_id, list | tuple | set):
+        return {int(token_id) for token_id in eos_token_id if token_id is not None}
+    return {int(eos_token_id)}
+
+
+def _truncate_generation_at_eos(
+    token_ids: list[int],
+    logprobs: Optional[list[float]],
+    *,
+    eos_token_ids: set[int],
+) -> tuple[list[int], Optional[list[float]], bool]:
+    if not eos_token_ids:
+        return token_ids, logprobs, False
+    for idx, token_id in enumerate(token_ids):
+        if token_id in eos_token_ids:
+            end = idx + 1
+            return token_ids[:end], logprobs[:end] if logprobs is not None else None, True
+    return token_ids, logprobs, False
+
+
+def _encode_token_pattern(tokenizer: Any, text: str) -> list[int]:
+    if not text or tokenizer is None or not hasattr(tokenizer, "encode"):
+        return []
+    try:
+        return normalize_token_ids(tokenizer.encode(text, add_special_tokens=False))
+    except Exception:
+        logger.warning(
+            "Failed to tokenize teacher intervention thinking tag %r; protection disabled for this tag.",
+            text,
+        )
+        return []
+
+
+def _match_token_pattern(token_ids: list[int], pattern: list[int], position: int) -> bool:
+    return bool(pattern) and token_ids[position : position + len(pattern)] == pattern
+
+
+def _thinking_block_state(
+    token_ids: list[int],
+    *,
+    start_pattern: list[int],
+    end_pattern: list[int],
+) -> _ThinkingBlockState:
+    if not start_pattern or not end_pattern:
+        return _ThinkingBlockState()
+    seen_start = False
+    seen_closed = False
+    open_block = False
+    position = 0
+    while position < len(token_ids):
+        if _match_token_pattern(token_ids, start_pattern, position):
+            if open_block:
+                return _ThinkingBlockState(valid=False, open=True, reason="nested_start")
+            if seen_closed:
+                return _ThinkingBlockState(valid=False, open=False, reason="reopened_after_close")
+            seen_start = True
+            open_block = True
+            position += len(start_pattern)
+            continue
+        if _match_token_pattern(token_ids, end_pattern, position):
+            if not open_block:
+                return _ThinkingBlockState(valid=False, open=False, reason="unmatched_close")
+            open_block = False
+            seen_closed = True
+            position += len(end_pattern)
+            continue
+        position += 1
+    return _ThinkingBlockState(valid=True, open=open_block if seen_start else False)
+
+
+def _expand_segment_to_token_patterns(
+    token_ids: list[int],
+    start: int,
+    end: int,
+    *,
+    patterns: list[list[int]],
+) -> tuple[int, int]:
+    adjusted_start = start
+    adjusted_end = end
+    for pattern in patterns:
+        if not pattern or len(pattern) <= 1:
+            continue
+        for position in range(0, max(len(token_ids) - len(pattern) + 1, 0)):
+            pattern_end = position + len(pattern)
+            if token_ids[position:pattern_end] != pattern:
+                continue
+            if position < adjusted_start < pattern_end:
+                adjusted_start = position
+            if position < adjusted_end < pattern_end:
+                adjusted_end = pattern_end
+    return adjusted_start, min(adjusted_end, len(token_ids))
+
+
+def _generation_is_terminal(
+    *,
+    token_ids: list[int],
+    max_tokens: int,
+    stop_reason: Any,
+    finish_reason: Any,
+    eos_truncated: bool,
+) -> bool:
+    if eos_truncated or _is_stop_reason(finish_reason):
+        return True
+    if _is_length_reason(finish_reason) or _is_abort_reason(finish_reason):
+        return False
+    if _is_stop_reason(stop_reason):
+        return True
+    if _is_abort_reason(stop_reason):
+        return False
+    # Older rollout adapters exposed only stop_reason="completed"; keep the
+    # previous short-generation-is-terminal heuristic when raw finish_reason is absent.
+    if finish_reason is None and _normalize_finish_reason(stop_reason) == "completed" and len(token_ids) < max_tokens:
+        return True
+    return False
+
+
+def _record_skipped_intervention(
+    skipped_interventions: list[dict[str, Any]],
+    *,
+    reason: str,
+    attempt: int,
+    start: int,
+    end: int,
+    candidate_response_ids: Optional[list[int]] = None,
+    candidate_response_mask: Optional[list[int]] = None,
+    teacher_tokens: int = 0,
+    student_suffix_tokens: int = 0,
+) -> None:
+    skipped_interventions.append(
+        {
+            "reason": reason,
+            "attempt": int(attempt),
+            "start": int(start),
+            "end": int(end),
+            "candidate_tokens": 0 if candidate_response_ids is None else len(candidate_response_ids),
+            "candidate_trainable_tokens": 0 if candidate_response_mask is None else int(sum(candidate_response_mask)),
+            "teacher_tokens": int(teacher_tokens),
+            "student_suffix_tokens": int(student_suffix_tokens),
+        }
+    )
+
+
+_MOE_CONFIG_ATTRIBUTES = (
+    "num_experts",
+    "num_local_experts",
+    "num_experts_per_tok",
+    "n_routed_experts",
+    "n_shared_experts",
+    "moe_intermediate_size",
+    "shared_expert_intermediate_size",
+    "first_k_dense_replace",
+)
+
+
+def _get_config_value(config: Any, name: str) -> Any:
+    if config is None:
+        return None
+    if isinstance(config, dict):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def _is_positive_config_value(value: Any) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, int | float):
+        return value > 0
+    return True
+
+
+def _is_moe_like_hf_config(hf_config: Any) -> bool:
+    configs = [hf_config]
+    text_config = _get_config_value(hf_config, "text_config")
+    if text_config is not None:
+        configs.append(text_config)
+    for config in configs:
+        model_type = _get_config_value(config, "model_type")
+        if model_type is not None and "moe" in str(model_type).lower():
+            return True
+        architectures = _get_config_value(config, "architectures") or []
+        if isinstance(architectures, str):
+            architectures = [architectures]
+        if any("moe" in str(architecture).lower() for architecture in architectures):
+            return True
+        for attr_name in _MOE_CONFIG_ATTRIBUTES:
+            if _is_positive_config_value(_get_config_value(config, attr_name)):
+                return True
+    return False
 
 
 def _response_relative_nonfinite_positions(
@@ -599,6 +865,9 @@ class AgentLoopWorker:
         self.teacher_intervention_enabled = False
         self.teacher_intervention_config = None
         self._teacher_intervention_logged_samples = 0
+        self._teacher_intervention_logged_step = None
+        self._teacher_intervention_thinking_start_pattern: list[int] = []
+        self._teacher_intervention_thinking_end_pattern: list[int] = []
         if self.distillation_enabled:
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 
@@ -610,6 +879,8 @@ class AgentLoopWorker:
             self.distillation_config = self.teacher_server_manager.distillation_config
             self.teacher_intervention_config = self.distillation_config.intervention
             self.teacher_intervention_enabled = self.teacher_intervention_config.enabled
+            self._validate_teacher_intervention_compatibility()
+            self._init_teacher_intervention_token_patterns()
 
         # Load tools once per worker; each trajectory just reuses self.tools.
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
@@ -639,6 +910,82 @@ class AgentLoopWorker:
             trace_config.get("token2text", False),
             trace_config.get("max_samples_per_step_per_worker", None),
         )
+
+    def _validate_teacher_intervention_compatibility(self) -> None:
+        if not self.teacher_intervention_enabled:
+            return
+        if getattr(self.rollout_config, "enable_rollout_routing_replay", False):
+            raise NotImplementedError(
+                "distillation.intervention.enabled is incompatible with "
+                "actor_rollout_ref.rollout.enable_rollout_routing_replay. Repaired trajectories rewrite tokens after "
+                "rollout, so captured routed experts would be stale."
+            )
+        if _is_moe_like_hf_config(getattr(self.model_config, "hf_config", None)):
+            raise NotImplementedError(
+                "distillation.intervention.enabled does not currently support MoE models. Repaired trajectories "
+                "need fresh router decisions for inserted teacher and regenerated student tokens."
+            )
+
+    def _init_teacher_intervention_token_patterns(self) -> None:
+        config = self.teacher_intervention_config
+        if config is None or not getattr(config, "protect_thinking_blocks", True):
+            self._teacher_intervention_thinking_start_pattern = []
+            self._teacher_intervention_thinking_end_pattern = []
+            return
+        tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is None:
+            self._teacher_intervention_thinking_start_pattern = []
+            self._teacher_intervention_thinking_end_pattern = []
+            return
+        self._teacher_intervention_thinking_start_pattern = _encode_token_pattern(
+            tokenizer,
+            getattr(config, "thinking_start_text", "<think>"),
+        )
+        self._teacher_intervention_thinking_end_pattern = _encode_token_pattern(
+            tokenizer,
+            getattr(config, "thinking_end_text", "</think>"),
+        )
+
+    def _ensure_teacher_intervention_token_patterns(self) -> None:
+        if not hasattr(self, "_teacher_intervention_thinking_start_pattern"):
+            AgentLoopWorker._init_teacher_intervention_token_patterns(self)
+
+    def _teacher_intervention_thinking_state(self, response_ids: list[int]) -> _ThinkingBlockState:
+        AgentLoopWorker._ensure_teacher_intervention_token_patterns(self)
+        return _thinking_block_state(
+            response_ids,
+            start_pattern=getattr(self, "_teacher_intervention_thinking_start_pattern", []),
+            end_pattern=getattr(self, "_teacher_intervention_thinking_end_pattern", []),
+        )
+
+    def _expand_teacher_intervention_segment_for_token_patterns(self, response_ids: list[int], start: int, end: int):
+        AgentLoopWorker._ensure_teacher_intervention_token_patterns(self)
+        return _expand_segment_to_token_patterns(
+            response_ids,
+            start,
+            end,
+            patterns=[
+                getattr(self, "_teacher_intervention_thinking_start_pattern", []),
+                getattr(self, "_teacher_intervention_thinking_end_pattern", []),
+            ],
+        )
+
+    def _intervention_prompt_logprobs(self) -> int:
+        distillation_config = getattr(self, "distillation_config", None)
+        loss_config = getattr(distillation_config, "distillation_loss", None)
+        loss_settings = getattr(loss_config, "loss_settings", None)
+        if loss_config is not None and getattr(loss_settings, "use_topk", False):
+            return int(loss_config.topk)
+        return 0
+
+    def _maybe_reset_teacher_intervention_log_counter(self, sample_kwargs: Optional[dict[str, Any]]) -> None:
+        if not sample_kwargs or "global_steps" not in sample_kwargs:
+            return
+        global_steps = sample_kwargs["global_steps"]
+        global_steps = global_steps.item() if hasattr(global_steps, "item") else global_steps
+        if global_steps != getattr(self, "_teacher_intervention_logged_step", None):
+            self._teacher_intervention_logged_step = global_steps
+            self._teacher_intervention_logged_samples = 0
 
     def _get_mm_processor_kwargs(self, audio_data: Optional[list[Any]] = None) -> dict[str, Any]:
         """Return multimodal processor kwargs with audio sampling-rate defaults."""
@@ -724,10 +1071,14 @@ class AgentLoopWorker:
         # NOTE: __do_sample__ is an internal per-sample override used by REMAX combined rollout.
         # Do not forward it to concrete agent loops, which may reject unknown kwargs.
         per_sample_do_sample = batch.non_tensor_batch.get("__do_sample__")
+        has_global_steps = "global_steps" in batch.meta_info
+        global_steps = batch.meta_info.get("global_steps")
         tasks = []
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items() if k != "__do_sample__"}
+            if has_global_steps and "global_steps" not in kwargs:
+                kwargs["global_steps"] = global_steps
             sample_sampling_params = dict(sampling_params)
             if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
                 apply_greedy_sampling_params(sample_sampling_params)
@@ -1123,7 +1474,7 @@ class AgentLoopWorker:
             mm_processor_kwargs=output.mm_processor_kwargs,
             routing_key=routing_key,
             request_id=request_id,
-            prompt_logprobs=0,
+            prompt_logprobs=AgentLoopWorker._intervention_prompt_logprobs(self),
         )
         return _coerce_teacher_logprob_scoring_result(result)
 
@@ -1135,9 +1486,9 @@ class AgentLoopWorker:
         max_tokens: int,
         sampling_params: Optional[dict[str, Any]],
         output: AgentLoopOutput,
-    ) -> tuple[list[int], list[float]]:
+    ) -> _StudentSuffixGenerationResult:
         if max_tokens <= 0:
-            return [], []
+            return _StudentSuffixGenerationResult(token_ids=[], logprobs=[])
         repair_sampling_params = dict(sampling_params or {})
         repair_sampling_params["max_tokens"] = max_tokens
         repair_sampling_params["logprobs"] = True
@@ -1151,8 +1502,8 @@ class AgentLoopWorker:
             audio_data=multi_modal_data.get("audios"),
             mm_processor_kwargs=output.mm_processor_kwargs,
         )
-        suffix_ids = student_output.token_ids[:max_tokens]
-        suffix_logprobs = (student_output.log_probs or [])[: len(suffix_ids)]
+        suffix_ids = list(student_output.token_ids[:max_tokens])
+        suffix_logprobs = list((student_output.log_probs or [])[: len(suffix_ids)])
         if len(suffix_logprobs) != len(suffix_ids):
             raise RuntimeError(
                 "Teacher intervention requires student suffix token logprobs for re-scoring, but the "
@@ -1163,7 +1514,27 @@ class AgentLoopWorker:
             )
         if suffix_logprobs and not torch.isfinite(torch.tensor(suffix_logprobs, dtype=torch.float32)).all():
             raise RuntimeError(f"Student suffix generation returned NaN/Inf logprobs for request_id={request_id!r}.")
-        return suffix_ids, suffix_logprobs
+        finish_reason = (student_output.extra_fields or {}).get("finish_reason")
+        suffix_ids, suffix_logprobs, eos_truncated = _truncate_generation_at_eos(
+            suffix_ids,
+            suffix_logprobs,
+            eos_token_ids=_tokenizer_eos_token_ids(self.tokenizer),
+        )
+        return _StudentSuffixGenerationResult(
+            token_ids=suffix_ids,
+            logprobs=suffix_logprobs,
+            stop_reason=student_output.stop_reason,
+            finish_reason=finish_reason,
+            terminal=_generation_is_terminal(
+                token_ids=suffix_ids,
+                max_tokens=max_tokens,
+                stop_reason=student_output.stop_reason,
+                finish_reason=finish_reason,
+                eos_truncated=eos_truncated,
+            )
+            or _generation_was_aborted(stop_reason=student_output.stop_reason, finish_reason=finish_reason),
+            eos_truncated=eos_truncated,
+        )
 
     async def _maybe_repair_with_teacher(
         self,
@@ -1177,7 +1548,22 @@ class AgentLoopWorker:
         if not self.teacher_intervention_enabled or validate:
             return
 
+        AgentLoopWorker._maybe_reset_teacher_intervention_log_counter(self, sample_kwargs)
+        AgentLoopWorker._ensure_teacher_intervention_token_patterns(self)
+        output.extra_fields["teacher_intervention_count"] = 0
+        output.extra_fields["teacher_interventions"] = []
+        output.extra_fields["teacher_intervention_skipped"] = []
+        interventions: list[dict[str, Any]] = output.extra_fields["teacher_interventions"]
+        skipped_interventions: list[dict[str, Any]] = output.extra_fields["teacher_intervention_skipped"]
+
+        if output.routed_experts is not None:
+            raise NotImplementedError(
+                "distillation.intervention.enabled cannot repair outputs that already contain routed_experts. "
+                "Repaired tokens would need fresh router decisions; disable intervention or routing replay."
+            )
+
         intervention_config: DistillationInterventionConfig = self.teacher_intervention_config
+        min_trainable_tokens = int(getattr(intervention_config, "min_trainable_tokens_after_repair", 1))
         response_ids = list(output.response_ids[: self.rollout_config.response_length])
         if len(output.response_mask) < len(response_ids):
             raise RuntimeError(
@@ -1224,8 +1610,8 @@ class AgentLoopWorker:
             raise RuntimeError("Teacher intervention requires a non-empty prompt_ids list.")
         routing_key = self._teacher_routing_key(sample_kwargs)
         base_request_id = output.extra_fields.get("rollout_request_id") or uuid4().hex
-        interventions: list[dict[str, Any]] = []
         cached_teacher_result = None
+        eos_token_ids = _tokenizer_eos_token_ids(self.tokenizer)
 
         for attempt in range(intervention_config.max_interventions_per_sample + 1):
             teacher_result = await self._score_sequence_for_intervention(
@@ -1237,7 +1623,7 @@ class AgentLoopWorker:
             )
             cached_teacher_result = teacher_result
             teacher_response_logprobs = _teacher_response_logprobs(
-                teacher_logprobs=teacher_result.logprobs,
+                teacher_logprobs=_teacher_gap_logprobs(teacher_result),
                 prompt_len=len(prompt_ids),
                 response_len=len(response_ids),
             )
@@ -1258,6 +1644,12 @@ class AgentLoopWorker:
                 break
 
             start, end, score = bad_segment
+            start, end = AgentLoopWorker._expand_teacher_intervention_segment_for_token_patterns(
+                self,
+                response_ids,
+                start,
+                end,
+            )
             prefix_response_ids = response_ids[:start]
             prefix_response_mask = response_mask[:start]
             prefix_response_logprobs = response_logprobs[:start]
@@ -1267,51 +1659,157 @@ class AgentLoopWorker:
                 self.rollout_config.response_length - len(prefix_response_ids),
             )
             if teacher_max_tokens <= 0:
+                _record_skipped_intervention(
+                    skipped_interventions,
+                    reason="teacher_token_budget_exhausted",
+                    attempt=attempt,
+                    start=start,
+                    end=end,
+                    candidate_response_ids=response_ids,
+                    candidate_response_mask=response_mask,
+                )
                 break
 
-            teacher_segment_ids = await self.teacher_server_manager.generate_teacher_segment_single(
-                prefix_ids=prompt_ids + prefix_response_ids,
-                max_tokens=teacher_max_tokens,
-                multi_modal_data=output.multi_modal_data,
-                mm_processor_kwargs=output.mm_processor_kwargs,
-                routing_key=routing_key,
-                request_id=f"{base_request_id}:teacher-generate:{attempt}",
+            teacher_generation = _coerce_teacher_generation_result(
+                await self.teacher_server_manager.generate_teacher_segment_single(
+                    prefix_ids=prompt_ids + prefix_response_ids,
+                    max_tokens=teacher_max_tokens,
+                    multi_modal_data=output.multi_modal_data,
+                    mm_processor_kwargs=output.mm_processor_kwargs,
+                    routing_key=routing_key,
+                    request_id=f"{base_request_id}:teacher-generate:{attempt}",
+                )
+            )
+            if _generation_was_aborted(
+                stop_reason=teacher_generation.stop_reason,
+                finish_reason=teacher_generation.finish_reason,
+            ):
+                _record_skipped_intervention(
+                    skipped_interventions,
+                    reason="teacher_generation_aborted",
+                    attempt=attempt,
+                    start=start,
+                    end=end,
+                    candidate_response_ids=prefix_response_ids,
+                    candidate_response_mask=prefix_response_mask,
+                    teacher_tokens=len(teacher_generation.token_ids),
+                )
+                break
+            teacher_segment_ids, _, teacher_eos_truncated = _truncate_generation_at_eos(
+                list(teacher_generation.token_ids),
+                None,
+                eos_token_ids=eos_token_ids,
             )
             if len(teacher_segment_ids) > teacher_max_tokens:
                 raise RuntimeError(
                     "Teacher intervention generation returned more tokens than requested: "
-                    f"len(teacher_segment_ids)={len(teacher_segment_ids)}, teacher_max_tokens={teacher_max_tokens}. "
+                    f"len(teacher_segment_ids)={len(teacher_segment_ids)}, "
+                    f"teacher_max_tokens={teacher_max_tokens}. "
                     "The rollout backend should return generated tokens only and respect sampling max_tokens."
                 )
             if not teacher_segment_ids:
+                _record_skipped_intervention(
+                    skipped_interventions,
+                    reason="teacher_generation_empty",
+                    attempt=attempt,
+                    start=start,
+                    end=end,
+                    candidate_response_ids=prefix_response_ids,
+                    candidate_response_mask=prefix_response_mask,
+                )
                 break
 
+            teacher_terminal = _generation_is_terminal(
+                token_ids=teacher_segment_ids,
+                max_tokens=teacher_max_tokens,
+                stop_reason=teacher_generation.stop_reason,
+                finish_reason=teacher_generation.finish_reason,
+                eos_truncated=teacher_eos_truncated,
+            )
             teacher_segment_mask_value = 1 if intervention_config.train_on_teacher_segments else 0
             teacher_segment_mask = [teacher_segment_mask_value] * len(teacher_segment_ids)
+            # Placeholder values keep response_logprobs aligned. They are ignored when teacher tokens are masked,
+            # and train_on_teacher_segments=True drops rollout logprobs so the actor recomputes them.
             teacher_segment_logprobs = [0.0] * len(teacher_segment_ids)
-            teacher_stopped = len(teacher_segment_ids) < teacher_max_tokens
             remaining_tokens = self.rollout_config.response_length - len(prefix_response_ids) - len(teacher_segment_ids)
-            if teacher_stopped:
-                remaining_tokens = 0
-            student_suffix_ids, student_suffix_logprobs = await self._generate_student_suffix(
-                request_id=base_request_id,
-                prefix_ids=prompt_ids + prefix_response_ids + teacher_segment_ids,
-                max_tokens=remaining_tokens,
-                sampling_params=sampling_params,
-                output=output,
+            student_suffix_result = _StudentSuffixGenerationResult(token_ids=[], logprobs=[])
+            if not teacher_terminal:
+                student_suffix_result = await self._generate_student_suffix(
+                    request_id=base_request_id,
+                    prefix_ids=prompt_ids + prefix_response_ids + teacher_segment_ids,
+                    max_tokens=remaining_tokens,
+                    sampling_params=sampling_params,
+                    output=output,
+                )
+            candidate_response_ids = prefix_response_ids + teacher_segment_ids + student_suffix_result.token_ids
+            candidate_response_mask = (
+                prefix_response_mask + teacher_segment_mask + [1] * len(student_suffix_result.token_ids)
             )
-            response_ids = prefix_response_ids + teacher_segment_ids + student_suffix_ids
-            response_mask = prefix_response_mask + teacher_segment_mask + [1] * len(student_suffix_ids)
-            response_logprobs = prefix_response_logprobs + teacher_segment_logprobs + student_suffix_logprobs
-            gap_mask = prefix_gap_mask + [0] * len(teacher_segment_ids) + [1] * len(student_suffix_ids)
+            candidate_response_logprobs = (
+                prefix_response_logprobs + teacher_segment_logprobs + student_suffix_result.logprobs
+            )
+            candidate_gap_mask = (
+                prefix_gap_mask + [0] * len(teacher_segment_ids) + [1] * len(student_suffix_result.token_ids)
+            )
             _validate_intervention_state(
                 context=f"after repair attempt {attempt}",
-                response_ids=response_ids,
-                response_mask=response_mask,
-                response_logprobs=response_logprobs,
-                gap_mask=gap_mask,
+                response_ids=candidate_response_ids,
+                response_mask=candidate_response_mask,
+                response_logprobs=candidate_response_logprobs,
+                gap_mask=candidate_gap_mask,
                 response_length_limit=self.rollout_config.response_length,
             )
+            thinking_state = AgentLoopWorker._teacher_intervention_thinking_state(self, candidate_response_ids)
+            if not thinking_state.valid:
+                _record_skipped_intervention(
+                    skipped_interventions,
+                    reason="invalid_thinking_block",
+                    attempt=attempt,
+                    start=start,
+                    end=end,
+                    candidate_response_ids=candidate_response_ids,
+                    candidate_response_mask=candidate_response_mask,
+                    teacher_tokens=len(teacher_segment_ids),
+                    student_suffix_tokens=len(student_suffix_result.token_ids),
+                )
+                skipped_interventions[-1]["thinking_reason"] = thinking_state.reason
+                break
+            candidate_terminal = teacher_terminal or student_suffix_result.terminal
+            if (
+                candidate_terminal
+                and thinking_state.open
+                and getattr(intervention_config, "require_closed_thinking_on_terminal", True)
+            ):
+                _record_skipped_intervention(
+                    skipped_interventions,
+                    reason="terminal_open_thinking_block",
+                    attempt=attempt,
+                    start=start,
+                    end=end,
+                    candidate_response_ids=candidate_response_ids,
+                    candidate_response_mask=candidate_response_mask,
+                    teacher_tokens=len(teacher_segment_ids),
+                    student_suffix_tokens=len(student_suffix_result.token_ids),
+                )
+                break
+            if sum(candidate_response_mask) < min_trainable_tokens:
+                _record_skipped_intervention(
+                    skipped_interventions,
+                    reason="insufficient_trainable_tokens",
+                    attempt=attempt,
+                    start=start,
+                    end=end,
+                    candidate_response_ids=candidate_response_ids,
+                    candidate_response_mask=candidate_response_mask,
+                    teacher_tokens=len(teacher_segment_ids),
+                    student_suffix_tokens=len(student_suffix_result.token_ids),
+                )
+                break
+
+            response_ids = candidate_response_ids
+            response_mask = candidate_response_mask
+            response_logprobs = candidate_response_logprobs
+            gap_mask = candidate_gap_mask
             cached_teacher_result = None
             interventions.append(
                 {
@@ -1320,9 +1818,16 @@ class AgentLoopWorker:
                     "end": end,
                     "score": score,
                     "teacher_tokens": len(teacher_segment_ids),
-                    "student_suffix_tokens": len(student_suffix_ids),
+                    "student_suffix_tokens": len(student_suffix_result.token_ids),
+                    "teacher_stop_reason": teacher_generation.stop_reason,
+                    "teacher_finish_reason": teacher_generation.finish_reason,
+                    "student_suffix_stop_reason": student_suffix_result.stop_reason,
+                    "student_suffix_finish_reason": student_suffix_result.finish_reason,
+                    "terminated": candidate_terminal,
                 }
             )
+            if candidate_terminal:
+                break
 
         output.response_ids = response_ids[: self.rollout_config.response_length]
         output.response_mask = response_mask[: len(output.response_ids)]
@@ -1337,6 +1842,7 @@ class AgentLoopWorker:
         )
         output.extra_fields["teacher_intervention_count"] = len(interventions)
         output.extra_fields["teacher_interventions"] = interventions
+        output.extra_fields["teacher_intervention_skipped"] = skipped_interventions
         if cached_teacher_result is not None:
             _store_teacher_scoring_result(
                 output,
@@ -1373,6 +1879,9 @@ class AgentLoopWorker:
             ):
                 output.extra_fields.setdefault("teacher_logprob_nonfinite_count", 0)
                 output.extra_fields.setdefault("teacher_logprob_nonfinite_positions", [])
+                output.extra_fields.setdefault(
+                    "teacher_logprob_nonfinite_replacement", DEFAULT_NONFINITE_LOGPROB_REPLACEMENT
+                )
                 return
             routing_key = self._teacher_routing_key(sample_kwargs)
             teacher_result = await self.teacher_server_manager.compute_teacher_logprobs_single(

@@ -100,6 +100,7 @@ teacher_intervention_gap_metric=${TEACHER_INTERVENTION_GAP_METRIC:-k3}
 teacher_intervention_gap_threshold=${TEACHER_INTERVENTION_GAP_THRESHOLD:-1.0}
 teacher_intervention_max_count=${TEACHER_INTERVENTION_MAX_COUNT:-4}
 teacher_intervention_train_teacher=${TEACHER_INTERVENTION_TRAIN_TEACHER:-False}
+teacher_intervention_min_trainable_tokens=${TEACHER_INTERVENTION_MIN_TRAINABLE_TOKENS:-1}
 teacher_intervention_temperature=${TEACHER_INTERVENTION_TEMPERATURE:-0.7}
 opd_diagnostics_enabled=${OPD_DIAGNOSTICS_ENABLED:-True}
 opd_diagnostics_position_bin_size=${OPD_DIAGNOSTICS_POSITION_BIN_SIZE:-512}
@@ -275,6 +276,7 @@ if [ "$NODE_RANK" -eq 0 ]; then
         distillation.intervention.gap_threshold=${teacher_intervention_gap_threshold} \
         distillation.intervention.max_interventions_per_sample=${teacher_intervention_max_count} \
         distillation.intervention.train_on_teacher_segments=${teacher_intervention_train_teacher} \
+        distillation.intervention.min_trainable_tokens_after_repair=${teacher_intervention_min_trainable_tokens} \
         distillation.intervention.teacher_temperature=${teacher_intervention_temperature} \
         distillation.diagnostics.enabled=${opd_diagnostics_enabled} \
         distillation.diagnostics.position_bin_size=${opd_diagnostics_position_bin_size} \

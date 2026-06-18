@@ -79,12 +79,16 @@ def _extract_prompt_logprobs_sglang(
         input_top_logprobs = meta_info.get("input_top_logprobs") or []
     prompt_ids_ls: list[list[int]] = []
     prompt_logprobs_ls: list[list[float]] = []
+    sampled_prompt_ids_ls: list[list[int]] = []
+    sampled_prompt_logprobs_ls: list[list[float]] = []
     # Entry 0 has logprob=None (no predicting context); skip it, matching vLLM.
     for position in range(1, len(input_token_logprobs)):
+        sampled_logprob, sampled_token_id, _ = input_token_logprobs[position]
+        sampled_prompt_ids_ls.append([int(sampled_token_id)])
+        sampled_prompt_logprobs_ls.append([float(sampled_logprob)])
         if num_prompt_logprobs == 0:
-            logprob, token_id, _ = input_token_logprobs[position]
-            prompt_ids_ls.append([int(token_id)])
-            prompt_logprobs_ls.append([float(logprob)])
+            prompt_ids_ls.append([int(sampled_token_id)])
+            prompt_logprobs_ls.append([float(sampled_logprob)])
         else:
             top_entries = input_top_logprobs[position]
             # SGLang returns ranked best-first; we preserve that ordering so rank
@@ -100,12 +104,16 @@ def _extract_prompt_logprobs_sglang(
     pad_width = max(num_prompt_logprobs, 1)
     prompt_ids_ls.append([0] * pad_width)
     prompt_logprobs_ls.append([0.0] * pad_width)
+    sampled_prompt_ids_ls.append([0])
+    sampled_prompt_logprobs_ls.append([0.0])
     assert len(prompt_ids_ls) == sequence_length, (
         f"SGLang prompt_logprobs length ({len(prompt_ids_ls)}) does not match "
         f"sequence length ({sequence_length}); check logprob_start_len=0 invariant."
     )
     result_dict["prompt_ids"] = prompt_ids_ls
     result_dict["prompt_logprobs"] = prompt_logprobs_ls
+    result_dict["sampled_prompt_ids"] = sampled_prompt_ids_ls
+    result_dict["sampled_prompt_logprobs"] = sampled_prompt_logprobs_ls
 
 
 class SGLangHttpServer:
@@ -643,7 +651,7 @@ class SGLangHttpServer:
                     -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
                 )
 
-        extra_fields = {"global_steps": self.global_steps}
+        extra_fields = {"global_steps": self.global_steps, "finish_reason": finish_reason}
         if prompt_logprobs is not None:
             _extract_prompt_logprobs_sglang(
                 meta_info=meta_info,

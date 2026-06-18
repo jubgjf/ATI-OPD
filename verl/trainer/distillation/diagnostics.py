@@ -584,23 +584,30 @@ def compute_intervention_metrics(
     *,
     intervention_counts: list[Any],
     interventions: list[Any],
+    intervention_skipped: list[Any] | None = None,
     response_mask: torch.Tensor,
 ) -> dict[str, float]:
     """Aggregate teacher-intervention metadata collected during rollout."""
     counts = np.asarray([0 if value is None else int(value) for value in intervention_counts], dtype=np.float32)
+    response_mask_bool = response_mask.detach().bool().cpu()
+    valid_lengths_tensor = response_mask_bool.sum(dim=1)
     metrics = {
         "opd_intervention/rate": float((counts > 0).mean()) if counts.size else 0.0,
         "opd_intervention/count_mean": float(counts.mean()) if counts.size else 0.0,
         "opd_intervention/count_max": float(counts.max()) if counts.size else 0.0,
+        "opd_intervention/zero_trainable_sample_fraction": float((valid_lengths_tensor == 0).float().mean().item())
+        if valid_lengths_tensor.numel()
+        else 0.0,
     }
 
-    total_valid_tokens = int(response_mask.detach().bool().cpu().sum().item())
+    total_valid_tokens = int(valid_lengths_tensor.sum().item())
+    metrics["opd_intervention/trainable_token_fraction"] = total_valid_tokens / max(response_mask.numel(), 1)
     teacher_tokens = 0
     suffix_tokens = 0
     first_positions = []
     first_position_fracs = []
     scores = []
-    valid_lengths = response_mask.detach().bool().cpu().sum(dim=1).tolist()
+    valid_lengths = valid_lengths_tensor.tolist()
     for sample_idx, sample_interventions in enumerate(interventions):
         if sample_interventions is None:
             continue
@@ -627,6 +634,33 @@ def compute_intervention_metrics(
     if scores:
         metrics["opd_intervention/gap_score_mean"] = float(np.mean(scores))
         metrics["opd_intervention/gap_score_max"] = float(np.max(scores))
+
+    skipped_counts = []
+    skipped_reason_counts: dict[str, int] = {}
+    for sample_skipped in intervention_skipped or []:
+        if sample_skipped is None:
+            skipped_counts.append(0)
+            continue
+        if isinstance(sample_skipped, dict):
+            skipped_items = [sample_skipped]
+        elif isinstance(sample_skipped, list | tuple):
+            skipped_items = [item for item in sample_skipped if isinstance(item, dict)]
+        else:
+            skipped_items = []
+        skipped_counts.append(len(skipped_items))
+        for item in skipped_items:
+            reason = item.get("reason")
+            if reason is not None:
+                skipped_reason_counts[str(reason)] = skipped_reason_counts.get(str(reason), 0) + 1
+    skipped_array = np.asarray(skipped_counts, dtype=np.float32)
+    metrics["opd_intervention/skipped_count_mean"] = float(skipped_array.mean()) if skipped_array.size else 0.0
+    metrics["opd_intervention/skipped_count_max"] = float(skipped_array.max()) if skipped_array.size else 0.0
+    metrics["opd_intervention/skipped_sample_fraction"] = (
+        float((skipped_array > 0).mean()) if skipped_array.size else 0.0
+    )
+    skipped_denom = max(int(skipped_array.sum()), 1)
+    for reason, count in skipped_reason_counts.items():
+        metrics[f"opd_intervention/skipped_reason/{reason}"] = count / skipped_denom
     return metrics
 
 

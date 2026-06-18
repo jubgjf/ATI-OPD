@@ -785,6 +785,11 @@ distillation:
     gap_threshold: 1.0
     max_interventions_per_sample: 4
     train_on_teacher_segments: false
+    min_trainable_tokens_after_repair: 1
+    protect_thinking_blocks: true
+    thinking_start_text: <think>
+    thinking_end_text: </think>
+    require_closed_thinking_on_terminal: true
     teacher_temperature: 0.7
     teacher_top_p: 1.0
     teacher_top_k: -1

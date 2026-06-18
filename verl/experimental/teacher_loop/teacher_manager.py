@@ -41,6 +41,8 @@ class TeacherLogprobScoringResult:
 
     ids: torch.Tensor
     logprobs: torch.Tensor
+    sampled_ids: torch.Tensor | None = None
+    sampled_logprobs: torch.Tensor | None = None
     nonfinite_count: int = 0
     nonfinite_sequence_positions: list[int] | None = None
     replacement_value: float = DEFAULT_NONFINITE_LOGPROB_REPLACEMENT
@@ -53,6 +55,23 @@ class TeacherLogprobScoringResult:
     def __post_init__(self):
         if self.nonfinite_sequence_positions is None:
             self.nonfinite_sequence_positions = []
+        if self.sampled_ids is None and self.ids.ndim == 2 and self.ids.shape[-1] == 1:
+            self.sampled_ids = self.ids
+        if self.sampled_logprobs is None and self.logprobs.ndim == 2 and self.logprobs.shape[-1] == 1:
+            self.sampled_logprobs = self.logprobs
+
+
+@dataclass
+class TeacherGenerationResult:
+    """Teacher intervention generation output with backend stop metadata."""
+
+    token_ids: list[int]
+    stop_reason: Optional[str] = None
+    finish_reason: Optional[str] = None
+
+    def __iter__(self) -> Iterator[list[int]]:
+        # Backward-compatible unpacking for older tests/call sites that treated the result as token ids.
+        yield self.token_ids
 
 
 def _get_teacher_sampling_params(
@@ -247,6 +266,16 @@ class AsyncTeacherLLMServerManager:
         try:
             teacher_ids = torch.tensor(extra_fields["prompt_ids"], dtype=torch.int32)
             teacher_logprobs = torch.tensor(extra_fields["prompt_logprobs"])
+            sampled_teacher_ids = (
+                torch.tensor(extra_fields["sampled_prompt_ids"], dtype=torch.int32)
+                if "sampled_prompt_ids" in extra_fields
+                else None
+            )
+            sampled_teacher_logprobs = (
+                torch.tensor(extra_fields["sampled_prompt_logprobs"])
+                if "sampled_prompt_logprobs" in extra_fields
+                else None
+            )
         except Exception as exc:
             raise RuntimeError(
                 "Teacher logprob scoring returned prompt scoring fields that could not be converted to tensors for "
@@ -278,11 +307,41 @@ class AsyncTeacherLLMServerManager:
                 f"expected width={expected_width}, teacher_ids.shape={tuple(teacher_ids.shape)}, "
                 f"teacher_logprobs.shape={tuple(teacher_logprobs.shape)}, sampling_params={sampling_params}."
             )
+        if (sampled_teacher_ids is None) != (sampled_teacher_logprobs is None):
+            raise RuntimeError(
+                "Teacher logprob scoring must return both sampled_prompt_ids and sampled_prompt_logprobs, "
+                f"but got extra_fields keys: {sorted(extra_fields.keys())}."
+            )
+        if sampled_teacher_ids is not None:
+            if sampled_teacher_ids.ndim != 2 or sampled_teacher_logprobs.ndim != 2:
+                raise RuntimeError(
+                    "Teacher sampled prompt scoring fields must be rank-2 tensors, but got "
+                    f"sampled_teacher_ids.shape={tuple(sampled_teacher_ids.shape)}, "
+                    f"sampled_teacher_logprobs.shape={tuple(sampled_teacher_logprobs.shape)}."
+                )
+            if sampled_teacher_ids.shape != sampled_teacher_logprobs.shape or sampled_teacher_ids.shape != (
+                len(sequence_ids),
+                1,
+            ):
+                raise RuntimeError(
+                    "Teacher sampled prompt scoring fields must have shape [sequence_len, 1], but got "
+                    f"sampled_teacher_ids.shape={tuple(sampled_teacher_ids.shape)}, "
+                    f"sampled_teacher_logprobs.shape={tuple(sampled_teacher_logprobs.shape)}, "
+                    f"sequence_len={len(sequence_ids)}."
+                )
         replacement_value = _finite_logprob_replacement(self.distillation_loss_config)
         teacher_logprobs, nonfinite_sequence_positions = _sanitize_nonfinite_teacher_logprobs(
             teacher_logprobs,
             replacement=replacement_value,
         )
+        if sampled_teacher_logprobs is not None:
+            sampled_teacher_logprobs, sampled_nonfinite_sequence_positions = _sanitize_nonfinite_teacher_logprobs(
+                sampled_teacher_logprobs,
+                replacement=replacement_value,
+            )
+            nonfinite_sequence_positions = sorted(
+                set(nonfinite_sequence_positions).union(sampled_nonfinite_sequence_positions)
+            )
         nonfinite_count = len(nonfinite_sequence_positions)
         if nonfinite_count:
             warning_count = getattr(self, "_nonfinite_teacher_logprob_warnings", 0)
@@ -309,9 +368,17 @@ class AsyncTeacherLLMServerManager:
                 f"teacher={teacher_key!r}, request_id={resolved_request_id!r}, "
                 f"max_logprob={teacher_logprobs.max().item():.6f}."
             )
+        if sampled_teacher_logprobs is not None and sampled_teacher_logprobs.max().item() > 1e-6:
+            raise RuntimeError(
+                "Teacher sampled logprob scoring returned positive log probabilities after sanitization for "
+                f"teacher={teacher_key!r}, request_id={resolved_request_id!r}, "
+                f"max_logprob={sampled_teacher_logprobs.max().item():.6f}."
+            )
         return TeacherLogprobScoringResult(
             ids=teacher_ids,
             logprobs=teacher_logprobs,
+            sampled_ids=sampled_teacher_ids,
+            sampled_logprobs=sampled_teacher_logprobs,
             nonfinite_count=nonfinite_count,
             nonfinite_sequence_positions=nonfinite_sequence_positions,
             replacement_value=replacement_value,
@@ -325,7 +392,7 @@ class AsyncTeacherLLMServerManager:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
         request_id: Optional[str] = None,
-    ) -> list[int]:
+    ) -> TeacherGenerationResult:
         """Generate a short teacher intervention segment from a single unpadded prefix."""
         if not prefix_ids:
             raise ValueError("generate_teacher_segment_single received an empty prefix.")
@@ -350,4 +417,8 @@ class AsyncTeacherLLMServerManager:
                 f"Teacher intervention generation returned no token_ids for "
                 f"teacher={teacher_key!r}, request_id={resolved_request_id!r}."
             )
-        return teacher_output.token_ids
+        return TeacherGenerationResult(
+            token_ids=teacher_output.token_ids,
+            stop_reason=teacher_output.stop_reason,
+            finish_reason=(teacher_output.extra_fields or {}).get("finish_reason"),
+        )

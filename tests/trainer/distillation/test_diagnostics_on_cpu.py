@@ -229,11 +229,16 @@ def test_compute_intervention_metrics_on_cpu():
             {"start": 16, "score": 2.0, "teacher_tokens": 2, "student_suffix_tokens": 4},
         ],
     ]
+    skipped = [
+        [],
+        [{"reason": "insufficient_trainable_tokens", "attempt": 0, "candidate_trainable_tokens": 0}],
+    ]
     response_mask = torch.ones((2, 20), dtype=torch.bool)
 
     metrics = compute_intervention_metrics(
         intervention_counts=counts,
         interventions=interventions,
+        intervention_skipped=skipped,
         response_mask=response_mask,
     )
 
@@ -242,3 +247,23 @@ def test_compute_intervention_metrics_on_cpu():
     assert metrics["opd_intervention/teacher_token_fraction"] == 4 / 40
     assert metrics["opd_intervention/student_suffix_token_fraction"] == 12 / 40
     assert metrics["opd_intervention/first_position_mean"] == 4
+    assert metrics["opd_intervention/zero_trainable_sample_fraction"] == 0.0
+    assert metrics["opd_intervention/trainable_token_fraction"] == 1.0
+    assert metrics["opd_intervention/skipped_count_mean"] == 0.5
+    assert metrics["opd_intervention/skipped_count_max"] == 1.0
+    assert metrics["opd_intervention/skipped_sample_fraction"] == 0.5
+    assert metrics["opd_intervention/skipped_reason/insufficient_trainable_tokens"] == 1.0
+
+
+def test_compute_intervention_metrics_counts_zero_trainable_samples_on_cpu():
+    response_mask = torch.tensor([[0, 0, 0], [1, 0, 0]], dtype=torch.bool)
+
+    metrics = compute_intervention_metrics(
+        intervention_counts=[0, 0],
+        interventions=[[], []],
+        intervention_skipped=[[], []],
+        response_mask=response_mask,
+    )
+
+    assert metrics["opd_intervention/zero_trainable_sample_fraction"] == 0.5
+    assert metrics["opd_intervention/trainable_token_fraction"] == 1 / 6

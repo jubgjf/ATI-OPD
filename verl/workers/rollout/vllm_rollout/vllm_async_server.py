@@ -540,9 +540,11 @@ class vLLMHttpServer:
                 log_probs=None,
                 routed_experts=None,
                 stop_reason="aborted",
+                extra_fields={"global_steps": self.global_steps, "finish_reason": "abort"},
             )
 
-        extra_fields = {"global_steps": self.global_steps}
+        finish_reason = final_res.outputs[0].finish_reason
+        extra_fields = {"global_steps": self.global_steps, "finish_reason": finish_reason}
         extract_prompt_logprobs(
             output=final_res,
             num_prompt_logprobs=sampling_params.prompt_logprobs,
@@ -558,7 +560,6 @@ class vLLMHttpServer:
             routed_experts = final_res.outputs[0].routed_experts
 
         # Determine stop reason from finish_reason
-        finish_reason = final_res.outputs[0].finish_reason
         if finish_reason == "abort":
             stop_reason = "aborted"
         elif finish_reason in ("stop", "length"):

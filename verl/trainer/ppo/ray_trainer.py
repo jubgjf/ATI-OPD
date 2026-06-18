@@ -37,6 +37,7 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
+from verl.trainer.distillation.config_validation import validate_distillation_intervention_training_config
 from verl.trainer.distillation.diagnostics import (
     OpdDiagnosticsTracker,
     compute_entropy_heatmap_row,
@@ -286,6 +287,7 @@ class RayPPOTrainer:
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        validate_distillation_intervention_training_config(self.config)
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -1449,12 +1451,13 @@ class RayPPOTrainer:
             has_intervention_fields = (
                 "teacher_intervention_count" in batch.non_tensor_batch
                 and "teacher_interventions" in batch.non_tensor_batch
+                and "teacher_intervention_skipped" in batch.non_tensor_batch
             )
             if intervention_enabled and not has_intervention_fields:
                 raise RuntimeError(
                     "OPD intervention diagnostics are enabled, but rollout output did not include "
-                    "'teacher_intervention_count' and 'teacher_interventions'. Check that the DMPD agent-loop "
-                    "intervention path is active for every training sample."
+                    "'teacher_intervention_count', 'teacher_interventions', and 'teacher_intervention_skipped'. "
+                    "Check that the DMPD agent-loop intervention path is active for every training sample."
                 )
             if has_intervention_fields:
                 metrics.update(
@@ -1463,6 +1466,9 @@ class RayPPOTrainer:
                             batch.non_tensor_batch["teacher_intervention_count"]
                         ),
                         interventions=self._non_tensor_to_list(batch.non_tensor_batch["teacher_interventions"]),
+                        intervention_skipped=self._non_tensor_to_list(
+                            batch.non_tensor_batch["teacher_intervention_skipped"]
+                        ),
                         response_mask=response_mask,
                     )
                 )

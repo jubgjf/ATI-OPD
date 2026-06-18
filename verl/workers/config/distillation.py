@@ -137,6 +137,11 @@ class DistillationInterventionConfig(BaseConfig):
     gap_threshold: float = 1.0
     max_interventions_per_sample: int = 4
     train_on_teacher_segments: bool = False
+    min_trainable_tokens_after_repair: int = 1
+    protect_thinking_blocks: bool = True
+    thinking_start_text: str = "<think>"
+    thinking_end_text: str = "</think>"
+    require_closed_thinking_on_terminal: bool = True
     teacher_temperature: float = 0.7
     teacher_top_p: float = 1.0
     teacher_top_k: int = -1
@@ -154,6 +159,8 @@ class DistillationInterventionConfig(BaseConfig):
             raise ValueError("teacher_segment_length must be positive.")
         if self.max_interventions_per_sample < 0:
             raise ValueError("max_interventions_per_sample must be non-negative.")
+        if self.min_trainable_tokens_after_repair < 0:
+            raise ValueError("min_trainable_tokens_after_repair must be non-negative.")
         if self.gap_aggregation not in {"mean", "max"}:
             raise ValueError(f"Unsupported gap_aggregation: {self.gap_aggregation!r}.")
         if self.gap_metric not in {"kl", "k1", "abs", "mse", "k2", "low_var_kl", "k3"}:

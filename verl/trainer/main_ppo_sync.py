@@ -68,6 +68,7 @@ from verl.single_controller.ray import (
     create_colocated_worker_cls,
 )
 from verl.trainer.distillation import is_distillation_enabled
+from verl.trainer.distillation.config_validation import validate_distillation_intervention_training_config
 from verl.trainer.distillation.diagnostics import (
     OpdDiagnosticsTracker,
     compute_entropy_heatmap_row,
@@ -408,6 +409,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             extra_fields = field.get("extra_fields", {})
             field["teacher_intervention_count"] = extra_fields.get("teacher_intervention_count", 0)
             field["teacher_interventions"] = extra_fields.get("teacher_interventions", [])
+            field["teacher_intervention_skipped"] = extra_fields.get("teacher_intervention_skipped", [])
             field["teacher_logprob_nonfinite_count"] = extra_fields.get("teacher_logprob_nonfinite_count", 0)
             field["teacher_logprob_nonfinite_positions"] = extra_fields.get("teacher_logprob_nonfinite_positions", [])
             # do not store raw image/video
@@ -502,6 +504,7 @@ class PPOTrainer:
         resource_pool_manager: ResourcePoolManager,
     ):
         self.config = config
+        validate_distillation_intervention_training_config(self.config)
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_critic = need_critic(self.config)
@@ -1636,7 +1639,7 @@ class PPOTrainer:
             fields.extend(["old_log_probs", "entropy", "teacher_logprobs"])
             fields.extend(["teacher_logprob_nonfinite_count", "teacher_logprob_nonfinite_positions"])
             if diagnostics_config.collect_intervention_metrics:
-                fields.extend(["teacher_intervention_count", "teacher_interventions"])
+                fields.extend(["teacher_intervention_count", "teacher_interventions", "teacher_intervention_skipped"])
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
         num_turns = np.array(data.pop("num_turns").tolist())
         prompt_length = data["prompts"].offsets().diff()
@@ -1646,6 +1649,7 @@ class PPOTrainer:
         teacher_logprob_nonfinite_positions = None
         intervention_counts = []
         intervention_items = []
+        intervention_skipped = []
         if diagnostics_enabled:
             teacher_response_logprobs = self._extract_teacher_response_logprobs(data)
             if "teacher_logprobs" in data.keys():
@@ -1661,6 +1665,8 @@ class PPOTrainer:
                     intervention_counts = self._non_tensor_to_list(data.pop("teacher_intervention_count"))
                 if "teacher_interventions" in data.keys():
                     intervention_items = self._non_tensor_to_list(data.pop("teacher_interventions"))
+                if "teacher_intervention_skipped" in data.keys():
+                    intervention_skipped = self._non_tensor_to_list(data.pop("teacher_intervention_skipped"))
         data = data.to_padded_tensor()
         data["token_level_scores"] = data["rm_scores"]
         if "token_level_rewards" not in data:
@@ -1708,10 +1714,12 @@ class PPOTrainer:
                 if non_padding_mask.any():
                     intervention_counts = self._filter_list_by_mask(intervention_counts, non_padding_mask)
                     intervention_items = self._filter_list_by_mask(intervention_items, non_padding_mask)
+                    intervention_skipped = self._filter_list_by_mask(intervention_skipped, non_padding_mask)
                 metrics.update(
                     compute_intervention_metrics(
                         intervention_counts=intervention_counts,
                         interventions=intervention_items,
+                        intervention_skipped=intervention_skipped,
                         response_mask=diagnostics_batch["response_mask"],
                     )
                 )
