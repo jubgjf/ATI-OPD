@@ -657,7 +657,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         model_output = {}
 
         input_ids = micro_batch["input_ids"]
-        cu_seqlens = input_ids.offsets()
+        output_offsets = input_ids.offsets()
         if use_remove_padding:
             labels = labels.squeeze(0)
             logits_rmpad = logits.squeeze(0)
@@ -679,9 +679,17 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 else:
                     entropy_rmpad = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits_rmpad)
 
-            log_probs = torch.nested.nested_tensor_from_jagged(log_probs.squeeze(0), cu_seqlens)
+            log_probs = tu.nested_tensor_from_jagged_values(
+                log_probs.squeeze(0),
+                output_offsets,
+                context="TorchTitan LM model_output['log_probs']",
+            )
             if calculate_entropy:
-                entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+                entropy = tu.nested_tensor_from_jagged_values(
+                    entropy_rmpad,
+                    output_offsets,
+                    context="TorchTitan LM model_output['entropy']",
+                )
         else:
             logits.div_(temperature)
             if calculate_entropy:
@@ -690,16 +698,24 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 else:
                     entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
-            seq_lengths = cu_seqlens.diff()
+            seq_lengths = output_offsets.diff()
             starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
             logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
-            logits_rmpad = torch.cat([t for t in logits.unbind()])
+            logits_rmpad = torch.cat(tu.safe_unbind_jagged_nested_tensor(logits, context="TorchTitan LM logits"))
             log_probs = logprobs_from_logits(logits=logits_rmpad, labels=output_args["labels"])
-            log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+            log_probs = tu.nested_tensor_from_jagged_values(
+                log_probs,
+                output_offsets,
+                context="TorchTitan LM model_output['log_probs']",
+            )
             if calculate_entropy:
                 entropy = torch.nested.narrow(entropy, 1, starts, seq_lengths, layout=torch.jagged)
-                entropy_rmpad = torch.cat([t for t in entropy.unbind()])
-                entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+                entropy_rmpad = torch.cat(tu.safe_unbind_jagged_nested_tensor(entropy, context="TorchTitan LM entropy"))
+                entropy = tu.nested_tensor_from_jagged_values(
+                    entropy_rmpad,
+                    output_offsets,
+                    context="TorchTitan LM model_output['entropy']",
+                )
 
         model_output["log_probs"] = log_probs
         if calculate_entropy:

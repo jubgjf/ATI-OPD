@@ -37,6 +37,7 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
+from verl.trainer.distillation.batch_filter import to_tensordict_without_distillation_supervision
 from verl.trainer.distillation.config_validation import validate_distillation_intervention_training_config
 from verl.trainer.distillation.diagnostics import (
     OpdDiagnosticsTracker,
@@ -1145,7 +1146,7 @@ class RayPPOTrainer:
         metrics.update(global_balance_stats)
 
     def _compute_values(self, batch: DataProto) -> DataProto:
-        batch_td = batch.to_tensordict()
+        batch_td = self._to_tensordict_without_distillation_supervision(batch)
         # step 2: convert from padding to nopadding
         batch_td = left_right_2_no_padding(batch_td)
         # step 3: add meta info
@@ -1160,7 +1161,7 @@ class RayPPOTrainer:
 
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
         # step 1: convert dataproto to tensordict.
-        batch_td = batch.to_tensordict()
+        batch_td = self._to_tensordict_without_distillation_supervision(batch)
         # step 2: convert from padding to nopadding
         batch_td = left_right_2_no_padding(batch_td)
         # step 3: add meta info
@@ -1185,7 +1186,7 @@ class RayPPOTrainer:
     def _compute_old_log_prob(self, batch: DataProto):
         # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
         # step 1: convert dataproto to tensordict.
-        batch_td = batch.to_tensordict()
+        batch_td = self._to_tensordict_without_distillation_supervision(batch)
         # step 2: convert from padding to nopadding
         batch_td = left_right_2_no_padding(batch_td)
         # step 3: add meta info
@@ -1218,6 +1219,10 @@ class RayPPOTrainer:
         old_log_prob = tu.get_tensordict(result)
         old_log_prob = DataProto.from_tensordict(old_log_prob)
         return old_log_prob, old_log_prob_mfu
+
+    @staticmethod
+    def _to_tensordict_without_distillation_supervision(batch: DataProto):
+        return to_tensordict_without_distillation_supervision(batch)
 
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout

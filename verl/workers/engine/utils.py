@@ -138,7 +138,8 @@ def postprocess_batch_func(output_lst, indices, data: TensorDict):
                     nt, context=f"model_output[{key!r}] from micro-batch {micro_batch_idx}"
                 )
             ]
-            model_output[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+            ragged_idx = getattr(model_output[key][0], "_ragged_idx", model_output[key][0].dim() - 1)
+            model_output[key] = tu.nested_tensor_from_tensor_list(tensors, ragged_idx=ragged_idx)
         else:
             raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 

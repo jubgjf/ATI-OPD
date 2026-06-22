@@ -630,10 +630,18 @@ class AutomodelEngineWithLMHead(AutomodelEngine):
                         )
 
             if pad_mode == DatasetPadMode.NO_PADDING:
-                cu_seqlens = input_ids.offsets()
-                log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+                output_offsets = input_ids.offsets()
+                log_probs = tu.nested_tensor_from_jagged_values(
+                    log_probs,
+                    output_offsets,
+                    context="AutoModel LM model_output['log_probs']",
+                )
                 if calculate_entropy:
-                    entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+                    entropy = tu.nested_tensor_from_jagged_values(
+                        entropy_rmpad,
+                        output_offsets,
+                        context="AutoModel LM model_output['entropy']",
+                    )
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
@@ -658,18 +666,28 @@ class AutomodelEngineWithLMHead(AutomodelEngine):
                         entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
                 if pad_mode == DatasetPadMode.NO_PADDING:
-                    cu_seqlens = input_ids.offsets()
-                    seq_lengths = cu_seqlens.diff()
+                    output_offsets = input_ids.offsets()
+                    seq_lengths = output_offsets.diff()
                     starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
                     logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
-                    logits_rmpad = torch.cat([t for t in logits.unbind()])
+                    logits_rmpad = torch.cat(tu.safe_unbind_jagged_nested_tensor(logits, context="AutoModel LM logits"))
                     input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
                     log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
-                    log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+                    log_probs = tu.nested_tensor_from_jagged_values(
+                        log_probs,
+                        output_offsets,
+                        context="AutoModel LM model_output['log_probs']",
+                    )
                     if calculate_entropy:
                         entropy = torch.nested.narrow(entropy, 1, starts, seq_lengths, layout=torch.jagged)
-                        entropy_rmpad = torch.cat([t for t in entropy.unbind()])
-                        entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+                        entropy_rmpad = torch.cat(
+                            tu.safe_unbind_jagged_nested_tensor(entropy, context="AutoModel LM entropy")
+                        )
+                        entropy = tu.nested_tensor_from_jagged_values(
+                            entropy_rmpad,
+                            output_offsets,
+                            context="AutoModel LM model_output['entropy']",
+                        )
                 else:
                     raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
