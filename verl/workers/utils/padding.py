@@ -96,11 +96,11 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
     return data
 
 
-def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor:
+def no_padding_2_padding(tensor: torch.Tensor | tu.JaggedTensorParts, data: TensorDict) -> torch.Tensor:
     """Slice response from unpad model output.
 
     Args:
-        tensor: a nested tensor or a tensor of shape (total_nnz,*),
+        tensor: a nested tensor, JaggedTensorParts, or a tensor of shape (total_nnz,*),
             total_nnz is the total number of tokens across all sequences in the batch
 
         data: TensorDict with "prompts", "responses", "attention_mask"
@@ -108,7 +108,10 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
     Returns:
         tensor: sliced response tensor of shape [bsz, max_response_len, *]
     """
-    values = tensor.values() if tensor.is_nested else tensor
+    if isinstance(tensor, tu.JaggedTensorParts):
+        values = tensor.values
+    else:
+        values = tensor.values() if tensor.is_nested else tensor
     prompt_ids = data["prompts"]
     response_ids = data["responses"]
 

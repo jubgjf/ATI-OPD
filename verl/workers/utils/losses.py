@@ -37,7 +37,7 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         # for each sample, loss mask shape is [1, prompt_length + response_length]
         loss_mask = data["loss_mask"]
 
-        log_prob_flatten = log_prob.values()
+        log_prob_flatten = log_prob.values if isinstance(log_prob, tu.JaggedTensorParts) else log_prob.values()
         loss_mask_flatten = loss_mask.values()
 
         # left-shift the loss mask by one token to align with log_prob

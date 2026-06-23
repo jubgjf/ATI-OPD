@@ -23,7 +23,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.device import is_npu_available
 from verl.utils.py_functional import append_to_dict
-from verl.utils.seqlen_balancing import rearrange_micro_batches, restore_dynamic_batch
+from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 
 
 def enable_full_determinism(seed: int):
@@ -129,23 +129,41 @@ def postprocess_batch_func(output_lst, indices, data: TensorDict):
                 model_output[key].append(val)
 
     # concat results from micro batches
-    for key, val in model_output.items():
+    for key, micro_outputs in model_output.items():
         if pad_mode == DatasetPadMode.NO_PADDING:
-            tensors = [
-                tensor
-                for micro_batch_idx, nt in enumerate(model_output[key])
-                for tensor in tu.safe_unbind_jagged_nested_tensor(
-                    nt, context=f"model_output[{key!r}] from micro-batch {micro_batch_idx}"
+            tensors = []
+            ragged_idx = None
+            for micro_batch_idx, output in enumerate(micro_outputs):
+                split_tensors, output_ragged_idx = tu.safe_unbind_jagged_output(
+                    output,
+                    context=f"model_output[{key!r}] from micro-batch {micro_batch_idx}",
                 )
-            ]
-            ragged_idx = getattr(model_output[key][0], "_ragged_idx", model_output[key][0].dim() - 1)
+                if ragged_idx is None:
+                    ragged_idx = output_ragged_idx
+                elif ragged_idx != output_ragged_idx:
+                    raise RuntimeError(
+                        f"Cannot postprocess model_output[{key!r}]: inconsistent ragged_idx across micro-batches, "
+                        f"got {ragged_idx} and {output_ragged_idx} at micro-batch {micro_batch_idx}."
+                    )
+                tensors.extend(split_tensors)
+
+            # Reverse dynamic batching before rebuilding the final NestedTensor so the micro-batch handoff
+            # does not need a second offsets read from an intermediate output NestedTensor.
+            if use_dynamic_bsz:
+                if indices is None:
+                    raise RuntimeError(f"Cannot restore dynamic batch for model_output[{key!r}]: indices is None.")
+                flat_indices = [idx for batch_indices in indices for idx in batch_indices]
+                if len(flat_indices) != len(tensors):
+                    raise RuntimeError(
+                        f"Cannot restore dynamic batch for model_output[{key!r}]: got {len(flat_indices)} indices "
+                        f"for {len(tensors)} output tensors."
+                    )
+                reverse_indices = get_reverse_idx(flat_indices)
+                tensors = [tensors[i] for i in reverse_indices]
+
             model_output[key] = tu.nested_tensor_from_tensor_list(tensors, ragged_idx=ragged_idx)
         else:
             raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
-
-        # reverse with dynamic bsz
-        if use_dynamic_bsz:
-            model_output[key] = restore_dynamic_batch(model_output[key], indices)
 
     # loss
     for o in output_lst:

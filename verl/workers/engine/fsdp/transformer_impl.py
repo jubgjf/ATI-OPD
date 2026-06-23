@@ -1111,7 +1111,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         if self.use_ulysses_sp:
                             pad_size = output_args["pad_size"]
                             v = gather_outputs_and_unpad(v, gather_dim=0, unpad_dim=0, padding_size=pad_size)
-                        model_output[k] = tu.nested_tensor_from_jagged_values(
+                        model_output[k] = tu.jagged_tensor_parts_from_values(
                             v,
                             output_offsets,
                             context=f"FSDP LM model_output[{k!r}]",
@@ -1146,19 +1146,19 @@ class FSDPEngineWithLMHead(FSDPEngine):
             if pad_mode == DatasetPadMode.NO_PADDING:
                 output_offsets = input_ids.offsets()
                 # (bsz, j1), for each sample, is the length of each sample: [real_prompt length + real_response length]
-                log_probs = tu.nested_tensor_from_jagged_values(
+                log_probs = tu.jagged_tensor_parts_from_values(
                     log_probs,
                     output_offsets,
                     context="FSDP LM model_output['log_probs']",
                 )
                 if calculate_entropy:
-                    entropy = tu.nested_tensor_from_jagged_values(
+                    entropy = tu.jagged_tensor_parts_from_values(
                         entropy_rmpad,
                         output_offsets,
                         context="FSDP LM model_output['entropy']",
                     )
                 if calculate_sum_pi_squared:
-                    sum_pi_squared = tu.nested_tensor_from_jagged_values(
+                    sum_pi_squared = tu.jagged_tensor_parts_from_values(
                         sum_pi_squared_rmpad,
                         output_offsets,
                         context="FSDP LM model_output['sum_pi_squared']",
@@ -1196,7 +1196,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
                     log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
-                    log_probs = tu.nested_tensor_from_jagged_values(
+                    log_probs = tu.jagged_tensor_parts_from_values(
                         log_probs,
                         output_offsets,
                         context="FSDP LM model_output['log_probs']",
@@ -1206,7 +1206,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         entropy_rmpad = torch.cat(
                             tu.safe_unbind_jagged_nested_tensor(entropy, context="FSDP LM entropy")
                         )
-                        entropy = tu.nested_tensor_from_jagged_values(
+                        entropy = tu.jagged_tensor_parts_from_values(
                             entropy_rmpad,
                             output_offsets,
                             context="FSDP LM model_output['entropy']",
@@ -1221,7 +1221,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                                 context="FSDP LM sum_pi_squared",
                             )
                         )
-                        sum_pi_squared = tu.nested_tensor_from_jagged_values(
+                        sum_pi_squared = tu.jagged_tensor_parts_from_values(
                             sum_pi_squared_rmpad,
                             output_offsets,
                             context="FSDP LM model_output['sum_pi_squared']",
@@ -1311,7 +1311,7 @@ class FSDPEngineWithValueHead(FSDPEngineWithLMHead):
             if pad_mode == DatasetPadMode.NO_PADDING:
                 output_offsets = input_ids.offsets()
                 # (bsz, j1), for each sample, is the length of each sample: [real_prompt length + real_response length]
-                values = tu.nested_tensor_from_jagged_values(
+                values = tu.jagged_tensor_parts_from_values(
                     values_rmpad,
                     output_offsets,
                     context="FSDP value model_output['values']",
@@ -1333,7 +1333,7 @@ class FSDPEngineWithValueHead(FSDPEngineWithLMHead):
                 values = torch.nested.narrow(values, 1, starts, seq_lengths, layout=torch.jagged)
                 values_rmpad = torch.cat(tu.safe_unbind_jagged_nested_tensor(values, context="FSDP value logits"))
                 # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
-                values = tu.nested_tensor_from_jagged_values(
+                values = tu.jagged_tensor_parts_from_values(
                     values_rmpad,
                     output_offsets,
                     context="FSDP value model_output['values']",
