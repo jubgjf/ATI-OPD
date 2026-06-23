@@ -22,6 +22,7 @@ ls -l /usr/lib64/libjemalloc.so.2
 export LD_PRELOAD=/usr/lib64/libjemalloc.so.2:${LD_PRELOAD}
 echo ============================
 
+rm -rf $HOME/vllm*
 tar -xf $DATASET_DIR/libs/vllm-build.tar.gz -C $HOME
 . $HOME/anaconda3/etc/profile.d/conda.sh
 mkdir -p $HOME/anaconda3/envs/verl
@@ -34,6 +35,8 @@ cd $WORKSPACE
 pip install -r requirements-npu.txt
 pip install -e .
 echo ============================
+
+ln -sfnT /opt/huawei/dataset/jnguan/apps/configs/dotnetrc $HOME/.netrc
 
 export HCCL_EXEC_TIMEOUT=3600
 export HCCL_LOG_LEVEL=0
@@ -119,10 +122,8 @@ total_epochs=3
 save_freq=200
 test_freq=10
 
-export WANDB_MODE=offline
-export WANDB_DIR=$WORKSPACE
+export WANDB_MODE=online
 export WANDB_START_METHOD=thread
-mkdir -p ${WANDB_DIR}
 
 ### 启动分布式网络配置
 export NODE_RANK=${VC_TASK_INDEX}

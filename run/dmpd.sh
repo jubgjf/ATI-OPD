@@ -22,6 +22,7 @@ ls -l /usr/lib64/libjemalloc.so.2
 export LD_PRELOAD=/usr/lib64/libjemalloc.so.2:${LD_PRELOAD}
 echo ============================
 
+rm -rf $HOME/vllm*
 tar -xf $DATASET_DIR/libs/vllm-build.tar.gz -C $HOME
 . $HOME/anaconda3/etc/profile.d/conda.sh
 mkdir -p $HOME/anaconda3/envs/verl
@@ -34,6 +35,8 @@ cd $WORKSPACE
 pip install -r requirements-npu.txt
 pip install -e .
 echo ============================
+
+ln -sfnT /opt/huawei/dataset/jnguan/apps/configs/dotnetrc $HOME/.netrc
 
 export HCCL_EXEC_TIMEOUT=3600
 export HCCL_LOG_LEVEL=0
@@ -97,7 +100,7 @@ teacher_intervention_enabled=${TEACHER_INTERVENTION_ENABLED:-True}
 teacher_intervention_segment_length=${TEACHER_INTERVENTION_SEGMENT_LENGTH:-128}
 teacher_intervention_teacher_length=${TEACHER_INTERVENTION_TEACHER_LENGTH:-128}
 teacher_intervention_gap_metric=${TEACHER_INTERVENTION_GAP_METRIC:-k3}
-teacher_intervention_gap_threshold=${TEACHER_INTERVENTION_GAP_THRESHOLD:-1.0}
+teacher_intervention_gap_threshold=${TEACHER_INTERVENTION_GAP_THRESHOLD:-0.3}
 teacher_intervention_max_count=${TEACHER_INTERVENTION_MAX_COUNT:-4}
 teacher_intervention_train_teacher=${TEACHER_INTERVENTION_TRAIN_TEACHER:-False}
 teacher_intervention_min_trainable_tokens=${TEACHER_INTERVENTION_MIN_TRAINABLE_TOKENS:-1}
@@ -119,10 +122,8 @@ total_epochs=3
 save_freq=200
 test_freq=10
 
-export WANDB_MODE=offline
-export WANDB_DIR=$WORKSPACE
+export WANDB_MODE=online
 export WANDB_START_METHOD=thread
-mkdir -p ${WANDB_DIR}
 
 ### 启动分布式网络配置
 export NODE_RANK=${VC_TASK_INDEX}
