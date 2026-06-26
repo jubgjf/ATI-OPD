@@ -420,6 +420,19 @@ class ValidationGenerationsLogger:
         """Log samples to wandb as a table"""
 
         fields = self._sample_fields(samples)
+        if self._samples_are_records(samples):
+            columns = ["step", "sample_index", *fields]
+            if not hasattr(self, "validation_table"):
+                self.validation_table = wandb.Table(columns=columns)
+
+            new_table = wandb.Table(columns=columns, data=self.validation_table.data)
+            for sample_index, sample in enumerate(samples):
+                new_table.add_data(step, sample_index, *self._sample_to_values(sample, fields))
+
+            if wandb.run is not None:
+                wandb.log({self.table_name: new_table}, step=step)
+            self.validation_table = new_table
+            return
 
         # Create column names for all samples
         columns = ["step"] + sum([[f"{field}_{i + 1}" for field in fields] for i in range(len(samples))], [])
@@ -557,3 +570,7 @@ class ValidationGenerationsLogger:
         if isinstance(sample, dict):
             return [sample.get(field) for field in fields]
         return list(sample)
+
+    @staticmethod
+    def _samples_are_records(samples):
+        return bool(samples) and isinstance(samples[0], dict)

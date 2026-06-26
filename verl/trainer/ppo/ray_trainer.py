@@ -141,21 +141,26 @@ def _build_validation_sample_records(
     gts: list[Any],
     scores: list[float],
     reward_extra_infos_dict: dict[str, list],
+    response_lengths: list[int] | None = None,
+    finish_reasons: list[Any] | None = None,
 ) -> list[dict[str, Any]]:
     records = []
     for idx, (input_text, output_text, gt, score) in enumerate(zip(inputs, outputs, gts, scores, strict=True)):
-        records.append(
-            {
-                "input": input_text,
-                "output": output_text,
-                "ground_truth": gt,
-                "score": score,
-                "acc": _get_reward_extra_value(reward_extra_infos_dict, "acc", idx),
-                "pred": _get_reward_extra_value(reward_extra_infos_dict, "pred", idx),
-                "has_answer_pattern": _has_answer_pattern(output_text),
-                "has_boxed_pattern": _has_boxed_pattern(output_text),
-            }
-        )
+        record = {
+            "input": input_text,
+            "output": output_text,
+            "ground_truth": gt,
+            "score": score,
+            "acc": _get_reward_extra_value(reward_extra_infos_dict, "acc", idx),
+            "pred": _get_reward_extra_value(reward_extra_infos_dict, "pred", idx),
+            "has_answer_pattern": _has_answer_pattern(output_text),
+            "has_boxed_pattern": _has_boxed_pattern(output_text),
+        }
+        if response_lengths is not None:
+            record["response_token_count"] = response_lengths[idx] if idx < len(response_lengths) else None
+        if finish_reasons is not None:
+            record["finish_reason"] = finish_reasons[idx] if idx < len(finish_reasons) else None
+        records.append(record)
     return records
 
 
@@ -750,6 +755,8 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_response_lengths = []
+        sample_finish_reasons = []
         processed_samples = 0
 
         for test_data in self.val_dataloader:
@@ -812,6 +819,12 @@ class RayPPOTrainer:
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
+            if "response_mask" in test_output_gen_batch.batch:
+                sample_response_lengths.extend(
+                    [int(length) for length in test_output_gen_batch.batch["response_mask"].sum(dim=-1).cpu().tolist()]
+                )
+            if "finish_reason" in test_output_gen_batch.non_tensor_batch:
+                sample_finish_reasons.extend(test_output_gen_batch.non_tensor_batch["finish_reason"].tolist())
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -851,6 +864,8 @@ class RayPPOTrainer:
                 gts=sample_gts,
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
+                response_lengths=sample_response_lengths,
+                finish_reasons=sample_finish_reasons,
             )
             if include_format_metrics
             else None
