@@ -209,6 +209,18 @@ def _is_length_reason(value: Any) -> bool:
     return _normalize_finish_reason(value) in {"length", "max_tokens", "max_new_tokens"}
 
 
+def _apply_generation_max_tokens(sampling_params: dict[str, Any], meta_info: dict[str, Any]) -> None:
+    """Forward an explicit generation token budget from DataProto metadata."""
+    if "generation_max_tokens" not in meta_info:
+        return
+    max_tokens = meta_info["generation_max_tokens"]
+    max_tokens = max_tokens.item() if hasattr(max_tokens, "item") else max_tokens
+    max_tokens = int(max_tokens)
+    if max_tokens <= 0:
+        raise ValueError(f"generation_max_tokens must be positive, got {max_tokens}.")
+    sampling_params["max_tokens"] = max_tokens
+
+
 def _is_stop_reason(value: Any) -> bool:
     return _normalize_finish_reason(value) in {"stop", "eos", "end", "stop_sequence"}
 
@@ -1037,6 +1049,7 @@ class AgentLoopWorker:
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["top_k"] = config.val_kwargs.top_k
             sampling_params["temperature"] = config.val_kwargs.temperature
+        _apply_generation_max_tokens(sampling_params, batch.meta_info)
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:

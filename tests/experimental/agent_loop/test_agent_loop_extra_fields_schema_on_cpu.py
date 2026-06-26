@@ -28,6 +28,7 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopOutput,
     AgentLoopWorker,
     DictConfigWrap,
+    _apply_generation_max_tokens,
     _compute_intervention_gap,
     _InternalAgentLoopOutput,
     _is_moe_like_hf_config,
@@ -44,6 +45,29 @@ from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.utils.rollout_trace import RolloutTraceConfig
 from verl.workers.config import DistillationInterventionConfig
 from verl.workers.rollout.replica import TokenOutput
+
+
+def test_apply_generation_max_tokens_adds_sampling_param_on_cpu():
+    sampling_params = {"temperature": 0, "top_p": 1.0}
+
+    _apply_generation_max_tokens(sampling_params, {"generation_max_tokens": 128})
+
+    assert sampling_params["max_tokens"] == 128
+    assert sampling_params["temperature"] == 0
+    assert sampling_params["top_p"] == 1.0
+
+
+def test_apply_generation_max_tokens_missing_meta_keeps_sampling_param_on_cpu():
+    sampling_params = {"temperature": 0}
+
+    _apply_generation_max_tokens(sampling_params, {})
+
+    assert sampling_params == {"temperature": 0}
+
+
+def test_apply_generation_max_tokens_rejects_non_positive_value_on_cpu():
+    with pytest.raises(ValueError, match="generation_max_tokens must be positive"):
+        _apply_generation_max_tokens({}, {"generation_max_tokens": 0})
 
 
 class _FakeServerManager:

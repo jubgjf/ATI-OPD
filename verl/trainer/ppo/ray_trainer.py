@@ -807,9 +807,14 @@ class RayPPOTrainer:
         include_format_metrics: bool = False,
         repeat_times: int | None = None,
         do_sample: bool | None = None,
+        generation_max_tokens: int | None = None,
     ):
         generation_manager = generation_manager or self.async_rollout_manager
         repeat_times = repeat_times or self.config.actor_rollout_ref.rollout.val_kwargs.n
+        if generation_max_tokens is not None:
+            generation_max_tokens = int(generation_max_tokens)
+            if generation_max_tokens <= 0:
+                raise ValueError(f"generation_max_tokens must be positive, got {generation_max_tokens}.")
         validation_data_dir = (
             self.config.trainer.get("validation_data_dir", None) if validation_data_dir is None else validation_data_dir
         )
@@ -861,6 +866,8 @@ class RayPPOTrainer:
                 "validate": True,
                 "global_steps": self.global_steps,
             }
+            if generation_max_tokens is not None:
+                test_gen_batch.meta_info["generation_max_tokens"] = generation_max_tokens
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
@@ -1061,6 +1068,7 @@ class RayPPOTrainer:
 
         teacher_log_generations = int(self.config.trainer.get("log_teacher_val_generations", 0))
         teacher_generation_manager = self._get_teacher_validation_manager()
+        teacher_generation_max_tokens = int(self.config.actor_rollout_ref.rollout.response_length)
         teacher_metrics = self._validate(
             generation_manager=teacher_generation_manager,
             metric_prefix="teacher-val",
@@ -1072,6 +1080,7 @@ class RayPPOTrainer:
             include_format_metrics=True,
             repeat_times=1,
             do_sample=False,
+            generation_max_tokens=teacher_generation_max_tokens,
         )
         assert teacher_metrics, f"{teacher_metrics=}"
         return teacher_metrics
