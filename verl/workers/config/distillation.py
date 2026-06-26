@@ -24,6 +24,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from .rollout import RolloutConfig
 
 __all__ = [
+    "DistillationLossHorizonConfig",
     "DistillationLossConfig",
     "DistillationInterventionConfig",
     "DistillationDiagnosticsConfig",
@@ -33,6 +34,40 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+@dataclass
+class DistillationLossHorizonConfig(BaseConfig):
+    """Configuration for limiting OPD supervision to a response prefix."""
+
+    mode: str = "full"
+    tokens: int = 4096
+    start_tokens: int = 2048
+    end_tokens: int = 4096
+    increment_tokens: int = 512
+    interval_steps: int = 50
+
+    def __post_init__(self):
+        mode = self.mode.lower()
+        if mode not in {"full", "fixed", "progressive"}:
+            raise ValueError(
+                f"distillation.distillation_loss.horizon.mode must be one of "
+                f"'full', 'fixed', or 'progressive', got {self.mode!r}."
+            )
+        if self.tokens <= 0:
+            raise ValueError("distillation.distillation_loss.horizon.tokens must be positive.")
+        if self.start_tokens <= 0:
+            raise ValueError("distillation.distillation_loss.horizon.start_tokens must be positive.")
+        if self.end_tokens <= 0:
+            raise ValueError("distillation.distillation_loss.horizon.end_tokens must be positive.")
+        if self.increment_tokens <= 0:
+            raise ValueError("distillation.distillation_loss.horizon.increment_tokens must be positive.")
+        if self.interval_steps <= 0:
+            raise ValueError("distillation.distillation_loss.horizon.interval_steps must be positive.")
+        if self.end_tokens < self.start_tokens:
+            raise ValueError(
+                "distillation.distillation_loss.horizon.end_tokens must be greater than or equal to start_tokens."
+            )
 
 
 @dataclass
@@ -65,6 +100,8 @@ class DistillationLossConfig(BaseConfig):
         Lower bound for PPO clipping ratio.
     clip_ratio_high (float):
         Upper bound for PPO clipping ratio.
+    horizon (DistillationLossHorizonConfig):
+        Optional TOPD/POPD-style prefix horizon for distillation supervision only.
     loss_settings (DistillationLossSettings, optional):
         Runtime-populated settings based on loss_mode. Not set by user.
     """
@@ -81,6 +118,7 @@ class DistillationLossConfig(BaseConfig):
     clip_ratio: float = 0.2
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
+    horizon: DistillationLossHorizonConfig = field(default_factory=DistillationLossHorizonConfig)
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size

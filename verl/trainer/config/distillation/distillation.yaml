@@ -54,6 +54,18 @@ distillation_loss:
   # Upper bound for PPO clipping ratio.
   clip_ratio_high: 0.2
 
+  # TOPD/POPD-style prefix horizon for distillation supervision only.
+  # The student still generates a full response; reward and PPO use the full response_mask.
+  horizon:
+    _target_: verl.workers.config.DistillationLossHorizonConfig
+    # full: old behavior; fixed: TOPD fixed prefix; progressive: POPD increasing prefix.
+    mode: full
+    tokens: 4096
+    start_tokens: 2048
+    end_tokens: 4096
+    increment_tokens: 512
+    interval_steps: 50
+
 # Teacher intervention config. When enabled, the student first completes a
 # normal rollout; only segments whose teacher/student gap crosses the threshold
 # are repaired by a short teacher generation followed by student suffix

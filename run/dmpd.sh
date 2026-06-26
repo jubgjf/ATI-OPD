@@ -96,7 +96,6 @@ data_seed=-42
 distillation_loss_mode=k1
 use_policy_gradient=True
 distillation_topk=64
-teacher_intervention_enabled=${TEACHER_INTERVENTION_ENABLED:-True}
 teacher_intervention_segment_length=${TEACHER_INTERVENTION_SEGMENT_LENGTH:-128}
 teacher_intervention_teacher_length=${TEACHER_INTERVENTION_TEACHER_LENGTH:-128}
 teacher_intervention_gap_metric=${TEACHER_INTERVENTION_GAP_METRIC:-k3}
@@ -273,7 +272,7 @@ if [ "$NODE_RANK" -eq 0 ]; then
         distillation.distillation_loss.use_policy_gradient=${use_policy_gradient} \
         distillation.distillation_loss.loss_max_clamp=10.0 \
         distillation.distillation_loss.log_prob_min_clamp=-10.0 \
-        distillation.intervention.enabled=${teacher_intervention_enabled} \
+        distillation.intervention.enabled=True \
         distillation.intervention.student_segment_length=${teacher_intervention_segment_length} \
         distillation.intervention.teacher_segment_length=${teacher_intervention_teacher_length} \
         distillation.intervention.gap_metric=${teacher_intervention_gap_metric} \

@@ -774,6 +774,14 @@ distillation:
     clip_ratio: 0.2
     clip_ratio_low: 0.2
     clip_ratio_high: 0.2
+    horizon:
+      _target_: verl.workers.config.DistillationLossHorizonConfig
+      mode: full
+      tokens: 4096
+      start_tokens: 2048
+      end_tokens: 4096
+      increment_tokens: 512
+      interval_steps: 50
   intervention:
     _target_: verl.workers.config.DistillationInterventionConfig
     enabled: false

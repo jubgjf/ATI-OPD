@@ -321,6 +321,74 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+def _get_horizon_config_value(horizon_config: Any, key: str, default: Any = None) -> Any:
+    if horizon_config is None:
+        return default
+    if isinstance(horizon_config, dict):
+        return horizon_config.get(key, default)
+    if hasattr(horizon_config, "get"):
+        return horizon_config.get(key, default)
+    return getattr(horizon_config, key, default)
+
+
+def compute_distillation_horizon_tokens(horizon_config: Any, global_steps: int) -> Optional[int]:
+    """Return the active OPD supervision horizon for TOPD/POPD masking."""
+    mode = str(_get_horizon_config_value(horizon_config, "mode", "full")).lower()
+    if mode == "full":
+        return None
+    if mode == "fixed":
+        return int(_get_horizon_config_value(horizon_config, "tokens"))
+    if mode == "progressive":
+        start_tokens = int(_get_horizon_config_value(horizon_config, "start_tokens"))
+        end_tokens = int(_get_horizon_config_value(horizon_config, "end_tokens"))
+        increment_tokens = int(_get_horizon_config_value(horizon_config, "increment_tokens"))
+        interval_steps = int(_get_horizon_config_value(horizon_config, "interval_steps"))
+        increments = max(int(global_steps), 0) // interval_steps
+        return min(end_tokens, start_tokens + increments * increment_tokens)
+    raise ValueError(
+        f"distillation.distillation_loss.horizon.mode must be one of 'full', 'fixed', or 'progressive', got {mode!r}."
+    )
+
+
+def build_distillation_prefix_mask(response_mask: torch.Tensor, horizon_tokens: int) -> torch.Tensor:
+    """Build an OPD-only prefix mask without changing the task reward response_mask."""
+    response_mask_bool = response_mask.bool()
+    valid_positions = response_mask_bool.long().cumsum(dim=-1)
+    prefix_mask = response_mask_bool & (valid_positions <= horizon_tokens)
+    return prefix_mask.to(dtype=response_mask.dtype)
+
+
+def apply_distillation_horizon_mask(
+    data: DataProto,
+    horizon_config: Any,
+    global_steps: int,
+) -> dict[str, float]:
+    """Attach distillation_loss_mask to the batch when TOPD/POPD prefix masking is enabled."""
+    horizon_tokens = compute_distillation_horizon_tokens(horizon_config, global_steps)
+    if horizon_tokens is None:
+        return {}
+
+    response_mask = data.batch["response_mask"]
+    loss_mask = build_distillation_prefix_mask(response_mask=response_mask, horizon_tokens=horizon_tokens)
+    data.batch["distillation_loss_mask"] = loss_mask
+
+    response_mask_bool = response_mask.bool()
+    loss_mask_bool = loss_mask.bool()
+    response_tokens = response_mask_bool.sum(dim=-1)
+    loss_tokens = loss_mask_bool.sum(dim=-1)
+    total_response_tokens = response_tokens.sum().item()
+    total_loss_tokens = loss_tokens.sum().item()
+    token_fraction = total_loss_tokens / total_response_tokens if total_response_tokens > 0 else 0.0
+    clipped_sample_fraction = ((response_tokens > horizon_tokens) & (response_tokens > 0)).float().mean().item()
+
+    return {
+        "distillation/horizon_tokens": float(horizon_tokens),
+        "distillation/mask_token_fraction": float(token_fraction),
+        "distillation/mask_tokens/mean": loss_tokens.float().mean().item(),
+        "distillation/mask_clipped_sample_fraction": float(clipped_sample_fraction),
+    }
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -1995,6 +2063,18 @@ class RayPPOTrainer:
                     # but might affect the loss calculation (due to the change of mini-batching).
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
+
+                    distillation_enabled = self.distillation_config is not None and is_distillation_enabled(
+                        self.config.get("distillation")
+                    )
+                    if distillation_enabled:
+                        metrics.update(
+                            apply_distillation_horizon_mask(
+                                data=batch,
+                                horizon_config=self.distillation_config.distillation_loss.horizon,
+                                global_steps=self.global_steps,
+                            )
+                        )
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
