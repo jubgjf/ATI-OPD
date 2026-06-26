@@ -388,6 +388,7 @@ def _flatten_dict(raw: dict[str, Any], *, sep: str) -> dict[str, Any]:
 class ValidationGenerationsLogger:
     project_name: str = None
     experiment_name: str = None
+    table_name: str = "val/generations"
 
     def log(self, loggers, samples, step):
         if "wandb" in loggers:
@@ -418,10 +419,10 @@ class ValidationGenerationsLogger:
     def _log_generations_to_wandb(self, samples, step, wandb):
         """Log samples to wandb as a table"""
 
+        fields = self._sample_fields(samples)
+
         # Create column names for all samples
-        columns = ["step"] + sum(
-            [[f"input_{i + 1}", f"output_{i + 1}", f"score_{i + 1}"] for i in range(len(samples))], []
-        )
+        columns = ["step"] + sum([[f"{field}_{i + 1}" for field in fields] for i in range(len(samples))], [])
 
         if not hasattr(self, "validation_table"):
             # Initialize the table on first call
@@ -435,13 +436,13 @@ class ValidationGenerationsLogger:
         row_data = []
         row_data.append(step)
         for sample in samples:
-            row_data.extend(sample)
+            row_data.extend(self._sample_to_values(sample, fields))
 
         new_table.add_data(*row_data)
 
         # Update reference and log
         if wandb.run is not None:
-            wandb.log({"val/generations": new_table}, step=step)
+            wandb.log({self.table_name: new_table}, step=step)
         self.validation_table = new_table
 
     def log_generations_to_swanlab(self, samples, step):
@@ -451,13 +452,14 @@ class ValidationGenerationsLogger:
         swanlab_table = swanlab.echarts.Table()
 
         # Create column names
-        headers = ["step", "input", "output", "score"]
+        fields = self._sample_fields(samples)
+        headers = ["step", *fields]
 
-        swanlab_row_list = [[step, *sample] for sample in samples]
+        swanlab_row_list = [[step, *self._sample_to_values(sample, fields)] for sample in samples]
         swanlab_table.add(headers=headers, rows=swanlab_row_list)
 
         # Log to swanlab
-        swanlab.log({"val/generations": swanlab_table}, step=step)
+        swanlab.log({self.table_name: swanlab_table}, step=step)
 
     def log_generations_to_mlflow(self, samples, step):
         """Log validation generation to mlflow as artifacts"""
@@ -469,10 +471,12 @@ class ValidationGenerationsLogger:
 
         try:
             with tempfile.TemporaryDirectory() as tmp_dir:
-                validation_gen_step_file = Path(tmp_dir, f"val_step{step}.json")
+                artifact_stem = self.table_name.replace("/", "_")
+                validation_gen_step_file = Path(tmp_dir, f"{artifact_stem}_step{step}.json")
+                fields = self._sample_fields(samples)
                 row_data = []
                 for sample in samples:
-                    data = {"input": sample[0], "output": sample[1], "score": sample[2]}
+                    data = dict(zip(fields, self._sample_to_values(sample, fields), strict=True))
                     row_data.append(data)
                 with open(validation_gen_step_file, "w") as file:
                     json.dump(row_data, file)
@@ -490,19 +494,15 @@ class ValidationGenerationsLogger:
         if task is None:
             return
 
+        fields = self._sample_fields(samples)
         table = [
-            {
-                "step": step,
-                "input": sample[0],
-                "output": sample[1],
-                "score": sample[2],
-            }
+            {"step": step, **dict(zip(fields, self._sample_to_values(sample, fields), strict=True))}
             for sample in samples
         ]
 
         logger = task.get_logger()
         logger.report_table(
-            series="Validation generations",
+            series=self.table_name,
             title="Validation",
             table_plot=pd.DataFrame.from_records(table),
             iteration=step,
@@ -530,20 +530,30 @@ class ValidationGenerationsLogger:
         for i, sample in enumerate(samples):
             text_content += f"### Sample {i + 1}\n"
 
-            # Assuming sample contains [input, output, score]
-            if len(sample) >= 3:
-                input_text, output_text, score = sample[0], sample[1], sample[2]
-
-                text_content += f"**Input:** {input_text}\n\n"
-                text_content += f"**Output:** {output_text}\n\n"
-                text_content += f"**Score:** {score}\n\n"
-            else:
-                # Handle cases where sample format might be different
-                text_content += f"**Data:** {sample}\n\n"
+            fields = self._sample_fields(samples)
+            for field, value in zip(fields, self._sample_to_values(sample, fields), strict=True):
+                text_content += f"**{field}:** {value}\n\n"
 
             text_content += "---\n\n"
 
         # Log to tensorboard as text
-        self.writer.add_text("val/generations", text_content, step)
+        self.writer.add_text(self.table_name, text_content, step)
         # Flush to ensure data is written
         self.writer.flush()
+
+    @staticmethod
+    def _sample_fields(samples):
+        if not samples:
+            return ["input", "output", "score"]
+        first_sample = samples[0]
+        if isinstance(first_sample, dict):
+            return list(first_sample.keys())
+        if len(first_sample) == 3:
+            return ["input", "output", "score"]
+        return [f"field_{i + 1}" for i in range(len(first_sample))]
+
+    @staticmethod
+    def _sample_to_values(sample, fields):
+        if isinstance(sample, dict):
+            return [sample.get(field) for field in fields]
+        return list(sample)

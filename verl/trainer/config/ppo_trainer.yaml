@@ -133,6 +133,15 @@ trainer:
   # Number of generations to log during validation
   log_val_generations: 0
 
+  # Run a small teacher validation pass at step 0 when val_before_train and distillation are enabled
+  teacher_val_before_train: true
+
+  # Maximum number of original validation samples for teacher validation; set negative for all, 0 to skip
+  teacher_val_max_samples: 256
+
+  # Number of teacher validation generations to log
+  log_teacher_val_generations: 32
+
   # Directory for logging rollout data; no dump if null
   rollout_data_dir: null
 

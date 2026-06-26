@@ -249,7 +249,10 @@ if [ "$NODE_RANK" -eq 0 ]; then
         trainer.nnodes=${STUDENT_NNODES} \
         trainer.device=npu \
         trainer.default_local_dir=${default_local_dir} \
-        trainer.val_before_train=False \
+        trainer.val_before_train=True \
+        trainer.teacher_val_before_train=True \
+        trainer.teacher_val_max_samples=${val_max_samples} \
+        trainer.log_teacher_val_generations=${val_batch_size} \
         trainer.save_freq=${save_freq} \
         trainer.test_freq=${test_freq} \
         trainer.total_epochs=${total_epochs} \

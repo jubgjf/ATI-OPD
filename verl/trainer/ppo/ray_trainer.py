@@ -18,8 +18,10 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import copy
 import json
 import os
+import re
 import uuid
 from collections import defaultdict
 from pprint import pprint
@@ -82,6 +84,176 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+_ANSWER_PATTERN_RE = re.compile(r"\banswer\s*:", re.IGNORECASE)
+
+
+def _has_answer_pattern(text: Any) -> bool:
+    return bool(_ANSWER_PATTERN_RE.search(str(text or "")))
+
+
+def _has_boxed_pattern(text: Any) -> bool:
+    text = str(text or "")
+    return r"\boxed{" in text or r"\boxed " in text
+
+
+def _is_invalid_pred(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized == "" or normalized == "[INVALID]"
+    return False
+
+
+def _get_reward_extra_value(reward_extra_infos_dict: dict[str, list], key: str, idx: int, default: Any = None) -> Any:
+    values = reward_extra_infos_dict.get(key)
+    if values is None or idx >= len(values):
+        return default
+    return values[idx]
+
+
+def _compute_validation_format_metrics(
+    outputs: list[str], reward_extra_infos_dict: dict[str, list]
+) -> dict[str, float]:
+    if not outputs:
+        return {
+            "format/answer_pattern_rate": 0.0,
+            "format/boxed_pattern_rate": 0.0,
+            "format/invalid_pred_rate": 0.0,
+        }
+
+    metrics = {
+        "format/answer_pattern_rate": float(np.mean([_has_answer_pattern(output) for output in outputs])),
+        "format/boxed_pattern_rate": float(np.mean([_has_boxed_pattern(output) for output in outputs])),
+    }
+    preds = reward_extra_infos_dict.get("pred")
+    if preds is None:
+        metrics["format/invalid_pred_rate"] = float("nan")
+    else:
+        metrics["format/invalid_pred_rate"] = float(np.mean([_is_invalid_pred(pred) for pred in preds]))
+    return metrics
+
+
+def _build_validation_sample_records(
+    inputs: list[str],
+    outputs: list[str],
+    gts: list[Any],
+    scores: list[float],
+    reward_extra_infos_dict: dict[str, list],
+) -> list[dict[str, Any]]:
+    records = []
+    for idx, (input_text, output_text, gt, score) in enumerate(zip(inputs, outputs, gts, scores, strict=True)):
+        records.append(
+            {
+                "input": input_text,
+                "output": output_text,
+                "ground_truth": gt,
+                "score": score,
+                "acc": _get_reward_extra_value(reward_extra_infos_dict, "acc", idx),
+                "pred": _get_reward_extra_value(reward_extra_infos_dict, "pred", idx),
+                "has_answer_pattern": _has_answer_pattern(output_text),
+                "has_boxed_pattern": _has_boxed_pattern(output_text),
+            }
+        )
+    return records
+
+
+def _aggregate_generation_timing(timings: list[dict[str, Any]]) -> dict[str, float]:
+    merged: dict[str, float] = {}
+    keys = sorted({key for timing in timings for key in timing})
+    for key in keys:
+        values = [timing[key] for timing in timings if key in timing]
+        if not values:
+            continue
+        if key.endswith("/min"):
+            merged[key] = float(np.min(values))
+        elif key.endswith("/max"):
+            merged[key] = float(np.max(values))
+        else:
+            merged[key] = float(np.mean(values))
+    return merged
+
+
+class _TeacherValidationGenerationManager:
+    """Route teacher validation generation to one or more existing teacher LLM clients."""
+
+    def __init__(
+        self,
+        *,
+        config,
+        agent_loop_manager_cls,
+        teacher_clients: dict[str, Any],
+        teacher_key: str,
+        reward_loop_worker_handles: list[Any] | None = None,
+    ):
+        if not teacher_clients:
+            raise ValueError("teacher validation requires at least one teacher LLM client")
+
+        self.teacher_key = teacher_key
+        self.teacher_clients = teacher_clients
+        self.manager_by_teacher_key = {
+            teacher_name: agent_loop_manager_cls.create(
+                config=config,
+                llm_client=teacher_client,
+                teacher_client=teacher_clients,
+                reward_loop_worker_handles=reward_loop_worker_handles,
+            )
+            for teacher_name, teacher_client in teacher_clients.items()
+        }
+
+    def generate_sequences(self, prompts: DataProto) -> DataProto:
+        """Generate validation responses with teacher clients, preserving the input sample order."""
+        if len(self.manager_by_teacher_key) == 1:
+            manager = next(iter(self.manager_by_teacher_key.values()))
+            return manager.generate_sequences(prompts)
+
+        if self.teacher_key not in prompts.non_tensor_batch:
+            raise ValueError(
+                f"teacher validation has multiple teacher clients but validation samples do not contain "
+                f"routing key {self.teacher_key!r} (configured by distillation.teacher_key)"
+            )
+
+        route_values = prompts.non_tensor_batch[self.teacher_key]
+        ordered_indices: list[int] = []
+        outputs = []
+        timings = []
+        for teacher_name, manager in self.manager_by_teacher_key.items():
+            idxs = [
+                idx
+                for idx, value in enumerate(route_values)
+                if str(value.item() if hasattr(value, "item") else value) == teacher_name
+            ]
+            if not idxs:
+                continue
+            ordered_indices.extend(idxs)
+            output = manager.generate_sequences(prompts[idxs])
+            timing = output.meta_info.pop("timing", None)
+            if timing is not None:
+                timings.append(timing)
+            outputs.append(output)
+
+        missing_routes = sorted(
+            {
+                str(value.item() if hasattr(value, "item") else value)
+                for value in route_values
+                if str(value.item() if hasattr(value, "item") else value) not in self.manager_by_teacher_key
+            }
+        )
+        if missing_routes:
+            raise ValueError(
+                f"teacher validation routing key {self.teacher_key!r} contains unknown teacher values "
+                f"{missing_routes}; available teachers are {sorted(self.manager_by_teacher_key)}"
+            )
+        if not outputs:
+            raise ValueError("teacher validation received an empty routed batch")
+
+        output = DataProto.concat(outputs)
+        restore_indices = torch.tensor(np.argsort(np.array(ordered_indices)), dtype=torch.long)
+        output.reorder(restore_indices)
+        if timings:
+            output.meta_info["timing"] = _aggregate_generation_timing(timings)
+        return output
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -313,6 +485,14 @@ class RayPPOTrainer:
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
+        self.teacher_validation_generations_logger = ValidationGenerationsLogger(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            table_name="teacher-val/generations",
+        )
+        self.teacher_validation_manager = None
+        self.agent_loop_manager_cls = None
+        self.reward_loop_worker_handles = None
         self.opd_entropy_tracker: OpdDiagnosticsTracker | None = None
         self.opd_gap_tracker: OpdDiagnosticsTracker | None = None
         self.opd_gap_high_tracker: OpdDiagnosticsTracker | None = None
@@ -417,10 +597,13 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(
+        self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, filename_prefix: str | None = None
+    ):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        filename_stem = f"{filename_prefix}_step{self.global_steps}" if filename_prefix else str(self.global_steps)
+        filename = os.path.join(dump_path, f"{filename_stem}.jsonl")
 
         n = len(inputs)
         base_data = {
@@ -479,10 +662,21 @@ class RayPPOTrainer:
                 dump_path=rollout_data_dir,
             )
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
+    def _maybe_log_val_generations(
+        self,
+        inputs,
+        outputs,
+        scores,
+        generations_to_log: int | None = None,
+        generation_logger: ValidationGenerationsLogger | None = None,
+        sample_records: list[dict[str, Any]] | None = None,
+    ):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
-        generations_to_log = self.config.trainer.log_val_generations
+        generations_to_log = (
+            self.config.trainer.log_val_generations if generations_to_log is None else generations_to_log
+        )
+        generation_logger = generation_logger or self.validation_generations_logger
 
         if generations_to_log == 0:
             return
@@ -490,8 +684,8 @@ class RayPPOTrainer:
         import numpy as np
 
         # Create tuples of (input, output, score) and sort by input text
-        samples = list(zip(inputs, outputs, scores, strict=True))
-        samples.sort(key=lambda x: x[0])  # Sort by input text
+        samples = sample_records if sample_records is not None else list(zip(inputs, outputs, scores, strict=True))
+        samples.sort(key=lambda x: x["input"] if isinstance(x, dict) else x[0])  # Sort by input text
 
         # Use fixed random seed for deterministic shuffling
         rng = np.random.RandomState(42)
@@ -501,7 +695,7 @@ class RayPPOTrainer:
         samples = samples[:generations_to_log]
 
         # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+        generation_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
@@ -527,7 +721,25 @@ class RayPPOTrainer:
         batch_reward = self.reward_loop_manager.compute_rm_score(batch)
         return batch_reward
 
-    def _validate(self, merged: bool = False):
+    def _validate(
+        self,
+        merged: bool = False,
+        generation_manager=None,
+        metric_prefix: str = "val",
+        max_samples: int | None = None,
+        log_generations: int | None = None,
+        validation_generations_logger: ValidationGenerationsLogger | None = None,
+        validation_data_dir: str | None = None,
+        dump_filename_prefix: str | None = None,
+        include_format_metrics: bool = False,
+        repeat_times: int | None = None,
+        do_sample: bool | None = None,
+    ):
+        generation_manager = generation_manager or self.async_rollout_manager
+        repeat_times = repeat_times or self.config.actor_rollout_ref.rollout.val_kwargs.n
+        validation_data_dir = (
+            self.config.trainer.get("validation_data_dir", None) if validation_data_dir is None else validation_data_dir
+        )
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -538,9 +750,17 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        processed_samples = 0
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
+            if max_samples is not None:
+                remaining = max_samples - processed_samples
+                if remaining <= 0:
+                    break
+                if len(test_batch) > remaining:
+                    test_batch = test_batch[:remaining]
+                processed_samples += len(test_batch)
 
             if "uid" not in test_batch.non_tensor_batch:
                 test_batch.non_tensor_batch["uid"] = np.array(
@@ -548,9 +768,7 @@ class RayPPOTrainer:
                 )
 
             # repeat test batch
-            test_batch = test_batch.repeat(
-                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
-            )
+            test_batch = test_batch.repeat(repeat_times=repeat_times, interleave=True)
 
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
@@ -562,7 +780,9 @@ class RayPPOTrainer:
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
                 "recompute_log_prob": False,
-                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample
+                if do_sample is None
+                else do_sample,
                 "validate": True,
                 "global_steps": self.global_steps,
             }
@@ -571,7 +791,7 @@ class RayPPOTrainer:
             # pad to be divisible by dp_size
             size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            test_output_gen_batch_padded = generation_manager.generate_sequences(test_gen_batch_padded)
 
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
                 # for colocate reward models, we need to sleep rollout model
@@ -624,18 +844,36 @@ class RayPPOTrainer:
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        sample_records = (
+            _build_validation_sample_records(
+                inputs=sample_inputs,
+                outputs=sample_outputs,
+                gts=sample_gts,
+                scores=sample_scores,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+            )
+            if include_format_metrics
+            else None
+        )
+        self._maybe_log_val_generations(
+            inputs=sample_inputs,
+            outputs=sample_outputs,
+            scores=sample_scores,
+            generations_to_log=log_generations,
+            generation_logger=validation_generations_logger,
+            sample_records=sample_records,
+        )
 
         # dump generations
-        val_data_dir = self.config.trainer.get("validation_data_dir", None)
-        if val_data_dir:
+        if validation_data_dir:
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
                 gts=sample_gts,
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
-                dump_path=val_data_dir,
+                dump_path=validation_data_dir,
+                filename_prefix=dump_filename_prefix,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
@@ -650,9 +888,19 @@ class RayPPOTrainer:
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        metrics = self._val_metrics_update(
+            data_sources, sample_uids, reward_extra_infos_dict, sample_turns, metric_prefix=metric_prefix
+        )
+        if include_format_metrics:
+            for metric_name, value in _compute_validation_format_metrics(
+                sample_outputs, reward_extra_infos_dict
+            ).items():
+                metrics[f"{metric_prefix}-aux/{metric_name}"] = value
+        return metrics
 
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
+    def _val_metrics_update(
+        self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns, metric_prefix="val"
+    ):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -665,19 +913,85 @@ class RayPPOTrainer:
                         and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
                         and (f"@{n_max}" in metric_name)
                     ):
-                        metric_sec = "val-core"
+                        metric_sec = f"{metric_prefix}-core"
                     else:
-                        metric_sec = "val-aux"
+                        metric_sec = f"{metric_prefix}-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)
-            metric_dict["val-aux/num_turns/min"] = sample_turns.min()
-            metric_dict["val-aux/num_turns/max"] = sample_turns.max()
-            metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+            metric_dict[f"{metric_prefix}-aux/num_turns/min"] = sample_turns.min()
+            metric_dict[f"{metric_prefix}-aux/num_turns/max"] = sample_turns.max()
+            metric_dict[f"{metric_prefix}-aux/num_turns/mean"] = sample_turns.mean()
 
         return metric_dict
+
+    def _make_teacher_validation_config(self):
+        teacher_config = copy.deepcopy(self.config)
+        with open_dict(teacher_config.actor_rollout_ref.rollout.val_kwargs):
+            teacher_config.actor_rollout_ref.rollout.val_kwargs.top_p = 1.0
+            teacher_config.actor_rollout_ref.rollout.val_kwargs.top_k = -1
+            teacher_config.actor_rollout_ref.rollout.val_kwargs.temperature = 0
+            if "do_sample" in teacher_config.actor_rollout_ref.rollout.val_kwargs:
+                teacher_config.actor_rollout_ref.rollout.val_kwargs.do_sample = False
+        return teacher_config
+
+    def _get_teacher_validation_manager(self):
+        if self.teacher_validation_manager is not None:
+            return self.teacher_validation_manager
+        if self.teacher_model_manager is None:
+            raise RuntimeError("teacher validation requested but teacher_model_manager is not initialized")
+        if self.agent_loop_manager_cls is None:
+            raise RuntimeError("teacher validation requested before AgentLoopManager class is initialized")
+
+        teacher_clients = self.teacher_model_manager.get_client()
+        teacher_config = self._make_teacher_validation_config()
+        teacher_key = self.config.distillation.teacher_key
+        self.teacher_validation_manager = _TeacherValidationGenerationManager(
+            config=teacher_config,
+            agent_loop_manager_cls=self.agent_loop_manager_cls,
+            teacher_clients=teacher_clients,
+            teacher_key=teacher_key,
+            reward_loop_worker_handles=self.reward_loop_worker_handles,
+        )
+        return self.teacher_validation_manager
+
+    def _validate_teacher_before_train(self):
+        if not self.config.trainer.get("teacher_val_before_train", False):
+            return {}
+        if not self.use_teacher_policy or self.distillation_config is None:
+            print("Skipping teacher validation before train because distillation teacher policy is not enabled.")
+            return {}
+        if not is_distillation_enabled(self.config.distillation):
+            print("Skipping teacher validation before train because distillation.enabled is false.")
+            return {}
+
+        teacher_val_max_samples = self.config.trainer.get("teacher_val_max_samples", 256)
+        if teacher_val_max_samples is not None:
+            teacher_val_max_samples = int(teacher_val_max_samples)
+            if teacher_val_max_samples == 0:
+                print("Skipping teacher validation before train because trainer.teacher_val_max_samples=0.")
+                return {}
+            if teacher_val_max_samples < 0:
+                teacher_val_max_samples = None
+
+        teacher_log_generations = int(self.config.trainer.get("log_teacher_val_generations", 0))
+        teacher_generation_manager = self._get_teacher_validation_manager()
+        teacher_metrics = self._validate(
+            generation_manager=teacher_generation_manager,
+            metric_prefix="teacher-val",
+            max_samples=teacher_val_max_samples,
+            log_generations=teacher_log_generations,
+            validation_generations_logger=self.teacher_validation_generations_logger,
+            validation_data_dir=self.config.trainer.get("validation_data_dir", None),
+            dump_filename_prefix="teacher_val",
+            include_format_metrics=True,
+            repeat_times=1,
+            do_sample=False,
+        )
+        assert teacher_metrics, f"{teacher_metrics=}"
+        return teacher_metrics
 
     def _merge_validation_results(self, result_a, result_b):
         if result_a is None and result_b is None:
@@ -863,6 +1177,7 @@ class RayPPOTrainer:
             AgentLoopManager = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
         else:
             from verl.experimental.agent_loop import AgentLoopManager
+        self.agent_loop_manager_cls = AgentLoopManager
 
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
@@ -878,6 +1193,7 @@ class RayPPOTrainer:
         # To stream teacher computation with actor rollout, we instead pass the full manager so that the
         # teacher loop workers can sleep/wake together with rollout workers
         reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+        self.reward_loop_worker_handles = reward_loop_worker_handles
         self.async_rollout_manager = AgentLoopManager.create(
             config=self.config,
             llm_client=self.llm_server_manager.get_client(),
@@ -1549,6 +1865,10 @@ class RayPPOTrainer:
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
+            teacher_val_metrics = self._validate_teacher_before_train()
+            if teacher_val_metrics:
+                pprint(f"Initial teacher validation metrics: {teacher_val_metrics}")
+                logger.log(data=teacher_val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 logger.finish()
                 return
