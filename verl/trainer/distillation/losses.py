@@ -161,10 +161,11 @@ def compute_topk_loss(
         case _:
             raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
 
+    loss_topk = int(distillation_config.distillation_loss.topk)
     outputs = distillation_loss_fn(
         student_logits=student_logits,
-        teacher_topk_log_probs=data["teacher_logprobs"],
-        teacher_topk_ids=data["teacher_ids"],
+        teacher_topk_log_probs=data["teacher_logprobs"][..., :loss_topk],
+        teacher_topk_ids=data["teacher_ids"][..., :loss_topk],
         config=distillation_config,
         data_format=data_format,
     )
@@ -379,7 +380,10 @@ def compute_distillation_loss_reverse_kl_estimator(
     - distillation_metrics: Dictionary of metrics.
     """
     student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
-    teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
+    teacher_logprob_key = (
+        "teacher_sampled_logprobs" if "teacher_sampled_logprobs" in data.keys() else "teacher_logprobs"
+    )
+    teacher_log_probs = no_padding_2_padding(data[teacher_logprob_key], data).squeeze(-1)
     if data["response_mask"].is_nested:
         response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
     else:

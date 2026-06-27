@@ -14,7 +14,12 @@
 
 from verl import DataProto
 
-DISTILLATION_SUPERVISION_TENSOR_KEYS = ("teacher_logprobs", "teacher_ids")
+DISTILLATION_SUPERVISION_TENSOR_KEYS = (
+    "teacher_logprobs",
+    "teacher_ids",
+    "teacher_sampled_logprobs",
+    "teacher_sampled_ids",
+)
 
 
 def to_tensordict_without_distillation_supervision(batch: DataProto):

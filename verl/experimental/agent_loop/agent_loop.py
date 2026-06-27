@@ -55,6 +55,7 @@ from verl.experimental.teacher_loop.teacher_manager import (
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
 from verl.trainer.distillation import is_distillation_enabled
+from verl.trainer.distillation.diagnostics import compute_rewrite_overlap_metrics
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
@@ -456,6 +457,10 @@ def _store_teacher_scoring_result(
     )
     output.extra_fields["teacher_ids"] = result.ids
     output.extra_fields["teacher_logprobs"] = result.logprobs
+    if result.sampled_ids is not None:
+        output.extra_fields["teacher_sampled_ids"] = result.sampled_ids
+    if result.sampled_logprobs is not None:
+        output.extra_fields["teacher_sampled_logprobs"] = result.sampled_logprobs
     output.extra_fields["teacher_logprob_nonfinite_count"] = len(nonfinite_positions)
     output.extra_fields["teacher_logprob_nonfinite_positions"] = nonfinite_positions
     output.extra_fields["teacher_logprob_nonfinite_replacement"] = result.replacement_value
@@ -612,10 +617,18 @@ class AgentLoopOutput(BaseModel):
             output["extra_fields"].pop("teacher_ids", None),
             output["extra_fields"].pop("teacher_logprobs", None),
         )
+        teacher_sampled_ids, teacher_sampled_logprobs = (
+            output["extra_fields"].pop("teacher_sampled_ids", None),
+            output["extra_fields"].pop("teacher_sampled_logprobs", None),
+        )
         if teacher_ids is not None:
             output["teacher_ids"] = teacher_ids
         if teacher_logprobs is not None:
             output["teacher_logprobs"] = teacher_logprobs
+        if teacher_sampled_ids is not None:
+            output["teacher_sampled_ids"] = teacher_sampled_ids
+        if teacher_sampled_logprobs is not None:
+            output["teacher_sampled_logprobs"] = teacher_sampled_logprobs
         return output
 
 
@@ -642,6 +655,10 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded log probabilities from teacher model for prompt/response tokens."""
     teacher_ids: Optional[torch.Tensor] = None
     """Padded token ids corresponding to the teacher log probabilities."""
+    teacher_sampled_logprobs: Optional[torch.Tensor] = None
+    """Padded sampled-token teacher log probabilities for prompt/response tokens."""
+    teacher_sampled_ids: Optional[torch.Tensor] = None
+    """Padded sampled token ids corresponding to teacher_sampled_logprobs."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
@@ -982,13 +999,20 @@ class AgentLoopWorker:
             ],
         )
 
-    def _intervention_prompt_logprobs(self) -> int:
+    def _teacher_prompt_logprobs(self) -> int:
         distillation_config = getattr(self, "distillation_config", None)
         loss_config = getattr(distillation_config, "distillation_loss", None)
         loss_settings = getattr(loss_config, "loss_settings", None)
+        prompt_logprobs = 0
         if loss_config is not None and getattr(loss_settings, "use_topk", False):
-            return int(loss_config.topk)
-        return 0
+            prompt_logprobs = max(prompt_logprobs, int(loss_config.topk))
+        diagnostics_config = getattr(distillation_config, "diagnostics", None)
+        if diagnostics_config is not None and getattr(diagnostics_config, "collect_topk_overlap", False):
+            prompt_logprobs = max(prompt_logprobs, int(getattr(diagnostics_config, "topk", 64) or 64))
+        return prompt_logprobs
+
+    def _intervention_prompt_logprobs(self) -> int:
+        return AgentLoopWorker._teacher_prompt_logprobs(self)
 
     def _maybe_reset_teacher_intervention_log_counter(self, sample_kwargs: Optional[dict[str, Any]]) -> None:
         if not sample_kwargs or "global_steps" not in sample_kwargs:
@@ -1290,6 +1314,10 @@ class AgentLoopWorker:
             output.extra_fields.pop("teacher_ids", None),
             output.extra_fields.pop("teacher_logprobs", None),
         )
+        teacher_sampled_ids, teacher_sampled_logprobs = (
+            output.extra_fields.pop("teacher_sampled_ids", None),
+            output.extra_fields.pop("teacher_sampled_logprobs", None),
+        )
         if teacher_ids is not None and teacher_logprobs is not None:
             # TODO(wuxibin): remove padding and use tensordict.
             from verl.experimental.teacher_loop.teacher_manager import _pad_teacher_outputs
@@ -1297,6 +1325,18 @@ class AgentLoopWorker:
             teacher_ids, teacher_logprobs = _pad_teacher_outputs(
                 teacher_ids,
                 teacher_logprobs,
+                prompt_width=prompt_output["input_ids"].shape[1],
+                response_width=response_output["input_ids"].shape[1],
+                prompt_length=len(output.prompt_ids),
+                response_length=len(output.response_ids),
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+        if teacher_sampled_ids is not None and teacher_sampled_logprobs is not None:
+            from verl.experimental.teacher_loop.teacher_manager import _pad_teacher_outputs
+
+            teacher_sampled_ids, teacher_sampled_logprobs = _pad_teacher_outputs(
+                teacher_sampled_ids,
+                teacher_sampled_logprobs,
                 prompt_width=prompt_output["input_ids"].shape[1],
                 response_width=response_output["input_ids"].shape[1],
                 prompt_length=len(output.prompt_ids),
@@ -1318,6 +1358,8 @@ class AgentLoopWorker:
             mm_processor_kwargs=output.mm_processor_kwargs,
             teacher_logprobs=teacher_logprobs,
             teacher_ids=teacher_ids,
+            teacher_sampled_logprobs=teacher_sampled_logprobs,
+            teacher_sampled_ids=teacher_sampled_ids,
             reward_score=output.reward_score,
             num_turns=output.num_turns,
             metrics=output.metrics,
@@ -1663,6 +1705,7 @@ class AgentLoopWorker:
                 start,
                 end,
             )
+            original_student_segment_ids = response_ids[start:end]
             prefix_response_ids = response_ids[:start]
             prefix_response_mask = response_mask[:start]
             prefix_response_logprobs = response_logprobs[:start]
@@ -1731,6 +1774,7 @@ class AgentLoopWorker:
                     candidate_response_mask=prefix_response_mask,
                 )
                 break
+            rewrite_overlap_metrics = compute_rewrite_overlap_metrics(original_student_segment_ids, teacher_segment_ids)
 
             teacher_terminal = _generation_is_terminal(
                 token_ids=teacher_segment_ids,
@@ -1837,6 +1881,7 @@ class AgentLoopWorker:
                     "student_suffix_stop_reason": student_suffix_result.stop_reason,
                     "student_suffix_finish_reason": student_suffix_result.finish_reason,
                     "terminated": candidate_terminal,
+                    **rewrite_overlap_metrics,
                 }
             )
             if candidate_terminal:
@@ -1877,18 +1922,26 @@ class AgentLoopWorker:
     ) -> None:
         """Compute teacher logprobs for single sample."""
         if self.distillation_enabled and not validate:
-            expected_width = (
-                self.distillation_config.distillation_loss.topk
-                if self.distillation_config.distillation_loss.loss_settings.use_topk
-                else 1
-            )
+            prompt_logprobs = AgentLoopWorker._teacher_prompt_logprobs(self)
+            expected_width = max(prompt_logprobs, 1)
             existing_ids = output.extra_fields.get("teacher_ids")
             existing_logprobs = output.extra_fields.get("teacher_logprobs")
+            existing_sampled_ids = output.extra_fields.get("teacher_sampled_ids")
+            existing_sampled_logprobs = output.extra_fields.get("teacher_sampled_logprobs")
+            has_required_sampled_fields = expected_width == 1 or (
+                existing_sampled_ids is not None
+                and existing_sampled_logprobs is not None
+                and existing_sampled_ids.shape[0]
+                == existing_sampled_logprobs.shape[0]
+                == len(prompt_ids) + len(response_ids)
+                and existing_sampled_logprobs.shape[-1] == 1
+            )
             if (
                 existing_ids is not None
                 and existing_logprobs is not None
                 and existing_ids.shape[0] == existing_logprobs.shape[0] == len(prompt_ids) + len(response_ids)
                 and existing_logprobs.shape[-1] == expected_width
+                and has_required_sampled_fields
             ):
                 output.extra_fields.setdefault("teacher_logprob_nonfinite_count", 0)
                 output.extra_fields.setdefault("teacher_logprob_nonfinite_positions", [])
@@ -1903,6 +1956,7 @@ class AgentLoopWorker:
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 routing_key=routing_key,
                 request_id=output.extra_fields.get("rollout_request_id"),
+                prompt_logprobs=prompt_logprobs,
             )
             _store_teacher_scoring_result(
                 output,
@@ -1930,10 +1984,17 @@ class AgentLoopWorker:
         has_routed_experts = _require_consistent_optional_field(inputs, "routed_experts")
         has_teacher_logprobs = _require_consistent_optional_field(inputs, "teacher_logprobs")
         has_teacher_ids = _require_consistent_optional_field(inputs, "teacher_ids")
+        has_teacher_sampled_logprobs = _require_consistent_optional_field(inputs, "teacher_sampled_logprobs")
+        has_teacher_sampled_ids = _require_consistent_optional_field(inputs, "teacher_sampled_ids")
         if has_teacher_logprobs != has_teacher_ids:
             raise RuntimeError(
                 "Inconsistent teacher scoring fields across agent loop outputs: teacher_logprobs and teacher_ids "
                 "must both be present or both be absent for every sample."
+            )
+        if has_teacher_sampled_logprobs != has_teacher_sampled_ids:
+            raise RuntimeError(
+                "Inconsistent teacher sampled scoring fields across agent loop outputs: teacher_sampled_logprobs "
+                "and teacher_sampled_ids must both be present or both be absent for every sample."
             )
         if has_response_logprobs:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
@@ -1942,6 +2003,11 @@ class AgentLoopWorker:
         if has_teacher_logprobs and has_teacher_ids:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
+        if has_teacher_sampled_logprobs and has_teacher_sampled_ids:
+            optional_outputs["teacher_sampled_logprobs"] = torch.cat(
+                [input.teacher_sampled_logprobs for input in inputs], dim=0
+            )
+            optional_outputs["teacher_sampled_ids"] = torch.cat([input.teacher_sampled_ids for input in inputs], dim=0)
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]

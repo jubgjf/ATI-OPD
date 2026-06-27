@@ -228,7 +228,7 @@ class DistillationDiagnosticsConfig(BaseConfig):
     high_gap_threshold: float = 1.0
     collect_intervention_metrics: bool = True
     collect_topk_overlap: bool = False
-    topk: int = 16
+    topk: Optional[int] = None
 
     def __post_init__(self):
         if self.position_bin_size <= 0:
@@ -243,13 +243,8 @@ class DistillationDiagnosticsConfig(BaseConfig):
             raise ValueError(
                 f"diagnostics.high_gap_threshold must be finite and non-negative, got {self.high_gap_threshold!r}."
             )
-        if self.topk <= 0:
+        if self.topk is not None and self.topk <= 0:
             raise ValueError("diagnostics.topk must be positive.")
-        if self.collect_topk_overlap:
-            raise NotImplementedError(
-                "Top-k overlap diagnostics are not implemented for the sampled-token OPD path yet. "
-                "Set distillation.diagnostics.collect_topk_overlap=false."
-            )
 
 
 @dataclass
@@ -400,12 +395,17 @@ class DistillationConfig(BaseConfig):
         if not self.enabled:
             return
 
+        if self.diagnostics.topk is None:
+            object.__setattr__(self.diagnostics, "topk", int(self.distillation_loss.topk or 64))
         self.teacher_models = self._resolve_teacher_models()
         teacher_world_size_sum = 0
+        logprob_topk = self.distillation_loss.topk if self.distillation_loss.loss_settings.use_topk else None
+        if self.diagnostics.collect_topk_overlap:
+            logprob_topk = max(int(logprob_topk or 0), int(self.diagnostics.topk))
         for teacher_model in self.teacher_models.values():
             teacher_model.validate_and_prepare_for_distillation(
-                use_topk=self.distillation_loss.loss_settings.use_topk,
-                topk=self.distillation_loss.topk,
+                use_topk=logprob_topk is not None and logprob_topk > 0,
+                topk=logprob_topk,
             )
             teacher_world_size_sum += teacher_model.world_size
         total_pool_size = self.n_gpus_per_node * self.nnodes

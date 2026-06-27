@@ -49,6 +49,7 @@ from verl.trainer.distillation.diagnostics import (
     compute_intervention_metrics,
     compute_opd_diagnostics_metrics,
     compute_teacher_logprob_nonfinite_heatmap_row,
+    extract_response_topk_scores,
     extract_sampled_response_logprobs,
 )
 from verl.trainer.distillation.losses import is_distillation_enabled
@@ -1683,10 +1684,32 @@ class RayPPOTrainer:
         return diagnostics_config
 
     def _extract_teacher_response_logprobs_for_diagnostics(self, batch: DataProto) -> torch.Tensor | None:
-        teacher_logprobs = batch.batch.get("teacher_logprobs", None)
+        teacher_logprobs = batch.batch.get("teacher_sampled_logprobs", None)
+        context = "teacher_sampled_logprobs"
+        if teacher_logprobs is None:
+            teacher_logprobs = batch.batch.get("teacher_logprobs", None)
+            context = "teacher_logprobs"
         if teacher_logprobs is None:
             return None
         return extract_sampled_response_logprobs(
+            sequence_logprobs=teacher_logprobs,
+            response_mask=batch.batch["response_mask"],
+            prompt_width=batch.batch["prompts"].shape[1],
+            context=context,
+        )
+
+    def _extract_teacher_response_topk_for_diagnostics(
+        self,
+        batch: DataProto,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
+        teacher_ids = batch.batch.get("teacher_ids", None)
+        teacher_logprobs = batch.batch.get("teacher_logprobs", None)
+        if teacher_ids is None or teacher_logprobs is None:
+            return None, None
+        if teacher_ids.ndim != 3 or teacher_ids.shape[-1] <= 1:
+            return None, None
+        return extract_response_topk_scores(
+            sequence_ids=teacher_ids,
             sequence_logprobs=teacher_logprobs,
             response_mask=batch.batch["response_mask"],
             prompt_width=batch.batch["prompts"].shape[1],
@@ -1841,6 +1864,11 @@ class RayPPOTrainer:
             )
 
         teacher_response_logprobs = self._extract_teacher_response_logprobs_for_diagnostics(batch)
+        teacher_response_topk_ids, teacher_response_topk_logprobs = (
+            self._extract_teacher_response_topk_for_diagnostics(batch)
+            if diagnostics_config.collect_topk_overlap
+            else (None, None)
+        )
         teacher_logprob_nonfinite_positions = None
         if "teacher_logprob_nonfinite_positions" in batch.non_tensor_batch:
             teacher_logprob_nonfinite_positions = self._non_tensor_to_list(
@@ -1848,13 +1876,21 @@ class RayPPOTrainer:
             )
         metrics = compute_opd_diagnostics_metrics(
             student_logprobs=student_logprobs,
+            response_ids=batch.batch.get("responses", None),
             teacher_logprobs=teacher_response_logprobs,
+            teacher_topk_ids=teacher_response_topk_ids,
+            teacher_topk_logprobs=teacher_response_topk_logprobs,
             teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
             entropy=entropy,
             response_mask=response_mask,
             rm_scores=batch.batch.get("rm_scores", None),
             bin_size=diagnostics_config.position_bin_size,
             high_gap_threshold=diagnostics_config.high_gap_threshold,
+            overlap_topk=(
+                int(diagnostics_config.topk or self.distillation_config.distillation_loss.topk or 64)
+                if diagnostics_config.collect_topk_overlap
+                else None
+            ),
         )
         metrics["opd/gap_abs/available"] = 1.0 if teacher_response_logprobs is not None else 0.0
 

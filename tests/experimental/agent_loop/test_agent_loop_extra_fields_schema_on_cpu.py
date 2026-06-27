@@ -581,6 +581,7 @@ class _DirectInterventionWorker:
         thinking_start_text: str = "<think>",
         thinking_end_text: str = "</think>",
         log_examples_per_worker: int = 0,
+        diagnostics_topk: Optional[int] = None,
     ):
         self.tokenizer = _FakeTokenizer()
         self.rollout_config = OmegaConf.create({"response_length": response_length})
@@ -604,7 +605,11 @@ class _DirectInterventionWorker:
             distillation_loss=SimpleNamespace(
                 topk=topk or 64,
                 loss_settings=SimpleNamespace(use_topk=topk is not None),
-            )
+            ),
+            diagnostics=SimpleNamespace(
+                collect_topk_overlap=diagnostics_topk is not None,
+                topk=diagnostics_topk or 64,
+            ),
         )
         self._teacher_intervention_logged_samples = 0
         self._teacher_intervention_logged_step = None
@@ -806,6 +811,47 @@ async def test_teacher_intervention_empty_response_emits_metadata_on_cpu():
     assert output.extra_fields["teacher_intervention_count"] == 0
     assert output.extra_fields["teacher_interventions"] == []
     assert output.extra_fields["teacher_intervention_skipped"] == []
+
+
+@pytest.mark.asyncio
+async def test_teacher_intervention_overlap_diagnostics_requests_topk_and_keeps_sampled_fields_on_cpu():
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[30, 31], stop_reason="completed", finish_reason="length"),
+        high_gap_start=0,
+        topk_width=4,
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        diagnostics_topk=4,
+    )
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "overlap-diagnostics"},
+    )
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "top_p": 0.95, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert teacher_manager.prompt_logprobs_calls == [4, 4]
+    assert output.extra_fields["teacher_ids"].shape[-1] == 4
+    assert output.extra_fields["teacher_logprobs"].shape[-1] == 4
+    assert output.extra_fields["teacher_sampled_ids"].shape[-1] == 1
+    assert output.extra_fields["teacher_sampled_logprobs"].shape[-1] == 1
+    assert output.extra_fields["teacher_intervention_count"] == 1
+    intervention = output.extra_fields["teacher_interventions"][0]
+    assert intervention["rewrite_exact_position_overlap"] == 0.0
+    assert intervention["rewrite_lcs_ratio"] == 0.0
+    assert intervention["rewrite_length_ratio"] == 1.0
 
 
 @pytest.mark.asyncio

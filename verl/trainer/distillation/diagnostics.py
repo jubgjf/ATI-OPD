@@ -269,6 +269,68 @@ def _head_tail_metrics(
     return metrics
 
 
+def compute_topk_ladder(topk: int) -> list[int]:
+    """Return powers-of-two coverage checkpoints ending at ``topk``."""
+    if topk <= 0:
+        raise ValueError(f"topk must be positive, got {topk}.")
+    ladder = []
+    value = 1
+    while value < topk:
+        ladder.append(value)
+        value *= 2
+    if not ladder or ladder[-1] != topk:
+        ladder.append(topk)
+    return ladder
+
+
+def extract_response_topk_scores(
+    *,
+    sequence_ids: torch.Tensor,
+    sequence_logprobs: torch.Tensor,
+    response_mask: torch.Tensor,
+    prompt_width: int,
+    context: str = "teacher_topk",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract response-aligned top-k ids/logprobs from padded prompt+response teacher scoring output."""
+    if sequence_ids.ndim != 3 or sequence_logprobs.ndim != 3:
+        raise RuntimeError(
+            f"{context} ids/logprobs must have rank 3 for OPD overlap diagnostics, "
+            f"got ids.shape={tuple(sequence_ids.shape)} and logprobs.shape={tuple(sequence_logprobs.shape)}."
+        )
+    if sequence_ids.shape != sequence_logprobs.shape:
+        raise RuntimeError(
+            f"{context} ids/logprobs shape mismatch: "
+            f"ids.shape={tuple(sequence_ids.shape)}, logprobs.shape={tuple(sequence_logprobs.shape)}."
+        )
+    if sequence_ids.shape[0] != response_mask.shape[0]:
+        raise RuntimeError(
+            f"{context} batch-size mismatch: ids.shape={tuple(sequence_ids.shape)}, "
+            f"response_mask.shape={tuple(response_mask.shape)}."
+        )
+    if sequence_ids.shape[:2] == response_mask.shape:
+        response_ids = sequence_ids
+        response_logprobs = sequence_logprobs
+    else:
+        if prompt_width <= 0:
+            raise RuntimeError("OPD overlap diagnostics require a positive padded prompt width.")
+        response_width = response_mask.shape[1]
+        start = prompt_width - 1
+        end = start + response_width
+        if sequence_ids.shape[1] < end:
+            raise RuntimeError(
+                f"Cannot align {context} with response tokens: ids.shape={tuple(sequence_ids.shape)}, "
+                f"prompt_width={prompt_width}, response_width={response_width}, expected at least {end} positions."
+            )
+        response_ids = sequence_ids[:, start:end]
+        response_logprobs = sequence_logprobs[:, start:end]
+    if response_ids.shape[:2] != response_mask.shape:
+        raise RuntimeError(
+            f"OPD overlap diagnostics produced misaligned {context}: "
+            f"response_ids.shape={tuple(response_ids.shape)}, response_mask.shape={tuple(response_mask.shape)}."
+        )
+    return response_ids, response_logprobs
+
+
 def binary_auc(scores: torch.Tensor, labels: torch.Tensor) -> Optional[float]:
     """Compute ROC AUC with average ranks; returns None if only one class exists."""
     scores = _to_cpu_float(scores).flatten()
@@ -350,16 +412,110 @@ def extract_sampled_response_logprobs(
     return response_logprobs
 
 
+def compute_overlap_diagnostics(
+    *,
+    response_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    teacher_topk_logprobs: torch.Tensor,
+    sampled_teacher_logprobs: Optional[torch.Tensor] = None,
+    bin_size: int,
+    topk: int,
+) -> dict[str, float]:
+    """Compute teacher top-k support diagnostics for student response tokens."""
+    if response_ids.shape != response_mask.shape:
+        raise ValueError(
+            f"response_ids and response_mask must align, got {response_ids.shape=} and {response_mask.shape=}."
+        )
+    if teacher_topk_ids.shape != teacher_topk_logprobs.shape:
+        raise ValueError(
+            "teacher_topk_ids and teacher_topk_logprobs must align, "
+            f"got {teacher_topk_ids.shape=} and {teacher_topk_logprobs.shape=}."
+        )
+    if teacher_topk_ids.ndim != 3 or teacher_topk_ids.shape[:2] != response_mask.shape:
+        raise ValueError(
+            "teacher_topk_ids must have shape [batch, response_len, k], "
+            f"got {teacher_topk_ids.shape=} and response_mask.shape={response_mask.shape}."
+        )
+    if topk <= 0:
+        raise ValueError(f"topk must be positive, got {topk}.")
+
+    response_ids = response_ids.detach().cpu()
+    response_mask = response_mask.detach().bool().cpu()
+    teacher_topk_ids = teacher_topk_ids.detach().cpu()
+    teacher_topk_logprobs = _to_cpu_float(teacher_topk_logprobs)
+    finite_topk = torch.isfinite(teacher_topk_logprobs)
+    valid_topk_rows = response_mask & finite_topk.any(dim=-1)
+    available_topk = min(int(topk), int(teacher_topk_ids.shape[-1]))
+    metrics: dict[str, float] = {}
+
+    for k in compute_topk_ladder(topk):
+        if k > available_topk:
+            continue
+        coverage = (teacher_topk_ids[..., :k] == response_ids.unsqueeze(-1)).any(dim=-1)
+        coverage = coverage & valid_topk_rows
+        _put_if_present(metrics, f"opd/overlap/top{k}_rate", _safe_mean(coverage[valid_topk_rows].float()))
+        metrics.update(
+            compute_binned_event_rates(
+                event_mask=coverage,
+                response_mask=valid_topk_rows,
+                bin_size=bin_size,
+                prefix=f"opd/overlap/top{k}_bin",
+            )
+        )
+        metrics.update(
+            _head_tail_metrics(
+                coverage.float(),
+                valid_topk_rows,
+                prefix=f"opd/overlap/top{k}",
+                bin_size=bin_size,
+            )
+        )
+
+    if sampled_teacher_logprobs is not None:
+        if sampled_teacher_logprobs.ndim == 3 and sampled_teacher_logprobs.shape[-1] == 1:
+            sampled_teacher_logprobs = sampled_teacher_logprobs.squeeze(-1)
+        if sampled_teacher_logprobs.shape != response_mask.shape:
+            raise ValueError(
+                "sampled_teacher_logprobs and response_mask must align for OPD overlap diagnostics, "
+                f"got {sampled_teacher_logprobs.shape=} and {response_mask.shape=}."
+            )
+        sampled_teacher_logprobs = _to_cpu_float(sampled_teacher_logprobs)
+        sampled_prob = sampled_teacher_logprobs.exp()
+        sampled_valid = response_mask & torch.isfinite(sampled_prob)
+        sampled_values = sampled_prob[sampled_valid]
+        _put_if_present(metrics, "opd/overlap/teacher_sampled_prob_mean", _safe_mean(sampled_values))
+        _put_if_present(metrics, "opd/overlap/teacher_sampled_prob_p10", _safe_quantile(sampled_values, 0.1))
+        _put_if_present(metrics, "opd/overlap/teacher_sampled_prob_p50", _safe_quantile(sampled_values, 0.5))
+        metrics.update(
+            compute_binned_token_means(
+                sampled_prob,
+                sampled_valid,
+                bin_size=bin_size,
+                prefix="opd/overlap/teacher_sampled_prob_bin",
+            )
+        )
+
+    topk_probs = torch.where(finite_topk, teacher_topk_logprobs.exp(), torch.zeros_like(teacher_topk_logprobs))
+    topk_mass = topk_probs[:, :, :available_topk].sum(dim=-1)
+    _put_if_present(metrics, "opd/overlap/teacher_topk_mass_mean", _masked_mean(topk_mass, valid_topk_rows))
+    return metrics
+
+
 def compute_opd_diagnostics_metrics(
     *,
     student_logprobs: torch.Tensor,
     response_mask: torch.Tensor,
     bin_size: int,
+    response_ids: Optional[torch.Tensor] = None,
     teacher_logprobs: Optional[torch.Tensor] = None,
+    teacher_topk_ids: Optional[torch.Tensor] = None,
+    teacher_topk_logprobs: Optional[torch.Tensor] = None,
     teacher_logprob_nonfinite_positions: Optional[list[Any]] = None,
     entropy: Optional[torch.Tensor] = None,
     rm_scores: Optional[torch.Tensor] = None,
     high_gap_threshold: float = 1.0,
+    overlap_topk: Optional[int] = None,
 ) -> dict[str, float]:
     """Compute low-overhead OPD diagnostics from sampled-token tensors."""
     if student_logprobs.shape != response_mask.shape:
@@ -439,6 +595,24 @@ def compute_opd_diagnostics_metrics(
                 incorrect_mean = _safe_mean(seq_reward.detach().float().cpu()[~labels.detach().cpu()])
                 _put_if_present(metrics, "opd/reward/correct_mean", correct_mean)
                 _put_if_present(metrics, "opd/reward/incorrect_mean", incorrect_mean)
+
+    if (
+        overlap_topk is not None
+        and response_ids is not None
+        and teacher_topk_ids is not None
+        and teacher_topk_logprobs is not None
+    ):
+        metrics.update(
+            compute_overlap_diagnostics(
+                response_ids=response_ids,
+                response_mask=response_mask,
+                teacher_topk_ids=teacher_topk_ids,
+                teacher_topk_logprobs=teacher_topk_logprobs,
+                sampled_teacher_logprobs=teacher_logprobs,
+                bin_size=bin_size,
+                topk=overlap_topk,
+            )
+        )
 
     if entropy is not None:
         if entropy.shape != response_mask.shape:
@@ -580,6 +754,47 @@ def compute_value_heatmap_row(
     return np.asarray(row, dtype=np.float32)
 
 
+def _as_int_list(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().tolist()
+    elif isinstance(value, np.ndarray):
+        value = value.tolist()
+    if not isinstance(value, list | tuple):
+        return []
+    return [int(item) for item in value]
+
+
+def _lcs_length(left: list[int], right: list[int]) -> int:
+    if not left or not right:
+        return 0
+    previous = [0] * (len(right) + 1)
+    for left_item in left:
+        current = [0]
+        for idx, right_item in enumerate(right, start=1):
+            if left_item == right_item:
+                current.append(previous[idx - 1] + 1)
+            else:
+                current.append(max(previous[idx], current[-1]))
+        previous = current
+    return previous[-1]
+
+
+def compute_rewrite_overlap_metrics(original_student_segment_ids: Any, teacher_segment_ids: Any) -> dict[str, float]:
+    """Compare a replaced student segment with the teacher rewrite."""
+    original_ids = _as_int_list(original_student_segment_ids)
+    teacher_ids = _as_int_list(teacher_segment_ids)
+    max_len = max(len(original_ids), len(teacher_ids), 1)
+    min_len = min(len(original_ids), len(teacher_ids))
+    exact_matches = sum(1 for idx in range(min_len) if original_ids[idx] == teacher_ids[idx])
+    return {
+        "rewrite_exact_position_overlap": exact_matches / max_len,
+        "rewrite_lcs_ratio": _lcs_length(original_ids, teacher_ids) / max_len,
+        "rewrite_length_ratio": min_len / max_len,
+    }
+
+
 def compute_intervention_metrics(
     *,
     intervention_counts: list[Any],
@@ -607,6 +822,9 @@ def compute_intervention_metrics(
     first_positions = []
     first_position_fracs = []
     scores = []
+    rewrite_exact_position_overlaps = []
+    rewrite_lcs_ratios = []
+    rewrite_length_ratios = []
     valid_lengths = valid_lengths_tensor.tolist()
     for sample_idx, sample_interventions in enumerate(interventions):
         if sample_interventions is None:
@@ -619,6 +837,22 @@ def compute_intervention_metrics(
             score = item.get("score")
             if score is not None:
                 scores.append(float(score))
+            if {
+                "rewrite_exact_position_overlap",
+                "rewrite_lcs_ratio",
+                "rewrite_length_ratio",
+            }.issubset(item):
+                rewrite_exact_position_overlaps.append(float(item["rewrite_exact_position_overlap"]))
+                rewrite_lcs_ratios.append(float(item["rewrite_lcs_ratio"]))
+                rewrite_length_ratios.append(float(item["rewrite_length_ratio"]))
+            elif "original_student_segment_ids" in item and "teacher_segment_ids" in item:
+                rewrite_metrics = compute_rewrite_overlap_metrics(
+                    item["original_student_segment_ids"],
+                    item["teacher_segment_ids"],
+                )
+                rewrite_exact_position_overlaps.append(rewrite_metrics["rewrite_exact_position_overlap"])
+                rewrite_lcs_ratios.append(rewrite_metrics["rewrite_lcs_ratio"])
+                rewrite_length_ratios.append(rewrite_metrics["rewrite_length_ratio"])
             if item_idx == 0:
                 start = int(item.get("start", 0) or 0)
                 first_positions.append(start)
@@ -634,6 +868,14 @@ def compute_intervention_metrics(
     if scores:
         metrics["opd_intervention/gap_score_mean"] = float(np.mean(scores))
         metrics["opd_intervention/gap_score_max"] = float(np.max(scores))
+    if rewrite_exact_position_overlaps:
+        metrics["opd_intervention/rewrite_exact_position_overlap_mean"] = float(
+            np.mean(rewrite_exact_position_overlaps)
+        )
+    if rewrite_lcs_ratios:
+        metrics["opd_intervention/rewrite_lcs_ratio_mean"] = float(np.mean(rewrite_lcs_ratios))
+    if rewrite_length_ratios:
+        metrics["opd_intervention/rewrite_length_ratio_mean"] = float(np.mean(rewrite_length_ratios))
 
     skipped_counts = []
     skipped_reason_counts: dict[str, int] = {}

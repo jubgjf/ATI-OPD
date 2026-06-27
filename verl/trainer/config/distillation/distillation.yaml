@@ -111,7 +111,8 @@ diagnostics:
   high_gap_threshold: 1.0
   collect_intervention_metrics: true
   collect_topk_overlap: false
-  topk: 16
+  # null: follow distillation_loss.topk; set explicitly to request a wider/narrower diagnostics top-k.
+  topk: null
 
 
 # Number of GPUs per node in the distillation teacher resource pool

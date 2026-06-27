@@ -813,7 +813,7 @@ distillation:
     high_gap_threshold: 1.0
     collect_intervention_metrics: true
     collect_topk_overlap: false
-    topk: 16
+    topk: null
   n_gpus_per_node: 8
   nnodes: 0
   teacher_models:
