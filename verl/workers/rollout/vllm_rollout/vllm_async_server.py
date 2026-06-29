@@ -250,7 +250,7 @@ class vLLMHttpServer:
         args = {
             "dtype": self.config.dtype,
             "load_format": self.config.load_format,
-            "skip_tokenizer_init": self.config.skip_tokenizer_init,
+            "skip_tokenizer_init": False,
             "distributed_executor_backend": "mp",
             "worker_extension_cls": self._get_worker_extension_cls(),
             "trust_remote_code": self.model_config.trust_remote_code,
