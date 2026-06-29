@@ -6,10 +6,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 fi
 
 run_npu_opd_job() {
-    HOME=${HOME:-/home/ma-user}
-    DATASET_DIR=${DATASET_DIR:-/opt/huawei/dataset/jnguan}
-    WORKSPACE=${WORKSPACE:-$DATASET_DIR/code/DMPD}
-    NETRC_PATH=${NETRC_PATH:-$DATASET_DIR/apps/configs/dotnetrc}
+    HOME=/home/ma-user
+    DATASET_DIR=/opt/huawei/dataset/jnguan
+    WORKSPACE=$DATASET_DIR/code/DMPD
+    NETRC_PATH=$DATASET_DIR/apps/configs/dotnetrc
 
     npu-smi info
     echo ============================
