@@ -69,6 +69,24 @@ def test_progressive_horizon_schedule_on_cpu():
     assert compute_distillation_horizon_tokens(horizon_config, global_steps=999) == 5
 
 
+def test_apply_progressive_horizon_uses_start_tokens_on_first_logged_training_step_on_cpu():
+    response_mask = torch.ones(1, 8, dtype=torch.long)
+    batch = TensorDict({"response_mask": response_mask.clone()}, batch_size=[1])
+    data = DataProto(batch=batch)
+    horizon_config = SimpleNamespace(
+        mode="progressive",
+        start_tokens=2,
+        end_tokens=4,
+        increment_tokens=2,
+        interval_steps=1,
+    )
+
+    metrics = apply_distillation_horizon_mask(data=data, horizon_config=horizon_config, global_steps=1)
+
+    assert metrics["distillation/horizon_tokens"] == 2.0
+    assert torch.equal(data.batch["distillation_loss_mask"], torch.tensor([[1, 1, 0, 0, 0, 0, 0, 0]]))
+
+
 def test_full_horizon_does_not_attach_distillation_loss_mask_on_cpu():
     batch = TensorDict({"response_mask": torch.ones(1, 4, dtype=torch.long)}, batch_size=[1])
     data = DataProto(batch=batch)
