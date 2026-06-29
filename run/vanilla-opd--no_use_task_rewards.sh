@@ -4,7 +4,7 @@ set -x
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-DEFAULT_EXPERIMENT_NAME=${EXPERIMENT_NAME:-vanilla-opd}
+DEFAULT_EXPERIMENT_NAME=${EXPERIMENT_NAME:-vanilla-opd--no_use_task_rewards}
 USE_TASK_REWARDS=False
 
 METHOD_HYDRA_OVERRIDES=()

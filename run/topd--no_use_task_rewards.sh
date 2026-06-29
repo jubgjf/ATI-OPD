@@ -4,7 +4,7 @@ set -x
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-DEFAULT_EXPERIMENT_NAME=${EXPERIMENT_NAME:-topd}
+DEFAULT_EXPERIMENT_NAME=${EXPERIMENT_NAME:-topd--no_use_task_rewards}
 USE_TASK_REWARDS=False
 
 distillation_horizon_tokens=${DISTILLATION_HORIZON_TOKENS:-4096}
