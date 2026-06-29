@@ -365,7 +365,10 @@ def apply_distillation_horizon_mask(
     global_steps: int,
 ) -> dict[str, float]:
     """Attach distillation_loss_mask to the batch when TOPD/POPD prefix masking is enabled."""
-    horizon_tokens = compute_distillation_horizon_tokens(horizon_config, global_steps)
+    # The trainer's logged global step is 1-based inside the training loop. Keep the
+    # POPD schedule 0-based so the first optimizer step uses start_tokens.
+    schedule_step = max(int(global_steps) - 1, 0)
+    horizon_tokens = compute_distillation_horizon_tokens(horizon_config, schedule_step)
     if horizon_tokens is None:
         return {}
 
