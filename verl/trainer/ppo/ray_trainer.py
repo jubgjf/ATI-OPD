@@ -21,7 +21,6 @@ This trainer supports model-agonistic model initialization with huggingface
 import copy
 import json
 import os
-import re
 import uuid
 from collections import defaultdict
 from pprint import pprint
@@ -78,6 +77,7 @@ from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
+from verl.utils.reward_score import math_dapo
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
@@ -86,16 +86,17 @@ from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
-_ANSWER_PATTERN_RE = re.compile(r"\banswer\s*:", re.IGNORECASE)
-
 
 def _has_answer_pattern(text: Any) -> bool:
-    return bool(_ANSWER_PATTERN_RE.search(str(text or "")))
+    return math_dapo.has_answer_label(text)
 
 
 def _has_boxed_pattern(text: Any) -> bool:
-    text = str(text or "")
-    return r"\boxed{" in text or r"\boxed " in text
+    return math_dapo.has_boxed_answer(text)
+
+
+def _has_accepted_answer_format(text: Any) -> bool:
+    return math_dapo.has_accepted_answer_format(text)
 
 
 def _is_invalid_pred(value: Any) -> bool:
@@ -121,18 +122,72 @@ def _compute_validation_format_metrics(
         return {
             "format/answer_pattern_rate": 0.0,
             "format/boxed_pattern_rate": 0.0,
+            "format/accepted_answer_format_rate": 0.0,
             "format/invalid_pred_rate": 0.0,
         }
 
     metrics = {
         "format/answer_pattern_rate": float(np.mean([_has_answer_pattern(output) for output in outputs])),
         "format/boxed_pattern_rate": float(np.mean([_has_boxed_pattern(output) for output in outputs])),
+        "format/accepted_answer_format_rate": float(
+            np.mean([_has_accepted_answer_format(output) for output in outputs])
+        ),
     }
     preds = reward_extra_infos_dict.get("pred")
     if preds is None:
         metrics["format/invalid_pred_rate"] = float("nan")
     else:
         metrics["format/invalid_pred_rate"] = float(np.mean([_is_invalid_pred(pred) for pred in preds]))
+    return metrics
+
+
+def _as_metric_values(values: Any) -> list[Any]:
+    if values is None:
+        return []
+    if isinstance(values, np.ndarray):
+        return values.tolist()
+    if isinstance(values, torch.Tensor):
+        return values.detach().cpu().tolist()
+    if isinstance(values, list):
+        return values
+    if isinstance(values, tuple):
+        return list(values)
+    return [values]
+
+
+def _to_bool_metric(value: Any) -> bool:
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return bool(value)
+
+
+def _mean_bool_metric(values: Any) -> float | None:
+    metric_values = _as_metric_values(values)
+    if not metric_values:
+        return None
+    return float(np.mean([_to_bool_metric(value) for value in metric_values]))
+
+
+def _compute_reward_format_metrics(reward_extra_infos_dict: dict[str, Any]) -> dict[str, float]:
+    """Aggregate train-time reward parser diagnostics for wandb/console logging."""
+    metrics = {}
+    key_to_metric = {
+        "has_answer_pattern": "format/answer_pattern_rate",
+        "has_boxed_pattern": "format/boxed_pattern_rate",
+        "has_accepted_answer_format": "format/accepted_answer_format_rate",
+        "invalid_pred": "format/invalid_pred_rate",
+    }
+    for key, metric_name in key_to_metric.items():
+        value = _mean_bool_metric(reward_extra_infos_dict.get(key))
+        if value is not None:
+            metrics[metric_name] = value
+
+    if "format/invalid_pred_rate" not in metrics and "pred" in reward_extra_infos_dict:
+        preds = _as_metric_values(reward_extra_infos_dict.get("pred"))
+        if preds:
+            metrics["format/invalid_pred_rate"] = float(np.mean([_is_invalid_pred(pred) for pred in preds]))
     return metrics
 
 
@@ -156,6 +211,7 @@ def _build_validation_sample_records(
             "pred": _get_reward_extra_value(reward_extra_infos_dict, "pred", idx),
             "has_answer_pattern": _has_answer_pattern(output_text),
             "has_boxed_pattern": _has_boxed_pattern(output_text),
+            "has_accepted_answer_format": _has_accepted_answer_format(output_text),
         }
         if response_lengths is not None:
             record["response_token_count"] = response_lengths[idx] if idx < len(response_lengths) else None
@@ -1022,14 +1078,7 @@ class RayPPOTrainer:
         return metric_dict
 
     def _make_teacher_validation_config(self):
-        teacher_config = copy.deepcopy(self.config)
-        with open_dict(teacher_config.actor_rollout_ref.rollout.val_kwargs):
-            teacher_config.actor_rollout_ref.rollout.val_kwargs.top_p = 1.0
-            teacher_config.actor_rollout_ref.rollout.val_kwargs.top_k = -1
-            teacher_config.actor_rollout_ref.rollout.val_kwargs.temperature = 0
-            if "do_sample" in teacher_config.actor_rollout_ref.rollout.val_kwargs:
-                teacher_config.actor_rollout_ref.rollout.val_kwargs.do_sample = False
-        return teacher_config
+        return copy.deepcopy(self.config)
 
     def _get_teacher_validation_manager(self):
         if self.teacher_validation_manager is not None:
@@ -1082,8 +1131,6 @@ class RayPPOTrainer:
             validation_data_dir=self.config.trainer.get("validation_data_dir", None),
             dump_filename_prefix="teacher_val",
             include_format_metrics=True,
-            repeat_times=1,
-            do_sample=False,
             generation_max_tokens=teacher_generation_max_tokens,
         )
         assert teacher_metrics, f"{teacher_metrics=}"
@@ -1992,7 +2039,7 @@ class RayPPOTrainer:
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
+            val_metrics = self._validate(include_format_metrics=True)
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
@@ -2141,6 +2188,7 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        metrics.update(_compute_reward_format_metrics(reward_extra_infos_dict))
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -2314,7 +2362,7 @@ class RayPPOTrainer:
                     is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
-                        val_metrics: dict = self._validate()
+                        val_metrics: dict = self._validate(include_format_metrics=True)
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)

@@ -180,9 +180,9 @@ class DistillationInterventionConfig(BaseConfig):
     thinking_start_text: str = "<think>"
     thinking_end_text: str = "</think>"
     require_closed_thinking_on_terminal: bool = True
-    teacher_temperature: float = 0.7
-    teacher_top_p: float = 1.0
-    teacher_top_k: int = -1
+    teacher_temperature: float = 0.6
+    teacher_top_p: float = 0.95
+    teacher_top_k: int = 20
     log_examples_per_worker: int = 2
 
     def __post_init__(self):

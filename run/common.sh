@@ -59,8 +59,8 @@ run_npu_opd_job() {
     STUDENT_MODEL=${STUDENT_MODEL:-$DATASET_DIR/models/Qwen/Qwen3-8B}
     TEACHER_MODEL=${TEACHER_MODEL:-$DATASET_DIR/models/Qwen/Qwen3-32B}
 
-    dapo_math_train=${DAPO_MATH_TRAIN:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl/train.parquet}
-    dapo_math_valid=${DAPO_MATH_VALID:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl/test.parquet}
+    dapo_math_train=${DAPO_MATH_TRAIN:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl--qwen3/train.parquet}
+    dapo_math_valid=${DAPO_MATH_VALID:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl--qwen3/test.parquet}
     train_files=${TRAIN_FILES:-"['$dapo_math_train']"}
     valid_files=${VALID_FILES:-"['$dapo_math_valid']"}
 
@@ -83,13 +83,22 @@ run_npu_opd_job() {
     teacher_max_num_batched_tokens=${TEACHER_MAX_NUM_BATCHED_TOKENS:-2048}
     rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-128}
     teacher_max_num_seqs=${TEACHER_MAX_NUM_SEQS:-128}
+    rollout_temperature=${ROLLOUT_TEMPERATURE:-0.6}
+    rollout_top_p=${ROLLOUT_TOP_P:-0.95}
+    rollout_top_k=${ROLLOUT_TOP_K:-20}
+    rollout_do_sample=${ROLLOUT_DO_SAMPLE:-True}
+    val_temperature=${VAL_TEMPERATURE:-$rollout_temperature}
+    val_top_p=${VAL_TOP_P:-$rollout_top_p}
+    val_top_k=${VAL_TOP_K:-$rollout_top_k}
+    val_do_sample=${VAL_DO_SAMPLE:-True}
+    val_n=${VAL_N:-5}
 
     actor_lr=${ACTOR_LR:-1e-6}
     train_batch_size=${TRAIN_BATCH_SIZE:-64}
     ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-64}
     ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-$(( ((max_num_tokens + sp_size - 1) / sp_size + 127) / 128 * 128 ))}
     train_max_samples=${TRAIN_MAX_SAMPLES:--1}
-    val_max_samples=${VAL_MAX_SAMPLES:-4096}
+    val_max_samples=${VAL_MAX_SAMPLES:-256}
     val_batch_size=${VAL_BATCH_SIZE:-256}
     data_seed=${DATA_SEED:--42}
 
@@ -267,11 +276,20 @@ _submit_npu_verl_job() {
         "actor_rollout_ref.rollout.tensor_model_parallel_size=${student_tp}"
         "actor_rollout_ref.rollout.gpu_memory_utilization=${student_gpu_mem_util}"
         "actor_rollout_ref.rollout.n=${ROLLOUT_N:-1}"
+        "actor_rollout_ref.rollout.temperature=${rollout_temperature}"
+        "actor_rollout_ref.rollout.top_p=${rollout_top_p}"
+        "actor_rollout_ref.rollout.top_k=${rollout_top_k}"
+        "actor_rollout_ref.rollout.do_sample=${rollout_do_sample}"
         "actor_rollout_ref.rollout.max_model_len=${max_num_tokens}"
         "actor_rollout_ref.rollout.max_num_batched_tokens=${rollout_max_num_batched_tokens}"
         "actor_rollout_ref.rollout.max_num_seqs=${rollout_max_num_seqs}"
         "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True"
         "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}"
+        "actor_rollout_ref.rollout.val_kwargs.temperature=${val_temperature}"
+        "actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p}"
+        "actor_rollout_ref.rollout.val_kwargs.top_k=${val_top_k}"
+        "actor_rollout_ref.rollout.val_kwargs.do_sample=${val_do_sample}"
+        "actor_rollout_ref.rollout.val_kwargs.n=${val_n}"
         "reward.reward_manager.name=${reward_manager_name}"
         "trainer.balance_batch=True"
         "trainer.logger=${trainer_logger}"

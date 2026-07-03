@@ -17,11 +17,13 @@ import math
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from verl import DataProto
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     _build_validation_sample_records,
+    _compute_reward_format_metrics,
     _compute_validation_format_metrics,
     _TeacherValidationGenerationManager,
 )
@@ -30,13 +32,14 @@ from verl.utils.tracking import ValidationGenerationsLogger
 
 def test_teacher_validation_format_metrics_on_cpu():
     metrics = _compute_validation_format_metrics(
-        ["Answer: 42", r"The final result is \boxed{7}.", "No final answer"],
-        {"pred": ["42", "[INVALID]", None]},
+        ["**Answer:** 42", r"The final result is \boxed{7}.", "No final answer"],
+        {"pred": ["42", "7", None]},
     )
 
     assert metrics["format/answer_pattern_rate"] == pytest.approx(1 / 3)
     assert metrics["format/boxed_pattern_rate"] == pytest.approx(1 / 3)
-    assert metrics["format/invalid_pred_rate"] == pytest.approx(2 / 3)
+    assert metrics["format/accepted_answer_format_rate"] == pytest.approx(2 / 3)
+    assert metrics["format/invalid_pred_rate"] == pytest.approx(1 / 3)
 
 
 def test_teacher_validation_format_metrics_without_pred_on_cpu():
@@ -44,7 +47,30 @@ def test_teacher_validation_format_metrics_without_pred_on_cpu():
 
     assert metrics["format/answer_pattern_rate"] == 1.0
     assert metrics["format/boxed_pattern_rate"] == 0.0
+    assert metrics["format/accepted_answer_format_rate"] == 1.0
     assert math.isnan(metrics["format/invalid_pred_rate"])
+
+
+def test_training_reward_format_metrics_on_cpu():
+    metrics = _compute_reward_format_metrics(
+        {
+            "has_answer_pattern": np.array([True, False, False], dtype=object),
+            "has_boxed_pattern": np.array([False, True, False], dtype=object),
+            "has_accepted_answer_format": np.array([True, True, False], dtype=object),
+            "invalid_pred": np.array([False, False, True], dtype=object),
+        }
+    )
+
+    assert metrics["format/answer_pattern_rate"] == pytest.approx(1 / 3)
+    assert metrics["format/boxed_pattern_rate"] == pytest.approx(1 / 3)
+    assert metrics["format/accepted_answer_format_rate"] == pytest.approx(2 / 3)
+    assert metrics["format/invalid_pred_rate"] == pytest.approx(1 / 3)
+
+
+def test_training_reward_format_metrics_can_fallback_to_pred_on_cpu():
+    metrics = _compute_reward_format_metrics({"pred": np.array(["42", "[INVALID]", ""], dtype=object)})
+
+    assert metrics == {"format/invalid_pred_rate": pytest.approx(2 / 3)}
 
 
 def test_teacher_validation_sample_records_include_format_fields_on_cpu():
@@ -66,6 +92,7 @@ def test_teacher_validation_sample_records_include_format_fields_on_cpu():
             "pred": "42",
             "has_answer_pattern": True,
             "has_boxed_pattern": True,
+            "has_accepted_answer_format": True,
         }
     ]
 
@@ -84,6 +111,48 @@ def test_teacher_validation_metric_prefix_does_not_overwrite_student_on_cpu():
     assert "val-core/math_dapo/acc/mean@1" not in metrics
 
 
+def test_teacher_validation_before_train_uses_val_kwargs_on_cpu():
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.config = OmegaConf.create(
+        {
+            "trainer": {
+                "teacher_val_before_train": True,
+                "teacher_val_max_samples": 7,
+                "log_teacher_val_generations": 0,
+                "validation_data_dir": None,
+            },
+            "distillation": {"enabled": True},
+            "actor_rollout_ref": {"rollout": {"response_length": 128, "val_kwargs": {"n": 5, "do_sample": True}}},
+        }
+    )
+    trainer.use_teacher_policy = True
+    trainer.distillation_config = object()
+    trainer.teacher_validation_generations_logger = object()
+
+    class _Manager:
+        pass
+
+    manager = _Manager()
+    trainer._get_teacher_validation_manager = lambda: manager
+    captured = {}
+
+    def _validate(**kwargs):
+        captured.update(kwargs)
+        return {"teacher-val-core/math_dapo/acc/mean@5": 1.0}
+
+    trainer._validate = _validate
+
+    metrics = trainer._validate_teacher_before_train()
+
+    assert metrics == {"teacher-val-core/math_dapo/acc/mean@5": 1.0}
+    assert captured["generation_manager"] is manager
+    assert captured["metric_prefix"] == "teacher-val"
+    assert captured["max_samples"] == 7
+    assert "repeat_times" not in captured
+    assert "do_sample" not in captured
+    assert captured["generation_max_tokens"] == 128
+
+
 def test_validation_generation_logger_supports_teacher_record_shape_on_cpu():
     sample = {
         "input": "question",
@@ -94,6 +163,7 @@ def test_validation_generation_logger_supports_teacher_record_shape_on_cpu():
         "pred": "42",
         "has_answer_pattern": True,
         "has_boxed_pattern": False,
+        "has_accepted_answer_format": True,
     }
     fields = ValidationGenerationsLogger._sample_fields([sample])
 

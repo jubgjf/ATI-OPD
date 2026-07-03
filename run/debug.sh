@@ -34,8 +34,8 @@ MODEL_ROOT=${MODEL_ROOT:-/share/home/jnguan/share/models}
 DATASET_ROOT=${DATASET_ROOT:-/share/home/jnguan/share/datasets}
 STUDENT_MODEL=${STUDENT_MODEL:-"$MODEL_ROOT/Qwen3-0.6B"}
 TEACHER_MODEL=${TEACHER_MODEL:-"$STUDENT_MODEL"}
-TRAIN_FILE=${TRAIN_FILE:-"$DATASET_ROOT/DAPO-Math-17k-Processed-verl/train.parquet"}
-VAL_FILE=${VAL_FILE:-"$DATASET_ROOT/DAPO-Math-17k-Processed-verl/test.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"$DATASET_ROOT/DAPO-Math-17k-Processed-verl--qwen3/train.parquet"}
+VAL_FILE=${VAL_FILE:-"$DATASET_ROOT/DAPO-Math-17k-Processed-verl--qwen3/test.parquet"}
 
 STUDENT_GPUS=${STUDENT_GPUS:-4}
 TEACHER_GPUS=${TEACHER_GPUS:-4}
@@ -46,8 +46,8 @@ TEACHER_TP=${TEACHER_TP:-$TEACHER_GPUS}
 TEACHER_REPLICAS=${TEACHER_REPLICAS:-1}
 SP_SIZE=${SP_SIZE:-1}
 
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-512}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-128}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-$((2 * 1024))}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-$((18 * 1024))}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 1))}
 ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-1024}
 TEACHER_MAX_NUM_BATCHED_TOKENS=${TEACHER_MAX_NUM_BATCHED_TOKENS:-1024}
@@ -56,20 +56,30 @@ TEACHER_MAX_NUM_SEQS=${TEACHER_MAX_NUM_SEQS:-8}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.45}
 TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.45}
 ROLLOUT_N=${ROLLOUT_N:-1}
-ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-1.0}
+ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-0.6}
+ROLLOUT_TOP_P=${ROLLOUT_TOP_P:-0.95}
+ROLLOUT_TOP_K=${ROLLOUT_TOP_K:-20}
+ROLLOUT_DO_SAMPLE=${ROLLOUT_DO_SAMPLE:-True}
+VAL_TEMPERATURE=${VAL_TEMPERATURE:-$ROLLOUT_TEMPERATURE}
+VAL_TOP_P=${VAL_TOP_P:-$ROLLOUT_TOP_P}
+VAL_TOP_K=${VAL_TOP_K:-$ROLLOUT_TOP_K}
+VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
+VAL_N=${VAL_N:-5}
 ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
-TEACHER_ENFORCE_EAGER=${TEACHER_ENFORCE_EAGER:-True}
+TEACHER_ENFORCE_EAGER=${TEACHER_ENFORCE_EAGER:-False}
 SKIP_TOKENIZER_INIT=${SKIP_TOKENIZER_INIT:-True}
 ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-flash_attention_2}
+REMOTE_DISABLE_LD_PRELOAD=${REMOTE_DISABLE_LD_PRELOAD:-0}
 
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$TRAIN_BATCH_SIZE}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-8}
 TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:-16}
-VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:-16}
+VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:-256}
 DATA_SEED=${DATA_SEED:--42}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-2}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
+TEST_FREQ=${TEST_FREQ:--1}
 ACTOR_LR=${ACTOR_LR:-1e-6}
 PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-$(( (MAX_MODEL_LEN + 127) / 128 * 128 ))}
 
@@ -101,7 +111,12 @@ TEACHER_INTERVENTION_GAP_THRESHOLD=${TEACHER_INTERVENTION_GAP_THRESHOLD:-0.3}
 TEACHER_INTERVENTION_MAX_COUNT=${TEACHER_INTERVENTION_MAX_COUNT:-2}
 TEACHER_INTERVENTION_TRAIN_TEACHER=${TEACHER_INTERVENTION_TRAIN_TEACHER:-False}
 TEACHER_INTERVENTION_MIN_TRAINABLE_TOKENS=${TEACHER_INTERVENTION_MIN_TRAINABLE_TOKENS:-1}
-TEACHER_INTERVENTION_TEMPERATURE=${TEACHER_INTERVENTION_TEMPERATURE:-0.7}
+TEACHER_INTERVENTION_TEMPERATURE=${TEACHER_INTERVENTION_TEMPERATURE:-0.6}
+TEACHER_INTERVENTION_TOP_P=${TEACHER_INTERVENTION_TOP_P:-0.95}
+TEACHER_INTERVENTION_TOP_K=${TEACHER_INTERVENTION_TOP_K:-20}
+
+VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
+TEACHER_VAL_BEFORE_TRAIN=${TEACHER_VAL_BEFORE_TRAIN:-True}
 
 EXPERIMENT_TIMESTAMP=${EXPERIMENT_TIMESTAMP:-$(date +"%Y%m%d-%H%M%S")}
 EXPERIMENT_BASE_NAME=${EXPERIMENT_NAME:-"debug-${DEBUG_MODE}"}
@@ -148,6 +163,8 @@ case "$DEBUG_MODE" in
             "distillation.intervention.train_on_teacher_segments=${TEACHER_INTERVENTION_TRAIN_TEACHER}"
             "distillation.intervention.min_trainable_tokens_after_repair=${TEACHER_INTERVENTION_MIN_TRAINABLE_TOKENS}"
             "distillation.intervention.teacher_temperature=${TEACHER_INTERVENTION_TEMPERATURE}"
+            "distillation.intervention.teacher_top_p=${TEACHER_INTERVENTION_TOP_P}"
+            "distillation.intervention.teacher_top_k=${TEACHER_INTERVENTION_TOP_K}"
         )
         ;;
     *)
@@ -193,6 +210,9 @@ COMMON_OVERRIDES=(
     "actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION}"
     "actor_rollout_ref.rollout.n=${ROLLOUT_N}"
     "actor_rollout_ref.rollout.temperature=${ROLLOUT_TEMPERATURE}"
+    "actor_rollout_ref.rollout.top_p=${ROLLOUT_TOP_P}"
+    "actor_rollout_ref.rollout.top_k=${ROLLOUT_TOP_K}"
+    "actor_rollout_ref.rollout.do_sample=${ROLLOUT_DO_SAMPLE}"
     "actor_rollout_ref.rollout.max_model_len=${MAX_MODEL_LEN}"
     "actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
     "actor_rollout_ref.rollout.max_num_seqs=${ROLLOUT_MAX_NUM_SEQS}"
@@ -200,10 +220,11 @@ COMMON_OVERRIDES=(
     "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}"
     "actor_rollout_ref.rollout.enforce_eager=${ROLLOUT_ENFORCE_EAGER}"
     "actor_rollout_ref.rollout.skip_tokenizer_init=${SKIP_TOKENIZER_INIT}"
-    "actor_rollout_ref.rollout.val_kwargs.temperature=0"
-    "actor_rollout_ref.rollout.val_kwargs.do_sample=False"
-    "actor_rollout_ref.rollout.val_kwargs.top_p=1.0"
-    "actor_rollout_ref.rollout.val_kwargs.n=1"
+    "actor_rollout_ref.rollout.val_kwargs.temperature=${VAL_TEMPERATURE}"
+    "actor_rollout_ref.rollout.val_kwargs.do_sample=${VAL_DO_SAMPLE}"
+    "actor_rollout_ref.rollout.val_kwargs.top_p=${VAL_TOP_P}"
+    "actor_rollout_ref.rollout.val_kwargs.top_k=${VAL_TOP_K}"
+    "actor_rollout_ref.rollout.val_kwargs.n=${VAL_N}"
     "reward.reward_manager.name=naive"
     "critic.enable=False"
     "trainer.balance_batch=True"
@@ -214,10 +235,11 @@ COMMON_OVERRIDES=(
     "trainer.nnodes=${STUDENT_NNODES}"
     "trainer.device=cuda"
     "trainer.default_local_dir=${DEFAULT_LOCAL_DIR}"
-    "trainer.val_before_train=False"
-    "trainer.teacher_val_before_train=False"
+    "trainer.val_before_train=${VAL_BEFORE_TRAIN}"
+    "trainer.teacher_val_before_train=${TEACHER_VAL_BEFORE_TRAIN}"
+    "trainer.teacher_val_max_samples=${VAL_MAX_SAMPLES}"
     "trainer.save_freq=-1"
-    "trainer.test_freq=-1"
+    "trainer.test_freq=${TEST_FREQ}"
     "trainer.total_epochs=${TOTAL_EPOCHS}"
     "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}"
     "distillation.enabled=True"
@@ -269,6 +291,12 @@ print({
     "numba_njit_result": int(f(41)),
 }, flush=True)'
 
+if [[ "$REMOTE_DISABLE_LD_PRELOAD" == "1" ]]; then
+    REMOTE_LD_PRELOAD_LINE='unset LD_PRELOAD'
+else
+    REMOTE_LD_PRELOAD_LINE='export LD_PRELOAD="/lib64/libgomp.so.1:/lib64/libstdc++.so.6:/lib64/libgcc_s.so.1:${LD_PRELOAD:-}"'
+fi
+
 REMOTE_CMD='set -euo pipefail
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 export WANDB_MODE=disabled
@@ -282,7 +310,7 @@ export MKL_NUM_THREADS=1
 export NCCL_DEBUG=WARN
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ATTENTION_BACKEND='"${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"'
-export LD_PRELOAD="/lib64/libgomp.so.1:/lib64/libstdc++.so.6:/lib64/libgcc_s.so.1:${LD_PRELOAD:-}"
+'"${REMOTE_LD_PRELOAD_LINE}"'
 echo "[debug] remote pwd=$PWD"
 test -f '"$(printf "%q" "$TRAIN_FILE")"' || { echo "Missing TRAIN_FILE='"$TRAIN_FILE"'" >&2; exit 2; }
 test -f '"$(printf "%q" "$VAL_FILE")"' || { echo "Missing VAL_FILE='"$VAL_FILE"'" >&2; exit 2; }

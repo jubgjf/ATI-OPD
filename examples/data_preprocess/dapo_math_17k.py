@@ -23,6 +23,7 @@ deterministic train/test split when no test split is present.
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,17 @@ DATA_SOURCE = "open-r1/DAPO-Math-17k-Processed"
 REWARD_DATA_SOURCE = "math_dapo"
 DEFAULT_CONFIG_NAME = os.environ.get("DAPO_MATH_17K_CONFIG", "all")
 DEFAULT_LOCAL_DATASET_PATH = os.environ.get("DAPO_MATH_17K_LOCAL_PATH", "~/data/DAPO-Math-17k-Processed")
+PROMPT_STYLE_DAPO = "dapo"
+PROMPT_STYLE_QWEN3_BOXED = "qwen3_boxed"
+QWEN3_MATH_BOXED_INSTRUCTION = "Please reason step by step, and put your final answer within \\boxed{}."
+QWEN3_PROMPT_CLEANUP_PATTERNS = (
+    re.compile(
+        r"\s*让我们一步一步地思考。请以[“\"]Answer:\s*\\boxed\{<final_answer>\}[”\"]的格式输出最终答案。"
+        r"如果是选择题，请按顺序输出正确的选项，不带任何标点或空格。"
+        r"对于其他类型的问题，请只输出最终答案的数值。?\s*$"
+    ),
+    re.compile(r"\s*Remember to put your answer on its own line after [\"“]Answer:[\"”]\.?\s*$"),
+)
 
 
 def _expand_path(path: str) -> Path:
@@ -52,9 +64,24 @@ def _loads_json_field(value: Any, field_name: str, idx: int) -> Any:
         raise ValueError(f"DAPO-Math row {idx} has invalid JSON in {field_name}: {value[:200]!r}") from exc
 
 
+def _loads_prompt_field(value: Any, idx: int) -> Any:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError(f"DAPO-Math row {idx} has an empty prompt field.")
+    if not stripped.startswith(("{", "[")):
+        return value
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        # Raw problem text can start with markup like "[i]...[/i]".
+        return value
+
+
 def normalize_prompt(prompt: Any, idx: int) -> list[dict[str, str]]:
     """Normalize DAPO prompt variants to verl's single-turn chat-message schema."""
-    prompt = _loads_json_field(prompt, "prompt", idx)
+    prompt = _loads_prompt_field(prompt, idx)
     if isinstance(prompt, str):
         messages = [{"role": "user", "content": prompt}]
     elif isinstance(prompt, dict):
@@ -73,6 +100,40 @@ def normalize_prompt(prompt: Any, idx: int) -> list[dict[str, str]]:
     content = message.get("content")
     if role != "user" or not isinstance(content, str) or not content.strip():
         raise ValueError(f"DAPO-Math row {idx} has invalid prompt message: {message!r}.")
+    return [{"role": "user", "content": content}]
+
+
+def prompt_to_text(prompt: Any, idx: int) -> str:
+    """Extract a single user text prompt from raw text or chat-message variants."""
+    prompt = _loads_prompt_field(prompt, idx)
+    if isinstance(prompt, str):
+        text = prompt
+    else:
+        text = normalize_prompt(prompt, idx)[0]["content"]
+    text = text.strip()
+    if not text:
+        raise ValueError(f"DAPO-Math row {idx} has an empty prompt.")
+    return text
+
+
+def clean_qwen3_math_problem_text(text: str) -> str:
+    """Remove known answer-format suffixes before appending the Qwen3 boxed instruction."""
+    cleaned = text.strip()
+    changed = True
+    while changed:
+        changed = False
+        for pattern in QWEN3_PROMPT_CLEANUP_PATTERNS:
+            updated = pattern.sub("", cleaned).strip()
+            if updated != cleaned:
+                cleaned = updated
+                changed = True
+    return cleaned
+
+
+def build_qwen3_boxed_prompt(prompt: Any, idx: int) -> list[dict[str, str]]:
+    """Build Qwen3 math best-practice prompt from the raw problem text."""
+    problem = clean_qwen3_math_problem_text(prompt_to_text(prompt, idx))
+    content = f"{problem}\n\n{QWEN3_MATH_BOXED_INSTRUCTION}"
     return [{"role": "user", "content": content}]
 
 
@@ -110,15 +171,24 @@ def _build_reward_model_from_answer(example: dict[str, Any], idx: int) -> dict[s
     )
 
 
-def _select_prompt_value(example: dict[str, Any], idx: int) -> Any:
+def _select_prompt_value(example: dict[str, Any], idx: int, prompt_style: str = PROMPT_STYLE_DAPO) -> Any:
     # open-r1 keeps the original DAPO chat prompt in source_prompt. The prompt
     # column is a raw problem string intended for TRL-style trainers.
-    for field_name in ("source_prompt", "prompt", "problem", "question"):
+    if prompt_style == PROMPT_STYLE_QWEN3_BOXED:
+        field_names = ("prompt", "problem", "question")
+    elif prompt_style == PROMPT_STYLE_DAPO:
+        field_names = ("source_prompt", "prompt", "problem", "question")
+    else:
+        raise ValueError(
+            f"prompt_style must be one of {PROMPT_STYLE_DAPO!r}/{PROMPT_STYLE_QWEN3_BOXED!r}, got {prompt_style!r}."
+        )
+
+    for field_name in field_names:
         prompt = example.get(field_name)
         if prompt is not None:
             return prompt
 
-    raise ValueError(f"DAPO-Math row {idx} must contain source_prompt, prompt, problem, or question.")
+    raise ValueError(f"DAPO-Math row {idx} must contain one of {', '.join(field_names)}.")
 
 
 def _load_parquet_files(path: Path, config_name: str) -> datasets.DatasetDict:
@@ -184,7 +254,9 @@ def load_dapo_dataset(
     )
 
 
-def validate_and_tag_dataset(dataset: datasets.Dataset, split: str) -> datasets.Dataset:
+def validate_and_tag_dataset(
+    dataset: datasets.Dataset, split: str, prompt_style: str = PROMPT_STYLE_DAPO
+) -> datasets.Dataset:
     def process_fn(example: dict[str, Any], idx: int) -> dict[str, Any]:
         source_data_source = example.get("data_source")
         if source_data_source not in (None, REWARD_DATA_SOURCE):
@@ -193,13 +265,18 @@ def validate_and_tag_dataset(dataset: datasets.Dataset, split: str) -> datasets.
                 f"expected {REWARD_DATA_SOURCE!r} or a missing value."
             )
 
-        prompt = normalize_prompt(_select_prompt_value(example, idx), idx)
+        prompt_value = _select_prompt_value(example, idx, prompt_style=prompt_style)
+        if prompt_style == PROMPT_STYLE_QWEN3_BOXED:
+            prompt = build_qwen3_boxed_prompt(prompt_value, idx)
+        else:
+            prompt = normalize_prompt(prompt_value, idx)
         reward_model = _build_reward_model_from_answer(example, idx)
 
         extra_info = normalize_extra_info(example.get("extra_info"), idx)
         extra_info.setdefault("index", str(idx))
         extra_info["split"] = split
         extra_info["source_dataset"] = DATA_SOURCE
+        extra_info["prompt_style"] = prompt_style
         if source_data_source is not None:
             extra_info["source_data_source"] = source_data_source
 
@@ -223,6 +300,7 @@ def build_train_test_split(
     dataset_dict: datasets.DatasetDict,
     test_size: float,
     seed: int,
+    prompt_style: str = PROMPT_STYLE_DAPO,
 ) -> tuple[datasets.Dataset, datasets.Dataset]:
     if "train" not in dataset_dict:
         raise ValueError(f"DAPO-Math dataset must contain a train split; found splits: {list(dataset_dict.keys())}")
@@ -240,7 +318,10 @@ def build_train_test_split(
     if len(train_dataset) == 0 or len(test_dataset) == 0:
         raise ValueError(f"DAPO-Math split is empty: train={len(train_dataset)}, test={len(test_dataset)}")
 
-    return validate_and_tag_dataset(train_dataset, "train"), validate_and_tag_dataset(test_dataset, "test")
+    return (
+        validate_and_tag_dataset(train_dataset, "train", prompt_style=prompt_style),
+        validate_and_tag_dataset(test_dataset, "test", prompt_style=prompt_style),
+    )
 
 
 def write_examples(local_save_dir: Path, train_dataset: datasets.Dataset, test_dataset: datasets.Dataset) -> None:
@@ -256,12 +337,14 @@ def write_dataset_info(
     test_dataset: datasets.Dataset,
     local_dataset_path: str,
     config_name: str,
+    prompt_style: str,
     test_size: float,
     seed: int,
 ) -> None:
     info = {
         "source": DATA_SOURCE,
         "config_name": config_name,
+        "prompt_style": prompt_style,
         "local_dataset_path": str(_expand_path(local_dataset_path)),
         "train_rows": len(train_dataset),
         "test_rows": len(test_dataset),
@@ -286,6 +369,15 @@ if __name__ == "__main__":
         "--local_save_dir",
         default="~/data/dapo-math-17k-processed-verl",
         help="The save directory for the preprocessed train/test parquet files.",
+    )
+    parser.add_argument(
+        "--prompt_style",
+        default=PROMPT_STYLE_DAPO,
+        choices=(PROMPT_STYLE_DAPO, PROMPT_STYLE_QWEN3_BOXED),
+        help=(
+            "Prompt template to emit. 'dapo' preserves open-r1 source_prompt when available. "
+            "'qwen3_boxed' uses the raw prompt/problem text and appends Qwen3's boxed-answer math instruction."
+        ),
     )
     parser.add_argument(
         "--config_name",
@@ -313,7 +405,9 @@ if __name__ == "__main__":
     local_save_path.mkdir(parents=True, exist_ok=True)
 
     dataset = load_dapo_dataset(args.local_dataset_path, download=args.download, config_name=args.config_name)
-    train_dataset, test_dataset = build_train_test_split(dataset, test_size=args.test_size, seed=args.seed)
+    train_dataset, test_dataset = build_train_test_split(
+        dataset, test_size=args.test_size, seed=args.seed, prompt_style=args.prompt_style
+    )
 
     train_path = local_save_path / "train.parquet"
     test_path = local_save_path / "test.parquet"
@@ -326,6 +420,7 @@ if __name__ == "__main__":
         test_dataset,
         args.local_dataset_path,
         args.config_name,
+        args.prompt_style,
         args.test_size,
         args.seed,
     )

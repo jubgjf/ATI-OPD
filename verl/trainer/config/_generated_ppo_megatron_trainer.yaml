@@ -865,9 +865,9 @@ distillation:
     thinking_start_text: <think>
     thinking_end_text: </think>
     require_closed_thinking_on_terminal: true
-    teacher_temperature: 0.7
-    teacher_top_p: 1.0
-    teacher_top_k: -1
+    teacher_temperature: 0.6
+    teacher_top_p: 0.95
+    teacher_top_k: 20
     log_examples_per_worker: 2
   diagnostics:
     _target_: verl.workers.config.DistillationDiagnosticsConfig
@@ -912,7 +912,7 @@ distillation:
         skip_tokenizer_init: true
         prompt_length: ${oc.select:actor_rollout_ref.rollout.prompt_length}
         response_length: ${oc.select:actor_rollout_ref.rollout.response_length}
-        temperature: ${oc.select:actor_rollout_ref.rollout.temperature}
+        temperature: 1.0
   teacher_key: data_source
 trainer:
   balance_batch: true
