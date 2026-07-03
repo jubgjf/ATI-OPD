@@ -194,6 +194,7 @@ _run_npu_head_node() {
         --dashboard-port="$DASHBOARD_PORT" \
         --resources='{"NPU": '"$NPUS_PER_NODE"'}' \
         --block &
+    local ray_head_pid=$!
 
     echo "Waiting 10s for GCS to initialize..."
     sleep "${RAY_GCS_INIT_SLEEP_SECONDS:-10}"
@@ -217,16 +218,33 @@ _run_npu_head_node() {
         fi
     done
 
+    local job_exit_code=0
+    local errexit_was_set=0
+    case "$-" in
+        *e*) errexit_was_set=1 ;;
+    esac
+    set +e
     _submit_npu_verl_job
+    job_exit_code=$?
+    if [[ "$errexit_was_set" -eq 1 ]]; then
+        set -e
+    else
+        set +e
+    fi
 
-    echo "Job submitted. Check Dashboard at http://$CURRENT_IP:$DASHBOARD_PORT"
-    df -h
-    exit 0
+    echo "Ray job finished with exit code: $job_exit_code"
+    echo "Check Dashboard at http://$CURRENT_IP:$DASHBOARD_PORT"
+    df -h || true
+    echo "Stopping Ray cluster before exiting head node..."
+    ray stop --force || true
+    wait "$ray_head_pid" 2>/dev/null || true
+    exit "$job_exit_code"
 }
 
 _run_npu_worker_node() {
     echo "Starting Ray WORKER node connecting to $MASTER_ADDR..."
 
+    local restart_on_exit=${RAY_WORKER_RESTART_ON_EXIT:-False}
     while true; do
         echo "Attempting to connect to Ray Head ($MASTER_ADDR:$MASTER_PORT) from $MA_CURRENT_IP..."
 
@@ -236,7 +254,11 @@ _run_npu_worker_node() {
             --block
 
         EXIT_CODE=$?
-        echo "Ray worker 异常退出 (Exit Code: $EXIT_CODE)。可能是连接超时或网络波动，15秒后自动重试..."
+        echo "Ray worker exited with code $EXIT_CODE."
+        if [[ "$restart_on_exit" != "True" && "$restart_on_exit" != "true" && "$restart_on_exit" != "1" ]]; then
+            exit "$EXIT_CODE"
+        fi
+        echo "RAY_WORKER_RESTART_ON_EXIT=${restart_on_exit}; retrying in 15s..."
         sleep 15
     done
 }
