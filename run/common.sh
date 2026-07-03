@@ -56,8 +56,8 @@ run_npu_opd_job() {
     export VLLM_USE_V1=${VLLM_USE_V1:-1}
     ulimit -n "${ULIMIT_NOFILE:-65536}"
 
-    STUDENT_MODEL=${STUDENT_MODEL:-$DATASET_DIR/models/Qwen/Qwen3-8B}
-    TEACHER_MODEL=${TEACHER_MODEL:-$DATASET_DIR/models/Qwen/Qwen3-32B}
+    STUDENT_MODEL=${STUDENT_MODEL:-$DATASET_DIR/models/Qwen/Qwen3-1.7B}
+    TEACHER_MODEL=${TEACHER_MODEL:-$DATASET_DIR/models/Qwen/Qwen3-4B}
 
     dapo_math_train=${DAPO_MATH_TRAIN:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl--qwen3/train.parquet}
     dapo_math_valid=${DAPO_MATH_VALID:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl--qwen3/test.parquet}
@@ -77,7 +77,7 @@ run_npu_opd_job() {
     TEACHER_REPLICAS=${TEACHER_REPLICAS:-$((TEACHER_NNODES * TEACHER_NGPUS_PER_NODE / teacher_tp))}
 
     max_prompt_length=${MAX_PROMPT_LENGTH:-$((2 * 1024))}
-    max_response_length=${MAX_RESPONSE_LENGTH:-$((18 * 1024))}
+    max_response_length=${MAX_RESPONSE_LENGTH:-$((22 * 1024))}
     max_num_tokens=${MAX_NUM_TOKENS:-$((max_prompt_length + max_response_length + 1))}
     rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-2048}
     teacher_max_num_batched_tokens=${TEACHER_MAX_NUM_BATCHED_TOKENS:-2048}

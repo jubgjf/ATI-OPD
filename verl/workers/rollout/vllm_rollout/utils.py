@@ -14,6 +14,7 @@
 import ctypes
 import json
 import logging
+import math
 import os
 import platform
 import signal
@@ -38,6 +39,59 @@ VLLM_LORA_NAME = "123"
 VLLM_LORA_PATH = "simon_lora_path"
 
 VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
+
+
+def _top_prompt_logprobs_from_vllm_logprobs(logprobs_dict: dict, width: int) -> tuple[list[int], list[float]]:
+    """Return a rectangular top-k prompt-logprob row from a vLLM logprobs dict.
+
+    CUDA vLLM returns compact 1-based ranks for prompt logprobs, but some backends
+    can return rank metadata that is sparse or outside the requested top-k width.
+    Fall back to sorting by logprob so teacher prompt scoring remains backend
+    compatible while preserving the requested fixed-width contract.
+    """
+    if width <= 0:
+        raise ValueError(f"prompt_logprobs width must be positive, got {width}.")
+
+    prompt_ids: list[int | None] = [None] * width
+    prompt_logprobs: list[float | None] = [None] * width
+    rank_is_usable = True
+
+    for token_id_str, token_logprob in logprobs_dict.items():
+        try:
+            rank = int(token_logprob.rank)
+        except (TypeError, ValueError):
+            rank_is_usable = False
+            continue
+        if rank < 1:
+            rank_is_usable = False
+            continue
+        if rank > width:
+            continue
+
+        index = rank - 1
+        if prompt_ids[index] is not None:
+            rank_is_usable = False
+            continue
+        prompt_ids[index] = int(token_id_str)
+        prompt_logprobs[index] = float(token_logprob.logprob)
+
+    if rank_is_usable and all(token_id is not None for token_id in prompt_ids):
+        return [int(token_id) for token_id in prompt_ids], [float(logprob) for logprob in prompt_logprobs]
+
+    sorted_items = sorted(
+        logprobs_dict.items(),
+        key=lambda item: (
+            float(item[1].logprob) if math.isfinite(float(item[1].logprob)) else float("-inf"),
+            -int(item[0]),
+        ),
+        reverse=True,
+    )
+    prompt_ids = [int(token_id_str) for token_id_str, _ in sorted_items[:width]]
+    prompt_logprobs = [float(token_logprob.logprob) for _, token_logprob in sorted_items[:width]]
+    if len(prompt_ids) < width:
+        prompt_ids.extend([0] * (width - len(prompt_ids)))
+        prompt_logprobs.extend([float("-inf")] * (width - len(prompt_logprobs)))
+    return prompt_ids, prompt_logprobs
 
 
 def set_death_signal():
@@ -362,17 +416,10 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
             prompt_logprobs_ls.append([logprob])
             prompt_ids_ls.append([int(token_id_str)])
         else:
-            prompt_ids = [None] * num_prompt_logprobs
-            prompt_logprobs = [None] * num_prompt_logprobs
-            # We get either top-k logprobs or top-k plus the sampled logprob (if sampled token is not in top-k)
-            assert len(logprobs_dict) in [num_prompt_logprobs, num_prompt_logprobs + 1], len(logprobs_dict)
-            for token_id_str, token_logprob in logprobs_dict.items():
-                rank = token_logprob.rank
-                if rank > num_prompt_logprobs:
-                    continue  # the sampled token is not in the top-k
-                logprob = token_logprob.logprob
-                prompt_ids[rank - 1] = int(token_id_str)
-                prompt_logprobs[rank - 1] = logprob
+            prompt_ids, prompt_logprobs = _top_prompt_logprobs_from_vllm_logprobs(
+                logprobs_dict=logprobs_dict,
+                width=num_prompt_logprobs,
+            )
             prompt_logprobs_ls.append(prompt_logprobs)
             prompt_ids_ls.append(prompt_ids)
 
