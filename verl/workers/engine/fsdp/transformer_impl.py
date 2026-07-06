@@ -932,6 +932,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         output_args = {}
 
         if use_remove_padding:
+            output_args["output_offsets"] = input_ids.offsets().detach().cpu().clone()
             # support per sample temperature
             # temperature (bsz,)
             # input_ids (bsz, j1)
@@ -1005,6 +1006,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
                 input_ids_rmpad_rolled = torch.roll(input_ids.values(), shifts=-1, dims=0)
                 output_args["input_ids_rmpad_rolled"] = input_ids_rmpad_rolled
+                output_args["output_offsets"] = input_ids.offsets().detach().clone()
                 # we store the per sample temperature
                 output_args["temperature"] = temperature
 
@@ -1064,8 +1066,6 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         model_output = {}
 
-        input_ids = micro_batch["input_ids"]
-
         if use_remove_padding:
             input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
             temperature_rmpad = output_args["temperature_rmpad"]
@@ -1104,7 +1104,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
                 if distillation_use_topk:
                     outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
-                    output_offsets = input_ids.offsets()
+                    output_offsets = output_args["output_offsets"]
                     for k, v in outputs.items():
                         v = v.squeeze(0)
                         assert v.shape == log_probs.shape, f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
@@ -1144,7 +1144,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     )
 
             if pad_mode == DatasetPadMode.NO_PADDING:
-                output_offsets = input_ids.offsets()
+                output_offsets = output_args["output_offsets"]
                 # (bsz, j1), for each sample, is the length of each sample: [real_prompt length + real_response length]
                 log_probs = tu.jagged_tensor_parts_from_values(
                     log_probs,
@@ -1188,7 +1188,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     sum_pi_squared = verl_F.calculate_sum_pi_squared_from_logits(logits)
 
                 if pad_mode == DatasetPadMode.NO_PADDING:
-                    output_offsets = input_ids.offsets()
+                    output_offsets = output_args["output_offsets"]
                     seq_lengths = output_offsets.diff()
                     starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
                     logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
