@@ -21,15 +21,20 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
+MAX_REASONABLE_ENTROPY = 32.0
+MAX_REASONABLE_LOGPROB_ABS = 1.0e4
+
 
 def _to_cpu_float(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().float().cpu()
 
 
-def _masked_values(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def _masked_values(values: torch.Tensor, mask: torch.Tensor, value_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     values = _to_cpu_float(values)
     mask = mask.detach().bool().cpu()
     valid = mask & torch.isfinite(values)
+    if value_mask is not None:
+        valid = valid & value_mask.detach().bool().cpu()
     return values[valid]
 
 
@@ -58,6 +63,15 @@ def _masked_quantile(values: torch.Tensor, mask: torch.Tensor, q: float) -> Opti
     return _safe_quantile(_masked_values(values, mask), q)
 
 
+def _masked_event_fraction(event_mask: torch.Tensor, mask: torch.Tensor) -> Optional[float]:
+    mask = mask.detach().bool().cpu()
+    denom = int(mask.sum().item())
+    if denom == 0:
+        return None
+    event_mask = event_mask.detach().bool().cpu()
+    return int((event_mask & mask).sum().item()) / denom
+
+
 def _bin_key(prefix: str, start: int, end: int) -> str:
     return f"{prefix}/{start:04d}_{end:04d}"
 
@@ -68,6 +82,7 @@ def compute_binned_token_means(
     *,
     bin_size: int,
     prefix: str,
+    value_mask: Optional[torch.Tensor] = None,
 ) -> dict[str, float]:
     """Compute position-binned token means for a [batch, response_len] tensor."""
     if bin_size <= 0:
@@ -77,9 +92,11 @@ def compute_binned_token_means(
 
     metrics: dict[str, float] = {}
     response_len = values.shape[1]
+    value_mask_cpu = value_mask.detach().bool().cpu() if value_mask is not None else None
     for start in range(0, response_len, bin_size):
         end = min(start + bin_size, response_len)
-        mean = _masked_mean(values[:, start:end], mask[:, start:end])
+        bin_value_mask = value_mask_cpu[:, start:end] if value_mask_cpu is not None else None
+        mean = _safe_mean(_masked_values(values[:, start:end], mask[:, start:end], bin_value_mask))
         _put_if_present(metrics, _bin_key(prefix, start, end), mean)
     return metrics
 
@@ -553,10 +570,25 @@ def compute_opd_diagnostics_metrics(
         if teacher_logprobs.ndim == 3 and teacher_logprobs.shape[-1] == 1:
             teacher_logprobs = teacher_logprobs.squeeze(-1)
         if teacher_logprobs.shape == student_logprobs.shape:
-            token_reward = teacher_logprobs - student_logprobs
+            student_logprobs_cpu = _to_cpu_float(student_logprobs)
+            teacher_logprobs_cpu = _to_cpu_float(teacher_logprobs)
+            response_mask_cpu = response_mask.detach().bool().cpu()
+            gap_value_mask = (
+                torch.isfinite(student_logprobs_cpu)
+                & torch.isfinite(teacher_logprobs_cpu)
+                & (student_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
+                & (teacher_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
+            )
+            _put_if_present(
+                metrics,
+                "opd/gap_abs/outlier_token_fraction",
+                _masked_event_fraction(~gap_value_mask, response_mask_cpu),
+            )
+            valid_gap_response_mask = response_mask_cpu & gap_value_mask
+            token_reward = teacher_logprobs_cpu - student_logprobs_cpu
             abs_gap = token_reward.abs()
-            reward_values = _masked_values(token_reward, response_mask)
-            abs_gap_values = _masked_values(abs_gap, response_mask)
+            reward_values = _masked_values(token_reward, response_mask_cpu, gap_value_mask)
+            abs_gap_values = _masked_values(abs_gap, response_mask_cpu, gap_value_mask)
             _put_if_present(metrics, "opd/reward/mean", _safe_mean(reward_values))
             _put_if_present(metrics, "opd/reward/p10", _safe_quantile(reward_values, 0.1))
             _put_if_present(metrics, "opd/reward/p90", _safe_quantile(reward_values, 0.9))
@@ -565,10 +597,10 @@ def compute_opd_diagnostics_metrics(
             abs_gap_max = float(abs_gap_values.max().item()) if abs_gap_values.numel() else None
             _put_if_present(metrics, "opd/gap_abs/max", abs_gap_max)
             if abs_gap_values.numel():
-                high_gap_mask = (abs_gap > high_gap_threshold) & response_mask & torch.isfinite(abs_gap.float())
+                high_gap_mask = (abs_gap > high_gap_threshold) & valid_gap_response_mask
                 high_gap_metrics = compute_event_position_metrics(
                     event_mask=high_gap_mask,
-                    response_mask=response_mask,
+                    response_mask=valid_gap_response_mask,
                     metric_prefix="opd/gap_abs/high",
                     suffix_separator="_",
                     token_fraction_suffix="token_fraction",
@@ -578,16 +610,34 @@ def compute_opd_diagnostics_metrics(
                 metrics.update(high_gap_metrics)
                 metrics["opd/gap_abs/high_fraction"] = high_gap_metrics["opd/gap_abs/high_token_fraction"]
             metrics.update(
-                compute_binned_token_means(abs_gap, response_mask, bin_size=bin_size, prefix="opd/gap_abs_bin")
+                compute_binned_token_means(
+                    abs_gap,
+                    response_mask_cpu,
+                    bin_size=bin_size,
+                    prefix="opd/gap_abs_bin",
+                    value_mask=gap_value_mask,
+                )
             )
             metrics.update(
-                compute_binned_token_means(token_reward, response_mask, bin_size=bin_size, prefix="opd/reward_bin")
+                compute_binned_token_means(
+                    token_reward,
+                    response_mask_cpu,
+                    bin_size=bin_size,
+                    prefix="opd/reward_bin",
+                    value_mask=gap_value_mask,
+                )
             )
-            metrics.update(_head_tail_metrics(abs_gap, response_mask, prefix="opd/gap_abs", bin_size=bin_size))
-            metrics.update(_head_tail_metrics(token_reward, response_mask, prefix="opd/reward", bin_size=bin_size))
+            metrics.update(
+                _head_tail_metrics(abs_gap, valid_gap_response_mask, prefix="opd/gap_abs", bin_size=bin_size)
+            )
+            metrics.update(
+                _head_tail_metrics(token_reward, valid_gap_response_mask, prefix="opd/reward", bin_size=bin_size)
+            )
 
             if rm_scores is not None:
-                seq_reward = (token_reward * response_mask).sum(dim=1) / response_mask.sum(dim=1).clamp_min(1)
+                seq_reward = (token_reward * valid_gap_response_mask).sum(dim=1) / valid_gap_response_mask.sum(
+                    dim=1
+                ).clamp_min(1)
                 labels = rm_scores.detach().float().sum(dim=1) > 0
                 auc = binary_auc(seq_reward, labels)
                 _put_if_present(metrics, "opd/reward/correct_auc", auc)
@@ -617,11 +667,32 @@ def compute_opd_diagnostics_metrics(
     if entropy is not None:
         if entropy.shape != response_mask.shape:
             raise ValueError(f"entropy and response_mask must align, got {entropy.shape=} and {response_mask.shape=}.")
-        entropy_values = _masked_values(entropy, response_mask)
+        entropy_cpu = _to_cpu_float(entropy)
+        response_mask_cpu = response_mask.detach().bool().cpu()
+        entropy_value_mask = (
+            torch.isfinite(entropy_cpu) & (entropy_cpu >= 0.0) & (entropy_cpu <= MAX_REASONABLE_ENTROPY)
+        )
+        _put_if_present(
+            metrics,
+            "opd/entropy/outlier_token_fraction",
+            _masked_event_fraction(~entropy_value_mask, response_mask_cpu),
+        )
+        valid_entropy_response_mask = response_mask_cpu & entropy_value_mask
+        entropy_values = _masked_values(entropy_cpu, response_mask_cpu, entropy_value_mask)
         _put_if_present(metrics, "opd/entropy/mean", _safe_mean(entropy_values))
         _put_if_present(metrics, "opd/entropy/p90", _safe_quantile(entropy_values, 0.9))
-        metrics.update(compute_binned_token_means(entropy, response_mask, bin_size=bin_size, prefix="opd/entropy_bin"))
-        metrics.update(_head_tail_metrics(entropy, response_mask, prefix="opd/entropy", bin_size=bin_size))
+        metrics.update(
+            compute_binned_token_means(
+                entropy_cpu,
+                response_mask_cpu,
+                bin_size=bin_size,
+                prefix="opd/entropy_bin",
+                value_mask=entropy_value_mask,
+            )
+        )
+        metrics.update(
+            _head_tail_metrics(entropy_cpu, valid_entropy_response_mask, prefix="opd/entropy", bin_size=bin_size)
+        )
 
     return metrics
 
@@ -633,11 +704,14 @@ def compute_entropy_heatmap_row(
     bin_size: int,
 ) -> np.ndarray:
     """Return one heatmap row: mean entropy per response-position bin."""
+    entropy_cpu = _to_cpu_float(entropy)
+    entropy_value_mask = torch.isfinite(entropy_cpu) & (entropy_cpu >= 0.0) & (entropy_cpu <= MAX_REASONABLE_ENTROPY)
     return compute_value_heatmap_row(
-        values=entropy,
+        values=entropy_cpu,
         response_mask=response_mask,
         bin_size=bin_size,
         value_name="entropy",
+        value_mask=entropy_value_mask,
     )
 
 
@@ -656,11 +730,20 @@ def compute_gap_heatmap_row(
             "student_logprobs and teacher_logprobs must align for gap heatmap, "
             f"got {student_logprobs.shape=} and {teacher_logprobs.shape=}."
         )
+    student_logprobs_cpu = _to_cpu_float(student_logprobs)
+    teacher_logprobs_cpu = _to_cpu_float(teacher_logprobs)
+    gap_value_mask = (
+        torch.isfinite(student_logprobs_cpu)
+        & torch.isfinite(teacher_logprobs_cpu)
+        & (student_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
+        & (teacher_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
+    )
     return compute_value_heatmap_row(
-        values=(teacher_logprobs - student_logprobs).abs(),
+        values=(teacher_logprobs_cpu - student_logprobs_cpu).abs(),
         response_mask=response_mask,
         bin_size=bin_size,
         value_name="gap_abs",
+        value_mask=gap_value_mask,
     )
 
 
@@ -680,10 +763,19 @@ def compute_gap_high_heatmap_row(
             "student_logprobs and teacher_logprobs must align for high-gap heatmap, "
             f"got {student_logprobs.shape=} and {teacher_logprobs.shape=}."
         )
-    event_mask = (teacher_logprobs.float() - student_logprobs.float()).abs() > high_gap_threshold
+    student_logprobs_cpu = _to_cpu_float(student_logprobs)
+    teacher_logprobs_cpu = _to_cpu_float(teacher_logprobs)
+    gap_value_mask = (
+        torch.isfinite(student_logprobs_cpu)
+        & torch.isfinite(teacher_logprobs_cpu)
+        & (student_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
+        & (teacher_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
+    )
+    response_mask_cpu = response_mask.detach().bool().cpu()
+    event_mask = ((teacher_logprobs_cpu - student_logprobs_cpu).abs() > high_gap_threshold) & gap_value_mask
     return compute_event_heatmap_row(
         event_mask=event_mask,
-        response_mask=response_mask,
+        response_mask=response_mask_cpu & gap_value_mask,
         bin_size=bin_size,
         event_name="gap_abs_high",
     )
@@ -736,6 +828,7 @@ def compute_value_heatmap_row(
     response_mask: torch.Tensor,
     bin_size: int,
     value_name: str,
+    value_mask: Optional[torch.Tensor] = None,
 ) -> np.ndarray:
     """Return one heatmap row: mean value per response-position bin."""
     if bin_size <= 0:
@@ -746,10 +839,12 @@ def compute_value_heatmap_row(
         )
     values = _to_cpu_float(values)
     mask = response_mask.detach().bool().cpu()
+    value_mask_cpu = value_mask.detach().bool().cpu() if value_mask is not None else None
     row = []
     for start in range(0, values.shape[1], bin_size):
         end = min(start + bin_size, values.shape[1])
-        mean = _masked_mean(values[:, start:end], mask[:, start:end])
+        bin_value_mask = value_mask_cpu[:, start:end] if value_mask_cpu is not None else None
+        mean = _safe_mean(_masked_values(values[:, start:end], mask[:, start:end], bin_value_mask))
         row.append(np.nan if mean is None else mean)
     return np.asarray(row, dtype=np.float32)
 

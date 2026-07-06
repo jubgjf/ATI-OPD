@@ -170,6 +170,50 @@ def test_compute_entropy_heatmap_row_and_tracker_on_cpu():
         fig.clear()
 
 
+def test_opd_diagnostics_filters_sentinel_outliers_on_cpu():
+    student_logprobs = torch.tensor([[-1.0, -1.0, -1.0, -1.0]])
+    teacher_logprobs = torch.tensor([[-1.2, -1.0e38, -2.0, -3.0]])
+    entropy = torch.tensor([[0.1, 1.0e38, 0.3, 0.5]])
+    response_mask = torch.ones((1, 4), dtype=torch.bool)
+
+    metrics = compute_opd_diagnostics_metrics(
+        student_logprobs=student_logprobs,
+        teacher_logprobs=teacher_logprobs,
+        entropy=entropy,
+        response_mask=response_mask,
+        bin_size=2,
+        high_gap_threshold=0.5,
+    )
+
+    assert metrics["opd/gap_abs/outlier_token_fraction"] == pytest.approx(1 / 4)
+    assert metrics["opd/gap_abs/mean"] == pytest.approx((0.2 + 1.0 + 2.0) / 3)
+    assert metrics["opd/gap_abs_bin/0000_0002"] == pytest.approx(0.2)
+    assert metrics["opd/gap_abs_bin/0002_0004"] == pytest.approx(1.5)
+    assert metrics["opd/gap_abs/high_bin/0000_0002"] == pytest.approx(0.0)
+    assert metrics["opd/gap_abs/high_bin/0002_0004"] == pytest.approx(1.0)
+    assert metrics["opd/entropy/outlier_token_fraction"] == pytest.approx(1 / 4)
+    assert metrics["opd/entropy/mean"] == pytest.approx((0.1 + 0.3 + 0.5) / 3)
+
+    entropy_row = compute_entropy_heatmap_row(entropy, response_mask, bin_size=2)
+    gap_row = compute_gap_heatmap_row(
+        student_logprobs=student_logprobs,
+        teacher_logprobs=teacher_logprobs,
+        response_mask=response_mask,
+        bin_size=2,
+    )
+    high_gap_row = compute_gap_high_heatmap_row(
+        student_logprobs=student_logprobs,
+        teacher_logprobs=teacher_logprobs,
+        response_mask=response_mask,
+        bin_size=2,
+        high_gap_threshold=0.5,
+    )
+
+    np.testing.assert_allclose(entropy_row, np.array([0.1, 0.4], dtype=np.float32))
+    np.testing.assert_allclose(gap_row, np.array([0.2, 1.5], dtype=np.float32), rtol=1e-6)
+    np.testing.assert_allclose(high_gap_row, np.array([0.0, 1.0], dtype=np.float32))
+
+
 def test_compute_gap_heatmap_row_and_tracker_on_cpu():
     student_logprobs = torch.tensor([[-1.0, -1.0, -1.0, -1.0]])
     teacher_logprobs = torch.tensor([[[-1.0], [-2.0], [-3.0], [-5.0]]])
