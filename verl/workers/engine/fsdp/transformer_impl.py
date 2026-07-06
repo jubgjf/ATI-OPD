@@ -61,11 +61,12 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
 from verl.utils.py_functional import convert_to_regular_types
-from verl.utils.torch_functional import logprobs_from_logits
+from verl.utils.torch_functional import logprobs_from_logits, topk_logprobs_from_logits
 from verl.utils.ulysses import (
     gather_outputs_and_unpad,
     get_ulysses_sequence_parallel_group,
     set_ulysses_sequence_parallel_group,
+    slice_input_tensor,
     ulysses_pad,
     ulysses_pad_and_slice_inputs,
 )
@@ -906,6 +907,62 @@ class EngineTrainModeCtx(BaseEngineCtx):
 
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithLMHead(FSDPEngine):
+    @staticmethod
+    def _response_target_ids_rmpad(
+        *,
+        micro_batch: TensorDict,
+        output_offsets: torch.Tensor,
+        topk: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if "student_topk_ids" not in micro_batch:
+            raise RuntimeError("token_reward_direct top-k actor update requires 'student_topk_ids' in the micro batch.")
+        target_ids = micro_batch["student_topk_ids"][..., :topk].to(device=device, dtype=torch.long)
+        if target_ids.ndim != 3:
+            raise RuntimeError(
+                "student_topk_ids must have shape [batch, response_len, topk] for token_reward_direct, "
+                f"got {tuple(target_ids.shape)}."
+            )
+
+        prompts = micro_batch["prompts"]
+        responses = micro_batch["responses"]
+        attention_mask = micro_batch["attention_mask"]
+        prompt_width = prompts.shape[1]
+        response_lens = attention_mask[:, prompt_width : prompt_width + responses.shape[1]].sum(dim=1).to(torch.long)
+        sequence_offsets = output_offsets.to(device=device, dtype=torch.long)[1:]
+        total_nnz = int(output_offsets[-1].item())
+        target_ids_rmpad = torch.zeros((total_nnz, target_ids.shape[-1]), dtype=torch.long, device=device)
+        for row_idx, (resp_len, seq_offset) in enumerate(zip(response_lens, sequence_offsets, strict=True)):
+            resp_len_int = int(resp_len.item())
+            if resp_len_int == 0:
+                continue
+            if resp_len_int > target_ids.shape[1]:
+                raise RuntimeError(
+                    "student_topk_ids response dimension is shorter than the effective response length: "
+                    f"student_topk_ids.shape={tuple(target_ids.shape)}, response_len={resp_len_int}."
+                )
+            start = int(seq_offset.item()) - resp_len_int - 1
+            end = int(seq_offset.item()) - 1
+            target_ids_rmpad[start:end] = target_ids[row_idx, :resp_len_int]
+        return target_ids_rmpad
+
+    @staticmethod
+    def _gather_target_logprobs_from_logits(logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
+        if logits.ndim != 2 or target_ids.ndim != 2:
+            raise RuntimeError(
+                "Expected logits [tokens, vocab] and target_ids [tokens, topk], "
+                f"got logits.shape={tuple(logits.shape)}, target_ids.shape={tuple(target_ids.shape)}."
+            )
+        if logits.shape[0] != target_ids.shape[0]:
+            raise RuntimeError(
+                "Target ids must align with logits along token dimension, "
+                f"got logits.shape={tuple(logits.shape)}, target_ids.shape={tuple(target_ids.shape)}."
+            )
+        logits_float = logits.float()
+        log_normalizer = torch.logsumexp(logits_float, dim=-1, keepdim=True)
+        target_logits = torch.gather(logits_float, dim=-1, index=target_ids.to(device=logits.device, dtype=torch.long))
+        return target_logits - log_normalizer
+
     def prepare_model_inputs(self, micro_batch: TensorDict):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
@@ -1057,14 +1114,31 @@ class FSDPEngineWithLMHead(FSDPEngine):
             data=micro_batch, key="calculate_sum_pi_squared", default=False
         )
         distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
+        diagnostics_student_topk = int(
+            tu.get_non_tensor_data(data=micro_batch, key="diagnostics_student_topk", default=0) or 0
+        )
+        token_reward_direct_topk = int(
+            tu.get_non_tensor_data(data=micro_batch, key="token_reward_direct_topk", default=0) or 0
+        )
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
                 "calculate_sum_pi_squared=True is not supported with use_fused_kernels=True: "
                 "fused kernels do not materialize the full logits tensor needed for Σπ²."
             )
+        if diagnostics_student_topk > 0 and use_fused_kernels:
+            raise NotImplementedError(
+                "diagnostics_student_topk is not supported with use_fused_kernels=True because fused kernels "
+                "do not materialize logits needed for student top-k diagnostics."
+            )
+        if token_reward_direct_topk > 0 and use_fused_kernels:
+            raise NotImplementedError(
+                "token_reward_direct_topk is not supported with use_fused_kernels=True because fused kernels "
+                "do not materialize logits needed to gather the current policy logprob on student top-k ids."
+            )
 
         model_output = {}
+        token_reward_direct_log_probs = None
 
         if use_remove_padding:
             input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
@@ -1082,11 +1156,32 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 inplace_backward = True
                 if calculate_entropy:
                     inplace_backward = False
+                if diagnostics_student_topk > 0:
+                    inplace_backward = False
                 log_probs = logprobs_from_logits(
                     logits=logits_rmpad,
                     labels=input_ids_rmpad_rolled,
                     inplace_backward=inplace_backward,
                 )
+
+                if diagnostics_student_topk > 0:
+                    student_topk_ids, student_topk_logprobs = topk_logprobs_from_logits(
+                        logits_rmpad, diagnostics_student_topk
+                    )
+                if token_reward_direct_topk > 0:
+                    output_offsets = output_args["output_offsets"]
+                    target_ids_rmpad = self._response_target_ids_rmpad(
+                        micro_batch=micro_batch,
+                        output_offsets=output_offsets,
+                        topk=token_reward_direct_topk,
+                        device=logits_rmpad.device,
+                    )
+                    if self.use_ulysses_sp:
+                        target_ids_rmpad = slice_input_tensor(target_ids_rmpad.unsqueeze(0), dim=1).squeeze(0)
+                    token_reward_direct_log_probs = self._gather_target_logprobs_from_logits(
+                        logits_rmpad,
+                        target_ids_rmpad,
+                    )
 
                 # compute entropy
                 if calculate_entropy:
@@ -1142,12 +1237,35 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         unpad_dim=0,
                         padding_size=pad_size,
                     )
+                if diagnostics_student_topk > 0:
+                    student_topk_ids = gather_outputs_and_unpad(
+                        student_topk_ids,
+                        gather_dim=0,
+                        unpad_dim=0,
+                        padding_size=pad_size,
+                    )
+                    student_topk_logprobs = gather_outputs_and_unpad(
+                        student_topk_logprobs,
+                        gather_dim=0,
+                        unpad_dim=0,
+                        padding_size=pad_size,
+                    )
+                if token_reward_direct_log_probs is not None:
+                    token_reward_direct_log_probs = gather_outputs_and_unpad(
+                        token_reward_direct_log_probs,
+                        gather_dim=0,
+                        unpad_dim=0,
+                        padding_size=pad_size,
+                    )
 
             if pad_mode == DatasetPadMode.NO_PADDING:
                 output_offsets = output_args["output_offsets"]
                 # (bsz, j1), for each sample, is the length of each sample: [real_prompt length + real_response length]
+                log_probs_for_output = (
+                    token_reward_direct_log_probs if token_reward_direct_log_probs is not None else log_probs
+                )
                 log_probs = tu.jagged_tensor_parts_from_values(
-                    log_probs,
+                    log_probs_for_output,
                     output_offsets,
                     context="FSDP LM model_output['log_probs']",
                 )
@@ -1162,6 +1280,17 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         sum_pi_squared_rmpad,
                         output_offsets,
                         context="FSDP LM model_output['sum_pi_squared']",
+                    )
+                if diagnostics_student_topk > 0:
+                    student_topk_ids = tu.jagged_tensor_parts_from_values(
+                        student_topk_ids,
+                        output_offsets,
+                        context="FSDP LM model_output['student_topk_ids']",
+                    )
+                    student_topk_logprobs = tu.jagged_tensor_parts_from_values(
+                        student_topk_logprobs,
+                        output_offsets,
+                        context="FSDP LM model_output['student_topk_logprobs']",
                     )
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
@@ -1186,6 +1315,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
                 if calculate_sum_pi_squared:
                     sum_pi_squared = verl_F.calculate_sum_pi_squared_from_logits(logits)
+                if diagnostics_student_topk > 0:
+                    student_topk_ids, student_topk_logprobs = topk_logprobs_from_logits(
+                        logits, diagnostics_student_topk
+                    )
 
                 if pad_mode == DatasetPadMode.NO_PADDING:
                     output_offsets = output_args["output_offsets"]
@@ -1195,9 +1328,23 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     logits_rmpad = torch.cat(tu.safe_unbind_jagged_nested_tensor(logits, context="FSDP LM logits"))
                     input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
                     log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+                    if token_reward_direct_topk > 0:
+                        target_ids_rmpad = self._response_target_ids_rmpad(
+                            micro_batch=micro_batch,
+                            output_offsets=output_offsets,
+                            topk=token_reward_direct_topk,
+                            device=logits_rmpad.device,
+                        )
+                        token_reward_direct_log_probs = self._gather_target_logprobs_from_logits(
+                            logits_rmpad,
+                            target_ids_rmpad,
+                        )
                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
+                    log_probs_for_output = (
+                        token_reward_direct_log_probs if token_reward_direct_log_probs is not None else log_probs
+                    )
                     log_probs = tu.jagged_tensor_parts_from_values(
-                        log_probs,
+                        log_probs_for_output,
                         output_offsets,
                         context="FSDP LM model_output['log_probs']",
                     )
@@ -1226,6 +1373,35 @@ class FSDPEngineWithLMHead(FSDPEngine):
                             output_offsets,
                             context="FSDP LM model_output['sum_pi_squared']",
                         )
+                    if diagnostics_student_topk > 0:
+                        student_topk_ids = torch.nested.narrow(
+                            student_topk_ids, 1, starts, seq_lengths, layout=torch.jagged
+                        )
+                        student_topk_ids_rmpad = torch.cat(
+                            tu.safe_unbind_jagged_nested_tensor(
+                                student_topk_ids,
+                                context="FSDP LM student_topk_ids",
+                            )
+                        )
+                        student_topk_logprobs = torch.nested.narrow(
+                            student_topk_logprobs, 1, starts, seq_lengths, layout=torch.jagged
+                        )
+                        student_topk_logprobs_rmpad = torch.cat(
+                            tu.safe_unbind_jagged_nested_tensor(
+                                student_topk_logprobs,
+                                context="FSDP LM student_topk_logprobs",
+                            )
+                        )
+                        student_topk_ids = tu.jagged_tensor_parts_from_values(
+                            student_topk_ids_rmpad,
+                            output_offsets,
+                            context="FSDP LM model_output['student_topk_ids']",
+                        )
+                        student_topk_logprobs = tu.jagged_tensor_parts_from_values(
+                            student_topk_logprobs_rmpad,
+                            output_offsets,
+                            context="FSDP LM model_output['student_topk_logprobs']",
+                        )
                 else:
                     raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
@@ -1234,6 +1410,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
             model_output["entropy"] = entropy
         if calculate_sum_pi_squared:
             model_output["sum_pi_squared"] = sum_pi_squared
+        if diagnostics_student_topk > 0:
+            model_output["student_topk_ids"] = student_topk_ids
+            model_output["student_topk_logprobs"] = student_topk_logprobs
 
         return model_output
 

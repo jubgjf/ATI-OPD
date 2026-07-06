@@ -110,8 +110,14 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
             - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
     """
-    sequence_score = batch.batch["token_level_scores"].sum(-1)
-    sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+    token_level_scores = batch.batch["token_level_scores"]
+    token_level_rewards = batch.batch["token_level_rewards"]
+    if token_level_scores.dim() == 3:
+        token_level_scores = token_level_scores.sum(dim=-1)
+    if token_level_rewards.dim() == 3:
+        token_level_rewards = token_level_rewards.sum(dim=-1)
+    sequence_score = token_level_scores.sum(-1)
+    sequence_reward = token_level_rewards.sum(-1)
 
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]
@@ -147,8 +153,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         logger.warning("All samples are aborted, returning default reward metrics")
         reward_mean = reward_max = reward_min = float("nan")
 
-    valid_adv = torch.masked_select(advantages, response_mask)
-    valid_returns = torch.masked_select(returns, response_mask)
+    advantage_mask = response_mask.unsqueeze(-1).expand_as(advantages) if advantages.dim() == 3 else response_mask
+    returns_mask = response_mask.unsqueeze(-1).expand_as(returns) if returns.dim() == 3 else response_mask
+    valid_adv = torch.masked_select(advantages, advantage_mask)
+    valid_returns = torch.masked_select(returns, returns_mask)
 
     if valid_adv.numel() > 0:
         adv_mean = torch.mean(valid_adv).detach().item()
@@ -188,9 +196,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     if use_critic:
         values = batch.batch["values"]
         valid_values = torch.masked_select(values, response_mask)
-        if valid_returns.numel() > 0 and valid_values.numel() > 0:
-            return_diff_var = torch.var(valid_returns - valid_values)
-            return_var = torch.var(valid_returns)
+        returns_for_value = returns.sum(dim=-1) if returns.dim() == response_mask.dim() + 1 else returns
+        valid_returns_for_value = torch.masked_select(returns_for_value, response_mask)
+        if valid_returns_for_value.numel() > 0 and valid_values.numel() > 0:
+            return_diff_var = torch.var(valid_returns_for_value - valid_values)
+            return_var = torch.var(valid_returns_for_value)
             critic_value_metrics = {
                 # values
                 "critic/values/mean": torch.mean(valid_values).detach().item(),
@@ -388,6 +398,8 @@ def compute_variance_proxy_metrics(batch: DataProto, gradient_norm: float = None
 
     # Get scalar advantages (mean over timesteps)
     advantages = batch.batch["advantages"]
+    if advantages.dim() != response_mask.dim():
+        return metrics
     # Compute mean advantage per trajectory using masked_mean
     advantages_scalar = verl_F.masked_mean(advantages, response_mask, axis=-1)
 

@@ -378,6 +378,7 @@ actor_rollout_ref:
     use_shm: false
     trust_remote_code: false
     custom_chat_template: null
+    chat_template_from_model: null
     external_lib: null
     override_config: {}
     enable_gradient_checkpointing: true
@@ -588,6 +589,7 @@ critic:
     use_shm: false
     trust_remote_code: false
     custom_chat_template: null
+    chat_template_from_model: null
     external_lib: null
     override_config: {}
     enable_gradient_checkpointing: true
@@ -781,10 +783,13 @@ algorithm:
 distillation:
   _target_: verl.workers.config.DistillationConfig
   enabled: false
+  use_actor_loss: true
   distillation_loss:
     _target_: verl.workers.config.DistillationLossConfig
     loss_mode: k3
     topk: 32
+    top_k_strategy: only_stu
+    reward_weight_mode: student_p
     use_task_rewards: true
     distillation_loss_coef: 1.0
     loss_max_clamp: null
@@ -809,6 +814,7 @@ distillation:
     student_segment_length: 128
     teacher_segment_length: 128
     gap_metric: k3
+    gap_distribution_topk: 16
     gap_aggregation: mean
     gap_threshold: 1.0
     max_interventions_per_sample: 4
@@ -833,6 +839,7 @@ distillation:
     high_gap_threshold: 1.0
     collect_intervention_metrics: true
     collect_topk_overlap: false
+    collect_rethinking_opd_metrics: false
     topk: null
   n_gpus_per_node: 8
   nnodes: 0

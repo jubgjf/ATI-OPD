@@ -52,6 +52,7 @@ from verl.trainer.distillation.diagnostics import (
     extract_sampled_response_logprobs,
 )
 from verl.trainer.distillation.losses import is_distillation_enabled
+from verl.trainer.distillation.token_reward import compute_only_student_topk_token_reward
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -1642,7 +1643,7 @@ class RayPPOTrainer:
 
         return ref_log_prob
 
-    def _compute_old_log_prob(self, batch: DataProto):
+    def _compute_old_log_prob(self, batch: DataProto, global_steps: int | None = None):
         # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
         # step 1: convert dataproto to tensordict.
         batch_td = self._to_tensordict_without_distillation_supervision(batch)
@@ -1650,10 +1651,23 @@ class RayPPOTrainer:
         batch_td = left_right_2_no_padding(batch_td)
         # step 3: add meta info
         calculate_sum_pi_squared = self.config.actor_rollout_ref.actor.get("calculate_sum_pi_squared", False)
+        diagnostics_config = self._distillation_diagnostics_config()
+        diagnostics_student_topk = self._token_reward_direct_topk()
+        if (
+            diagnostics_config is not None
+            and getattr(diagnostics_config, "collect_rethinking_opd_metrics", False)
+            and is_distillation_enabled(self.config.get("distillation"))
+            and (global_steps is None or global_steps % diagnostics_config.log_interval == 0)
+        ):
+            diagnostics_student_topk = max(
+                diagnostics_student_topk,
+                int(diagnostics_config.topk or self.distillation_config.distillation_loss.topk or 64),
+            )
         tu.assign_non_tensor(
             batch_td,
             calculate_entropy=True,
             calculate_sum_pi_squared=calculate_sum_pi_squared,
+            diagnostics_student_topk=diagnostics_student_topk,
             compute_loss=False,
         )
         output = self.actor_rollout_wg.compute_log_prob(batch_td)
@@ -1662,6 +1676,8 @@ class RayPPOTrainer:
         log_probs = tu.get(output, "log_probs")
         routed_experts = tu.get(output, "routed_experts")
         sum_pi_squared = tu.get(output, "sum_pi_squared") if calculate_sum_pi_squared else None
+        student_topk_ids = tu.get(output, "student_topk_ids") if diagnostics_student_topk > 0 else None
+        student_topk_logprobs = tu.get(output, "student_topk_logprobs") if diagnostics_student_topk > 0 else None
 
         old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
         # step 4. No padding to padding
@@ -1669,12 +1685,18 @@ class RayPPOTrainer:
         log_probs = no_padding_2_padding(log_probs, batch_td)
         if sum_pi_squared is not None:
             sum_pi_squared = no_padding_2_padding(sum_pi_squared, batch_td)
+        if student_topk_ids is not None and student_topk_logprobs is not None:
+            student_topk_ids = no_padding_2_padding(student_topk_ids, batch_td)
+            student_topk_logprobs = no_padding_2_padding(student_topk_logprobs, batch_td)
         # step 5: rebuild a tensordict and convert to dataproto
         result = {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
         if routed_experts is not None:
             result["routed_experts"] = routed_experts
         if sum_pi_squared is not None:
             result["sum_pi_squared"] = sum_pi_squared.float()
+        if student_topk_ids is not None and student_topk_logprobs is not None:
+            result["student_topk_ids"] = student_topk_ids.long()
+            result["student_topk_logprobs"] = student_topk_logprobs.float()
         old_log_prob = tu.get_tensordict(result)
         old_log_prob = DataProto.from_tensordict(old_log_prob)
         return old_log_prob, old_log_prob_mfu
@@ -1695,8 +1717,10 @@ class RayPPOTrainer:
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
+        token_reward_direct_topk = self._token_reward_direct_topk()
         distillation_use_topk = (
             self.distillation_config.distillation_loss.loss_settings.use_topk
+            and getattr(self.distillation_config, "use_actor_loss", True)
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
@@ -1709,6 +1733,7 @@ class RayPPOTrainer:
             batch_td,
             calculate_entropy=calculate_entropy,
             distillation_use_topk=distillation_use_topk,
+            token_reward_direct_topk=token_reward_direct_topk,
             global_batch_size=ppo_mini_batch_size,
             mini_batch_size=ppo_mini_batch_size,
             epochs=ppo_epochs,
@@ -1732,6 +1757,31 @@ class RayPPOTrainer:
         if diagnostics_config is None or not diagnostics_config.enabled:
             return None
         return diagnostics_config
+
+    def _uses_token_reward_direct(self) -> bool:
+        if self.distillation_config is None or not is_distillation_enabled(self.config.get("distillation")):
+            return False
+        adv_estimator = self.config.algorithm.adv_estimator
+        adv_estimator = getattr(adv_estimator, "value", adv_estimator)
+        return str(adv_estimator) == "token_reward_direct"
+
+    def _token_reward_direct_topk(self) -> int:
+        if not self._uses_token_reward_direct():
+            return 0
+        if getattr(self.distillation_config, "use_actor_loss", True):
+            raise ValueError(
+                "ADV_ESTIMATOR=token_reward_direct requires distillation.use_actor_loss=False so the teacher "
+                "signal is applied through token rewards instead of the actor-side distillation loss."
+            )
+        loss_config = self.distillation_config.distillation_loss
+        if loss_config.top_k_strategy != "only_stu":
+            raise NotImplementedError(
+                "ADV_ESTIMATOR=token_reward_direct currently supports only "
+                f"distillation.distillation_loss.top_k_strategy='only_stu', got {loss_config.top_k_strategy!r}."
+            )
+        if loss_config.topk is None or int(loss_config.topk) <= 0:
+            raise ValueError("ADV_ESTIMATOR=token_reward_direct requires distillation.distillation_loss.topk > 0.")
+        return int(loss_config.topk)
 
     def _extract_teacher_response_logprobs_for_diagnostics(self, batch: DataProto) -> torch.Tensor | None:
         teacher_logprobs = batch.batch.get("teacher_sampled_logprobs", None)
@@ -1766,6 +1816,38 @@ class RayPPOTrainer:
             context="teacher_logprobs",
         )
 
+    def _compute_token_reward_direct_scores(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, float]]:
+        topk = self._token_reward_direct_topk()
+        missing_keys = {
+            key for key in ("student_topk_ids", "student_topk_logprobs", "response_mask") if key not in batch.batch
+        }
+        if missing_keys:
+            raise RuntimeError(
+                "ADV_ESTIMATOR=token_reward_direct requires student top-k logprobs from actor recomputation, "
+                f"but batch is missing {sorted(missing_keys)}. Make sure rollout_correction.bypass_mode=False."
+            )
+
+        teacher_topk_ids, teacher_topk_logprobs = self._extract_teacher_response_topk_for_diagnostics(batch)
+        if teacher_topk_ids is None or teacher_topk_logprobs is None:
+            raise RuntimeError(
+                "ADV_ESTIMATOR=token_reward_direct requires teacher top-k prompt logprobs. "
+                "Check distillation.distillation_loss.topk and teacher inference logprob settings."
+            )
+
+        loss_config = self.distillation_config.distillation_loss
+        token_rewards, reward_metrics = compute_only_student_topk_token_reward(
+            student_topk_ids=batch.batch["student_topk_ids"],
+            student_topk_logprobs=batch.batch["student_topk_logprobs"],
+            teacher_topk_ids=teacher_topk_ids,
+            teacher_topk_logprobs=teacher_topk_logprobs,
+            response_mask=batch.batch["response_mask"],
+            reward_mask=batch.batch.get("distillation_loss_mask", batch.batch["response_mask"]),
+            topk=topk,
+            reward_weight_mode=loss_config.reward_weight_mode,
+            log_prob_min_clamp=loss_config.log_prob_min_clamp,
+        )
+        return token_rewards, reward_metrics
+
     @staticmethod
     def _non_tensor_to_list(value) -> list[Any]:
         if value is None:
@@ -1793,6 +1875,7 @@ class RayPPOTrainer:
             return
 
         import matplotlib.pyplot as plt
+
         import wandb
 
         if entropy is not None:
@@ -1917,6 +2000,7 @@ class RayPPOTrainer:
         teacher_response_topk_ids, teacher_response_topk_logprobs = (
             self._extract_teacher_response_topk_for_diagnostics(batch)
             if diagnostics_config.collect_topk_overlap
+            or getattr(diagnostics_config, "collect_rethinking_opd_metrics", False)
             else (None, None)
         )
         teacher_logprob_nonfinite_positions = None
@@ -1928,6 +2012,8 @@ class RayPPOTrainer:
             student_logprobs=student_logprobs,
             response_ids=batch.batch.get("responses", None),
             teacher_logprobs=teacher_response_logprobs,
+            student_topk_ids=batch.batch.get("student_topk_ids", None),
+            student_topk_logprobs=batch.batch.get("student_topk_logprobs", None),
             teacher_topk_ids=teacher_response_topk_ids,
             teacher_topk_logprobs=teacher_response_topk_logprobs,
             teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
@@ -1939,6 +2025,7 @@ class RayPPOTrainer:
             overlap_topk=(
                 int(diagnostics_config.topk or self.distillation_config.distillation_loss.topk or 64)
                 if diagnostics_config.collect_topk_overlap
+                or getattr(diagnostics_config, "collect_rethinking_opd_metrics", False)
                 else None
             ),
         )
@@ -2187,8 +2274,17 @@ class RayPPOTrainer:
                             batch = batch.union(batch_reward)
 
                         # extract reward_tensor and reward_extra_infos_dict for training
-                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
-                        metrics.update(_compute_reward_format_metrics(reward_extra_infos_dict))
+                        if "rm_scores" in batch.batch:
+                            reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                            metrics.update(_compute_reward_format_metrics(reward_extra_infos_dict))
+                        elif self._uses_token_reward_direct():
+                            reward_tensor = torch.zeros_like(batch.batch["response_mask"], dtype=torch.float32)
+                            reward_extra_infos_dict = {}
+                        else:
+                            raise RuntimeError(
+                                "Training reward is missing rm_scores. Enable a reward source or use "
+                                "ADV_ESTIMATOR=token_reward_direct with distillation top-k rewards."
+                            )
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -2196,6 +2292,7 @@ class RayPPOTrainer:
                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+                    opd_entropy = None
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
@@ -2206,7 +2303,9 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(
+                                batch, global_steps=self.global_steps
+                            )
                             entropys = old_log_prob.batch["entropys"]
                             opd_entropy = entropys.detach()
                             response_masks = batch.batch["response_mask"]
@@ -2255,6 +2354,27 @@ class RayPPOTrainer:
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
+                        if self._uses_token_reward_direct():
+                            if self.config.algorithm.use_kl_in_reward:
+                                raise NotImplementedError(
+                                    "ADV_ESTIMATOR=token_reward_direct now keeps top-k rewards as [B,T,K], "
+                                    "which is incompatible with sampled-token in-reward KL. This matches the "
+                                    "OPD paper setting where KL coefficient is 0; set algorithm.use_kl_in_reward=False."
+                                )
+                            token_reward_tensor, token_reward_metrics = self._compute_token_reward_direct_scores(batch)
+                            metrics.update(token_reward_metrics)
+                            loss_config = self.distillation_config.distillation_loss
+                            if loss_config.use_task_rewards:
+                                raise NotImplementedError(
+                                    "Combining task rewards with [B,T,K] token_reward_direct rewards is not "
+                                    "implemented. Set distillation.distillation_loss.use_task_rewards=False for "
+                                    "paper-style OPD."
+                                )
+                            else:
+                                reward_tensor = token_reward_tensor
+                                metrics["distillation/token_reward_direct/combined_with_task_rewards"] = 0.0
+                            batch.batch["rm_scores"] = reward_tensor
+
                         batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
@@ -2276,10 +2396,13 @@ class RayPPOTrainer:
                                 global_steps=self.global_steps,
                             )
                         )
+                        for diagnostics_key in ("student_topk_ids", "student_topk_logprobs"):
+                            if diagnostics_key in batch.batch and not self._uses_token_reward_direct():
+                                batch.batch.pop(diagnostics_key)
 
-                        # Compute rollout correction: IS weights, rejection sampling, and metrics
-                        # Only runs in decoupled mode (computes once per batch using stable π_old)
-                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        # Compute rollout correction while old_log_probs is still the sampled-token
+                        # [B, T] proximal-policy logprob. token_reward_direct later swaps old_log_probs
+                        # to [B, T, K] top-k logprobs for the actor loss.
                         if (
                             rollout_corr_config is not None
                             and "rollout_log_probs" in batch.batch
@@ -2291,6 +2414,17 @@ class RayPPOTrainer:
                             batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
+
+                        if self._uses_token_reward_direct():
+                            missing_topk_training_keys = {
+                                key for key in ("student_topk_ids", "student_topk_logprobs") if key not in batch.batch
+                            }
+                            if missing_topk_training_keys:
+                                raise RuntimeError(
+                                    "ADV_ESTIMATOR=token_reward_direct requires student top-k tensors through "
+                                    f"actor update, but missing {sorted(missing_topk_training_keys)}."
+                                )
+                            batch.batch["old_log_probs"] = batch.batch["student_topk_logprobs"]
 
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(

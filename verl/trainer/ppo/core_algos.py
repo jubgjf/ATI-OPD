@@ -108,6 +108,7 @@ class AdvantageEstimator(str, Enum):
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
     GDPO = "gdpo"
+    TOKEN_REWARD_DIRECT = "token_reward_direct"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -866,6 +867,39 @@ def compute_rloo_vectorized_outcome_advantage(
     return adv, adv
 
 
+@register_adv_est(AdvantageEstimator.TOKEN_REWARD_DIRECT)
+def compute_token_reward_direct_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use token-level rewards directly as advantages.
+
+    This estimator is intended for OPD variants whose teacher produces a dense
+    token reward. Top-k rewards with shape [B, T, K] are kept in that shape so
+    the policy loss can update every retained candidate token.
+    """
+    with torch.no_grad():
+        if token_level_rewards.dim() == response_mask.dim() + 1:
+            mask = response_mask.unsqueeze(-1)
+        else:
+            mask = response_mask
+        advantages = token_level_rewards * mask
+        returns = advantages.clone()
+    return advantages, returns
+
+
+def _loss_mask_for_policy_values(
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Return a mask aligned to policy-loss values and the 2D token count if needed."""
+    if values.dim() == response_mask.dim() + 1:
+        return response_mask.unsqueeze(-1).expand_as(values), response_mask.sum()
+    return response_mask, None
+
+
 @register_adv_est(AdvantageEstimator.OPTIMAL_TOKEN_BASELINE)
 def compute_optimal_token_baseline_advantage(
     token_level_rewards: torch.Tensor,
@@ -1244,11 +1278,19 @@ def compute_policy_loss(
         + f" but get the value: {clip_ratio_c}."
     )
 
+    loss_mask, local_batch_num_tokens = _loss_mask_for_policy_values(log_prob, response_mask)
+    if advantages.shape != log_prob.shape or old_log_prob.shape != log_prob.shape:
+        raise ValueError(
+            "PPO policy loss expected old_log_prob, log_prob, and advantages to have the same shape, "
+            f"got old_log_prob.shape={tuple(old_log_prob.shape)}, log_prob.shape={tuple(log_prob.shape)}, "
+            f"advantages.shape={tuple(advantages.shape)}."
+        )
+
     negative_approx_kl = log_prob - old_log_prob
     # Clamp negative_approx_kl for stability
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     ratio = torch.exp(negative_approx_kl)
-    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, loss_mask)
 
     pg_losses1 = -advantages * ratio
     if cliprange_low is None:
@@ -1261,16 +1303,19 @@ def compute_policy_loss(
     clip_pg_losses1 = torch.maximum(
         pg_losses1, pg_losses2
     )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), loss_mask)
 
     pg_losses3 = -advantages * clip_ratio_c
     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
-    pg_clipfrac_lower = verl_F.masked_mean(
-        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
-    )
+    pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), loss_mask)
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=loss_mask,
+        loss_agg_mode=loss_agg_mode,
+        batch_num_tokens=local_batch_num_tokens,
+    )
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
@@ -1326,11 +1371,19 @@ def compute_policy_loss_vanilla(
         + f" but get the value: {clip_ratio_c}."
     )
 
+    loss_mask, local_batch_num_tokens = _loss_mask_for_policy_values(log_prob, response_mask)
+    if advantages.shape != log_prob.shape or old_log_prob.shape != log_prob.shape:
+        raise ValueError(
+            "PPO policy loss expected old_log_prob, log_prob, and advantages to have the same shape, "
+            f"got old_log_prob.shape={tuple(old_log_prob.shape)}, log_prob.shape={tuple(log_prob.shape)}, "
+            f"advantages.shape={tuple(advantages.shape)}."
+        )
+
     negative_approx_kl = log_prob - old_log_prob
     # Clamp negative_approx_kl for stability
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     ratio = torch.exp(negative_approx_kl)
-    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, loss_mask)
 
     pg_losses1 = -advantages * ratio
     if cliprange_low is None:
@@ -1343,23 +1396,30 @@ def compute_policy_loss_vanilla(
     clip_pg_losses1 = torch.maximum(
         pg_losses1, pg_losses2
     )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), loss_mask)
 
     pg_losses3 = -advantages * clip_ratio_c
     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
-    pg_clipfrac_lower = verl_F.masked_mean(
-        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
-    )
+    pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), loss_mask)
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
 
     # Apply rollout correction weights if provided
     if rollout_is_weights is not None:
+        if rollout_is_weights.dim() == pg_losses.dim() - 1:
+            rollout_is_weights = rollout_is_weights.unsqueeze(-1)
+        if rollout_is_weights.shape != pg_losses.shape:
+            raise ValueError(
+                "rollout_is_weights must be broadcastable to PPO policy loss shape, "
+                f"got rollout_is_weights.shape={tuple(rollout_is_weights.shape)} and "
+                f"pg_losses.shape={tuple(pg_losses.shape)}."
+            )
         pg_losses = pg_losses * rollout_is_weights
 
-    pg_loss = agg_loss(
-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
-    )
+    global_batch_info = dict(config.global_batch_info)
+    if local_batch_num_tokens is not None and global_batch_info.get("batch_num_tokens", None) is None:
+        global_batch_info["batch_num_tokens"] = local_batch_num_tokens
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=loss_mask, loss_agg_mode=loss_agg_mode, **global_batch_info)
 
     pg_metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),

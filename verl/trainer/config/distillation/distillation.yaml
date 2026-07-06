@@ -13,6 +13,10 @@ defaults:
 # Whether to enable distillation.
 enabled: false
 
+# Whether to add the built-in actor-side distillation loss. Set false for
+# ADV_ESTIMATOR=token_reward_direct, where distillation enters as token rewards.
+use_actor_loss: true
+
 # distillation loss config
 distillation_loss:
 
@@ -25,6 +29,12 @@ distillation_loss:
 
   # If distillation loss requires top-k logits, this is the value of k
   topk: 32
+
+  # Top-k support strategy for token-reward OPD.
+  top_k_strategy: only_stu
+
+  # Weighting scheme when reducing top-k token rewards to one scalar token reward.
+  reward_weight_mode: student_p
 
   # Whether to include task rewards alongside distillation loss.
   use_task_rewards: true
@@ -80,6 +90,7 @@ intervention:
   student_segment_length: 128
   teacher_segment_length: 128
   gap_metric: k3
+  gap_distribution_topk: 16
   gap_aggregation: mean
   gap_threshold: 1.0
   max_interventions_per_sample: 4
@@ -111,6 +122,7 @@ diagnostics:
   high_gap_threshold: 1.0
   collect_intervention_metrics: true
   collect_topk_overlap: false
+  collect_rethinking_opd_metrics: false
   # null: follow distillation_loss.topk; set explicitly to request a wider/narrower diagnostics top-k.
   topk: null
 

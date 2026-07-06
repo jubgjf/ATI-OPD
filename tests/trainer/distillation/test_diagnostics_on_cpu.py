@@ -27,6 +27,7 @@ from verl.trainer.distillation.diagnostics import (
     compute_intervention_metrics,
     compute_opd_diagnostics_metrics,
     compute_overlap_diagnostics,
+    compute_rethinking_opd_diagnostics,
     compute_teacher_logprob_nonfinite_heatmap_row,
     compute_topk_ladder,
     extract_response_topk_scores,
@@ -90,6 +91,39 @@ def test_distillation_overlap_diagnostics_topk_defaults_to_loss_topk_on_cpu():
     teacher_config = next(iter(config.teacher_models.values()))
     assert config.diagnostics.topk == 64
     assert teacher_config.inference.engine_kwargs["vllm"]["max_logprobs"] == 64
+
+
+def test_distillation_rethinking_opd_diagnostics_requests_teacher_topk_on_cpu():
+    config = DistillationConfig(
+        enabled=True,
+        n_gpus_per_node=1,
+        nnodes=1,
+        distillation_loss=DistillationLossConfig(loss_mode="k1", topk=16),
+        diagnostics=DistillationDiagnosticsConfig(
+            collect_topk_overlap=False,
+            collect_rethinking_opd_metrics=True,
+            topk=16,
+        ),
+        teacher_models={
+            "teacher_model": DistillationTeacherModelConfig(
+                key="teacher",
+                model_path="dummy",
+                num_replicas=1,
+                inference=RolloutConfig(
+                    name="vllm",
+                    prompt_length=4,
+                    response_length=8,
+                    tensor_model_parallel_size=1,
+                    data_parallel_size=1,
+                    pipeline_model_parallel_size=1,
+                    engine_kwargs={"vllm": {}},
+                ),
+            )
+        },
+    )
+
+    teacher_config = next(iter(config.teacher_models.values()))
+    assert teacher_config.inference.engine_kwargs["vllm"]["max_logprobs"] == 16
 
 
 def test_compute_opd_diagnostics_metrics_logs_late_gap_and_entropy_on_cpu():
@@ -332,6 +366,34 @@ def test_compute_overlap_diagnostics_skips_unavailable_k_on_cpu():
     assert metrics["opd/overlap/top2_rate"] == 1.0
     assert "opd/overlap/top4_rate" not in metrics
     assert metrics["opd/overlap/teacher_sampled_prob_mean"] == pytest.approx((0.6 + 0.01) / 2)
+
+
+def test_compute_rethinking_opd_diagnostics_logs_support_intersection_metrics_on_cpu():
+    response_mask = torch.tensor([[1, 1]], dtype=torch.bool)
+    student_topk_ids = torch.tensor([[[1, 2, 3, 4], [10, 11, 12, 13]]])
+    teacher_topk_ids = torch.tensor([[[2, 3, 5, 6], [14, 15, 16, 17]]])
+    student_topk_logprobs = torch.log(torch.tensor([[[0.40, 0.30, 0.20, 0.05], [0.40, 0.30, 0.20, 0.05]]]))
+    teacher_topk_logprobs = torch.log(torch.tensor([[[0.50, 0.25, 0.10, 0.05], [0.50, 0.25, 0.10, 0.05]]]))
+
+    metrics = compute_rethinking_opd_diagnostics(
+        response_mask=response_mask,
+        student_topk_ids=student_topk_ids,
+        student_topk_logprobs=student_topk_logprobs,
+        teacher_topk_ids=teacher_topk_ids,
+        teacher_topk_logprobs=teacher_topk_logprobs,
+        bin_size=1,
+        topk=4,
+    )
+
+    expected_advantage = (0.6 * np.log((2 / 3) / 0.6) + 0.4 * np.log((1 / 3) / 0.4)) / 2
+    assert metrics["distillation/overlap_ratio"] == pytest.approx(0.25)
+    assert metrics["distillation/overlap_mass_student"] == pytest.approx(0.25)
+    assert metrics["distillation/overlap_mass_teacher"] == pytest.approx(0.375)
+    assert metrics["distillation/empty_overlap_fraction"] == pytest.approx(0.5)
+    assert metrics["distillation/overlap_token_advantage"] == pytest.approx(expected_advantage, rel=1e-5)
+    assert "distillation/entropy_gap" in metrics
+    assert metrics["distillation/entropy_gap_residual_bucket_approximation"] == 1.0
+    assert metrics["distillation/overlap_ratio_top1"] == pytest.approx(0.0)
 
 
 def test_extract_response_topk_scores_from_padded_teacher_scoring_on_cpu():

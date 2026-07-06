@@ -32,10 +32,11 @@ REMOTE_PYTHON=${REMOTE_PYTHON:-python3}
 DEBUG_MODE=${DEBUG_MODE:-topd}
 MODEL_ROOT=${MODEL_ROOT:-/share/home/jnguan/share/models}
 DATASET_ROOT=${DATASET_ROOT:-/share/home/jnguan/share/datasets}
-STUDENT_MODEL=${STUDENT_MODEL:-"$MODEL_ROOT/Qwen3-0.6B"}
-TEACHER_MODEL=${TEACHER_MODEL:-"$STUDENT_MODEL"}
+STUDENT_MODEL=${STUDENT_MODEL:-"$MODEL_ROOT/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"}
+TEACHER_MODEL=${TEACHER_MODEL:-"$MODEL_ROOT/Skywork/Skywork-OR1-Math-7B"}
 TRAIN_FILE=${TRAIN_FILE:-"$DATASET_ROOT/DAPO-Math-17k-Processed-verl--qwen3/train.parquet"}
 VAL_FILE=${VAL_FILE:-"$DATASET_ROOT/DAPO-Math-17k-Processed-verl--qwen3/test.parquet"}
+CHAT_TEMPLATE_MODEL=${CHAT_TEMPLATE_MODEL:-$TEACHER_MODEL}
 
 STUDENT_GPUS=${STUDENT_GPUS:-4}
 TEACHER_GPUS=${TEACHER_GPUS:-4}
@@ -46,8 +47,8 @@ TEACHER_TP=${TEACHER_TP:-$TEACHER_GPUS}
 TEACHER_REPLICAS=${TEACHER_REPLICAS:-1}
 SP_SIZE=${SP_SIZE:-1}
 
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-$((2 * 1024))}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-$((18 * 1024))}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-15360}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 1))}
 ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-1024}
 TEACHER_MAX_NUM_BATCHED_TOKENS=${TEACHER_MAX_NUM_BATCHED_TOKENS:-1024}
@@ -55,16 +56,16 @@ ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-8}
 TEACHER_MAX_NUM_SEQS=${TEACHER_MAX_NUM_SEQS:-8}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.45}
 TEACHER_GPU_MEMORY_UTILIZATION=${TEACHER_GPU_MEMORY_UTILIZATION:-0.45}
-ROLLOUT_N=${ROLLOUT_N:-1}
-ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-0.6}
-ROLLOUT_TOP_P=${ROLLOUT_TOP_P:-0.95}
-ROLLOUT_TOP_K=${ROLLOUT_TOP_K:-20}
+ROLLOUT_N=${ROLLOUT_N:-4}
+ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-1.0}
+ROLLOUT_TOP_P=${ROLLOUT_TOP_P:-1.0}
+ROLLOUT_TOP_K=${ROLLOUT_TOP_K:--1}
 ROLLOUT_DO_SAMPLE=${ROLLOUT_DO_SAMPLE:-True}
-VAL_TEMPERATURE=${VAL_TEMPERATURE:-$ROLLOUT_TEMPERATURE}
-VAL_TOP_P=${VAL_TOP_P:-$ROLLOUT_TOP_P}
+VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.7}
+VAL_TOP_P=${VAL_TOP_P:-0.95}
 VAL_TOP_K=${VAL_TOP_K:-$ROLLOUT_TOP_K}
 VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
-VAL_N=${VAL_N:-5}
+VAL_N=${VAL_N:-2}
 ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
 TEACHER_ENFORCE_EAGER=${TEACHER_ENFORCE_EAGER:-False}
 SKIP_TOKENIZER_INIT=${SKIP_TOKENIZER_INIT:-True}
@@ -77,14 +78,23 @@ VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-8}
 TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:-16}
 VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:-256}
 DATA_SEED=${DATA_SEED:--42}
+DATA_TRUNCATION=${DATA_TRUNCATION:-error}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-2}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
 TEST_FREQ=${TEST_FREQ:--1}
 ACTOR_LR=${ACTOR_LR:-1e-6}
 PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-$(( (MAX_MODEL_LEN + 127) / 128 * 128 ))}
 
+ADV_ESTIMATOR=${ADV_ESTIMATOR:-token_reward_direct}
+if [[ "$ADV_ESTIMATOR" == "token_reward_direct" ]]; then
+    DISTILLATION_USE_ACTOR_LOSS=${DISTILLATION_USE_ACTOR_LOSS:-False}
+else
+    DISTILLATION_USE_ACTOR_LOSS=${DISTILLATION_USE_ACTOR_LOSS:-True}
+fi
 DISTILLATION_LOSS_MODE=${DISTILLATION_LOSS_MODE:-k1}
 DISTILLATION_TOPK=${DISTILLATION_TOPK:-16}
+TOP_K_STRATEGY=${TOP_K_STRATEGY:-only_stu}
+REWARD_WEIGHT_MODE=${REWARD_WEIGHT_MODE:-student_p}
 DISTILLATION_USE_TASK_REWARDS=${DISTILLATION_USE_TASK_REWARDS:-False}
 DISTILLATION_USE_POLICY_GRADIENT=${DISTILLATION_USE_POLICY_GRADIENT:-True}
 DISTILLATION_LOSS_MAX_CLAMP=${DISTILLATION_LOSS_MAX_CLAMP:-10.0}
@@ -97,6 +107,7 @@ DISTILLATION_HORIZON_INTERVAL_STEPS=${DISTILLATION_HORIZON_INTERVAL_STEPS:-1}
 
 OPD_DIAGNOSTICS_ENABLED=${OPD_DIAGNOSTICS_ENABLED:-True}
 OPD_DIAGNOSTICS_COLLECT_TOPK_OVERLAP=${OPD_DIAGNOSTICS_COLLECT_TOPK_OVERLAP:-True}
+OPD_DIAGNOSTICS_COLLECT_RETHINKING_OPD=${OPD_DIAGNOSTICS_COLLECT_RETHINKING_OPD:-True}
 OPD_DIAGNOSTICS_TOPK=${OPD_DIAGNOSTICS_TOPK:-$DISTILLATION_TOPK}
 OPD_DIAGNOSTICS_POSITION_BIN_SIZE=${OPD_DIAGNOSTICS_POSITION_BIN_SIZE:-32}
 OPD_DIAGNOSTICS_HEATMAP_INTERVAL=${OPD_DIAGNOSTICS_HEATMAP_INTERVAL:-1}
@@ -107,6 +118,7 @@ OPD_DIAGNOSTICS_HIGH_GAP_THRESHOLD=${OPD_DIAGNOSTICS_HIGH_GAP_THRESHOLD:-1.0}
 TEACHER_INTERVENTION_SEGMENT_LENGTH=${TEACHER_INTERVENTION_SEGMENT_LENGTH:-32}
 TEACHER_INTERVENTION_TEACHER_LENGTH=${TEACHER_INTERVENTION_TEACHER_LENGTH:-32}
 TEACHER_INTERVENTION_GAP_METRIC=${TEACHER_INTERVENTION_GAP_METRIC:-k3}
+TEACHER_INTERVENTION_GAP_DISTRIBUTION_TOPK=${TEACHER_INTERVENTION_GAP_DISTRIBUTION_TOPK:-16}
 TEACHER_INTERVENTION_GAP_THRESHOLD=${TEACHER_INTERVENTION_GAP_THRESHOLD:-0.3}
 TEACHER_INTERVENTION_MAX_COUNT=${TEACHER_INTERVENTION_MAX_COUNT:-2}
 TEACHER_INTERVENTION_TRAIN_TEACHER=${TEACHER_INTERVENTION_TRAIN_TEACHER:-False}
@@ -116,7 +128,11 @@ TEACHER_INTERVENTION_TOP_P=${TEACHER_INTERVENTION_TOP_P:-0.95}
 TEACHER_INTERVENTION_TOP_K=${TEACHER_INTERVENTION_TOP_K:-20}
 
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
-TEACHER_VAL_BEFORE_TRAIN=${TEACHER_VAL_BEFORE_TRAIN:-True}
+TEACHER_VAL_BEFORE_TRAIN=${TEACHER_VAL_BEFORE_TRAIN:-False}
+TRAINER_LOGGER=${TRAINER_LOGGER:-'["console"]'}
+PROJECT_NAME=${PROJECT_NAME:-DMPD-debug}
+WANDB_MODE=${WANDB_MODE:-disabled}
+WANDB_DISABLED=${WANDB_DISABLED:-true}
 
 EXPERIMENT_TIMESTAMP=${EXPERIMENT_TIMESTAMP:-$(date +"%Y%m%d-%H%M%S")}
 EXPERIMENT_BASE_NAME=${EXPERIMENT_NAME:-"debug-${DEBUG_MODE}"}
@@ -158,6 +174,7 @@ case "$DEBUG_MODE" in
             "distillation.intervention.student_segment_length=${TEACHER_INTERVENTION_SEGMENT_LENGTH}"
             "distillation.intervention.teacher_segment_length=${TEACHER_INTERVENTION_TEACHER_LENGTH}"
             "distillation.intervention.gap_metric=${TEACHER_INTERVENTION_GAP_METRIC}"
+            "distillation.intervention.gap_distribution_topk=${TEACHER_INTERVENTION_GAP_DISTRIBUTION_TOPK}"
             "distillation.intervention.gap_threshold=${TEACHER_INTERVENTION_GAP_THRESHOLD}"
             "distillation.intervention.max_interventions_per_sample=${TEACHER_INTERVENTION_MAX_COUNT}"
             "distillation.intervention.train_on_teacher_segments=${TEACHER_INTERVENTION_TRAIN_TEACHER}"
@@ -174,7 +191,7 @@ case "$DEBUG_MODE" in
 esac
 
 COMMON_OVERRIDES=(
-    "algorithm.adv_estimator=grpo"
+    "algorithm.adv_estimator=${ADV_ESTIMATOR}"
     "algorithm.use_kl_in_reward=False"
     "algorithm.rollout_correction.bypass_mode=False"
     "data.train_files=[\"${TRAIN_FILE}\"]"
@@ -186,11 +203,12 @@ COMMON_OVERRIDES=(
     "data.max_prompt_length=${MAX_PROMPT_LENGTH}"
     "data.max_response_length=${MAX_RESPONSE_LENGTH}"
     "data.filter_overlong_prompts=True"
-    "data.truncation=left"
+    "data.truncation=${DATA_TRUNCATION}"
     "data.shuffle=False"
     "data.seed=${DATA_SEED}"
     "data.dataloader_num_workers=0"
     "actor_rollout_ref.model.path=${STUDENT_MODEL}"
+    "actor_rollout_ref.model.chat_template_from_model=${CHAT_TEMPLATE_MODEL}"
     "actor_rollout_ref.model.use_remove_padding=True"
     "actor_rollout_ref.model.enable_gradient_checkpointing=True"
     "+actor_rollout_ref.model.override_config.attn_implementation=${ATTN_IMPLEMENTATION}"
@@ -228,8 +246,8 @@ COMMON_OVERRIDES=(
     "reward.reward_manager.name=naive"
     "critic.enable=False"
     "trainer.balance_batch=True"
-    "trainer.logger=[\"console\"]"
-    "trainer.project_name=DMPD-debug"
+    "trainer.logger=${TRAINER_LOGGER}"
+    "trainer.project_name=${PROJECT_NAME}"
     "trainer.experiment_name=${EXPERIMENT_FULL_NAME}"
     "trainer.n_gpus_per_node=${STUDENT_GPUS}"
     "trainer.nnodes=${STUDENT_NNODES}"
@@ -243,6 +261,7 @@ COMMON_OVERRIDES=(
     "trainer.total_epochs=${TOTAL_EPOCHS}"
     "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}"
     "distillation.enabled=True"
+    "distillation.use_actor_loss=${DISTILLATION_USE_ACTOR_LOSS}"
     "distillation.n_gpus_per_node=${TEACHER_GPUS}"
     "distillation.nnodes=${TEACHER_NNODES}"
     "distillation.teacher_models.teacher_model.model_path=${TEACHER_MODEL}"
@@ -257,12 +276,15 @@ COMMON_OVERRIDES=(
     "distillation.teacher_models.teacher_model.inference.skip_tokenizer_init=${SKIP_TOKENIZER_INIT}"
     "distillation.distillation_loss.loss_mode=${DISTILLATION_LOSS_MODE}"
     "distillation.distillation_loss.topk=${DISTILLATION_TOPK}"
+    "distillation.distillation_loss.top_k_strategy=${TOP_K_STRATEGY}"
+    "distillation.distillation_loss.reward_weight_mode=${REWARD_WEIGHT_MODE}"
     "distillation.distillation_loss.use_task_rewards=${DISTILLATION_USE_TASK_REWARDS}"
     "distillation.distillation_loss.use_policy_gradient=${DISTILLATION_USE_POLICY_GRADIENT}"
     "distillation.distillation_loss.loss_max_clamp=${DISTILLATION_LOSS_MAX_CLAMP}"
     "distillation.distillation_loss.log_prob_min_clamp=${DISTILLATION_LOG_PROB_MIN_CLAMP}"
     "distillation.diagnostics.enabled=${OPD_DIAGNOSTICS_ENABLED}"
     "distillation.diagnostics.collect_topk_overlap=${OPD_DIAGNOSTICS_COLLECT_TOPK_OVERLAP}"
+    "distillation.diagnostics.collect_rethinking_opd_metrics=${OPD_DIAGNOSTICS_COLLECT_RETHINKING_OPD}"
     "distillation.diagnostics.topk=${OPD_DIAGNOSTICS_TOPK}"
     "distillation.diagnostics.position_bin_size=${OPD_DIAGNOSTICS_POSITION_BIN_SIZE}"
     "distillation.diagnostics.heatmap_interval=${OPD_DIAGNOSTICS_HEATMAP_INTERVAL}"
@@ -299,8 +321,8 @@ fi
 
 REMOTE_CMD='set -euo pipefail
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-export WANDB_MODE=disabled
-export WANDB_DISABLED=true
+export WANDB_MODE='"$WANDB_MODE"'
+export WANDB_DISABLED='"$WANDB_DISABLED"'
 export HYDRA_FULL_ERROR=1
 export RAY_DEDUP_LOGS=0
 export RAY_USAGE_STATS_ENABLED=0
@@ -316,6 +338,7 @@ test -f '"$(printf "%q" "$TRAIN_FILE")"' || { echo "Missing TRAIN_FILE='"$TRAIN_
 test -f '"$(printf "%q" "$VAL_FILE")"' || { echo "Missing VAL_FILE='"$VAL_FILE"'" >&2; exit 2; }
 test -d '"$(printf "%q" "$STUDENT_MODEL")"' || { echo "Missing STUDENT_MODEL='"$STUDENT_MODEL"'" >&2; exit 2; }
 test -d '"$(printf "%q" "$TEACHER_MODEL")"' || { echo "Missing TEACHER_MODEL='"$TEACHER_MODEL"'" >&2; exit 2; }
+test -d '"$(printf "%q" "$CHAT_TEMPLATE_MODEL")"' || { echo "Missing CHAT_TEMPLATE_MODEL='"$CHAT_TEMPLATE_MODEL"'" >&2; exit 2; }
 '
 
 if [[ "$RUN_PREFLIGHT" == "1" ]]; then
@@ -323,10 +346,15 @@ if [[ "$RUN_PREFLIGHT" == "1" ]]; then
 "
 fi
 
-REMOTE_CMD+="${REMOTE_PYTHON} -m verl.trainer.main_ppo"
+REMOTE_CMD+="TRAIN_CMD=($(printf "%q" "$REMOTE_PYTHON") -m verl.trainer.main_ppo)
+"
 for override in "${OVERRIDES[@]}"; do
-    REMOTE_CMD+=" $(printf "%q" "$override")"
+    REMOTE_CMD+="TRAIN_CMD+=($(printf "%q" "$override"))
+"
 done
+REMOTE_CMD+='echo "[debug] train command overrides=\$(( \${#TRAIN_CMD[@]} - 3 ))"
+"\${TRAIN_CMD[@]}"
+'
 
 cat <<EOF
 [debug] submitting GPU debug job
@@ -339,8 +367,9 @@ cat <<EOF
   gpu split:    student ${STUDENT_GPUS}g tp=${STUDENT_TP}, teacher ${TEACHER_GPUS}g tp=${TEACHER_TP}
   steps:        ${TOTAL_TRAINING_STEPS}
   max lengths:  prompt ${MAX_PROMPT_LENGTH}, response ${MAX_RESPONSE_LENGTH}, model ${MAX_MODEL_LEN}
+  chat template:${CHAT_TEMPLATE_MODEL:-disabled}
   attention:    ${ATTN_IMPLEMENTATION}, vllm backend ${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}
-  wandb/ckpt:   disabled
+  wandb/ckpt:   WANDB_MODE=${WANDB_MODE}, checkpoint disabled
 EOF
 
 if [[ "$DRY_RUN" == "1" ]]; then

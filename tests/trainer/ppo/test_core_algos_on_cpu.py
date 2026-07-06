@@ -24,8 +24,10 @@ from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
+    compute_policy_loss_vanilla,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
+    compute_token_reward_direct_advantage,
     get_adv_estimator_fn,
     kl_penalty,
     register_adv_est,
@@ -139,6 +141,63 @@ class TestRegisterAdvEst(unittest.TestCase):
         """Test that name lookup is case-sensitive."""
         with pytest.raises(ValueError):
             get_adv_estimator_fn("GAE")  # Different case
+
+
+def test_token_reward_direct_advantage_masks_token_rewards_on_cpu():
+    rewards = torch.tensor([[1.0, -2.0, 3.0], [4.0, 5.0, -6.0]])
+    response_mask = torch.tensor([[1, 1, 0], [1, 0, 1]], dtype=torch.float32)
+
+    advantages, returns = compute_token_reward_direct_advantage(
+        token_level_rewards=rewards,
+        response_mask=response_mask,
+    )
+
+    expected = rewards * response_mask
+    assert torch.allclose(advantages, expected)
+    assert torch.allclose(returns, expected)
+
+
+class _PolicyLossConfig(dict):
+    def __getattr__(self, key):
+        return self[key]
+
+
+def test_token_reward_direct_advantage_preserves_topk_rewards_on_cpu():
+    rewards = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]])
+    response_mask = torch.tensor([[1, 0, 1]], dtype=torch.float32)
+
+    advantages, returns = compute_token_reward_direct_advantage(
+        token_level_rewards=rewards,
+        response_mask=response_mask,
+    )
+
+    expected = torch.tensor([[[1.0, 2.0], [0.0, 0.0], [5.0, 6.0]]])
+    assert torch.allclose(advantages, expected)
+    assert torch.allclose(returns, expected)
+
+
+def test_vanilla_policy_loss_preserves_topk_normalization_on_cpu():
+    old_log_prob = torch.log(torch.tensor([[[0.5, 0.3], [0.4, 0.2]]]))
+    log_prob = old_log_prob.clone()
+    advantages = torch.ones_like(log_prob)
+    response_mask = torch.tensor([[1, 0]], dtype=torch.float32)
+    config = _PolicyLossConfig(
+        clip_ratio=0.2,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        global_batch_info={},
+    )
+
+    loss, metrics = compute_policy_loss_vanilla(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=config,
+    )
+
+    assert loss.item() == pytest.approx(-2.0)
+    assert metrics["actor/ppo_kl"] == pytest.approx(0.0)
 
 
 def test_multi_turn_compute_gae_advantage_return():

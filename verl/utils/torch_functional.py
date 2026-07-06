@@ -100,6 +100,17 @@ def logprobs_from_logits(logits, labels, inplace_backward=True):
     return output
 
 
+def topk_logprobs_from_logits(logits: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return top-k token ids and normalized log-probabilities without materializing full log-softmax."""
+    if topk <= 0:
+        raise ValueError(f"topk must be positive, got {topk}.")
+    topk = min(int(topk), int(logits.shape[-1]))
+    topk_logits, topk_ids = torch.topk(logits, k=topk, dim=-1)
+    log_normalizer = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
+    topk_logprobs = topk_logits.float() - log_normalizer
+    return topk_ids, topk_logprobs
+
+
 def logprobs_from_logits_flash_attn(
     logits: torch.Tensor, labels: torch.Tensor, inplace_backward: bool = True
 ) -> torch.Tensor:

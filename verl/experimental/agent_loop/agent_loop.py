@@ -29,6 +29,7 @@ and is designed to be fully replaceable by other agent frameworks such as:
 
 import asyncio
 import logging
+import math
 import os
 import random
 from abc import ABC, abstractmethod
@@ -82,6 +83,8 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+INTERVENTION_TOPK_DISTRIBUTION_GAP_METRICS = {"topk_kl", "topk_distribution_kl", "topk_dist_kl"}
+INTERVENTION_FULL_DISTRIBUTION_GAP_METRICS = {"full_kl", "full_distribution_kl", "distribution_kl"}
 
 
 @dataclass
@@ -107,6 +110,7 @@ def _compute_intervention_gap(
     metric: str,
 ) -> torch.Tensor:
     """Compute per-token teacher/student gap for intervention gating."""
+    metric = metric.lower()
     student_logprobs = student_logprobs.float()
     teacher_logprobs = teacher_logprobs.float()
     if metric in ("kl", "k1"):
@@ -158,6 +162,154 @@ def _teacher_response_logprobs(
     return response_logprobs
 
 
+def _uses_intervention_distribution_gap(metric: str) -> bool:
+    metric = metric.lower()
+    return metric in INTERVENTION_TOPK_DISTRIBUTION_GAP_METRICS | INTERVENTION_FULL_DISTRIBUTION_GAP_METRICS
+
+
+def _uses_intervention_full_distribution_gap(metric: str) -> bool:
+    return metric.lower() in INTERVENTION_FULL_DISTRIBUTION_GAP_METRICS
+
+
+def _response_distribution_scoring_rows(
+    *,
+    result: TeacherLogprobScoringResult,
+    prompt_len: int,
+    response_len: int,
+    context: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Slice prompt-logprob top-k/full rows so they align with response tokens."""
+    if response_len == 0:
+        return torch.empty((0, 0), dtype=torch.long), torch.empty((0, 0), dtype=torch.float32)
+    if prompt_len <= 0:
+        raise ValueError(f"{context} intervention scoring requires a non-empty prompt.")
+    ids = result.ids
+    logprobs = result.logprobs
+    if ids.ndim != 2 or logprobs.ndim != 2 or ids.shape != logprobs.shape:
+        raise RuntimeError(
+            f"{context} intervention distribution scoring expects aligned rank-2 ids/logprobs, "
+            f"got ids.shape={tuple(ids.shape)} and logprobs.shape={tuple(logprobs.shape)}."
+        )
+    required_len = prompt_len + response_len
+    if ids.shape[0] < required_len:
+        raise RuntimeError(
+            f"{context} intervention scoring returned too few prompt-logprob rows: "
+            f"ids.shape={tuple(ids.shape)}, prompt_len={prompt_len}, response_len={response_len}, "
+            f"required_sequence_len={required_len}."
+        )
+    start = prompt_len - 1
+    end = start + response_len
+    return ids[start:end].long(), logprobs[start:end].float()
+
+
+def _logprob_floor_from_distillation_config(distillation_config: Any) -> float:
+    loss_config = getattr(distillation_config, "distillation_loss", None)
+    floor = getattr(loss_config, "log_prob_min_clamp", None)
+    if floor is None:
+        floor = DEFAULT_NONFINITE_LOGPROB_REPLACEMENT
+    floor = float(floor)
+    if not math.isfinite(floor) or floor > 0:
+        raise ValueError(f"distillation_loss.log_prob_min_clamp must be finite and <= 0, got {floor!r}.")
+    return floor
+
+
+def _logprobs_on_support(
+    *,
+    source_ids: torch.Tensor,
+    source_logprobs: torch.Tensor,
+    support_ids: torch.Tensor,
+    log_prob_floor: float,
+) -> torch.Tensor:
+    source_logprobs = torch.nan_to_num(
+        source_logprobs.float(),
+        nan=log_prob_floor,
+        neginf=log_prob_floor,
+        posinf=0.0,
+    ).clamp_min(log_prob_floor)
+    matches = support_ids.unsqueeze(-1) == source_ids.long().unsqueeze(0)
+    floor_values = torch.full(
+        (support_ids.shape[0], source_ids.shape[0]),
+        log_prob_floor,
+        dtype=source_logprobs.dtype,
+        device=source_logprobs.device,
+    )
+    matched_logprobs = torch.where(matches, source_logprobs.unsqueeze(0).expand_as(floor_values), floor_values)
+    return matched_logprobs.max(dim=-1).values
+
+
+def _compute_distribution_intervention_gap(
+    *,
+    student_result: TeacherLogprobScoringResult,
+    teacher_result: TeacherLogprobScoringResult,
+    prompt_len: int,
+    response_len: int,
+    metric: str,
+    tokenizer: Any,
+    log_prob_floor: float,
+) -> torch.Tensor:
+    """Compute per-token KL(student || teacher) on top-k union support or exact full support."""
+    student_ids, student_logprobs = _response_distribution_scoring_rows(
+        result=student_result,
+        prompt_len=prompt_len,
+        response_len=response_len,
+        context="Student",
+    )
+    teacher_ids, teacher_logprobs = _response_distribution_scoring_rows(
+        result=teacher_result,
+        prompt_len=prompt_len,
+        response_len=response_len,
+        context="Teacher",
+    )
+    if student_ids.shape[0] != teacher_ids.shape[0]:
+        raise RuntimeError(
+            "Student and teacher intervention distribution scoring returned different response lengths: "
+            f"student_ids.shape={tuple(student_ids.shape)}, teacher_ids.shape={tuple(teacher_ids.shape)}."
+        )
+
+    exact_full_kl = _uses_intervention_full_distribution_gap(metric)
+    vocab_size = _tokenizer_vocab_size(tokenizer) if exact_full_kl else None
+    if exact_full_kl and vocab_size is None:
+        raise RuntimeError("gap_metric=full_kl requires a tokenizer with a known vocabulary size.")
+
+    gaps = []
+    for pos in range(response_len):
+        support_ids = torch.unique(torch.cat([student_ids[pos], teacher_ids[pos]], dim=0))
+        support_ids = support_ids[support_ids >= 0]
+        if vocab_size is not None:
+            support_ids = support_ids[support_ids < vocab_size]
+            if support_ids.numel() < vocab_size:
+                raise RuntimeError(
+                    "gap_metric=full_kl requires exact full-vocabulary prompt logprobs from both student and "
+                    "teacher, but the returned union support is incomplete at response position "
+                    f"{pos}: support={support_ids.numel()}, vocab_size={vocab_size}. "
+                    "Use gap_metric=topk_distribution_kl for the top-k approximation."
+                )
+        if support_ids.numel() == 0:
+            gaps.append(torch.tensor(0.0, dtype=torch.float32))
+            continue
+
+        support_ids = support_ids.to(student_ids.device)
+        student_lp = _logprobs_on_support(
+            source_ids=student_ids[pos].to(student_ids.device),
+            source_logprobs=student_logprobs[pos].to(student_ids.device),
+            support_ids=support_ids,
+            log_prob_floor=log_prob_floor,
+        )
+        teacher_lp = _logprobs_on_support(
+            source_ids=teacher_ids[pos].to(student_ids.device),
+            source_logprobs=teacher_logprobs[pos].to(student_ids.device),
+            support_ids=support_ids,
+            log_prob_floor=log_prob_floor,
+        )
+        student_log_dist = student_lp - torch.logsumexp(student_lp, dim=-1)
+        teacher_log_dist = teacher_lp - torch.logsumexp(teacher_lp, dim=-1)
+        kl = (student_log_dist.exp() * (student_log_dist - teacher_log_dist)).sum()
+        gaps.append(torch.clamp(torch.nan_to_num(kl.float(), nan=0.0, posinf=1e4, neginf=0.0), min=0.0))
+    if not gaps:
+        return torch.empty(0, dtype=torch.float32)
+    return torch.stack(gaps).cpu()
+
+
 def _teacher_gap_logprobs(result: TeacherLogprobScoringResult) -> torch.Tensor:
     if result.sampled_logprobs is not None:
         return result.sampled_logprobs
@@ -173,6 +325,74 @@ def _coerce_teacher_logprob_scoring_result(result: Any) -> TeacherLogprobScoring
     raise TypeError(
         "Teacher logprob scoring must return TeacherLogprobScoringResult or a legacy "
         f"(teacher_ids, teacher_logprobs) tuple, got {type(result).__name__}."
+    )
+
+
+def _coerce_prompt_logprob_scoring_output(
+    output: Any,
+    *,
+    sequence_len: int,
+    expected_width: int,
+    context: str,
+) -> TeacherLogprobScoringResult:
+    extra_fields = getattr(output, "extra_fields", None) or {}
+    missing_keys = {"prompt_ids", "prompt_logprobs"} - set(extra_fields)
+    if missing_keys:
+        raise RuntimeError(
+            f"{context} logprob scoring did not return required prompt scoring fields {sorted(missing_keys)}. "
+            f"Returned extra_fields keys: {sorted(extra_fields.keys())}."
+        )
+    try:
+        ids = torch.tensor(extra_fields["prompt_ids"], dtype=torch.int32)
+        logprobs = torch.tensor(extra_fields["prompt_logprobs"])
+        sampled_ids = (
+            torch.tensor(extra_fields["sampled_prompt_ids"], dtype=torch.int32)
+            if "sampled_prompt_ids" in extra_fields
+            else None
+        )
+        sampled_logprobs = (
+            torch.tensor(extra_fields["sampled_prompt_logprobs"]) if "sampled_prompt_logprobs" in extra_fields else None
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"{context} logprob scoring returned prompt scoring fields that could not be converted to tensors. "
+            f"prompt_ids type={type(extra_fields['prompt_ids']).__name__}, "
+            f"prompt_logprobs type={type(extra_fields['prompt_logprobs']).__name__}."
+        ) from exc
+    if ids.ndim != 2 or logprobs.ndim != 2 or ids.shape != logprobs.shape:
+        raise RuntimeError(
+            f"{context} logprob scoring expected aligned rank-2 prompt ids/logprobs, "
+            f"got ids.shape={tuple(ids.shape)} and logprobs.shape={tuple(logprobs.shape)}."
+        )
+    if ids.shape != (sequence_len, expected_width):
+        raise RuntimeError(
+            f"{context} logprob scoring returned unexpected prompt scoring shape: "
+            f"expected {(sequence_len, expected_width)}, got ids.shape={tuple(ids.shape)} and "
+            f"logprobs.shape={tuple(logprobs.shape)}."
+        )
+    if (sampled_ids is None) != (sampled_logprobs is None):
+        raise RuntimeError(
+            f"{context} logprob scoring must return sampled_prompt_ids and sampled_prompt_logprobs together, "
+            f"but got extra_fields keys: {sorted(extra_fields.keys())}."
+        )
+    if sampled_ids is not None and (
+        sampled_ids.ndim != 2
+        or sampled_logprobs.ndim != 2
+        or sampled_ids.shape != sampled_logprobs.shape
+        or sampled_ids.shape != (sequence_len, 1)
+    ):
+        raise RuntimeError(
+            f"{context} sampled prompt scoring fields must have shape [sequence_len, 1], "
+            f"got sampled_ids.shape={tuple(sampled_ids.shape)} and "
+            f"sampled_logprobs.shape={tuple(sampled_logprobs.shape)}."
+        )
+    if logprobs.numel() and torch.nan_to_num(logprobs.float(), posinf=1.0).max().item() > 1e-6:
+        raise RuntimeError(f"{context} prompt_logprobs contained positive log probabilities.")
+    return TeacherLogprobScoringResult(
+        ids=ids,
+        logprobs=logprobs,
+        sampled_ids=sampled_ids,
+        sampled_logprobs=sampled_logprobs,
     )
 
 
@@ -239,6 +459,23 @@ def _tokenizer_eos_token_ids(tokenizer: Any) -> set[int]:
     if isinstance(eos_token_id, list | tuple | set):
         return {int(token_id) for token_id in eos_token_id if token_id is not None}
     return {int(eos_token_id)}
+
+
+def _tokenizer_vocab_size(tokenizer: Any) -> Optional[int]:
+    try:
+        size = len(tokenizer)
+    except TypeError:
+        size = getattr(tokenizer, "vocab_size", None)
+    except Exception:
+        size = None
+    return int(size) if size is not None and int(size) > 0 else None
+
+
+def _invalid_token_ids_for_tokenizer(token_ids: list[int], tokenizer: Any) -> list[int]:
+    vocab_size = _tokenizer_vocab_size(tokenizer)
+    if vocab_size is None:
+        return []
+    return [int(token_id) for token_id in token_ids if int(token_id) < 0 or int(token_id) >= vocab_size]
 
 
 def _truncate_generation_at_eos(
@@ -979,10 +1216,18 @@ class AgentLoopWorker:
         if not hasattr(self, "_teacher_intervention_thinking_start_pattern"):
             AgentLoopWorker._init_teacher_intervention_token_patterns(self)
 
-    def _teacher_intervention_thinking_state(self, response_ids: list[int]) -> _ThinkingBlockState:
+    def _teacher_intervention_thinking_state(
+        self,
+        response_ids: list[int],
+        *,
+        prompt_ids: Optional[list[int]] = None,
+    ) -> _ThinkingBlockState:
         AgentLoopWorker._ensure_teacher_intervention_token_patterns(self)
+        token_ids = list(response_ids)
+        if prompt_ids:
+            token_ids = list(prompt_ids) + token_ids
         return _thinking_block_state(
-            response_ids,
+            token_ids,
             start_pattern=getattr(self, "_teacher_intervention_thinking_start_pattern", []),
             end_pattern=getattr(self, "_teacher_intervention_thinking_end_pattern", []),
         )
@@ -1006,13 +1251,35 @@ class AgentLoopWorker:
         prompt_logprobs = 0
         if loss_config is not None and getattr(loss_settings, "use_topk", False):
             prompt_logprobs = max(prompt_logprobs, int(loss_config.topk))
+        config = getattr(self, "config", None)
+        algorithm_config = getattr(config, "algorithm", None)
+        adv_estimator = getattr(algorithm_config, "adv_estimator", "")
+        adv_estimator = getattr(adv_estimator, "value", adv_estimator)
+        if loss_config is not None and str(adv_estimator) == "token_reward_direct":
+            prompt_logprobs = max(prompt_logprobs, int(loss_config.topk or 0))
         diagnostics_config = getattr(distillation_config, "diagnostics", None)
-        if diagnostics_config is not None and getattr(diagnostics_config, "collect_topk_overlap", False):
+        if diagnostics_config is not None and (
+            getattr(diagnostics_config, "collect_topk_overlap", False)
+            or getattr(diagnostics_config, "collect_rethinking_opd_metrics", False)
+        ):
             prompt_logprobs = max(prompt_logprobs, int(getattr(diagnostics_config, "topk", 64) or 64))
         return prompt_logprobs
 
     def _intervention_prompt_logprobs(self) -> int:
-        return AgentLoopWorker._teacher_prompt_logprobs(self)
+        prompt_logprobs = AgentLoopWorker._teacher_prompt_logprobs(self)
+        intervention_config = getattr(self, "teacher_intervention_config", None)
+        if intervention_config is None or not getattr(intervention_config, "enabled", False):
+            return prompt_logprobs
+
+        metric = str(getattr(intervention_config, "gap_metric", "")).lower()
+        if metric in INTERVENTION_TOPK_DISTRIBUTION_GAP_METRICS:
+            prompt_logprobs = max(prompt_logprobs, int(getattr(intervention_config, "gap_distribution_topk", 16)))
+        elif metric in INTERVENTION_FULL_DISTRIBUTION_GAP_METRICS:
+            vocab_size = _tokenizer_vocab_size(getattr(self, "tokenizer", None))
+            if vocab_size is None:
+                raise RuntimeError("gap_metric=full_kl requires a tokenizer with a known vocabulary size.")
+            prompt_logprobs = max(prompt_logprobs, vocab_size)
+        return prompt_logprobs
 
     def _maybe_reset_teacher_intervention_log_counter(self, sample_kwargs: Optional[dict[str, Any]]) -> None:
         if not sample_kwargs or "global_steps" not in sample_kwargs:
@@ -1533,6 +1800,40 @@ class AgentLoopWorker:
         )
         return _coerce_teacher_logprob_scoring_result(result)
 
+    async def _score_student_sequence_for_intervention(
+        self,
+        *,
+        request_id: str,
+        prompt_ids: list[int],
+        response_ids: list[int],
+        output: AgentLoopOutput,
+    ) -> TeacherLogprobScoringResult:
+        sequence_ids = prompt_ids + response_ids
+        prompt_logprobs = AgentLoopWorker._intervention_prompt_logprobs(self)
+        if prompt_logprobs < 0:
+            raise ValueError(f"Student intervention scoring requires prompt_logprobs >= 0, got {prompt_logprobs}.")
+        multi_modal_data = output.multi_modal_data or {}
+        student_output = await self.llm_client.generate(
+            request_id=request_id,
+            prompt_ids=sequence_ids,
+            sampling_params={
+                "max_tokens": 1,
+                "temperature": 1.0,
+                "prompt_logprobs": prompt_logprobs,
+                "logprobs": None,
+            },
+            image_data=multi_modal_data.get("images"),
+            video_data=multi_modal_data.get("videos"),
+            audio_data=multi_modal_data.get("audios"),
+            mm_processor_kwargs=output.mm_processor_kwargs,
+        )
+        return _coerce_prompt_logprob_scoring_output(
+            student_output,
+            sequence_len=len(sequence_ids),
+            expected_width=max(prompt_logprobs, 1),
+            context="Student intervention",
+        )
+
     async def _generate_student_suffix(
         self,
         *,
@@ -1677,23 +1978,40 @@ class AgentLoopWorker:
                 routing_key=routing_key,
             )
             cached_teacher_result = teacher_result
-            teacher_response_logprobs = _teacher_response_logprobs(
-                teacher_logprobs=_teacher_gap_logprobs(teacher_result),
-                prompt_len=len(prompt_ids),
-                response_len=len(response_ids),
-            )
-            student_response_logprobs = torch.tensor(response_logprobs[: len(response_ids)], dtype=torch.float32)
-            if teacher_response_logprobs.shape != student_response_logprobs.shape:
-                raise ValueError(
-                    "Teacher intervention scoring produced misaligned logprobs: "
-                    f"{teacher_response_logprobs.shape=} vs {student_response_logprobs.shape=}, "
-                    f"prompt_len={len(prompt_ids)}, response_len={len(response_ids)}, attempt={attempt}."
+            if _uses_intervention_distribution_gap(intervention_config.gap_metric):
+                student_result = await self._score_student_sequence_for_intervention(
+                    request_id=f"{base_request_id}:student-score:{attempt}",
+                    prompt_ids=prompt_ids,
+                    response_ids=response_ids,
+                    output=output,
                 )
-            gaps = _compute_intervention_gap(
-                student_logprobs=student_response_logprobs,
-                teacher_logprobs=teacher_response_logprobs,
-                metric=intervention_config.gap_metric,
-            )
+                gaps = _compute_distribution_intervention_gap(
+                    student_result=student_result,
+                    teacher_result=teacher_result,
+                    prompt_len=len(prompt_ids),
+                    response_len=len(response_ids),
+                    metric=intervention_config.gap_metric,
+                    tokenizer=self.tokenizer,
+                    log_prob_floor=_logprob_floor_from_distillation_config(self.distillation_config),
+                )
+            else:
+                teacher_response_logprobs = _teacher_response_logprobs(
+                    teacher_logprobs=_teacher_gap_logprobs(teacher_result),
+                    prompt_len=len(prompt_ids),
+                    response_len=len(response_ids),
+                )
+                student_response_logprobs = torch.tensor(response_logprobs[: len(response_ids)], dtype=torch.float32)
+                if teacher_response_logprobs.shape != student_response_logprobs.shape:
+                    raise ValueError(
+                        "Teacher intervention scoring produced misaligned logprobs: "
+                        f"{teacher_response_logprobs.shape=} vs {student_response_logprobs.shape=}, "
+                        f"prompt_len={len(prompt_ids)}, response_len={len(response_ids)}, attempt={attempt}."
+                    )
+                gaps = _compute_intervention_gap(
+                    student_logprobs=student_response_logprobs,
+                    teacher_logprobs=teacher_response_logprobs,
+                    metric=intervention_config.gap_metric,
+                )
             bad_segment = _select_intervention_segment(gaps, gap_mask, intervention_config)
             if bad_segment is None or len(interventions) >= intervention_config.max_interventions_per_sample:
                 break
@@ -1774,6 +2092,21 @@ class AgentLoopWorker:
                     candidate_response_mask=prefix_response_mask,
                 )
                 break
+            invalid_teacher_token_ids = _invalid_token_ids_for_tokenizer(teacher_segment_ids, self.tokenizer)
+            if invalid_teacher_token_ids:
+                _record_skipped_intervention(
+                    skipped_interventions,
+                    reason="teacher_generation_invalid_token_ids",
+                    attempt=attempt,
+                    start=start,
+                    end=end,
+                    candidate_response_ids=prefix_response_ids,
+                    candidate_response_mask=prefix_response_mask,
+                    teacher_tokens=len(teacher_segment_ids),
+                )
+                skipped_interventions[-1]["invalid_token_ids"] = invalid_teacher_token_ids[:8]
+                skipped_interventions[-1]["tokenizer_vocab_size"] = _tokenizer_vocab_size(self.tokenizer)
+                break
             rewrite_overlap_metrics = compute_rewrite_overlap_metrics(original_student_segment_ids, teacher_segment_ids)
 
             teacher_terminal = _generation_is_terminal(
@@ -1816,7 +2149,11 @@ class AgentLoopWorker:
                 gap_mask=candidate_gap_mask,
                 response_length_limit=self.rollout_config.response_length,
             )
-            thinking_state = AgentLoopWorker._teacher_intervention_thinking_state(self, candidate_response_ids)
+            thinking_state = AgentLoopWorker._teacher_intervention_thinking_state(
+                self,
+                candidate_response_ids,
+                prompt_ids=prompt_ids,
+            )
             if not thinking_state.valid:
                 _record_skipped_intervention(
                     skipped_interventions,

@@ -78,6 +78,10 @@ class DistillationLossConfig(BaseConfig):
         Distillation loss function to use.
     topk (int, optional):
         Number of top tokens to consider for top-k distillation losses.
+    top_k_strategy (str):
+        Top-k support strategy for token-reward OPD. Currently only "only_stu" is supported by the trainer path.
+    reward_weight_mode (str):
+        Probability weighting used when reducing top-k token rewards to a scalar reward.
     use_task_rewards (bool):
         Whether to include task rewards alongside distillation loss.
     distillation_loss_coef (float):
@@ -108,6 +112,8 @@ class DistillationLossConfig(BaseConfig):
 
     loss_mode: str = "k3"
     topk: Optional[int] = 128
+    top_k_strategy: str = "only_stu"
+    reward_weight_mode: str = "student_p"
     use_task_rewards: bool = True
     distillation_loss_coef: float = 1.0
     loss_max_clamp: Optional[float] = 10.0
@@ -135,6 +141,15 @@ class DistillationLossConfig(BaseConfig):
         from verl.trainer.distillation.losses import DistillationLossSettings, get_distillation_loss_settings
 
         self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
+        if self.topk is not None and self.topk <= 0:
+            raise ValueError("distillation_loss.topk must be positive when set.")
+        if self.top_k_strategy != "only_stu":
+            raise ValueError(f"Only top_k_strategy='only_stu' is currently supported, got {self.top_k_strategy!r}.")
+        if self.reward_weight_mode not in {"student_p", "teacher_p", "none"}:
+            raise ValueError(
+                "distillation_loss.reward_weight_mode must be one of 'student_p', 'teacher_p', or 'none', "
+                f"got {self.reward_weight_mode!r}."
+            )
 
         if self.policy_loss_mode != "vanilla":
             raise NotImplementedError(
@@ -171,6 +186,7 @@ class DistillationInterventionConfig(BaseConfig):
     student_segment_length: int = 128
     teacher_segment_length: int = 128
     gap_metric: str = "k3"
+    gap_distribution_topk: int = 16
     gap_aggregation: str = "mean"
     gap_threshold: float = 1.0
     max_interventions_per_sample: int = 4
@@ -201,8 +217,26 @@ class DistillationInterventionConfig(BaseConfig):
             raise ValueError("min_trainable_tokens_after_repair must be non-negative.")
         if self.gap_aggregation not in {"mean", "max"}:
             raise ValueError(f"Unsupported gap_aggregation: {self.gap_aggregation!r}.")
-        if self.gap_metric not in {"kl", "k1", "abs", "mse", "k2", "low_var_kl", "k3"}:
+        gap_metric = str(self.gap_metric).lower()
+        supported_gap_metrics = {
+            "kl",
+            "k1",
+            "abs",
+            "mse",
+            "k2",
+            "low_var_kl",
+            "k3",
+            "topk_kl",
+            "topk_distribution_kl",
+            "topk_dist_kl",
+            "full_kl",
+            "full_distribution_kl",
+            "distribution_kl",
+        }
+        if gap_metric not in supported_gap_metrics:
             raise ValueError(f"Unsupported gap_metric: {self.gap_metric!r}.")
+        if self.gap_distribution_topk <= 0:
+            raise ValueError("gap_distribution_topk must be positive.")
         if not math.isfinite(self.gap_threshold):
             raise ValueError(f"gap_threshold must be finite, got {self.gap_threshold!r}.")
         if not math.isfinite(self.teacher_temperature) or self.teacher_temperature < 0:
@@ -228,6 +262,7 @@ class DistillationDiagnosticsConfig(BaseConfig):
     high_gap_threshold: float = 1.0
     collect_intervention_metrics: bool = True
     collect_topk_overlap: bool = False
+    collect_rethinking_opd_metrics: bool = False
     topk: Optional[int] = None
 
     def __post_init__(self):
@@ -383,6 +418,7 @@ class DistillationConfig(BaseConfig):
     _mutable_fields = BaseConfig._mutable_fields | {"teacher_models", "n_gpus_per_node", "nnodes"}
 
     enabled: bool = False
+    use_actor_loss: bool = True
     n_gpus_per_node: int = 0
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
@@ -400,7 +436,9 @@ class DistillationConfig(BaseConfig):
         self.teacher_models = self._resolve_teacher_models()
         teacher_world_size_sum = 0
         logprob_topk = self.distillation_loss.topk if self.distillation_loss.loss_settings.use_topk else None
-        if self.diagnostics.collect_topk_overlap:
+        if not self.use_actor_loss:
+            logprob_topk = max(int(logprob_topk or 0), int(self.distillation_loss.topk or 0))
+        if self.diagnostics.collect_topk_overlap or self.diagnostics.collect_rethinking_opd_metrics:
             logprob_topk = max(int(logprob_topk or 0), int(self.diagnostics.topk))
         for teacher_model in self.teacher_models.values():
             teacher_model.validate_and_prepare_for_distillation(

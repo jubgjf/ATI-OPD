@@ -29,6 +29,7 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopWorker,
     DictConfigWrap,
     _apply_generation_max_tokens,
+    _compute_distribution_intervention_gap,
     _compute_intervention_gap,
     _InternalAgentLoopOutput,
     _is_moe_like_hf_config,
@@ -131,6 +132,9 @@ class _FakeTokenizer:
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
         del add_special_tokens
         return list(self.text_tokens.get(text, []))
+
+    def __len__(self) -> int:
+        return 100
 
     def pad(
         self,
@@ -492,6 +496,95 @@ class _FakeRepairStudentClient:
         return TokenOutput(token_ids=[40, 41], log_probs=[-0.2, -0.2])
 
 
+class _DistributionGapStudentClient(_FakeRepairStudentClient):
+    async def generate(
+        self,
+        request_id: str,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    ) -> TokenOutput:
+        if "prompt_logprobs" not in sampling_params:
+            return await super().generate(
+                request_id=request_id,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
+        self.calls.append(
+            {"request_id": request_id, "prompt_ids": list(prompt_ids), "sampling_params": sampling_params}
+        )
+        width = int(sampling_params["prompt_logprobs"])
+        assert width == 2
+        ids = [[1, 2] for _ in prompt_ids]
+        logprobs = torch.log(torch.tensor([[0.9, 0.1] for _ in prompt_ids], dtype=torch.float32)).tolist()
+        sampled_ids = [[int(token_id)] for token_id in prompt_ids]
+        sampled_logprobs = [[-0.1] for _ in prompt_ids]
+        return TokenOutput(
+            token_ids=[0],
+            extra_fields={
+                "prompt_ids": ids,
+                "prompt_logprobs": logprobs,
+                "sampled_prompt_ids": sampled_ids,
+                "sampled_prompt_logprobs": sampled_logprobs,
+            },
+        )
+
+
+class _DistributionGapTeacherManager:
+    def __init__(self):
+        self.scored_sequences: list[list[int]] = []
+        self.generated_prefixes: list[list[int]] = []
+        self.prompt_logprobs_calls: list[Optional[int]] = []
+
+    async def compute_teacher_logprobs_single(
+        self,
+        sequence_ids: list[int],
+        multi_modal_data: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        routing_key: Optional[str] = None,
+        request_id: Optional[str] = None,
+        prompt_logprobs: Optional[int] = None,
+    ) -> TeacherLogprobScoringResult:
+        del multi_modal_data, mm_processor_kwargs, routing_key, request_id
+        self.scored_sequences.append(list(sequence_ids))
+        self.prompt_logprobs_calls.append(prompt_logprobs)
+        assert prompt_logprobs == 2
+        ids = torch.tensor([[1, 2] for _ in sequence_ids], dtype=torch.int32)
+        probs = torch.tensor([[0.9, 0.1] for _ in sequence_ids], dtype=torch.float32)
+        # prompt_len=2, so row 1 scores the first response token.
+        if len(sequence_ids) > 2:
+            probs[1] = torch.tensor([0.1, 0.9])
+        sampled_ids = torch.tensor([[int(token_id)] for token_id in sequence_ids], dtype=torch.int32)
+        sampled_logprobs = torch.full((len(sequence_ids), 1), -0.1, dtype=torch.float32)
+        return TeacherLogprobScoringResult(
+            ids=ids,
+            logprobs=torch.log(probs),
+            sampled_ids=sampled_ids,
+            sampled_logprobs=sampled_logprobs,
+        )
+
+    async def generate_teacher_segment_single(
+        self,
+        prefix_ids: list[int],
+        max_tokens: int,
+        multi_modal_data: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        routing_key: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> TeacherGenerationResult:
+        del max_tokens, multi_modal_data, mm_processor_kwargs, routing_key, request_id
+        self.generated_prefixes.append(list(prefix_ids))
+        return TeacherGenerationResult(token_ids=[30], finish_reason="length")
+
+
 class _FixedGapTeacherManager:
     def __init__(
         self,
@@ -560,6 +653,7 @@ class _FixedGapTeacherManager:
 class _DirectInterventionWorker:
     _teacher_routing_key = AgentLoopWorker._teacher_routing_key
     _score_sequence_for_intervention = AgentLoopWorker._score_sequence_for_intervention
+    _score_student_sequence_for_intervention = AgentLoopWorker._score_student_sequence_for_intervention
     _generate_student_suffix = AgentLoopWorker._generate_student_suffix
     _maybe_repair_with_teacher = AgentLoopWorker._maybe_repair_with_teacher
     teacher_key = "data_source"
@@ -577,6 +671,7 @@ class _DirectInterventionWorker:
         min_trainable_tokens_after_repair: int = 1,
         gap_metric: str = "abs",
         gap_threshold: float = 1.0,
+        gap_distribution_topk: int = 16,
         topk: Optional[int] = None,
         thinking_start_text: str = "<think>",
         thinking_end_text: str = "</think>",
@@ -591,6 +686,7 @@ class _DirectInterventionWorker:
             student_segment_length=student_segment_length,
             teacher_segment_length=teacher_segment_length,
             gap_metric=gap_metric,
+            gap_distribution_topk=gap_distribution_topk,
             gap_threshold=gap_threshold,
             max_interventions_per_sample=max_interventions_per_sample,
             train_on_teacher_segments=train_on_teacher_segments,
@@ -605,6 +701,7 @@ class _DirectInterventionWorker:
             distillation_loss=SimpleNamespace(
                 topk=topk or 64,
                 loss_settings=SimpleNamespace(use_topk=topk is not None),
+                log_prob_min_clamp=-10.0,
             ),
             diagnostics=SimpleNamespace(
                 collect_topk_overlap=diagnostics_topk is not None,
@@ -855,6 +952,38 @@ async def test_teacher_intervention_overlap_diagnostics_requests_topk_and_keeps_
 
 
 @pytest.mark.asyncio
+async def test_teacher_intervention_skips_teacher_generation_with_tokenizer_out_of_range_ids_on_cpu():
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[30, 100], stop_reason="completed", finish_reason="length"),
+        high_gap_start=0,
+    )
+    worker = _DirectInterventionWorker(teacher_manager=teacher_manager, response_length=4)
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4],
+        response_mask=[1, 1, 1, 1],
+        response_logprobs=[-0.1] * 4,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "invalid-teacher-token"},
+    )
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert output.response_ids == [1, 2, 3, 4]
+    assert output.extra_fields["teacher_intervention_count"] == 0
+    assert output.extra_fields["teacher_intervention_skipped"][0]["reason"] == "teacher_generation_invalid_token_ids"
+    assert output.extra_fields["teacher_intervention_skipped"][0]["invalid_token_ids"] == [100]
+    assert output.extra_fields["teacher_intervention_skipped"][0]["tokenizer_vocab_size"] == 100
+    assert worker.llm_client.calls == []
+
+
+@pytest.mark.asyncio
 async def test_teacher_intervention_skips_zero_trainable_repair_and_preserves_original_on_cpu():
     teacher_manager = _FixedGapTeacherManager(
         TeacherGenerationResult(token_ids=[30], stop_reason="completed", finish_reason="stop"),
@@ -1070,6 +1199,67 @@ def test_teacher_intervention_k1_gap_uses_teacher_minus_student_on_cpu():
     assert bad_segment == (0, 2, pytest.approx(4.125))
 
 
+def test_teacher_intervention_full_kl_uses_full_vocab_support_on_cpu():
+    class _TinyTokenizer:
+        def __len__(self):
+            return 3
+
+    ids = torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.int32)
+    student_probs = torch.tensor([[0.5, 0.3, 0.2], [0.5, 0.3, 0.2]], dtype=torch.float32)
+    teacher_probs = torch.tensor([[0.2, 0.3, 0.5], [0.2, 0.3, 0.5]], dtype=torch.float32)
+    gaps = _compute_distribution_intervention_gap(
+        student_result=TeacherLogprobScoringResult(ids=ids, logprobs=torch.log(student_probs)),
+        teacher_result=TeacherLogprobScoringResult(ids=ids, logprobs=torch.log(teacher_probs)),
+        prompt_len=1,
+        response_len=1,
+        metric="full_kl",
+        tokenizer=_TinyTokenizer(),
+        log_prob_floor=-10.0,
+    )
+
+    expected = (student_probs[0] * (student_probs[0].log() - teacher_probs[0].log())).sum()
+    torch.testing.assert_close(gaps, expected.unsqueeze(0))
+
+
+@pytest.mark.asyncio
+async def test_teacher_intervention_topk_distribution_kl_triggers_repair_on_cpu():
+    teacher_manager = _DistributionGapTeacherManager()
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=4,
+        student_segment_length=1,
+        teacher_segment_length=1,
+        gap_metric="topk_distribution_kl",
+        gap_distribution_topk=2,
+        gap_threshold=1.0,
+    )
+    worker.llm_client = _DistributionGapStudentClient()
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4],
+        response_mask=[1, 1, 1, 1],
+        response_logprobs=[-0.1] * 4,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "distribution-kl"},
+    )
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert teacher_manager.prompt_logprobs_calls[0] == 2
+    assert worker.llm_client.calls[0]["sampling_params"]["prompt_logprobs"] == 2
+    assert teacher_manager.generated_prefixes == [[101, 102]]
+    assert output.response_ids == [30, 40, 41]
+    assert output.response_mask == [0, 1, 1]
+    assert output.extra_fields["teacher_intervention_count"] == 1
+    assert output.extra_fields["teacher_interventions"][0]["start"] == 0
+
+
 @pytest.mark.asyncio
 async def test_teacher_intervention_topk_no_repair_reuses_scoring_for_training_logprobs_on_cpu():
     teacher_manager = _FixedGapTeacherManager(
@@ -1180,6 +1370,40 @@ async def test_teacher_intervention_skips_invalid_thinking_block_repair_on_cpu()
     assert output.extra_fields["teacher_intervention_count"] == 0
     assert output.extra_fields["teacher_intervention_skipped"][0]["reason"] == "invalid_thinking_block"
     assert output.extra_fields["teacher_intervention_skipped"][0]["thinking_reason"] == "unmatched_close"
+
+
+@pytest.mark.asyncio
+async def test_teacher_intervention_allows_response_close_for_prompt_open_thinking_on_cpu():
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[92], stop_reason="completed", finish_reason="stop"),
+        high_gap_start=0,
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=4,
+        teacher_segment_length=1,
+        train_on_teacher_segments=True,
+    )
+    output = AgentLoopOutput(
+        prompt_ids=[101, 91],
+        response_ids=[1, 2, 3, 4],
+        response_mask=[1, 1, 1, 1],
+        response_logprobs=[-0.1] * 4,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "prompt-open-thinking"},
+    )
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert output.response_ids == [92]
+    assert output.extra_fields["teacher_intervention_count"] == 1
+    assert output.extra_fields["teacher_intervention_skipped"] == []
 
 
 @pytest.mark.asyncio

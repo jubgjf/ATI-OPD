@@ -113,7 +113,7 @@ def _get_teacher_generation_sampling_params(
         "temperature": intervention_config.teacher_temperature,
         "top_p": intervention_config.teacher_top_p,
         "top_k": intervention_config.teacher_top_k,
-        "logprobs": False,
+        "logprobs": None,
     }
 
 

@@ -23,6 +23,12 @@ import torch
 
 MAX_REASONABLE_ENTROPY = 32.0
 MAX_REASONABLE_LOGPROB_ABS = 1.0e4
+DISTILLATION_DIAGNOSTICS_PREFIX = "distillation"
+
+
+def _topk_distillation_metric_key(metric_name: str, *, k: int, configured_topk: int) -> str:
+    suffix = "" if int(k) == int(configured_topk) else f"_top{k}"
+    return f"{DISTILLATION_DIAGNOSTICS_PREFIX}/{metric_name}{suffix}"
 
 
 def _to_cpu_float(tensor: torch.Tensor) -> torch.Tensor:
@@ -70,6 +76,18 @@ def _masked_event_fraction(event_mask: torch.Tensor, mask: torch.Tensor) -> Opti
         return None
     event_mask = event_mask.detach().bool().cpu()
     return int((event_mask & mask).sum().item()) / denom
+
+
+def _topk_residual_bucket_entropy(logprobs: torch.Tensor, finite_mask: torch.Tensor) -> torch.Tensor:
+    probs = torch.where(finite_mask, logprobs.exp(), torch.zeros_like(logprobs))
+    topk_entropy = torch.where(finite_mask, -(probs * logprobs), torch.zeros_like(logprobs)).sum(dim=-1)
+    residual_mass = (1.0 - probs.sum(dim=-1)).clamp(min=0.0, max=1.0)
+    residual_entropy = torch.where(
+        residual_mass > 0,
+        -(residual_mass * residual_mass.clamp_min(torch.finfo(probs.dtype).tiny).log()),
+        torch.zeros_like(residual_mass),
+    )
+    return topk_entropy + residual_entropy
 
 
 def _bin_key(prefix: str, start: int, end: int) -> str:
@@ -519,6 +537,193 @@ def compute_overlap_diagnostics(
     return metrics
 
 
+def compute_rethinking_opd_diagnostics(
+    *,
+    response_mask: torch.Tensor,
+    student_topk_ids: torch.Tensor,
+    student_topk_logprobs: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    teacher_topk_logprobs: torch.Tensor,
+    bin_size: int,
+    topk: int,
+) -> dict[str, float]:
+    """Compute the top-k OPD dynamics from arXiv:2604.13016 on student-visited states."""
+    if student_topk_ids.shape != student_topk_logprobs.shape:
+        raise ValueError(
+            "student_topk_ids and student_topk_logprobs must align, "
+            f"got {student_topk_ids.shape=} and {student_topk_logprobs.shape=}."
+        )
+    if teacher_topk_ids.shape != teacher_topk_logprobs.shape:
+        raise ValueError(
+            "teacher_topk_ids and teacher_topk_logprobs must align, "
+            f"got {teacher_topk_ids.shape=} and {teacher_topk_logprobs.shape=}."
+        )
+    if student_topk_ids.ndim != 3 or student_topk_ids.shape[:2] != response_mask.shape:
+        raise ValueError(
+            "student_topk_ids must have shape [batch, response_len, k], "
+            f"got {student_topk_ids.shape=} and response_mask.shape={response_mask.shape}."
+        )
+    if teacher_topk_ids.ndim != 3 or teacher_topk_ids.shape[:2] != response_mask.shape:
+        raise ValueError(
+            "teacher_topk_ids must have shape [batch, response_len, k], "
+            f"got {teacher_topk_ids.shape=} and response_mask.shape={response_mask.shape}."
+        )
+    if topk <= 0:
+        raise ValueError(f"topk must be positive, got {topk}.")
+
+    response_mask = response_mask.detach().bool().cpu()
+    student_topk_ids = student_topk_ids.detach().cpu()
+    teacher_topk_ids = teacher_topk_ids.detach().cpu()
+    student_topk_logprobs = _to_cpu_float(student_topk_logprobs)
+    teacher_topk_logprobs = _to_cpu_float(teacher_topk_logprobs)
+
+    available_topk = min(int(topk), int(student_topk_ids.shape[-1]), int(teacher_topk_ids.shape[-1]))
+    metrics: dict[str, float] = {}
+    if available_topk <= 0:
+        return metrics
+
+    for k in compute_topk_ladder(topk):
+        if k > available_topk:
+            continue
+
+        student_ids = student_topk_ids[..., :k]
+        teacher_ids = teacher_topk_ids[..., :k]
+        student_logprobs = student_topk_logprobs[..., :k]
+        teacher_logprobs = teacher_topk_logprobs[..., :k]
+        student_finite = torch.isfinite(student_logprobs)
+        teacher_finite = torch.isfinite(teacher_logprobs)
+        valid_rows = response_mask & (student_finite.sum(dim=-1) >= k) & (teacher_finite.sum(dim=-1) >= k)
+
+        student_probs = torch.where(student_finite, student_logprobs.exp(), torch.zeros_like(student_logprobs))
+        teacher_probs = torch.where(teacher_finite, teacher_logprobs.exp(), torch.zeros_like(teacher_logprobs))
+        student_topk_mass = student_probs.sum(dim=-1)
+        teacher_topk_mass = teacher_probs.sum(dim=-1)
+        valid_rows = valid_rows & (student_topk_mass <= 1.001) & (teacher_topk_mass <= 1.001)
+
+        matches = student_ids.unsqueeze(-1) == teacher_ids.unsqueeze(-2)
+        matches = matches & student_finite.unsqueeze(-1) & teacher_finite.unsqueeze(-2)
+        student_overlap_mask = matches.any(dim=-1)
+        teacher_overlap_mask = matches.any(dim=-2)
+        overlap_count = student_overlap_mask.sum(dim=-1)
+        nonempty_overlap = overlap_count > 0
+        valid_overlap_rows = valid_rows & nonempty_overlap
+
+        overlap_ratio = overlap_count.detach().float() / float(k)
+        overlap_mass_student = torch.where(student_overlap_mask, student_probs, torch.zeros_like(student_probs)).sum(
+            dim=-1
+        )
+        overlap_mass_teacher = torch.where(teacher_overlap_mask, teacher_probs, torch.zeros_like(teacher_probs)).sum(
+            dim=-1
+        )
+
+        _put_if_present(
+            metrics,
+            _topk_distillation_metric_key("overlap_ratio", k=k, configured_topk=topk),
+            _masked_mean(overlap_ratio, valid_rows),
+        )
+        _put_if_present(
+            metrics,
+            _topk_distillation_metric_key("overlap_mass_student", k=k, configured_topk=topk),
+            _masked_mean(overlap_mass_student, valid_rows),
+        )
+        _put_if_present(
+            metrics,
+            _topk_distillation_metric_key("overlap_mass_teacher", k=k, configured_topk=topk),
+            _masked_mean(overlap_mass_teacher, valid_rows),
+        )
+        _put_if_present(
+            metrics,
+            _topk_distillation_metric_key("empty_overlap_fraction", k=k, configured_topk=topk),
+            _masked_event_fraction(~nonempty_overlap, valid_rows),
+        )
+        metrics.update(
+            compute_binned_token_means(
+                overlap_ratio,
+                valid_rows,
+                bin_size=bin_size,
+                prefix=_topk_distillation_metric_key("overlap_ratio_bin", k=k, configured_topk=topk),
+            )
+        )
+        metrics.update(
+            _head_tail_metrics(
+                overlap_ratio,
+                valid_rows,
+                prefix=_topk_distillation_metric_key("overlap_ratio", k=k, configured_topk=topk),
+                bin_size=bin_size,
+            )
+        )
+
+        matched_teacher_logprobs = torch.where(
+            matches,
+            teacher_logprobs.unsqueeze(-2),
+            torch.full_like(matches, float("-inf"), dtype=teacher_logprobs.dtype),
+        ).amax(dim=-1)
+        overlap_student_logprobs = torch.where(
+            student_overlap_mask,
+            student_logprobs,
+            torch.full_like(student_logprobs, float("-inf")),
+        )
+        overlap_teacher_logprobs = torch.where(
+            student_overlap_mask,
+            matched_teacher_logprobs,
+            torch.full_like(matched_teacher_logprobs, float("-inf")),
+        )
+        student_overlap_log_mass = torch.logsumexp(overlap_student_logprobs, dim=-1, keepdim=True)
+        teacher_overlap_log_mass = torch.logsumexp(overlap_teacher_logprobs, dim=-1, keepdim=True)
+        student_logp_bar = overlap_student_logprobs - student_overlap_log_mass
+        teacher_logp_bar = overlap_teacher_logprobs - teacher_overlap_log_mass
+        student_p_bar = torch.where(student_overlap_mask, student_logp_bar.exp(), torch.zeros_like(student_logp_bar))
+        advantage_values = torch.where(
+            student_overlap_mask,
+            student_p_bar * (teacher_logp_bar - student_logp_bar),
+            torch.zeros_like(student_p_bar),
+        )
+        overlap_token_advantage = advantage_values.sum(dim=-1) / overlap_count.clamp_min(1).float()
+        _put_if_present(
+            metrics,
+            _topk_distillation_metric_key("overlap_token_advantage", k=k, configured_topk=topk),
+            _masked_mean(overlap_token_advantage, valid_overlap_rows),
+        )
+        metrics.update(
+            compute_binned_token_means(
+                overlap_token_advantage,
+                valid_overlap_rows,
+                bin_size=bin_size,
+                prefix=_topk_distillation_metric_key("overlap_token_advantage_bin", k=k, configured_topk=topk),
+            )
+        )
+
+        student_entropy_approx = _topk_residual_bucket_entropy(student_logprobs, student_finite)
+        teacher_entropy_approx = _topk_residual_bucket_entropy(teacher_logprobs, teacher_finite)
+        entropy_gap_approx = (teacher_entropy_approx - student_entropy_approx).abs()
+        _put_if_present(
+            metrics,
+            _topk_distillation_metric_key("entropy_student", k=k, configured_topk=topk),
+            _masked_mean(student_entropy_approx, valid_rows),
+        )
+        _put_if_present(
+            metrics,
+            _topk_distillation_metric_key("entropy_teacher", k=k, configured_topk=topk),
+            _masked_mean(teacher_entropy_approx, valid_rows),
+        )
+        _put_if_present(
+            metrics,
+            _topk_distillation_metric_key("entropy_gap", k=k, configured_topk=topk),
+            _masked_mean(entropy_gap_approx, valid_rows),
+        )
+        metrics.update(
+            compute_binned_token_means(
+                entropy_gap_approx,
+                valid_rows,
+                bin_size=bin_size,
+                prefix=_topk_distillation_metric_key("entropy_gap_bin", k=k, configured_topk=topk),
+            )
+        )
+
+    metrics[f"{DISTILLATION_DIAGNOSTICS_PREFIX}/entropy_gap_residual_bucket_approximation"] = 1.0
+    return metrics
+
+
 def compute_opd_diagnostics_metrics(
     *,
     student_logprobs: torch.Tensor,
@@ -526,6 +731,8 @@ def compute_opd_diagnostics_metrics(
     bin_size: int,
     response_ids: Optional[torch.Tensor] = None,
     teacher_logprobs: Optional[torch.Tensor] = None,
+    student_topk_ids: Optional[torch.Tensor] = None,
+    student_topk_logprobs: Optional[torch.Tensor] = None,
     teacher_topk_ids: Optional[torch.Tensor] = None,
     teacher_topk_logprobs: Optional[torch.Tensor] = None,
     teacher_logprob_nonfinite_positions: Optional[list[Any]] = None,
@@ -638,6 +845,8 @@ def compute_opd_diagnostics_metrics(
                 seq_reward = (token_reward * valid_gap_response_mask).sum(dim=1) / valid_gap_response_mask.sum(
                     dim=1
                 ).clamp_min(1)
+                if rm_scores.ndim == response_mask.ndim + 1:
+                    rm_scores = rm_scores.sum(dim=-1)
                 labels = rm_scores.detach().float().sum(dim=1) > 0
                 auc = binary_auc(seq_reward, labels)
                 _put_if_present(metrics, "opd/reward/correct_auc", auc)
@@ -659,6 +868,25 @@ def compute_opd_diagnostics_metrics(
                 teacher_topk_ids=teacher_topk_ids,
                 teacher_topk_logprobs=teacher_topk_logprobs,
                 sampled_teacher_logprobs=teacher_logprobs,
+                bin_size=bin_size,
+                topk=overlap_topk,
+            )
+        )
+
+    if (
+        overlap_topk is not None
+        and student_topk_ids is not None
+        and student_topk_logprobs is not None
+        and teacher_topk_ids is not None
+        and teacher_topk_logprobs is not None
+    ):
+        metrics.update(
+            compute_rethinking_opd_diagnostics(
+                response_mask=response_mask,
+                student_topk_ids=student_topk_ids,
+                student_topk_logprobs=student_topk_logprobs,
+                teacher_topk_ids=teacher_topk_ids,
+                teacher_topk_logprobs=teacher_topk_logprobs,
                 bin_size=bin_size,
                 topk=overlap_topk,
             )

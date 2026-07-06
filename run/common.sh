@@ -56,8 +56,9 @@ run_npu_opd_job() {
     export VLLM_USE_V1=${VLLM_USE_V1:-1}
     ulimit -n "${ULIMIT_NOFILE:-65536}"
 
-    STUDENT_MODEL=${STUDENT_MODEL:-$DATASET_DIR/models/Qwen/Qwen3-1.7B}
-    TEACHER_MODEL=${TEACHER_MODEL:-$DATASET_DIR/models/Qwen/Qwen3-4B}
+    STUDENT_MODEL=${STUDENT_MODEL:-$DATASET_DIR/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
+    TEACHER_MODEL=${TEACHER_MODEL:-$DATASET_DIR/models/Skywork/Skywork-OR1-Math-7B}
+    CHAT_TEMPLATE_MODEL=${CHAT_TEMPLATE_MODEL:-$TEACHER_MODEL}
 
     dapo_math_train=${DAPO_MATH_TRAIN:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl--qwen3/train.parquet}
     dapo_math_valid=${DAPO_MATH_VALID:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl--qwen3/test.parquet}
@@ -77,21 +78,22 @@ run_npu_opd_job() {
     TEACHER_REPLICAS=${TEACHER_REPLICAS:-$((TEACHER_NNODES * TEACHER_NGPUS_PER_NODE / teacher_tp))}
 
     max_prompt_length=${MAX_PROMPT_LENGTH:-$((2 * 1024))}
-    max_response_length=${MAX_RESPONSE_LENGTH:-$((22 * 1024))}
+    max_response_length=${MAX_RESPONSE_LENGTH:-$((15 * 1024))}
     max_num_tokens=${MAX_NUM_TOKENS:-$((max_prompt_length + max_response_length + 1))}
     rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-2048}
     teacher_max_num_batched_tokens=${TEACHER_MAX_NUM_BATCHED_TOKENS:-2048}
     rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-128}
     teacher_max_num_seqs=${TEACHER_MAX_NUM_SEQS:-128}
-    rollout_temperature=${ROLLOUT_TEMPERATURE:-0.6}
-    rollout_top_p=${ROLLOUT_TOP_P:-0.95}
-    rollout_top_k=${ROLLOUT_TOP_K:-20}
+    rollout_n=${ROLLOUT_N:-4}
+    rollout_temperature=${ROLLOUT_TEMPERATURE:-1.0}
+    rollout_top_p=${ROLLOUT_TOP_P:-1.0}
+    rollout_top_k=${ROLLOUT_TOP_K:--1}
     rollout_do_sample=${ROLLOUT_DO_SAMPLE:-True}
-    val_temperature=${VAL_TEMPERATURE:-$rollout_temperature}
-    val_top_p=${VAL_TOP_P:-$rollout_top_p}
+    val_temperature=${VAL_TEMPERATURE:-0.7}
+    val_top_p=${VAL_TOP_P:-0.95}
     val_top_k=${VAL_TOP_K:-$rollout_top_k}
     val_do_sample=${VAL_DO_SAMPLE:-True}
-    val_n=${VAL_N:-5}
+    val_n=${VAL_N:-16}
 
     actor_lr=${ACTOR_LR:-1e-6}
     train_batch_size=${TRAIN_BATCH_SIZE:-64}
@@ -103,23 +105,28 @@ run_npu_opd_job() {
     data_seed=${DATA_SEED:--42}
 
     distillation_loss_mode=${DISTILLATION_LOSS_MODE:-k1}
-    use_task_rewards=${USE_TASK_REWARDS:-True}
+    top_k_strategy=${TOP_K_STRATEGY:-only_stu}
+    reward_weight_mode=${REWARD_WEIGHT_MODE:-student_p}
+    use_task_rewards=${USE_TASK_REWARDS:-False}
     use_policy_gradient=${USE_POLICY_GRADIENT:-True}
-    distillation_topk=${DISTILLATION_TOPK:-64}
+    distillation_topk=${DISTILLATION_TOPK:-16}
     distillation_loss_max_clamp=${DISTILLATION_LOSS_MAX_CLAMP:-10.0}
     distillation_log_prob_min_clamp=${DISTILLATION_LOG_PROB_MIN_CLAMP:--10.0}
     opd_diagnostics_enabled=${OPD_DIAGNOSTICS_ENABLED:-True}
     opd_diagnostics_collect_topk_overlap=${OPD_DIAGNOSTICS_COLLECT_TOPK_OVERLAP:-True}
+    opd_diagnostics_collect_rethinking_opd=${OPD_DIAGNOSTICS_COLLECT_RETHINKING_OPD:-True}
+    opd_diagnostics_topk=${OPD_DIAGNOSTICS_TOPK:-16}
     opd_diagnostics_position_bin_size=${OPD_DIAGNOSTICS_POSITION_BIN_SIZE:-512}
     opd_diagnostics_heatmap_interval=${OPD_DIAGNOSTICS_HEATMAP_INTERVAL:-10}
     opd_diagnostics_heatmap_history_steps=${OPD_DIAGNOSTICS_HEATMAP_HISTORY_STEPS:-80}
     opd_diagnostics_log_heatmap=${OPD_DIAGNOSTICS_LOG_HEATMAP:-True}
     opd_diagnostics_high_gap_threshold=${OPD_DIAGNOSTICS_HIGH_GAP_THRESHOLD:-1.0}
 
-    adv_estimator=${ADV_ESTIMATOR:-grpo}
+    adv_estimator=${ADV_ESTIMATOR:-token_reward_direct}
+    distillation_use_actor_loss=${DISTILLATION_USE_ACTOR_LOSS:-False}
     use_kl_in_reward=${USE_KL_IN_REWARD:-False}
     filter_overlong_prompts=${FILTER_OVERLONG_PROMPTS:-True}
-    data_truncation=${DATA_TRUNCATION:-left}
+    data_truncation=${DATA_TRUNCATION:-error}
     data_shuffle=${DATA_SHUFFLE:-False}
     enable_gradient_checkpointing=${ENABLE_GRADIENT_CHECKPOINTING:-True}
     rollout_name=${ROLLOUT_NAME:-vllm}
@@ -127,7 +134,7 @@ run_npu_opd_job() {
     trainer_logger=${TRAINER_LOGGER:-'["console","wandb"]'}
     trainer_device=${TRAINER_DEVICE:-npu}
     val_before_train=${VAL_BEFORE_TRAIN:-True}
-    teacher_val_before_train=${TEACHER_VAL_BEFORE_TRAIN:-True}
+    teacher_val_before_train=${TEACHER_VAL_BEFORE_TRAIN:-False}
     distillation_enabled=${DISTILLATION_ENABLED:-True}
 
     project_name=${PROJECT_NAME:-DMPD}
@@ -135,7 +142,7 @@ run_npu_opd_job() {
     experiment_base_name=${EXPERIMENT_NAME:-${DEFAULT_EXPERIMENT_NAME:-opd}}
     experiment_name=${EXPERIMENT_FULL_NAME:-"${experiment_base_name}-${experiment_timestamp}"}
     default_local_dir=${DEFAULT_LOCAL_DIR:-$WORKSPACE/outputs/${experiment_name}}
-    total_epochs=${TOTAL_EPOCHS:-3}
+    total_epochs=${TOTAL_EPOCHS:-1}
     save_freq=${SAVE_FREQ:-200}
     test_freq=${TEST_FREQ:-10}
 
@@ -282,6 +289,7 @@ _submit_npu_verl_job() {
         "data.shuffle=${data_shuffle}"
         "data.seed=${data_seed}"
         "actor_rollout_ref.model.path=${STUDENT_MODEL}"
+        "actor_rollout_ref.model.chat_template_from_model=${CHAT_TEMPLATE_MODEL}"
         "actor_rollout_ref.model.use_remove_padding=True"
         "actor_rollout_ref.model.enable_gradient_checkpointing=${enable_gradient_checkpointing}"
         "actor_rollout_ref.actor.use_torch_compile=False"
@@ -297,7 +305,7 @@ _submit_npu_verl_job() {
         "actor_rollout_ref.rollout.name=${rollout_name}"
         "actor_rollout_ref.rollout.tensor_model_parallel_size=${student_tp}"
         "actor_rollout_ref.rollout.gpu_memory_utilization=${student_gpu_mem_util}"
-        "actor_rollout_ref.rollout.n=${ROLLOUT_N:-1}"
+        "actor_rollout_ref.rollout.n=${rollout_n}"
         "actor_rollout_ref.rollout.temperature=${rollout_temperature}"
         "actor_rollout_ref.rollout.top_p=${rollout_top_p}"
         "actor_rollout_ref.rollout.top_k=${rollout_top_k}"
@@ -329,6 +337,7 @@ _submit_npu_verl_job() {
         "trainer.test_freq=${test_freq}"
         "trainer.total_epochs=${total_epochs}"
         "distillation.enabled=${distillation_enabled}"
+        "distillation.use_actor_loss=${distillation_use_actor_loss}"
         "distillation.n_gpus_per_node=${TEACHER_NGPUS_PER_NODE}"
         "distillation.nnodes=${TEACHER_NNODES}"
         "distillation.teacher_models.teacher_model.model_path=${TEACHER_MODEL}"
@@ -341,12 +350,16 @@ _submit_npu_verl_job() {
         "distillation.teacher_models.teacher_model.inference.max_num_seqs=${teacher_max_num_seqs}"
         "distillation.distillation_loss.loss_mode=${distillation_loss_mode}"
         "distillation.distillation_loss.topk=${distillation_topk}"
+        "distillation.distillation_loss.top_k_strategy=${top_k_strategy}"
+        "distillation.distillation_loss.reward_weight_mode=${reward_weight_mode}"
         "distillation.distillation_loss.use_task_rewards=${use_task_rewards}"
         "distillation.distillation_loss.use_policy_gradient=${use_policy_gradient}"
         "distillation.distillation_loss.loss_max_clamp=${distillation_loss_max_clamp}"
         "distillation.distillation_loss.log_prob_min_clamp=${distillation_log_prob_min_clamp}"
         "distillation.diagnostics.enabled=${opd_diagnostics_enabled}"
         "distillation.diagnostics.collect_topk_overlap=${opd_diagnostics_collect_topk_overlap}"
+        "distillation.diagnostics.collect_rethinking_opd_metrics=${opd_diagnostics_collect_rethinking_opd}"
+        "distillation.diagnostics.topk=${opd_diagnostics_topk}"
         "distillation.diagnostics.position_bin_size=${opd_diagnostics_position_bin_size}"
         "distillation.diagnostics.heatmap_interval=${opd_diagnostics_heatmap_interval}"
         "distillation.diagnostics.heatmap_history_steps=${opd_diagnostics_heatmap_history_steps}"

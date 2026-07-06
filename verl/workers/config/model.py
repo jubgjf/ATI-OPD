@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -24,6 +25,8 @@ from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 
 __all__ = ["HFModelConfig", "MtpConfig"]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -110,6 +113,9 @@ class HFModelConfig(BaseConfig):
     # custom chat template for the model
     custom_chat_template: Optional[str] = None
 
+    # copy chat template from another model or tokenizer path
+    chat_template_from_model: Optional[str] = None
+
     external_lib: Optional[str] = None
 
     override_config: dict = field(default_factory=dict)
@@ -146,6 +152,7 @@ class HFModelConfig(BaseConfig):
     mtp: MtpConfig = field(default_factory=MtpConfig)
 
     def __post_init__(self):
+        self._validate_target_modules()
         import_external_libs(self.external_lib)
 
         if self.hf_config_path is None:
@@ -170,11 +177,13 @@ class HFModelConfig(BaseConfig):
         ):
             self.processor.chat_template = self.tokenizer.chat_template
 
-        if self.custom_chat_template is not None:
-            if self.processor is not None:
-                self.processor.chat_template = self.custom_chat_template
-            else:
-                self.tokenizer.chat_template = self.custom_chat_template
+        if self.custom_chat_template is not None and self.chat_template_from_model is not None:
+            raise ValueError("Only one of custom_chat_template and chat_template_from_model can be set.")
+
+        if self.chat_template_from_model is not None:
+            self._load_chat_template_from_model(self.chat_template_from_model)
+        elif self.custom_chat_template is not None:
+            self._set_chat_template(self.custom_chat_template, source="custom_chat_template")
 
         self.local_hf_config_path = copy_to_local(self.hf_config_path, use_shm=self.use_shm)
         self.generation_config = get_generation_config(
@@ -229,6 +238,7 @@ class HFModelConfig(BaseConfig):
             if hasattr(self.hf_config, "text_config") and hasattr(self.hf_config.text_config, "mtp_num_hidden_layers"):
                 self.hf_config.text_config.mtp_num_hidden_layers = 0
 
+    def _validate_target_modules(self) -> None:
         # Ensure target_modules is a str or list[str] (only if not None)
         if self.target_modules is not None:
             if not isinstance(self.target_modules, (str | list)):
@@ -245,3 +255,54 @@ class HFModelConfig(BaseConfig):
 
     def get_processor(self):
         return self.processor if self.processor is not None else self.tokenizer
+
+    def _set_chat_template(self, chat_template: str, *, source: str) -> None:
+        if self.tokenizer is None and self.processor is None:
+            raise ValueError(f"{source} requires load_tokenizer=True so a tokenizer or processor is available.")
+        if self.tokenizer is not None:
+            self.tokenizer.chat_template = chat_template
+        if self.processor is not None:
+            self.processor.chat_template = chat_template
+
+    def _load_chat_template_from_model(self, source_model_path: str) -> None:
+        local_source_model_path = copy_to_local(source_model_path, use_shm=self.use_shm)
+        source_tokenizer = hf_tokenizer(local_source_model_path, trust_remote_code=self.trust_remote_code)
+        chat_template = getattr(source_tokenizer, "chat_template", None)
+        if not chat_template:
+            raise ValueError(f"Tokenizer at {source_model_path!r} does not define chat_template.")
+
+        self._set_chat_template(chat_template, source=f"chat_template_from_model={source_model_path!r}")
+        self._log_chat_template_probe(source_model_path=source_model_path, chat_template=chat_template)
+
+    def _log_chat_template_probe(self, *, source_model_path: str, chat_template: str) -> None:
+        if self.tokenizer is None:
+            logger.info(
+                "Loaded chat template from %s: template_len=%d; tokenizer probe skipped because tokenizer is absent.",
+                source_model_path,
+                len(chat_template),
+            )
+            return
+        try:
+            probe = [{"role": "user", "content": "Solve 1+1. Put the final answer in \\boxed{}."}]
+            rendered = self.tokenizer.apply_chat_template(probe, add_generation_prompt=True, tokenize=False)
+            think_ids = self.tokenizer.encode("<think>", add_special_tokens=False)
+            end_think_ids = self.tokenizer.encode("</think>", add_special_tokens=False)
+        except Exception as exc:
+            logger.warning(
+                "Loaded chat template from %s, but failed to render tokenizer probe: %s",
+                source_model_path,
+                exc,
+            )
+            return
+
+        logger.info(
+            "Loaded chat template from %s: template_len=%d, contains_think=%s, contains_end_think=%s, "
+            "think_ids=%s, end_think_ids=%s, rendered_prefix=%r",
+            source_model_path,
+            len(chat_template),
+            "<think>" in rendered,
+            "</think>" in rendered,
+            think_ids,
+            end_think_ids,
+            rendered[:240],
+        )

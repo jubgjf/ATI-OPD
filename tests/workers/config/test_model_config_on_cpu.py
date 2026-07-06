@@ -13,11 +13,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from types import SimpleNamespace
 
 import pytest
 from omegaconf import OmegaConf
 
+import verl.workers.config.model as model_config_module
 from verl.workers.config.model import HFModelConfig
+
+
+class _FakeTokenizer:
+    def __init__(self, chat_template=None):
+        self.chat_template = chat_template
+        self.bos_token_id = 1
+        self.eos_token_id = 2
+        self.pad_token_id = 2
+
+    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=False):
+        del messages, add_generation_prompt, tokenize
+        return "<｜begin▁of▁sentence｜><｜User｜>probe<｜Assistant｜><think>\n"
+
+    def encode(self, text, add_special_tokens=False):
+        del add_special_tokens
+        if text == "<think>":
+            return [151648]
+        if text == "</think>":
+            return [151649]
+        return [0]
 
 
 class TestHFModelConfigCPU:
@@ -94,3 +116,41 @@ class TestHFModelConfigCPU:
         merged_config = OmegaConf.merge(base_config, invalid_cli_config)
         with pytest.raises(TypeError):
             OmegaConf.to_object(merged_config)
+
+    def test_chat_template_from_model_sets_tokenizer_and_processor(self, monkeypatch):
+        student_tokenizer = _FakeTokenizer(chat_template="student-template")
+        source_tokenizer = _FakeTokenizer(chat_template="teacher-template")
+        student_processor = SimpleNamespace(chat_template=None)
+
+        def fake_hf_tokenizer(path, trust_remote_code=False):
+            del trust_remote_code
+            if path == "teacher":
+                return source_tokenizer
+            return student_tokenizer
+
+        monkeypatch.setattr(model_config_module, "copy_to_local", lambda src, **_: src)
+        monkeypatch.setattr(model_config_module, "hf_tokenizer", fake_hf_tokenizer)
+        monkeypatch.setattr(model_config_module, "hf_processor", lambda path, **_: student_processor)
+        monkeypatch.setattr(model_config_module, "get_generation_config", lambda *_, **__: SimpleNamespace())
+        monkeypatch.setattr(model_config_module, "update_model_config", lambda *_, **__: None)
+        monkeypatch.setattr(
+            model_config_module.AutoConfig,
+            "from_pretrained",
+            lambda *_, **__: SimpleNamespace(architectures=["FakeModel"], tie_word_embeddings=False),
+        )
+
+        config = HFModelConfig(path="student", chat_template_from_model="teacher")
+
+        assert config.tokenizer.chat_template == "teacher-template"
+        assert config.processor.chat_template == "teacher-template"
+
+    def test_chat_template_from_model_conflicts_with_custom_template(self, monkeypatch):
+        student_tokenizer = _FakeTokenizer(chat_template="student-template")
+        student_processor = SimpleNamespace(chat_template=None)
+
+        monkeypatch.setattr(model_config_module, "copy_to_local", lambda src, **_: src)
+        monkeypatch.setattr(model_config_module, "hf_tokenizer", lambda *_, **__: student_tokenizer)
+        monkeypatch.setattr(model_config_module, "hf_processor", lambda *_, **__: student_processor)
+
+        with pytest.raises(ValueError, match="Only one of custom_chat_template and chat_template_from_model"):
+            HFModelConfig(path="student", custom_chat_template="custom", chat_template_from_model="teacher")

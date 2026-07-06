@@ -24,6 +24,9 @@ trust_remote_code: False
 # custom chat template for the model
 custom_chat_template: null
 
+# copy chat template from another model or tokenizer path
+chat_template_from_model: null
+
 # whether to use external libs for the model
 external_lib: null
 
