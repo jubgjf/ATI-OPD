@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euox pipefail
 
+. .venv/bin/activate
+
 
 # Define config specifications: "config_name:output_file:config_arg"
 CONFIG_SPECS=(

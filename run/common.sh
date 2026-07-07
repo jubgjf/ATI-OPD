@@ -57,7 +57,7 @@ run_npu_opd_job() {
     ulimit -n "${ULIMIT_NOFILE:-65536}"
 
     STUDENT_MODEL=${STUDENT_MODEL:-$DATASET_DIR/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
-    TEACHER_MODEL=${TEACHER_MODEL:-$DATASET_DIR/models/Skywork/Skywork-OR1-Math-7B}
+    TEACHER_MODEL=${TEACHER_MODEL:-$DATASET_DIR/models/hbx/JustRL-DeepSeek-1.5B}
     CHAT_TEMPLATE_MODEL=${CHAT_TEMPLATE_MODEL:-$TEACHER_MODEL}
 
     dapo_math_train=${DAPO_MATH_TRAIN:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl--qwen3/train.parquet}
@@ -70,15 +70,15 @@ run_npu_opd_job() {
     TEACHER_NNODES=${TEACHER_NNODES:-$((VC_WORKER_NUM / 2))}
     STUDENT_NGPUS_PER_NODE=${STUDENT_NGPUS_PER_NODE:-8}
     TEACHER_NGPUS_PER_NODE=${TEACHER_NGPUS_PER_NODE:-8}
-    student_tp=${STUDENT_TP:-8}
+    student_tp=${STUDENT_TP:-4}
     student_gpu_mem_util=${STUDENT_GPU_MEM_UTIL:-0.6}
-    teacher_tp=${TEACHER_TP:-8}
+    teacher_tp=${TEACHER_TP:-4}
     teacher_gpu_mem_util=${TEACHER_GPU_MEM_UTIL:-0.6}
-    sp_size=${SP_SIZE:-8}
+    sp_size=${SP_SIZE:-4}
     TEACHER_REPLICAS=${TEACHER_REPLICAS:-$((TEACHER_NNODES * TEACHER_NGPUS_PER_NODE / teacher_tp))}
 
-    max_prompt_length=${MAX_PROMPT_LENGTH:-$((2 * 1024))}
-    max_response_length=${MAX_RESPONSE_LENGTH:-$((15 * 1024))}
+    max_prompt_length=${MAX_PROMPT_LENGTH:-$((1 * 1024))}
+    max_response_length=${MAX_RESPONSE_LENGTH:-$((23 * 1024))}
     max_num_tokens=${MAX_NUM_TOKENS:-$((max_prompt_length + max_response_length + 1))}
     rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-2048}
     teacher_max_num_batched_tokens=${TEACHER_MAX_NUM_BATCHED_TOKENS:-2048}
