@@ -5,11 +5,65 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     exit 1
 fi
 
+_load_external_train_config() {
+    local train_config_path=${TRAIN_CONFIG_PATH:-/opt/huawei/algorithm/train.config}
+    if [[ ! -s "$train_config_path" ]]; then
+        echo "No non-empty train config found at $train_config_path; skip external env loading."
+        return 0
+    fi
+
+    echo "Loading external train config from $train_config_path"
+    local allexport_was_set=0
+    case "$-" in
+        *a*) allexport_was_set=1 ;;
+    esac
+
+    set -o allexport
+    # shellcheck disable=SC1090
+    if ! . "$train_config_path"; then
+        if [[ "$allexport_was_set" -eq 0 ]]; then
+            set +o allexport
+        fi
+        echo "Failed to load external train config: $train_config_path" >&2
+        return 1
+    fi
+    if [[ "$allexport_was_set" -eq 0 ]]; then
+        set +o allexport
+    fi
+}
+
+_check_resume_required() {
+    if [[ "${resume_required:-False}" != "True" ]]; then
+        return 0
+    fi
+
+    if [[ -z "${WANDB_RUN_ID:-}" ]]; then
+        echo "RESUME_REQUIRED=True requires WANDB_RUN_ID to resume the same W&B run." >&2
+        return 1
+    fi
+
+    local tracker_file="$default_local_dir/latest_checkpointed_iteration.txt"
+    if [[ ! -f "$tracker_file" ]]; then
+        echo "RESUME_REQUIRED=True but checkpoint tracker is missing: $tracker_file" >&2
+        return 1
+    fi
+    local latest_step
+    latest_step=$(cat "$tracker_file")
+    local latest_ckpt="$default_local_dir/global_step_${latest_step}"
+    if [[ ! -d "$latest_ckpt" ]]; then
+        echo "RESUME_REQUIRED=True but latest checkpoint directory is missing: $latest_ckpt" >&2
+        return 1
+    fi
+    echo "Resume preflight passed: $latest_ckpt"
+}
+
 run_npu_opd_job() {
     HOME=/home/ma-user
     DATASET_DIR=/opt/huawei/dataset/jnguan
     WORKSPACE=$DATASET_DIR/code/DMPD
     NETRC_PATH=$DATASET_DIR/apps/configs/dotnetrc
+
+    _load_external_train_config || exit 1
 
     npu-smi info
     echo ============================
@@ -143,11 +197,20 @@ run_npu_opd_job() {
     experiment_name=${EXPERIMENT_FULL_NAME:-"${experiment_base_name}-${experiment_timestamp}"}
     default_local_dir=${DEFAULT_LOCAL_DIR:-$WORKSPACE/outputs/${experiment_name}}
     total_epochs=${TOTAL_EPOCHS:-1}
-    save_freq=${SAVE_FREQ:-200}
+    save_freq=${SAVE_FREQ:-20}
     test_freq=${TEST_FREQ:-10}
+    resume_required=${RESUME_REQUIRED:-False}
 
     export WANDB_MODE=${WANDB_MODE:-online}
     export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
+    case "$resume_required" in
+        True) export WANDB_RESUME=must ;;
+        False) ;;
+        *)
+            echo "RESUME_REQUIRED must be True or False, got: $resume_required" >&2
+            exit 1
+            ;;
+    esac
 
     export NODE_RANK=${NODE_RANK:-$VC_TASK_INDEX}
     export MASTER_ADDR=${MASTER_ADDR:-"${MA_VJ_NAME}-${MA_TASK_NAME}-0.${MA_VJ_NAME}"}
@@ -271,7 +334,7 @@ _run_npu_worker_node() {
 }
 
 _submit_npu_verl_job() {
-    local runtime_env=${RAY_RUNTIME_ENV:-verl/trainer/runtime_env.yaml}
+    _check_resume_required || return 1
 
     local -a hydra_args=(
         "algorithm.adv_estimator=${adv_estimator}"
@@ -369,9 +432,36 @@ _submit_npu_verl_job() {
 
     hydra_args+=("${METHOD_HYDRA_OVERRIDES[@]}")
 
+    local runtime_env_json
+    if [[ "$resume_required" == "True" ]]; then
+        runtime_env_json='{
+            "working_dir": "./",
+            "excludes": ["/.git/"],
+            "env_vars": {
+                "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
+                "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+                "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
+                "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
+                "WANDB_RUN_ID": "'"$WANDB_RUN_ID"'",
+                "WANDB_RESUME": "'"$WANDB_RESUME"'"
+            }
+        }'
+    else
+        runtime_env_json='{
+            "working_dir": "./",
+            "excludes": ["/.git/"],
+            "env_vars": {
+                "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
+                "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+                "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
+                "HCCL_NPU_SOCKET_PORT_RANGE": "auto"
+            }
+        }'
+    fi
+
     ray job submit \
         --address="http://127.0.0.1:$DASHBOARD_PORT" \
-        --runtime-env="$runtime_env" \
+        --runtime-env-json="$runtime_env_json" \
         -- \
         python3 -m verl.trainer.main_ppo "${hydra_args[@]}"
 }
