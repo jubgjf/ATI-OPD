@@ -106,3 +106,40 @@ def test_extract_prompt_logprobs_sorts_when_backend_ranks_are_invalid_on_cpu():
     assert result["prompt_logprobs"] == [[-0.1, -0.2], [-0.01, -0.02], [0.0, 0.0]]
     assert result["sampled_prompt_ids"] == [[10], [20], [0]]
     assert result["sampled_prompt_logprobs"] == [[-0.5], [-0.7], [0.0]]
+
+
+def test_extract_prompt_logprobs_marks_missing_sampled_token_as_negative_infinity_on_cpu():
+    output = SimpleNamespace(
+        prompt_token_ids=[101, 151644, 20],
+        prompt_logprobs=[
+            None,
+            {"11": _logprob(-0.1, 1), "12": _logprob(-0.2, 2)},
+            {"20": _logprob(-0.3, 1), "21": _logprob(-0.4, 2)},
+        ],
+    )
+
+    result = {}
+    extract_prompt_logprobs(output, num_prompt_logprobs=2, result_dict=result)
+
+    assert result["prompt_ids"] == [[11, 12], [20, 21], [0, 0]]
+    assert result["prompt_logprobs"] == [[-0.1, -0.2], [-0.3, -0.4], [0.0, 0.0]]
+    assert result["sampled_prompt_ids"] == [[151644], [20], [0]]
+    assert result["sampled_prompt_logprobs"] == [[float("-inf")], [-0.3], [0.0]]
+
+
+def test_extract_prompt_logprobs_zero_width_uses_sampled_token_fallback_on_cpu():
+    output = SimpleNamespace(
+        prompt_token_ids=[101, 151644],
+        prompt_logprobs=[
+            None,
+            {"11": _logprob(-0.1, 1)},
+        ],
+    )
+
+    result = {}
+    extract_prompt_logprobs(output, num_prompt_logprobs=0, result_dict=result)
+
+    assert result["prompt_ids"] == [[151644], [0]]
+    assert result["prompt_logprobs"] == [[float("-inf")], [0.0]]
+    assert result["sampled_prompt_ids"] == [[151644], [0]]
+    assert result["sampled_prompt_logprobs"] == [[float("-inf")], [0.0]]

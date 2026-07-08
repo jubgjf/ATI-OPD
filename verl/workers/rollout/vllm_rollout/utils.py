@@ -405,16 +405,12 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
             sampled_token_id = int(first_token_id_str)
             sampled_token_logprob = first_token_logprob.logprob
         if sampled_token_logprob is None:
-            raise RuntimeError(
-                f"vLLM prompt_logprobs did not include sampled prompt token {sampled_token_id} at position {position}."
-            )
+            sampled_token_logprob = float("-inf")
         sampled_prompt_ids_ls.append([sampled_token_id])
         sampled_prompt_logprobs_ls.append([sampled_token_logprob])
         if num_prompt_logprobs == 0:
-            token_id_str = list(logprobs_dict.keys())[0]
-            logprob = logprobs_dict[token_id_str].logprob
-            prompt_logprobs_ls.append([logprob])
-            prompt_ids_ls.append([int(token_id_str)])
+            prompt_logprobs_ls.append([sampled_token_logprob])
+            prompt_ids_ls.append([sampled_token_id])
         else:
             prompt_ids, prompt_logprobs = _top_prompt_logprobs_from_vllm_logprobs(
                 logprobs_dict=logprobs_dict,

@@ -1650,7 +1650,7 @@ async def test_teacher_manager_parses_topk_and_sampled_prompt_logprobs_on_cpu():
                     "prompt_ids": [[101, 0], [102, 0], [1, 0], [2, 0]],
                     "prompt_logprobs": [[-0.1, -0.2], [-0.3, -0.4], [-0.5, -0.6], [0.0, 0.0]],
                     "sampled_prompt_ids": [[101], [102], [1], [2]],
-                    "sampled_prompt_logprobs": [[-0.1], [-0.3], [-0.5], [0.0]],
+                    "sampled_prompt_logprobs": [[-0.1], [float("-inf")], [-0.5], [0.0]],
                 },
             )
 
@@ -1680,6 +1680,13 @@ async def test_teacher_manager_parses_topk_and_sampled_prompt_logprobs_on_cpu():
     assert result.sampled_logprobs is not None
     assert result.sampled_ids.shape == (4, 1)
     assert result.sampled_logprobs.shape == (4, 1)
+    assert torch.isfinite(result.sampled_logprobs).all()
+    torch.testing.assert_close(
+        result.sampled_logprobs[:, 0],
+        torch.tensor([-0.1, -10.0, -0.5, 0.0], dtype=result.sampled_logprobs.dtype),
+    )
+    assert result.nonfinite_count == 1
+    assert result.nonfinite_sequence_positions == [1]
 
 
 @pytest.mark.asyncio
