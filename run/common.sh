@@ -171,6 +171,10 @@ run_npu_opd_job() {
     opd_diagnostics_collect_rethinking_opd=${OPD_DIAGNOSTICS_COLLECT_RETHINKING_OPD:-True}
     opd_diagnostics_topk=${OPD_DIAGNOSTICS_TOPK:-16}
     opd_diagnostics_position_bin_size=${OPD_DIAGNOSTICS_POSITION_BIN_SIZE:-512}
+    opd_diagnostics_log_interval=${OPD_DIAGNOSTICS_LOG_INTERVAL:-5}
+    opd_diagnostics_topk_log_interval=${OPD_DIAGNOSTICS_TOPK_LOG_INTERVAL:-10}
+    opd_diagnostics_async_metrics=${OPD_DIAGNOSTICS_ASYNC_METRICS:-True}
+    opd_diagnostics_async_max_pending=${OPD_DIAGNOSTICS_ASYNC_MAX_PENDING:-1}
     opd_diagnostics_heatmap_interval=${OPD_DIAGNOSTICS_HEATMAP_INTERVAL:-10}
     opd_diagnostics_heatmap_history_steps=${OPD_DIAGNOSTICS_HEATMAP_HISTORY_STEPS:-80}
     opd_diagnostics_log_heatmap=${OPD_DIAGNOSTICS_LOG_HEATMAP:-True}
@@ -432,6 +436,10 @@ _submit_npu_verl_job() {
         "distillation.diagnostics.collect_rethinking_opd_metrics=${opd_diagnostics_collect_rethinking_opd}"
         "distillation.diagnostics.topk=${opd_diagnostics_topk}"
         "distillation.diagnostics.position_bin_size=${opd_diagnostics_position_bin_size}"
+        "distillation.diagnostics.log_interval=${opd_diagnostics_log_interval}"
+        "distillation.diagnostics.topk_log_interval=${opd_diagnostics_topk_log_interval}"
+        "distillation.diagnostics.async_metrics=${opd_diagnostics_async_metrics}"
+        "distillation.diagnostics.async_max_pending=${opd_diagnostics_async_max_pending}"
         "distillation.diagnostics.heatmap_interval=${opd_diagnostics_heatmap_interval}"
         "distillation.diagnostics.heatmap_history_steps=${opd_diagnostics_heatmap_history_steps}"
         "distillation.diagnostics.log_wandb_heatmap=${opd_diagnostics_log_heatmap}"

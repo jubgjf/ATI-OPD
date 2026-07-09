@@ -292,6 +292,10 @@ def test_distillation_diagnostics_bad_tail_threshold_validation_on_cpu():
     assert config.bad_tail_overlap_threshold == 0.25
     with pytest.raises(ValueError, match="bad_tail_deep_position"):
         DistillationDiagnosticsConfig(bad_tail_min_position=8, bad_tail_deep_position=4)
+    with pytest.raises(ValueError, match="topk_log_interval"):
+        DistillationDiagnosticsConfig(topk_log_interval=0)
+    with pytest.raises(ValueError, match="async_max_pending"):
+        DistillationDiagnosticsConfig(async_max_pending=0)
 
 
 def test_distillation_overlap_diagnostics_topk_defaults_to_loss_topk_on_cpu():

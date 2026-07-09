@@ -21,8 +21,10 @@ This trainer supports model-agonistic model initialization with huggingface
 import copy
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from pprint import pprint
 from typing import Any, Optional
 
@@ -91,6 +93,28 @@ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_pad
 
 def _has_answer_pattern(text: Any) -> bool:
     return math_dapo.has_answer_label(text)
+
+
+def _snapshot_diagnostics_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    return value
+
+
+def _snapshot_diagnostics_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    return {key: _snapshot_diagnostics_value(value) for key, value in kwargs.items()}
+
+
+def _compute_opd_diagnostics_background_metrics(
+    diagnostics_kwargs: dict[str, Any],
+    intervention_kwargs: dict[str, Any] | None,
+) -> dict[str, float]:
+    start_time = time.perf_counter()
+    metrics = compute_opd_diagnostics_metrics(**diagnostics_kwargs)
+    if intervention_kwargs is not None:
+        metrics.update(compute_intervention_metrics(**intervention_kwargs))
+    metrics["opd/diagnostics_async/worker_compute_seconds"] = time.perf_counter() - start_time
+    return metrics
 
 
 def _has_boxed_pattern(text: Any) -> bool:
@@ -633,6 +657,8 @@ class RayPPOTrainer:
         self.opd_gap_high_tracker: OpdDiagnosticsTracker | None = None
         self.opd_teacher_logprob_nonfinite_tracker: OpdDiagnosticsTracker | None = None
         self.opd_special_token_ids = resolve_special_token_ids(self.tokenizer)
+        self._opd_diagnostics_executor: ThreadPoolExecutor | None = None
+        self._opd_diagnostics_futures: list[tuple[int, Future[dict[str, float]], float]] = []
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
@@ -1964,20 +1990,20 @@ class RayPPOTrainer:
                 finally:
                     plt.close(fig)
 
-    def _compute_opd_diagnostics_metrics(
+    def _build_opd_diagnostics_inputs(
         self,
         *,
         batch: DataProto,
         entropy: torch.Tensor | None,
         global_steps: int,
-    ) -> dict[str, float]:
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, torch.Tensor | None, list[Any] | None] | None:
         diagnostics_config = self._distillation_diagnostics_config()
         if (
             diagnostics_config is None
             or not is_distillation_enabled(self.config.get("distillation"))
             or global_steps % diagnostics_config.log_interval != 0
         ):
-            return {}
+            return None
 
         required_keys = {"old_log_probs", "response_mask"}
         missing_keys = required_keys - set(batch.batch.keys())
@@ -1998,50 +2024,52 @@ class RayPPOTrainer:
                 f"got entropy.shape={tuple(entropy.shape)} and response_mask.shape={tuple(response_mask.shape)}."
             )
 
+        collect_topk_diagnostics = (
+            diagnostics_config.collect_topk_overlap
+            or getattr(diagnostics_config, "collect_rethinking_opd_metrics", False)
+        ) and global_steps % diagnostics_config.topk_log_interval == 0
         teacher_response_logprobs = self._extract_teacher_response_logprobs_for_diagnostics(batch)
         teacher_response_topk_ids, teacher_response_topk_logprobs = (
-            self._extract_teacher_response_topk_for_diagnostics(batch)
-            if diagnostics_config.collect_topk_overlap
-            or getattr(diagnostics_config, "collect_rethinking_opd_metrics", False)
-            else (None, None)
+            self._extract_teacher_response_topk_for_diagnostics(batch) if collect_topk_diagnostics else (None, None)
         )
         teacher_logprob_nonfinite_positions = None
         if "teacher_logprob_nonfinite_positions" in batch.non_tensor_batch:
             teacher_logprob_nonfinite_positions = self._non_tensor_to_list(
                 batch.non_tensor_batch["teacher_logprob_nonfinite_positions"]
             )
-        metrics = compute_opd_diagnostics_metrics(
-            student_logprobs=student_logprobs,
-            response_ids=batch.batch.get("responses", None),
-            teacher_logprobs=teacher_response_logprobs,
-            student_topk_ids=batch.batch.get("student_topk_ids", None),
-            student_topk_logprobs=batch.batch.get("student_topk_logprobs", None),
-            teacher_topk_ids=teacher_response_topk_ids,
-            teacher_topk_logprobs=teacher_response_topk_logprobs,
-            teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
-            entropy=entropy,
-            response_mask=response_mask,
-            rm_scores=batch.batch.get("rm_scores", None),
-            bin_size=diagnostics_config.position_bin_size,
-            high_gap_threshold=diagnostics_config.high_gap_threshold,
-            overlap_topk=(
+        diagnostics_kwargs = {
+            "student_logprobs": student_logprobs,
+            "response_ids": batch.batch.get("responses", None),
+            "teacher_logprobs": teacher_response_logprobs,
+            "student_topk_ids": batch.batch.get("student_topk_ids", None) if collect_topk_diagnostics else None,
+            "student_topk_logprobs": batch.batch.get("student_topk_logprobs", None)
+            if collect_topk_diagnostics
+            else None,
+            "teacher_topk_ids": teacher_response_topk_ids,
+            "teacher_topk_logprobs": teacher_response_topk_logprobs,
+            "teacher_logprob_nonfinite_positions": teacher_logprob_nonfinite_positions,
+            "entropy": entropy,
+            "response_mask": response_mask,
+            "rm_scores": batch.batch.get("rm_scores", None),
+            "bin_size": diagnostics_config.position_bin_size,
+            "high_gap_threshold": diagnostics_config.high_gap_threshold,
+            "overlap_topk": (
                 int(diagnostics_config.topk or self.distillation_config.distillation_loss.topk or 64)
-                if diagnostics_config.collect_topk_overlap
-                or getattr(diagnostics_config, "collect_rethinking_opd_metrics", False)
+                if collect_topk_diagnostics
                 else None
             ),
-            special_token_ids=self.opd_special_token_ids,
-            max_response_length=batch.batch["responses"].shape[-1] if "responses" in batch.batch else None,
-            bad_tail_min_position=diagnostics_config.bad_tail_min_position,
-            bad_tail_deep_position=diagnostics_config.bad_tail_deep_position,
-            bad_tail_extreme_position=diagnostics_config.bad_tail_extreme_position,
-            bad_tail_overlap_threshold=diagnostics_config.bad_tail_overlap_threshold,
-            bad_tail_teacher_prob_threshold=diagnostics_config.bad_tail_teacher_prob_threshold,
-            bad_tail_gap_threshold=diagnostics_config.bad_tail_gap_threshold,
-            bad_tail_reward_threshold=diagnostics_config.bad_tail_reward_threshold,
-            bad_tail_entropy_threshold=diagnostics_config.bad_tail_entropy_threshold,
-        )
-        metrics["opd/gap_abs/available"] = 1.0 if teacher_response_logprobs is not None else 0.0
+            "special_token_ids": self.opd_special_token_ids,
+            "max_response_length": batch.batch["responses"].shape[-1] if "responses" in batch.batch else None,
+            "bad_tail_min_position": diagnostics_config.bad_tail_min_position,
+            "bad_tail_deep_position": diagnostics_config.bad_tail_deep_position,
+            "bad_tail_extreme_position": diagnostics_config.bad_tail_extreme_position,
+            "bad_tail_overlap_threshold": diagnostics_config.bad_tail_overlap_threshold,
+            "bad_tail_teacher_prob_threshold": diagnostics_config.bad_tail_teacher_prob_threshold,
+            "bad_tail_gap_threshold": diagnostics_config.bad_tail_gap_threshold,
+            "bad_tail_reward_threshold": diagnostics_config.bad_tail_reward_threshold,
+            "bad_tail_entropy_threshold": diagnostics_config.bad_tail_entropy_threshold,
+        }
+        intervention_kwargs = None
 
         if diagnostics_config.collect_intervention_metrics:
             intervention_config = getattr(self.distillation_config, "intervention", None)
@@ -2058,28 +2086,158 @@ class RayPPOTrainer:
                     "Check that the DMPD agent-loop intervention path is active for every training sample."
                 )
             if has_intervention_fields:
-                metrics.update(
-                    compute_intervention_metrics(
-                        intervention_counts=self._non_tensor_to_list(
-                            batch.non_tensor_batch["teacher_intervention_count"]
-                        ),
-                        interventions=self._non_tensor_to_list(batch.non_tensor_batch["teacher_interventions"]),
-                        intervention_skipped=self._non_tensor_to_list(
-                            batch.non_tensor_batch["teacher_intervention_skipped"]
-                        ),
-                        response_mask=response_mask,
-                    )
-                )
+                intervention_kwargs = {
+                    "intervention_counts": self._non_tensor_to_list(
+                        batch.non_tensor_batch["teacher_intervention_count"]
+                    ),
+                    "interventions": self._non_tensor_to_list(batch.non_tensor_batch["teacher_interventions"]),
+                    "intervention_skipped": self._non_tensor_to_list(
+                        batch.non_tensor_batch["teacher_intervention_skipped"]
+                    ),
+                    "response_mask": response_mask,
+                }
+
+        return diagnostics_kwargs, intervention_kwargs, teacher_response_logprobs, teacher_logprob_nonfinite_positions
+
+    def _compute_opd_diagnostics_metrics(
+        self,
+        *,
+        batch: DataProto,
+        entropy: torch.Tensor | None,
+        global_steps: int,
+    ) -> dict[str, float]:
+        diagnostics_inputs = self._build_opd_diagnostics_inputs(
+            batch=batch,
+            entropy=entropy,
+            global_steps=global_steps,
+        )
+        if diagnostics_inputs is None:
+            return {}
+
+        diagnostics_kwargs, intervention_kwargs, teacher_response_logprobs, teacher_logprob_nonfinite_positions = (
+            diagnostics_inputs
+        )
+        metrics = compute_opd_diagnostics_metrics(**diagnostics_kwargs)
+        metrics["opd/gap_abs/available"] = 1.0 if teacher_response_logprobs is not None else 0.0
+        if intervention_kwargs is not None:
+            metrics.update(compute_intervention_metrics(**intervention_kwargs))
 
         self._maybe_log_opd_heatmaps(
             global_steps=global_steps,
-            entropy=entropy,
-            student_logprobs=student_logprobs,
+            entropy=diagnostics_kwargs["entropy"],
+            student_logprobs=diagnostics_kwargs["student_logprobs"],
             teacher_logprobs=teacher_response_logprobs,
             teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
-            response_mask=response_mask,
+            response_mask=diagnostics_kwargs["response_mask"],
         )
         return metrics
+
+    def _ensure_opd_diagnostics_executor(self) -> ThreadPoolExecutor:
+        if self._opd_diagnostics_executor is None:
+            self._opd_diagnostics_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="opd-diagnostics")
+        return self._opd_diagnostics_executor
+
+    def _drain_opd_diagnostics_futures(self, *, block: bool = False) -> dict[str, float]:
+        if not self._opd_diagnostics_futures:
+            return {}
+
+        pending: list[tuple[int, Future[dict[str, float]], float]] = []
+        completed = 0
+        failed = 0
+        for step, future, submitted_at in self._opd_diagnostics_futures:
+            if not block and not future.done():
+                pending.append((step, future, submitted_at))
+                continue
+            try:
+                result = future.result()
+                result["opd/diagnostics_async/wall_seconds"] = time.perf_counter() - submitted_at
+                log_step = max(int(step), int(getattr(self, "global_steps", step)))
+                result["opd/diagnostics_async/source_step"] = float(step)
+                result["opd/diagnostics_async/result_delay_steps"] = float(log_step - int(step))
+                if getattr(self, "logger", None) is not None:
+                    self.logger.log(data=result, step=log_step)
+                completed += 1
+            except Exception as exc:
+                failed += 1
+                print(f"Async OPD diagnostics failed for step {step}: {exc}")
+                if getattr(self, "logger", None) is not None:
+                    log_step = max(int(step), int(getattr(self, "global_steps", step)))
+                    self.logger.log(
+                        data={
+                            "opd/diagnostics_async/failed": 1.0,
+                            "opd/diagnostics_async/source_step": float(step),
+                        },
+                        step=log_step,
+                    )
+
+        self._opd_diagnostics_futures = pending
+        return {
+            "opd/diagnostics_async/completed": float(completed),
+            "opd/diagnostics_async/failed": float(failed),
+            "opd/diagnostics_async/pending": float(len(pending)),
+        }
+
+    def _shutdown_opd_diagnostics_executor(self) -> None:
+        if self._opd_diagnostics_executor is not None:
+            self._opd_diagnostics_executor.shutdown(wait=True)
+            self._opd_diagnostics_executor = None
+
+    def _submit_or_compute_opd_diagnostics_metrics(
+        self,
+        *,
+        batch: DataProto,
+        entropy: torch.Tensor | None,
+        global_steps: int,
+    ) -> dict[str, float]:
+        diagnostics_config = self._distillation_diagnostics_config()
+        if diagnostics_config is None or not getattr(diagnostics_config, "async_metrics", False):
+            return self._compute_opd_diagnostics_metrics(batch=batch, entropy=entropy, global_steps=global_steps)
+
+        diagnostics_inputs = self._build_opd_diagnostics_inputs(
+            batch=batch,
+            entropy=entropy,
+            global_steps=global_steps,
+        )
+        if diagnostics_inputs is None:
+            return {}
+
+        if len(self._opd_diagnostics_futures) >= diagnostics_config.async_max_pending:
+            return {
+                "opd/diagnostics_async/submitted": 0.0,
+                "opd/diagnostics_async/skipped_pending_full": 1.0,
+                "opd/diagnostics_async/pending": float(len(self._opd_diagnostics_futures)),
+            }
+
+        diagnostics_kwargs, intervention_kwargs, teacher_response_logprobs, teacher_logprob_nonfinite_positions = (
+            diagnostics_inputs
+        )
+        self._maybe_log_opd_heatmaps(
+            global_steps=global_steps,
+            entropy=diagnostics_kwargs["entropy"],
+            student_logprobs=diagnostics_kwargs["student_logprobs"],
+            teacher_logprobs=teacher_response_logprobs,
+            teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
+            response_mask=diagnostics_kwargs["response_mask"],
+        )
+
+        snapshot_start = time.perf_counter()
+        snapshot_kwargs = _snapshot_diagnostics_kwargs(diagnostics_kwargs)
+        snapshot_intervention_kwargs = (
+            _snapshot_diagnostics_kwargs(intervention_kwargs) if intervention_kwargs is not None else None
+        )
+        snapshot_seconds = time.perf_counter() - snapshot_start
+        future = self._ensure_opd_diagnostics_executor().submit(
+            _compute_opd_diagnostics_background_metrics,
+            snapshot_kwargs,
+            snapshot_intervention_kwargs,
+        )
+        self._opd_diagnostics_futures.append((global_steps, future, time.perf_counter()))
+        return {
+            "opd/diagnostics_async/submitted": 1.0,
+            "opd/diagnostics_async/skipped_pending_full": 0.0,
+            "opd/diagnostics_async/pending": float(len(self._opd_diagnostics_futures)),
+            "opd/diagnostics_async/snapshot_seconds": snapshot_seconds,
+        }
 
     def _update_critic(self, batch: DataProto) -> DataProto:
         batch_td = batch.to_tensordict()
@@ -2177,6 +2335,7 @@ class RayPPOTrainer:
                 metrics = {}
                 timing_raw = {}
                 opd_entropy = None
+                metrics.update(self._drain_opd_diagnostics_futures(block=False))
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -2401,13 +2560,14 @@ class RayPPOTrainer:
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        metrics.update(
-                            self._compute_opd_diagnostics_metrics(
-                                batch=batch,
-                                entropy=opd_entropy,
-                                global_steps=self.global_steps,
+                        with marked_timer("opd_diagnostics", timing_raw, color="green"):
+                            metrics.update(
+                                self._submit_or_compute_opd_diagnostics_metrics(
+                                    batch=batch,
+                                    entropy=opd_entropy,
+                                    global_steps=self.global_steps,
+                                )
                             )
-                        )
                         for diagnostics_key in ("student_topk_ids", "student_topk_logprobs"):
                             if diagnostics_key in batch.batch and not self._uses_token_reward_direct():
                                 batch.batch.pop(diagnostics_key)
@@ -2567,6 +2727,8 @@ class RayPPOTrainer:
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                    self._drain_opd_diagnostics_futures(block=True)
+                    self._shutdown_opd_diagnostics_executor()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     logger.finish()

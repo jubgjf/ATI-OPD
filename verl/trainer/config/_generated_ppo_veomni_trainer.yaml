@@ -805,6 +805,9 @@ distillation:
     enabled: false
     position_bin_size: 512
     log_interval: 1
+    topk_log_interval: 10
+    async_metrics: false
+    async_max_pending: 1
     heatmap_interval: 10
     heatmap_history_steps: 80
     log_wandb_heatmap: true

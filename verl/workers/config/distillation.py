@@ -256,6 +256,9 @@ class DistillationDiagnosticsConfig(BaseConfig):
     enabled: bool = False
     position_bin_size: int = 512
     log_interval: int = 1
+    topk_log_interval: int = 10
+    async_metrics: bool = False
+    async_max_pending: int = 1
     heatmap_interval: int = 10
     heatmap_history_steps: int = 80
     log_wandb_heatmap: bool = True
@@ -278,6 +281,10 @@ class DistillationDiagnosticsConfig(BaseConfig):
             raise ValueError("diagnostics.position_bin_size must be positive.")
         if self.log_interval <= 0:
             raise ValueError("diagnostics.log_interval must be positive.")
+        if self.topk_log_interval <= 0:
+            raise ValueError("diagnostics.topk_log_interval must be positive.")
+        if self.async_max_pending <= 0:
+            raise ValueError("diagnostics.async_max_pending must be positive.")
         if self.heatmap_interval <= 0:
             raise ValueError("diagnostics.heatmap_interval must be positive.")
         if self.heatmap_history_steps <= 0:

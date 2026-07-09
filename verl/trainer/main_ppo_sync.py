@@ -1699,31 +1699,32 @@ class PPOTrainer:
             gap_available = teacher_for_metrics is not None and (
                 teacher_for_metrics.ndim != 3 or teacher_for_metrics.shape[-1] == 1
             )
-            metrics.update(
-                compute_opd_diagnostics_metrics(
-                    student_logprobs=diagnostics_batch["old_log_probs"],
-                    teacher_logprobs=teacher_for_metrics,
-                    teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
-                    response_ids=diagnostics_batch.get("responses", None),
-                    entropy=diagnostics_batch["entropy"],
-                    response_mask=diagnostics_batch["response_mask"],
-                    rm_scores=diagnostics_batch.get("rm_scores", None),
-                    bin_size=diagnostics_config.position_bin_size,
-                    high_gap_threshold=diagnostics_config.high_gap_threshold,
-                    special_token_ids=self.opd_special_token_ids,
-                    max_response_length=(
-                        diagnostics_batch["responses"].shape[-1] if "responses" in diagnostics_batch else None
-                    ),
-                    bad_tail_min_position=diagnostics_config.bad_tail_min_position,
-                    bad_tail_deep_position=diagnostics_config.bad_tail_deep_position,
-                    bad_tail_extreme_position=diagnostics_config.bad_tail_extreme_position,
-                    bad_tail_overlap_threshold=diagnostics_config.bad_tail_overlap_threshold,
-                    bad_tail_teacher_prob_threshold=diagnostics_config.bad_tail_teacher_prob_threshold,
-                    bad_tail_gap_threshold=diagnostics_config.bad_tail_gap_threshold,
-                    bad_tail_reward_threshold=diagnostics_config.bad_tail_reward_threshold,
-                    bad_tail_entropy_threshold=diagnostics_config.bad_tail_entropy_threshold,
+            with marked_timer("opd_diagnostics", timing_raw, color="green"):
+                metrics.update(
+                    compute_opd_diagnostics_metrics(
+                        student_logprobs=diagnostics_batch["old_log_probs"],
+                        teacher_logprobs=teacher_for_metrics,
+                        teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
+                        response_ids=diagnostics_batch.get("responses", None),
+                        entropy=diagnostics_batch["entropy"],
+                        response_mask=diagnostics_batch["response_mask"],
+                        rm_scores=diagnostics_batch.get("rm_scores", None),
+                        bin_size=diagnostics_config.position_bin_size,
+                        high_gap_threshold=diagnostics_config.high_gap_threshold,
+                        special_token_ids=self.opd_special_token_ids,
+                        max_response_length=(
+                            diagnostics_batch["responses"].shape[-1] if "responses" in diagnostics_batch else None
+                        ),
+                        bad_tail_min_position=diagnostics_config.bad_tail_min_position,
+                        bad_tail_deep_position=diagnostics_config.bad_tail_deep_position,
+                        bad_tail_extreme_position=diagnostics_config.bad_tail_extreme_position,
+                        bad_tail_overlap_threshold=diagnostics_config.bad_tail_overlap_threshold,
+                        bad_tail_teacher_prob_threshold=diagnostics_config.bad_tail_teacher_prob_threshold,
+                        bad_tail_gap_threshold=diagnostics_config.bad_tail_gap_threshold,
+                        bad_tail_reward_threshold=diagnostics_config.bad_tail_reward_threshold,
+                        bad_tail_entropy_threshold=diagnostics_config.bad_tail_entropy_threshold,
+                    )
                 )
-            )
             metrics["opd/gap_abs/available"] = 1.0 if gap_available else 0.0
             if diagnostics_config.collect_intervention_metrics:
                 if non_padding_mask.any():
@@ -1750,6 +1751,10 @@ class PPOTrainer:
                 teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
                 response_mask=diagnostics_batch["response_mask"],
             )
+
+        metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+        n_gpus = self.resource_pool_manager.get_n_gpus()
+        metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
         # 3. other auxiliary metrics
         if non_padding_mask.any():
