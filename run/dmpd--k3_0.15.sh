@@ -4,15 +4,15 @@ set -x
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-DEFAULT_EXPERIMENT_NAME=${EXPERIMENT_NAME:-dmpd--train_on_teacher}
+DEFAULT_EXPERIMENT_NAME=${EXPERIMENT_NAME:-dmpd--k3_0.15}
 
 teacher_intervention_segment_length=${TEACHER_INTERVENTION_SEGMENT_LENGTH:-128}
 teacher_intervention_teacher_length=${TEACHER_INTERVENTION_TEACHER_LENGTH:-128}
 teacher_intervention_gap_metric=${TEACHER_INTERVENTION_GAP_METRIC:-k3}
 teacher_intervention_gap_distribution_topk=${TEACHER_INTERVENTION_GAP_DISTRIBUTION_TOPK:-16}
-teacher_intervention_gap_threshold=${TEACHER_INTERVENTION_GAP_THRESHOLD:-0.3}
+teacher_intervention_gap_threshold=${TEACHER_INTERVENTION_GAP_THRESHOLD:-0.15}
 teacher_intervention_max_count=${TEACHER_INTERVENTION_MAX_COUNT:-4}
-teacher_intervention_train_teacher=${TEACHER_INTERVENTION_TRAIN_TEACHER:-True}
+teacher_intervention_train_teacher=${TEACHER_INTERVENTION_TRAIN_TEACHER:-False}
 teacher_intervention_min_trainable_tokens=${TEACHER_INTERVENTION_MIN_TRAINABLE_TOKENS:-1}
 teacher_intervention_temperature=${TEACHER_INTERVENTION_TEMPERATURE:-0.6}
 teacher_intervention_top_p=${TEACHER_INTERVENTION_TOP_P:-0.95}
