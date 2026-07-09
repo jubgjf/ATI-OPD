@@ -50,6 +50,7 @@ from verl.trainer.distillation.diagnostics import (
     compute_teacher_logprob_nonfinite_heatmap_row,
     extract_response_topk_scores,
     extract_sampled_response_logprobs,
+    resolve_special_token_ids,
 )
 from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.distillation.token_reward import compute_only_student_topk_token_reward
@@ -631,6 +632,7 @@ class RayPPOTrainer:
         self.opd_gap_tracker: OpdDiagnosticsTracker | None = None
         self.opd_gap_high_tracker: OpdDiagnosticsTracker | None = None
         self.opd_teacher_logprob_nonfinite_tracker: OpdDiagnosticsTracker | None = None
+        self.opd_special_token_ids = resolve_special_token_ids(self.tokenizer)
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
@@ -2028,6 +2030,16 @@ class RayPPOTrainer:
                 or getattr(diagnostics_config, "collect_rethinking_opd_metrics", False)
                 else None
             ),
+            special_token_ids=self.opd_special_token_ids,
+            max_response_length=batch.batch["responses"].shape[-1] if "responses" in batch.batch else None,
+            bad_tail_min_position=diagnostics_config.bad_tail_min_position,
+            bad_tail_deep_position=diagnostics_config.bad_tail_deep_position,
+            bad_tail_extreme_position=diagnostics_config.bad_tail_extreme_position,
+            bad_tail_overlap_threshold=diagnostics_config.bad_tail_overlap_threshold,
+            bad_tail_teacher_prob_threshold=diagnostics_config.bad_tail_teacher_prob_threshold,
+            bad_tail_gap_threshold=diagnostics_config.bad_tail_gap_threshold,
+            bad_tail_reward_threshold=diagnostics_config.bad_tail_reward_threshold,
+            bad_tail_entropy_threshold=diagnostics_config.bad_tail_entropy_threshold,
         )
         metrics["opd/gap_abs/available"] = 1.0 if teacher_response_logprobs is not None else 0.0
 

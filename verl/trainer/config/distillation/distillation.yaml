@@ -125,6 +125,14 @@ diagnostics:
   collect_rethinking_opd_metrics: false
   # null: follow distillation_loss.topk; set explicitly to request a wider/narrower diagnostics top-k.
   topk: null
+  bad_tail_min_position: 12000
+  bad_tail_deep_position: 16000
+  bad_tail_extreme_position: 20000
+  bad_tail_overlap_threshold: 0.5
+  bad_tail_teacher_prob_threshold: 0.2
+  bad_tail_gap_threshold: 1.0
+  bad_tail_reward_threshold: -2.0
+  bad_tail_entropy_threshold: 4.0
 
 
 # Number of GPUs per node in the distillation teacher resource pool

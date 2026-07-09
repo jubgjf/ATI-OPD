@@ -18,22 +18,28 @@ import torch
 
 from verl.trainer.distillation.diagnostics import (
     OpdDiagnosticsTracker,
+    SpecialTokenIds,
     binary_auc,
     compute_binned_event_rates,
     compute_binned_token_means,
+    compute_bucket_denominator_metrics,
+    compute_coarse_token_stats,
     compute_entropy_heatmap_row,
     compute_gap_heatmap_row,
     compute_gap_high_heatmap_row,
     compute_intervention_metrics,
     compute_opd_diagnostics_metrics,
     compute_overlap_diagnostics,
+    compute_phase_and_special_token_metrics,
     compute_rethinking_opd_diagnostics,
     compute_teacher_logprob_nonfinite_heatmap_row,
     compute_topk_ladder,
     extract_response_topk_scores,
     extract_sampled_response_logprobs,
     positions_to_event_mask,
+    resolve_special_token_ids,
 )
+from verl.trainer.ppo.metric_utils import _response_length_tail_metrics
 from verl.workers.config import (
     DistillationConfig,
     DistillationDiagnosticsConfig,
@@ -41,6 +47,60 @@ from verl.workers.config import (
     DistillationTeacherModelConfig,
     RolloutConfig,
 )
+
+
+class _DummyQwenTokenizer:
+    eos_token_id = 151645
+
+    _token_to_id = {
+        "<|im_start|>": 151644,
+        "<|im_end|>": 151645,
+        "<|endoftext|>": 151643,
+        "<think>": 151667,
+        "</think>": 151668,
+        "<tool_call>": 151657,
+        "</tool_call>": 151658,
+    }
+
+    def convert_tokens_to_ids(self, token):
+        return self._token_to_id.get(token, -1)
+
+    def encode(self, text, add_special_tokens=False):
+        token_id = self._token_to_id.get(text)
+        return [] if token_id is None else [token_id]
+
+
+class _DummyDeepSeekStyleTokenizer:
+    bos_token_id = 1
+    eos_token_id = 2
+    pad_token_id = 2
+    bos_token = "<｜begin▁of▁sentence｜>"
+    eos_token = "<｜end▁of▁sentence｜>"
+    pad_token = "<｜end▁of▁sentence｜>"
+
+    _token_to_id = {
+        "<｜begin▁of▁sentence｜>": 1,
+        "<｜end▁of▁sentence｜>": 2,
+        "<｜User｜>": 10,
+        "<｜Assistant｜>": 11,
+        "<|EOT|>": 12,
+    }
+    _text_to_ids = {
+        "<think>": [101, 102],
+        "</think>": [103, 104],
+    }
+
+    def get_vocab(self):
+        return dict(self._token_to_id)
+
+    def convert_tokens_to_ids(self, token):
+        return self._token_to_id.get(token, -1)
+
+    def encode(self, text, add_special_tokens=False):
+        if text in self._text_to_ids:
+            return list(self._text_to_ids[text])
+        token_id = self._token_to_id.get(text)
+        return [] if token_id is None else [token_id]
 
 
 def test_compute_binned_token_means_respects_mask_on_cpu():
@@ -61,6 +121,177 @@ def test_compute_binned_event_rates_respects_mask_on_cpu():
 
     assert metrics["opd/event_bin/0000_0002"] == pytest.approx(2 / 3)
     assert metrics["opd/event_bin/0002_0004"] == 1.0
+
+
+def test_resolve_special_token_ids_finds_qwen3_tokens_on_cpu():
+    special = resolve_special_token_ids(_DummyQwenTokenizer())
+
+    assert special.im_end == 151645
+    assert special.endoftext == 151643
+    assert special.think_start == 151667
+    assert special.think_end == 151668
+    assert special.think_start_sequence == (151667,)
+    assert special.think_end_sequence == (151668,)
+    assert 151645 in special.generation_stop_ids
+    assert 151657 in special.foreign_control_ids
+
+
+def test_resolve_special_token_ids_handles_deepseek_style_multitoken_think_on_cpu():
+    special = resolve_special_token_ids(_DummyDeepSeekStyleTokenizer())
+
+    assert special.endoftext == 2
+    assert special.eot == 12
+    assert special.user_role == 10
+    assert special.assistant_role == 11
+    assert special.bos == 1
+    assert special.think_start is None
+    assert special.think_end is None
+    assert special.think_start_sequence == (101, 102)
+    assert special.think_end_sequence == (103, 104)
+    assert (2,) in special.generation_stop_sequences
+    assert 10 in special.foreign_control_ids
+    assert 11 in special.foreign_control_ids
+
+
+def test_bucket_denominators_and_coarse_empty_denominator_on_cpu():
+    response_mask = torch.zeros((2, 20001), dtype=torch.bool)
+    response_mask[0, :512] = True
+    response_mask[1, :16000] = True
+
+    metrics = compute_bucket_denominator_metrics(response_mask, bin_size=512)
+
+    assert metrics["bucket/bin/0000_0512/token_count"] == 1024
+    assert metrics["bucket/bin/0000_0512/sample_count"] == 2
+    assert metrics["bucket/bin/0512_1024/token_count"] == 512
+    assert metrics["bucket/coarse/16k_20k/token_count"] == 0
+    assert metrics["bucket/coarse/16k_20k/sample_count"] == 0
+
+    values = torch.ones_like(response_mask, dtype=torch.float32)
+    coarse = compute_coarse_token_stats(values, response_mask, prefix="opd/test")
+
+    assert coarse["opd/test/coarse/16k_20k/token_count"] == 0
+    assert "opd/test/coarse/16k_20k/mean" not in coarse
+
+
+def test_response_length_tail_metrics_separates_nonclipped_main_mass_on_cpu():
+    lengths = torch.tensor([7000.0, 6800.0, 23552.0, 6900.0])
+
+    metrics = _response_length_tail_metrics(lengths, max_response_length=23552)
+
+    assert metrics["response_length/clipped_count"] == 1
+    assert metrics["response_length/nonclipped_count"] == 3
+    assert metrics["response_length/nonclipped_mean"] == pytest.approx((7000 + 6800 + 6900) / 3)
+    assert metrics["response_length/main_mass_mean"] == pytest.approx((7000 + 6800 + 6900) / 3)
+    assert metrics["response_length/clipped_token_share"] == pytest.approx(23552 / lengths.sum().item())
+    assert metrics["response_length/survival_gt_16k"] == pytest.approx(0.25)
+    assert metrics["response_length/clip_given_gt_16k"] == pytest.approx(1.0)
+
+
+def test_response_length_tail_metrics_omits_main_mass_when_all_clipped_on_cpu():
+    metrics = _response_length_tail_metrics(torch.tensor([512.0, 512.0]), max_response_length=512)
+
+    assert metrics["response_length/clipped_count"] == 2
+    assert metrics["response_length/nonclipped_count"] == 0
+    assert "response_length/main_mass_mean" not in metrics
+
+
+def test_phase_parser_handles_qwen_think_cases_and_loss_mask_on_cpu():
+    special = SpecialTokenIds(
+        im_end=151645,
+        endoftext=151643,
+        think_start=151667,
+        think_end=151668,
+        im_start=151644,
+        generation_stop_ids=(151645, 151643),
+    )
+    responses = torch.tensor(
+        [
+            [151667, 10, 151668, 20, 151645, 0],
+            [151667, 10, 11, 12, 13, 14],
+            [20, 151645, 21, 0, 0, 0],
+            [151668, 20, 151645, 0, 0, 0],
+            [151667, 10, 151668, 151667, 20, 0],
+        ]
+    )
+    response_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 0, 0, 0],
+            [1, 1, 1, 0, 0, 0],
+            [1, 1, 1, 1, 1, 0],
+        ],
+        dtype=torch.bool,
+    )
+
+    info = compute_phase_and_special_token_metrics(
+        response_ids=responses,
+        response_mask=response_mask,
+        special_token_ids=special,
+        max_response_length=6,
+    )
+
+    assert info.metrics["format/has_think_end_ratio"] == pytest.approx(3 / 5)
+    assert info.metrics["format/unclosed_think_ratio"] == pytest.approx(1 / 5)
+    assert info.metrics["format/think_end_without_think_start_ratio"] == pytest.approx(1 / 5)
+    assert info.metrics["format/think_reopened_after_think_end_ratio"] == pytest.approx(1 / 5)
+    assert info.metrics["format/clipped_without_think_end_ratio"] == pytest.approx(1 / 5)
+    assert info.metrics["loss_mask/generation_stop_included_count"] == 3
+    assert info.metrics["response_end/ended_by_generation_stop_count"] == 2
+    assert info.metrics["loss_mask/think_end_included_count"] == 3
+    assert info.thinking_mask[0, :3].all()
+    assert info.answering_mask[0, 3:5].all()
+
+
+def test_phase_parser_handles_deepseek_style_multitoken_think_on_cpu():
+    special = resolve_special_token_ids(_DummyDeepSeekStyleTokenizer())
+    responses = torch.tensor(
+        [
+            [101, 102, 9, 103, 104, 20, 2, 0],
+            [101, 102, 9, 12, 13, 14, 15, 16],
+            [20, 103, 104, 2, 0, 0, 0, 0],
+            [101, 102, 9, 103, 104, 101, 102, 2],
+        ]
+    )
+    response_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 0, 0, 0, 0],
+            [1, 1, 1, 1, 1, 1, 1, 1],
+        ],
+        dtype=torch.bool,
+    )
+
+    info = compute_phase_and_special_token_metrics(
+        response_ids=responses,
+        response_mask=response_mask,
+        special_token_ids=special,
+        max_response_length=8,
+    )
+
+    assert info.metrics["format/has_think_start_ratio"] == pytest.approx(3 / 4)
+    assert info.metrics["format/has_think_end_ratio"] == pytest.approx(3 / 4)
+    assert info.metrics["format/unclosed_think_ratio"] == pytest.approx(1 / 4)
+    assert info.metrics["format/think_end_without_think_start_ratio"] == pytest.approx(1 / 4)
+    assert info.metrics["format/think_reopened_after_think_end_ratio"] == pytest.approx(1 / 4)
+    assert info.metrics["response_end/ended_by_generation_stop_count"] == 3
+    assert info.thinking_mask[0, :5].all()
+    assert info.answering_mask[0, 5:7].all()
+
+
+def test_distillation_diagnostics_bad_tail_threshold_validation_on_cpu():
+    config = DistillationDiagnosticsConfig(
+        bad_tail_min_position=4,
+        bad_tail_deep_position=8,
+        bad_tail_extreme_position=12,
+        bad_tail_overlap_threshold=0.25,
+    )
+
+    assert config.bad_tail_min_position == 4
+    assert config.bad_tail_overlap_threshold == 0.25
+    with pytest.raises(ValueError, match="bad_tail_deep_position"):
+        DistillationDiagnosticsConfig(bad_tail_min_position=8, bad_tail_deep_position=4)
 
 
 def test_distillation_overlap_diagnostics_topk_defaults_to_loss_topk_on_cpu():

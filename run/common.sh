@@ -175,6 +175,14 @@ run_npu_opd_job() {
     opd_diagnostics_heatmap_history_steps=${OPD_DIAGNOSTICS_HEATMAP_HISTORY_STEPS:-80}
     opd_diagnostics_log_heatmap=${OPD_DIAGNOSTICS_LOG_HEATMAP:-True}
     opd_diagnostics_high_gap_threshold=${OPD_DIAGNOSTICS_HIGH_GAP_THRESHOLD:-1.0}
+    opd_diagnostics_bad_tail_min_position=${OPD_DIAGNOSTICS_BAD_TAIL_MIN_POSITION:-12000}
+    opd_diagnostics_bad_tail_deep_position=${OPD_DIAGNOSTICS_BAD_TAIL_DEEP_POSITION:-16000}
+    opd_diagnostics_bad_tail_extreme_position=${OPD_DIAGNOSTICS_BAD_TAIL_EXTREME_POSITION:-20000}
+    opd_diagnostics_bad_tail_overlap_threshold=${OPD_DIAGNOSTICS_BAD_TAIL_OVERLAP_THRESHOLD:-0.5}
+    opd_diagnostics_bad_tail_teacher_prob_threshold=${OPD_DIAGNOSTICS_BAD_TAIL_TEACHER_PROB_THRESHOLD:-0.2}
+    opd_diagnostics_bad_tail_gap_threshold=${OPD_DIAGNOSTICS_BAD_TAIL_GAP_THRESHOLD:-1.0}
+    opd_diagnostics_bad_tail_reward_threshold=${OPD_DIAGNOSTICS_BAD_TAIL_REWARD_THRESHOLD:--2.0}
+    opd_diagnostics_bad_tail_entropy_threshold=${OPD_DIAGNOSTICS_BAD_TAIL_ENTROPY_THRESHOLD:-4.0}
 
     adv_estimator=${ADV_ESTIMATOR:-token_reward_direct}
     distillation_use_actor_loss=${DISTILLATION_USE_ACTOR_LOSS:-False}
@@ -428,6 +436,14 @@ _submit_npu_verl_job() {
         "distillation.diagnostics.heatmap_history_steps=${opd_diagnostics_heatmap_history_steps}"
         "distillation.diagnostics.log_wandb_heatmap=${opd_diagnostics_log_heatmap}"
         "distillation.diagnostics.high_gap_threshold=${opd_diagnostics_high_gap_threshold}"
+        "distillation.diagnostics.bad_tail_min_position=${opd_diagnostics_bad_tail_min_position}"
+        "distillation.diagnostics.bad_tail_deep_position=${opd_diagnostics_bad_tail_deep_position}"
+        "distillation.diagnostics.bad_tail_extreme_position=${opd_diagnostics_bad_tail_extreme_position}"
+        "distillation.diagnostics.bad_tail_overlap_threshold=${opd_diagnostics_bad_tail_overlap_threshold}"
+        "distillation.diagnostics.bad_tail_teacher_prob_threshold=${opd_diagnostics_bad_tail_teacher_prob_threshold}"
+        "distillation.diagnostics.bad_tail_gap_threshold=${opd_diagnostics_bad_tail_gap_threshold}"
+        "distillation.diagnostics.bad_tail_reward_threshold=${opd_diagnostics_bad_tail_reward_threshold}"
+        "distillation.diagnostics.bad_tail_entropy_threshold=${opd_diagnostics_bad_tail_entropy_threshold}"
     )
 
     hydra_args+=("${METHOD_HYDRA_OVERRIDES[@]}")

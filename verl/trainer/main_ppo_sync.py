@@ -77,6 +77,7 @@ from verl.trainer.distillation.diagnostics import (
     compute_intervention_metrics,
     compute_opd_diagnostics_metrics,
     compute_teacher_logprob_nonfinite_heatmap_row,
+    resolve_special_token_ids,
 )
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler, run_ppo
 from verl.trainer.ppo import core_algos
@@ -530,6 +531,7 @@ class PPOTrainer:
         )
         trust_remote_code = self.config.data.get("trust_remote_code", False)
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        self.opd_special_token_ids = resolve_special_token_ids(self.tokenizer)
         # Used for multimodal LLM, could be None
         self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
@@ -1702,11 +1704,24 @@ class PPOTrainer:
                     student_logprobs=diagnostics_batch["old_log_probs"],
                     teacher_logprobs=teacher_for_metrics,
                     teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
+                    response_ids=diagnostics_batch.get("responses", None),
                     entropy=diagnostics_batch["entropy"],
                     response_mask=diagnostics_batch["response_mask"],
                     rm_scores=diagnostics_batch.get("rm_scores", None),
                     bin_size=diagnostics_config.position_bin_size,
                     high_gap_threshold=diagnostics_config.high_gap_threshold,
+                    special_token_ids=self.opd_special_token_ids,
+                    max_response_length=(
+                        diagnostics_batch["responses"].shape[-1] if "responses" in diagnostics_batch else None
+                    ),
+                    bad_tail_min_position=diagnostics_config.bad_tail_min_position,
+                    bad_tail_deep_position=diagnostics_config.bad_tail_deep_position,
+                    bad_tail_extreme_position=diagnostics_config.bad_tail_extreme_position,
+                    bad_tail_overlap_threshold=diagnostics_config.bad_tail_overlap_threshold,
+                    bad_tail_teacher_prob_threshold=diagnostics_config.bad_tail_teacher_prob_threshold,
+                    bad_tail_gap_threshold=diagnostics_config.bad_tail_gap_threshold,
+                    bad_tail_reward_threshold=diagnostics_config.bad_tail_reward_threshold,
+                    bad_tail_entropy_threshold=diagnostics_config.bad_tail_entropy_threshold,
                 )
             )
             metrics["opd/gap_abs/available"] = 1.0 if gap_available else 0.0

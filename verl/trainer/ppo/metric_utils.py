@@ -86,6 +86,71 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
+def _safe_tensor_quantile(values: torch.Tensor, q: float) -> float:
+    if values.numel() == 0:
+        return float("nan")
+    return torch.quantile(values.float(), q).detach().item()
+
+
+def _length_distribution_metrics(prefix: str, lengths: torch.Tensor) -> dict[str, Any]:
+    lengths = lengths.detach().float()
+    if lengths.numel() == 0:
+        return {}
+    return {
+        f"{prefix}/count": float(lengths.numel()),
+        f"{prefix}/mean": torch.mean(lengths).detach().item(),
+        f"{prefix}/std": torch.std(lengths, unbiased=False).detach().item(),
+        f"{prefix}/min": torch.min(lengths).detach().item(),
+        f"{prefix}/p50": _safe_tensor_quantile(lengths, 0.50),
+        f"{prefix}/p75": _safe_tensor_quantile(lengths, 0.75),
+        f"{prefix}/p90": _safe_tensor_quantile(lengths, 0.90),
+        f"{prefix}/p95": _safe_tensor_quantile(lengths, 0.95),
+        f"{prefix}/p99": _safe_tensor_quantile(lengths, 0.99),
+        f"{prefix}/max": torch.max(lengths).detach().item(),
+    }
+
+
+def _response_length_tail_metrics(response_length: torch.Tensor, max_response_length: int) -> dict[str, Any]:
+    response_length = response_length.detach().float()
+    clipped = torch.eq(response_length, float(max_response_length))
+    nonclipped = ~clipped
+    total_tokens = torch.sum(response_length).detach().item()
+    clipped_tokens = torch.sum(response_length[clipped]).detach().item() if clipped.any() else 0.0
+    metrics = _length_distribution_metrics("response_length", response_length)
+    metrics["response_length/max_response_length"] = float(max_response_length)
+    metrics["response_length/clipped_count"] = float(clipped.sum().detach().item())
+    metrics["response_length/nonclipped_count"] = float(nonclipped.sum().detach().item())
+    metrics["response_length/clipped_token_share"] = clipped_tokens / max(float(total_tokens), 1.0)
+    metrics["response_length/right_tail_clip_count"] = metrics["response_length/clipped_count"]
+    metrics["response_length/right_tail_clip_ratio"] = torch.mean(clipped.float()).detach().item()
+    if nonclipped.any():
+        nonclipped_lengths = response_length[nonclipped]
+        metrics["response_length/nonclipped_mean"] = torch.mean(nonclipped_lengths).detach().item()
+        metrics["response_length/main_mass_mean"] = metrics["response_length/nonclipped_mean"]
+        metrics["response_length/nonclipped_p90"] = _safe_tensor_quantile(nonclipped_lengths, 0.90)
+        metrics["response_length/nonclipped_p99"] = _safe_tensor_quantile(nonclipped_lengths, 0.99)
+    if clipped.any():
+        metrics["response_length/clipped_mean"] = torch.mean(response_length[clipped]).detach().item()
+
+    threshold_labels = {
+        1024: "1k",
+        2048: "2k",
+        4096: "4k",
+        8192: "8k",
+        12000: "12k",
+        16000: "16k",
+        20000: "20k",
+        23000: "23k",
+    }
+    for threshold, label in threshold_labels.items():
+        above = response_length > float(threshold)
+        metrics[f"response_length/survival_gt_{label}"] = torch.mean(above.float()).detach().item()
+        denom = int(above.sum().detach().item())
+        if denom > 0:
+            metrics[f"response_length/clip_given_gt_{label}"] = float((clipped & above).sum().detach().item()) / denom
+    return metrics
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -261,6 +326,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
+    metrics.update(_response_length_tail_metrics(response_length, max_response_length))
+    metrics.update(_length_distribution_metrics("prompt_length", prompt_length))
+    metrics["prompt_length/max_prompt_length"] = float(max_prompt_length)
 
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:

@@ -25,6 +25,59 @@ MAX_REASONABLE_ENTROPY = 32.0
 MAX_REASONABLE_LOGPROB_ABS = 1.0e4
 DISTILLATION_DIAGNOSTICS_PREFIX = "distillation"
 
+LONG_SEQUENCE_THRESHOLDS = (1024, 2048, 4096, 8192, 12000, 16000, 20000, 23000)
+BAD_TAIL_MIN_POSITION = 12000
+BAD_TAIL_DEEP_POSITION = 16000
+BAD_TAIL_EXTREME_POSITION = 20000
+BAD_TAIL_OVERLAP_THRESHOLD = 0.5
+BAD_TAIL_TEACHER_PROB_THRESHOLD = 0.2
+BAD_TAIL_GAP_THRESHOLD = 1.0
+BAD_TAIL_REWARD_THRESHOLD = -2.0
+BAD_TAIL_ENTROPY_THRESHOLD = 4.0
+
+
+@dataclass(frozen=True)
+class SpecialTokenIds:
+    """Resolved tokenizer/control token ids used by long-sequence diagnostics."""
+
+    im_end: Optional[int] = None
+    endoftext: Optional[int] = None
+    eot: Optional[int] = None
+    think_start: Optional[int] = None
+    think_end: Optional[int] = None
+    im_start: Optional[int] = None
+    user_role: Optional[int] = None
+    assistant_role: Optional[int] = None
+    bos: Optional[int] = None
+    generation_stop_ids: tuple[int, ...] = ()
+    foreign_control_ids: tuple[int, ...] = ()
+    think_start_sequence: tuple[int, ...] = ()
+    think_end_sequence: tuple[int, ...] = ()
+    im_start_sequence: tuple[int, ...] = ()
+    generation_stop_sequences: tuple[tuple[int, ...], ...] = ()
+    foreign_control_sequences: tuple[tuple[int, ...], ...] = ()
+
+    def token_items(self) -> tuple[tuple[str, Optional[int]], ...]:
+        return (
+            ("im_end", self.im_end),
+            ("endoftext", self.endoftext),
+            ("eot", self.eot),
+            ("think_start", self.think_start),
+            ("think_end", self.think_end),
+        )
+
+
+@dataclass
+class ResponsePhaseInfo:
+    """Parsed response phase state and masks."""
+
+    metrics: dict[str, float]
+    thinking_mask: torch.Tensor
+    answering_mask: torch.Tensor
+    malformed_mask: torch.Tensor
+    clipped_mask: torch.Tensor
+    carrier_mask: torch.Tensor
+
 
 def _topk_distillation_metric_key(metric_name: str, *, k: int, configured_topk: int) -> str:
     suffix = "" if int(k) == int(configured_topk) else f"_top{k}"
@@ -56,9 +109,32 @@ def _safe_quantile(values: torch.Tensor, q: float) -> Optional[float]:
     return float(torch.quantile(values, q).item())
 
 
+def _safe_std(values: torch.Tensor) -> Optional[float]:
+    if values.numel() == 0:
+        return None
+    return float(values.float().std(unbiased=False).item())
+
+
 def _put_if_present(metrics: dict[str, float], key: str, value: Optional[float]) -> None:
     if value is not None and np.isfinite(value):
         metrics[key] = value
+
+
+def _put_distribution_metrics(metrics: dict[str, float], prefix: str, values: torch.Tensor) -> None:
+    values = _to_cpu_float(values).flatten()
+    values = values[torch.isfinite(values)]
+    if values.numel() == 0:
+        return
+    metrics[f"{prefix}/count"] = float(values.numel())
+    _put_if_present(metrics, f"{prefix}/mean", _safe_mean(values))
+    _put_if_present(metrics, f"{prefix}/std", _safe_std(values))
+    _put_if_present(metrics, f"{prefix}/min", float(values.min().item()))
+    _put_if_present(metrics, f"{prefix}/p50", _safe_quantile(values, 0.50))
+    _put_if_present(metrics, f"{prefix}/p75", _safe_quantile(values, 0.75))
+    _put_if_present(metrics, f"{prefix}/p90", _safe_quantile(values, 0.90))
+    _put_if_present(metrics, f"{prefix}/p95", _safe_quantile(values, 0.95))
+    _put_if_present(metrics, f"{prefix}/p99", _safe_quantile(values, 0.99))
+    _put_if_present(metrics, f"{prefix}/max", float(values.max().item()))
 
 
 def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> Optional[float]:
@@ -94,6 +170,243 @@ def _bin_key(prefix: str, start: int, end: int) -> str:
     return f"{prefix}/{start:04d}_{end:04d}"
 
 
+def _coarse_bucket_specs(response_len: int) -> list[tuple[str, int, int]]:
+    """Return overlapping coarse buckets used for long-sequence OPD diagnostics."""
+    response_len = max(int(response_len), 0)
+    specs = [
+        ("0_4k", 0, min(4096, response_len)),
+        ("4k_12k", min(4096, response_len), min(12000, response_len)),
+        ("12k_16k", min(12000, response_len), min(16000, response_len)),
+        ("16k_20k", min(16000, response_len), min(20000, response_len)),
+        ("20k_max", min(20000, response_len), response_len),
+        ("12k_max", min(12000, response_len), response_len),
+        ("16k_max", min(16000, response_len), response_len),
+        ("head", 0, min(4096, response_len)),
+        ("mid", min(4096, response_len), min(12000, response_len)),
+        ("tail", min(12000, response_len), response_len),
+        ("deep_tail", min(16000, response_len), response_len),
+        ("extreme_tail", min(20000, response_len), response_len),
+    ]
+    return [(name, start, end) for name, start, end in specs if end > start]
+
+
+def _single_token_id(tokenizer: Any, text: str) -> Optional[int]:
+    if tokenizer is None:
+        return None
+    try:
+        vocab = tokenizer.get_vocab()
+    except Exception:
+        vocab = None
+    if isinstance(vocab, dict) and text in vocab:
+        try:
+            return int(vocab[text])
+        except (TypeError, ValueError):
+            pass
+    try:
+        token_id = tokenizer.convert_tokens_to_ids(text)
+    except Exception:
+        token_id = None
+    if token_id is not None:
+        try:
+            token_id_int = int(token_id)
+            unk_token_id = getattr(tokenizer, "unk_token_id", None)
+            unk_token = getattr(tokenizer, "unk_token", None)
+            is_unknown = unk_token_id is not None and token_id_int == int(unk_token_id) and text != unk_token
+            if token_id_int >= 0 and not is_unknown:
+                return token_id_int
+        except (TypeError, ValueError):
+            pass
+    try:
+        encoded = tokenizer.encode(text, add_special_tokens=False)
+    except Exception:
+        encoded = []
+    if len(encoded) == 1:
+        return int(encoded[0])
+    return None
+
+
+def _token_sequence(tokenizer: Any, text: str) -> tuple[int, ...]:
+    token_id = _single_token_id(tokenizer, text)
+    if token_id is not None:
+        return (token_id,)
+    if tokenizer is None:
+        return ()
+    try:
+        encoded = tokenizer.encode(text, add_special_tokens=False)
+    except Exception:
+        encoded = []
+    return tuple(int(value) for value in encoded if value is not None)
+
+
+def _token_content(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    content = getattr(value, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(value, dict):
+        content = value.get("content")
+        if isinstance(content, str):
+            return content
+    return str(value)
+
+
+def _token_ids_from_value(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, int | np.integer):
+        return [int(value)]
+    if isinstance(value, list | tuple | set):
+        result = []
+        for item in value:
+            result.extend(_token_ids_from_value(item))
+        return result
+    return []
+
+
+def _unique_int_tuple(values: list[int | None]) -> tuple[int, ...]:
+    result = []
+    seen = set()
+    for value in values:
+        if value is None:
+            continue
+        token_id = int(value)
+        if token_id < 0 or token_id in seen:
+            continue
+        seen.add(token_id)
+        result.append(token_id)
+    return tuple(result)
+
+
+def _unique_sequence_tuple(sequences: list[tuple[int, ...]]) -> tuple[tuple[int, ...], ...]:
+    result = []
+    seen = set()
+    for sequence in sequences:
+        sequence = tuple(int(value) for value in sequence if value is not None)
+        if not sequence or sequence in seen:
+            continue
+        seen.add(sequence)
+        result.append(sequence)
+    return tuple(result)
+
+
+def resolve_special_token_ids(tokenizer: Any, generation_stop_ids: Optional[Any] = None) -> SpecialTokenIds:
+    """Resolve Qwen/chat/control token ids without assuming where the tokenizer stores them."""
+    eos_ids = _token_ids_from_value(getattr(tokenizer, "eos_token_id", None) if tokenizer is not None else None)
+    pad_ids = _token_ids_from_value(getattr(tokenizer, "pad_token_id", None) if tokenizer is not None else None)
+    generation_stop_values = _token_ids_from_value(generation_stop_ids)
+
+    endoftext = _single_token_id(tokenizer, "<|endoftext|>")
+    deepseek_end = _single_token_id(tokenizer, "<｜end▁of▁sentence｜>")
+    im_end = _single_token_id(tokenizer, "<|im_end|>")
+    eot = _single_token_id(tokenizer, "<|EOT|>")
+    think_start = _single_token_id(tokenizer, "<think>")
+    think_end = _single_token_id(tokenizer, "</think>")
+    im_start = _single_token_id(tokenizer, "<|im_start|>")
+    user_role = _single_token_id(tokenizer, "<｜User｜>")
+    assistant_role = _single_token_id(tokenizer, "<｜Assistant｜>")
+    bos = _single_token_id(tokenizer, "<｜begin▁of▁sentence｜>")
+    endoftext = endoftext if endoftext is not None else deepseek_end
+
+    stop_texts = [
+        _token_content(getattr(tokenizer, "eos_token", None) if tokenizer is not None else None),
+        _token_content(getattr(tokenizer, "pad_token", None) if tokenizer is not None else None),
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<｜end▁of▁sentence｜>",
+        "<|EOT|>",
+    ]
+    generation_stop_sequences = _unique_sequence_tuple(
+        [
+            *(
+                (int(token_id),)
+                for token_id in [*eos_ids, *generation_stop_values, im_end, endoftext, eot]
+                if token_id is not None
+            ),
+            *(_token_sequence(tokenizer, text) for text in stop_texts if text),
+        ]
+    )
+
+    control_texts = (
+        "<|object_ref_start|>",
+        "<|object_ref_end|>",
+        "<|box_start|>",
+        "<|box_end|>",
+        "<|quad_start|>",
+        "<|quad_end|>",
+        "<|vision_start|>",
+        "<|vision_end|>",
+        "<|vision_pad|>",
+        "<|image_pad|>",
+        "<|video_pad|>",
+        "<tool_call>",
+        "</tool_call>",
+        "<tool_response>",
+        "</tool_response>",
+        "<|fim_prefix|>",
+        "<|fim_middle|>",
+        "<|fim_suffix|>",
+        "<|fim_pad|>",
+        "<｜User｜>",
+        "<｜Assistant｜>",
+        "<｜begin▁of▁sentence｜>",
+    )
+    foreign_control_sequences = _unique_sequence_tuple([_token_sequence(tokenizer, token) for token in control_texts])
+    foreign_control_ids = _unique_int_tuple(
+        [sequence[0] for sequence in foreign_control_sequences if len(sequence) == 1]
+    )
+    stop_ids = _unique_int_tuple([*eos_ids, *generation_stop_values, im_end, endoftext, eot, *pad_ids])
+    return SpecialTokenIds(
+        im_end=im_end,
+        endoftext=endoftext,
+        eot=eot,
+        think_start=think_start,
+        think_end=think_end,
+        im_start=im_start,
+        user_role=user_role,
+        assistant_role=assistant_role,
+        bos=bos,
+        generation_stop_ids=stop_ids,
+        foreign_control_ids=foreign_control_ids,
+        think_start_sequence=_token_sequence(tokenizer, "<think>"),
+        think_end_sequence=_token_sequence(tokenizer, "</think>"),
+        im_start_sequence=_token_sequence(tokenizer, "<|im_start|>"),
+        generation_stop_sequences=generation_stop_sequences,
+        foreign_control_sequences=foreign_control_sequences,
+    )
+
+
+def special_token_resolution_metrics(special_token_ids: SpecialTokenIds) -> dict[str, float]:
+    metrics: dict[str, float] = {
+        "special_tokens/resolved/generation_stop_ids_count": float(len(special_token_ids.generation_stop_ids)),
+        "special_tokens/resolved/generation_stop_sequences_count": float(
+            len(special_token_ids.generation_stop_sequences)
+        ),
+        "special_tokens/resolved/foreign_control_ids_count": float(len(special_token_ids.foreign_control_ids)),
+        "special_tokens/resolved/foreign_control_sequences_count": float(
+            len(special_token_ids.foreign_control_sequences)
+        ),
+        "special_tokens/resolved/think_start_sequence_length": float(len(special_token_ids.think_start_sequence)),
+        "special_tokens/resolved/think_end_sequence_length": float(len(special_token_ids.think_end_sequence)),
+    }
+    for name, token_id in (
+        ("im_end_id", special_token_ids.im_end),
+        ("endoftext_id", special_token_ids.endoftext),
+        ("eot_id", special_token_ids.eot),
+        ("think_start_id", special_token_ids.think_start),
+        ("think_end_id", special_token_ids.think_end),
+        ("im_start_id", special_token_ids.im_start),
+        ("user_role_id", special_token_ids.user_role),
+        ("assistant_role_id", special_token_ids.assistant_role),
+        ("bos_id", special_token_ids.bos),
+    ):
+        if token_id is not None:
+            metrics[f"special_tokens/resolved/{name}"] = float(token_id)
+    return metrics
+
+
 def compute_binned_token_means(
     values: torch.Tensor,
     mask: torch.Tensor,
@@ -116,6 +429,96 @@ def compute_binned_token_means(
         bin_value_mask = value_mask_cpu[:, start:end] if value_mask_cpu is not None else None
         mean = _safe_mean(_masked_values(values[:, start:end], mask[:, start:end], bin_value_mask))
         _put_if_present(metrics, _bin_key(prefix, start, end), mean)
+    return metrics
+
+
+def compute_bucket_denominator_metrics(
+    response_mask: torch.Tensor,
+    *,
+    bin_size: int,
+) -> dict[str, float]:
+    """Record denominator metrics for fine and coarse response-position buckets."""
+    if bin_size <= 0:
+        raise ValueError(f"bin_size must be positive, got {bin_size}.")
+    response_mask_cpu = response_mask.detach().bool().cpu()
+    response_len = response_mask_cpu.shape[1]
+    response_lengths = response_mask_cpu.sum(dim=1)
+    clipped_mask = response_lengths == response_len
+    metrics: dict[str, float] = {}
+
+    def add_denominators(prefix: str, bucket_mask: torch.Tensor) -> None:
+        sample_mask = bucket_mask.any(dim=1)
+        metrics[f"{prefix}/token_count"] = float(bucket_mask.sum().item())
+        metrics[f"{prefix}/sample_count"] = float(sample_mask.sum().item())
+        metrics[f"{prefix}/clipped_sample_count"] = float((sample_mask & clipped_mask).sum().item())
+        metrics[f"{prefix}/nonclipped_sample_count"] = float((sample_mask & ~clipped_mask).sum().item())
+        if sample_mask.any():
+            metrics[f"{prefix}/avg_response_length_of_samples_in_bucket"] = float(
+                response_lengths[sample_mask].float().mean().item()
+            )
+
+    for start in range(0, response_len, bin_size):
+        end = min(start + bin_size, response_len)
+        add_denominators(f"bucket/bin/{start:04d}_{end:04d}", response_mask_cpu[:, start:end])
+
+    for name, start, end in _coarse_bucket_specs(response_len):
+        add_denominators(f"bucket/coarse/{name}", response_mask_cpu[:, start:end])
+    return metrics
+
+
+def compute_coarse_token_stats(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    prefix: str,
+    value_mask: Optional[torch.Tensor] = None,
+    include_distribution: bool = False,
+) -> dict[str, float]:
+    """Compute overlapping coarse-bucket token statistics and tail-head deltas."""
+    if values.shape != mask.shape:
+        raise ValueError(f"values and mask must have the same shape, got {values.shape=} and {mask.shape=}.")
+    values_cpu = _to_cpu_float(values)
+    mask_cpu = mask.detach().bool().cpu()
+    value_mask_cpu = value_mask.detach().bool().cpu() if value_mask is not None else None
+    response_len = values_cpu.shape[1]
+    metrics: dict[str, float] = {}
+    means: dict[str, float] = {}
+    for name, start, end in _coarse_bucket_specs(response_len):
+        current_mask = mask_cpu[:, start:end]
+        if value_mask_cpu is not None:
+            current_value_mask = value_mask_cpu[:, start:end]
+        else:
+            current_value_mask = None
+        values_flat = _masked_values(values_cpu[:, start:end], current_mask, current_value_mask)
+        token_count = (
+            int((current_mask & current_value_mask).sum().item())
+            if current_value_mask is not None
+            else int(current_mask.sum().item())
+        )
+        metrics[f"{prefix}/coarse/{name}/token_count"] = float(token_count)
+        if values_flat.numel() == 0:
+            continue
+        bucket_prefix = f"{prefix}/coarse/{name}"
+        mean = _safe_mean(values_flat)
+        _put_if_present(metrics, f"{bucket_prefix}/mean", mean)
+        if mean is not None:
+            means[name] = mean
+        if include_distribution:
+            _put_if_present(metrics, f"{bucket_prefix}/std", _safe_std(values_flat))
+            _put_if_present(metrics, f"{bucket_prefix}/p50", _safe_quantile(values_flat, 0.50))
+            _put_if_present(metrics, f"{bucket_prefix}/p90", _safe_quantile(values_flat, 0.90))
+            _put_if_present(metrics, f"{bucket_prefix}/p95", _safe_quantile(values_flat, 0.95))
+            _put_if_present(metrics, f"{bucket_prefix}/p99", _safe_quantile(values_flat, 0.99))
+            _put_if_present(metrics, f"{bucket_prefix}/max", float(values_flat.max().item()))
+    for tail_name, metric_name in (
+        ("tail", "tail_minus_head"),
+        ("deep_tail", "deep_tail_minus_head"),
+        ("extreme_tail", "extreme_tail_minus_head"),
+        ("16k_max", "16k_max_minus_0_4k"),
+        ("20k_max", "20k_max_minus_0_4k"),
+    ):
+        if "head" in means and tail_name in means:
+            metrics[f"{prefix}/coarse/{metric_name}"] = means[tail_name] - means["head"]
     return metrics
 
 
@@ -279,6 +682,325 @@ def compute_event_position_metrics(
         )
     )
     return metrics
+
+
+def _first_position(sequence: list[int], token_id: Optional[int]) -> Optional[int]:
+    if token_id is None:
+        return None
+    for idx, value in enumerate(sequence):
+        if int(value) == int(token_id):
+            return idx
+    return None
+
+
+def _count_token(sequence: list[int], token_id: Optional[int]) -> int:
+    if token_id is None:
+        return 0
+    return sum(1 for value in sequence if int(value) == int(token_id))
+
+
+def _contains_any(sequence: list[int], token_ids: tuple[int, ...]) -> bool:
+    if not token_ids:
+        return False
+    token_set = set(token_ids)
+    return any(int(value) in token_set for value in sequence)
+
+
+def _last_is_any(sequence: list[int], token_ids: tuple[int, ...]) -> bool:
+    if not sequence or not token_ids:
+        return False
+    return int(sequence[-1]) in set(token_ids)
+
+
+def _find_sequence_positions(sequence: list[int], pattern: tuple[int, ...]) -> list[int]:
+    if not pattern or len(pattern) > len(sequence):
+        return []
+    pattern_len = len(pattern)
+    return [
+        idx
+        for idx in range(0, len(sequence) - pattern_len + 1)
+        if tuple(int(value) for value in sequence[idx : idx + pattern_len]) == pattern
+    ]
+
+
+def _first_sequence_position(sequence: list[int], pattern: tuple[int, ...]) -> Optional[int]:
+    positions = _find_sequence_positions(sequence, pattern)
+    return positions[0] if positions else None
+
+
+def _contains_any_sequence(sequence: list[int], patterns: tuple[tuple[int, ...], ...]) -> bool:
+    return any(_first_sequence_position(sequence, pattern) is not None for pattern in patterns)
+
+
+def _ends_with_any_sequence(sequence: list[int], patterns: tuple[tuple[int, ...], ...]) -> bool:
+    if not sequence:
+        return False
+    return any(len(pattern) <= len(sequence) and tuple(sequence[-len(pattern) :]) == pattern for pattern in patterns)
+
+
+def compute_phase_and_special_token_metrics(
+    *,
+    response_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    special_token_ids: SpecialTokenIds,
+    max_response_length: Optional[int] = None,
+) -> ResponsePhaseInfo:
+    """Parse thinking/answering phases and terminal-token inclusion from generated responses."""
+    if response_ids.shape != response_mask.shape:
+        raise ValueError(
+            f"response_ids and response_mask must align, got {response_ids.shape=} and {response_mask.shape=}."
+        )
+    response_ids_cpu = response_ids.detach().cpu()
+    response_mask_cpu = response_mask.detach().bool().cpu()
+    batch_size, response_width = response_mask_cpu.shape
+    if max_response_length is None:
+        max_response_length = response_width
+
+    thinking_mask = torch.zeros_like(response_mask_cpu, dtype=torch.bool)
+    answering_mask = torch.zeros_like(response_mask_cpu, dtype=torch.bool)
+    malformed_mask = torch.zeros_like(response_mask_cpu, dtype=torch.bool)
+    carrier_mask = torch.zeros(batch_size, dtype=torch.bool)
+
+    lengths = response_mask_cpu.sum(dim=1).long()
+    clipped_mask = lengths >= int(max_response_length)
+    has_think_start = []
+    has_think_end = []
+    unclosed_think = []
+    repeated_think_start = []
+    repeated_think_end = []
+    think_end_without_start = []
+    think_reopened = []
+    generated_im_start = []
+    foreign_control_sample = []
+    malformed = []
+    contains_im_end = []
+    contains_endoftext = []
+    contains_generation_stop = []
+    ends_with_im_end = []
+    ends_with_endoftext = []
+    ends_with_generation_stop = []
+    im_end_included = []
+    endoftext_included = []
+    generation_stop_included = []
+    think_end_included = []
+    clipped_without_think_end = []
+    clipped_after_think_end = []
+    clipped_before_think_end = []
+    think_start_positions = []
+    think_end_positions = []
+    tokens_before_think_end = []
+    tokens_after_think_end = []
+
+    for sample_idx in range(batch_size):
+        length = int(lengths[sample_idx].item())
+        valid_ids = [int(value) for value in response_ids_cpu[sample_idx, :length].tolist()]
+        think_start_pattern = special_token_ids.think_start_sequence
+        think_end_pattern = special_token_ids.think_end_sequence
+        start_positions = _find_sequence_positions(valid_ids, think_start_pattern)
+        end_positions = _find_sequence_positions(valid_ids, think_end_pattern)
+        start_count = (
+            len(start_positions) if think_start_pattern else _count_token(valid_ids, special_token_ids.think_start)
+        )
+        end_count = len(end_positions) if think_end_pattern else _count_token(valid_ids, special_token_ids.think_end)
+        first_start = (
+            start_positions[0] if start_positions else _first_position(valid_ids, special_token_ids.think_start)
+        )
+        first_end = end_positions[0] if end_positions else _first_position(valid_ids, special_token_ids.think_end)
+        think_end_width = max(len(think_end_pattern), 1)
+        first_end_exclusive = (first_end + think_end_width) if first_end is not None else None
+        has_start = first_start is not None
+        has_end = first_end is not None
+        end_without_start = has_end and not has_start
+        reopened = False
+        if has_end and first_end_exclusive is not None:
+            suffix_after_first_end = valid_ids[first_end_exclusive:]
+            if think_start_pattern:
+                reopened = _first_sequence_position(suffix_after_first_end, think_start_pattern) is not None
+            elif special_token_ids.think_start is not None:
+                reopened = any(int(value) == int(special_token_ids.think_start) for value in suffix_after_first_end)
+        im_start_patterns = _unique_sequence_tuple(
+            [special_token_ids.im_start_sequence, _unique_int_tuple([special_token_ids.im_start])]
+        )
+        sample_generated_im_start = _contains_any_sequence(valid_ids, im_start_patterns)
+        foreign_control_patterns = special_token_ids.foreign_control_sequences or tuple(
+            (token_id,) for token_id in special_token_ids.foreign_control_ids
+        )
+        sample_foreign_control = _contains_any_sequence(valid_ids, foreign_control_patterns)
+        sample_malformed = (
+            end_without_start
+            or reopened
+            or start_count > 1
+            or end_count > 1
+            or sample_generated_im_start
+            or sample_foreign_control
+        )
+
+        if has_start:
+            think_start_positions.append(first_start)
+        if has_end and first_end_exclusive is not None:
+            think_end_positions.append(first_end)
+            tokens_before_think_end.append(first_end_exclusive)
+            tokens_after_think_end.append(max(length - first_end_exclusive, 0))
+        if has_start and not has_end:
+            unclosed = True
+        else:
+            unclosed = False
+
+        if (
+            has_start
+            and has_end
+            and first_start is not None
+            and first_end is not None
+            and first_end_exclusive is not None
+            and first_start < first_end
+        ):
+            thinking_mask[sample_idx, first_start : min(first_end_exclusive, length)] = True
+            if first_end_exclusive < length:
+                answering_mask[sample_idx, first_end_exclusive:length] = True
+        elif has_start and first_start is not None and not has_end:
+            thinking_mask[sample_idx, first_start:length] = True
+        elif not has_start and has_end and first_end is not None:
+            malformed_mask[sample_idx, :length] = True
+        if sample_malformed:
+            malformed_mask[sample_idx, :length] = True
+        carrier_mask[sample_idx] = bool(sample_malformed or unclosed or (clipped_mask[sample_idx] and not has_end))
+
+        has_think_start.append(has_start)
+        has_think_end.append(has_end)
+        unclosed_think.append(unclosed)
+        repeated_think_start.append(start_count > 1)
+        repeated_think_end.append(end_count > 1)
+        think_end_without_start.append(end_without_start)
+        think_reopened.append(reopened)
+        generated_im_start.append(sample_generated_im_start)
+        foreign_control_sample.append(sample_foreign_control)
+        malformed.append(sample_malformed)
+        im_end_patterns = _unique_sequence_tuple([_unique_int_tuple([special_token_ids.im_end])])
+        endoftext_patterns = _unique_sequence_tuple([_unique_int_tuple([special_token_ids.endoftext])])
+        generation_stop_patterns = special_token_ids.generation_stop_sequences or tuple(
+            (token_id,) for token_id in special_token_ids.generation_stop_ids
+        )
+        contains_im_end.append(_contains_any_sequence(valid_ids, im_end_patterns))
+        contains_endoftext.append(_contains_any_sequence(valid_ids, endoftext_patterns))
+        contains_generation_stop.append(_contains_any_sequence(valid_ids, generation_stop_patterns))
+        ends_with_im_end.append(_ends_with_any_sequence(valid_ids, im_end_patterns))
+        ends_with_endoftext.append(_ends_with_any_sequence(valid_ids, endoftext_patterns))
+        ends_with_generation_stop.append(_ends_with_any_sequence(valid_ids, generation_stop_patterns))
+        im_end_included.append(contains_im_end[-1])
+        endoftext_included.append(contains_endoftext[-1])
+        generation_stop_included.append(contains_generation_stop[-1])
+        think_end_included.append(has_end)
+        is_clipped = bool(clipped_mask[sample_idx].item())
+        clipped_without_think_end.append(is_clipped and not has_end)
+        clipped_after_think_end.append(is_clipped and has_end)
+        clipped_before_think_end.append(is_clipped and not has_end and has_start)
+
+    metrics: dict[str, float] = {}
+
+    def ratio(name: str, values: list[bool]) -> None:
+        metrics[name] = float(np.mean(values)) if values else 0.0
+
+    ratio("format/has_think_start_ratio", has_think_start)
+    ratio("format/has_think_end_ratio", has_think_end)
+    ratio("format/unclosed_think_ratio", unclosed_think)
+    ratio("format/repeated_think_start_ratio", repeated_think_start)
+    ratio("format/repeated_think_end_ratio", repeated_think_end)
+    ratio("format/think_end_without_think_start_ratio", think_end_without_start)
+    ratio("format/think_reopened_after_think_end_ratio", think_reopened)
+    ratio("format/generated_im_start_inside_response_ratio", generated_im_start)
+    ratio("format/foreign_control_token_sample_ratio", foreign_control_sample)
+    ratio("format/malformed_ratio", malformed)
+    ratio("format/clipped_without_think_end_ratio", clipped_without_think_end)
+    ratio("format/clipped_after_think_end_ratio", clipped_after_think_end)
+    ratio("format/clipped_before_think_end_ratio", clipped_before_think_end)
+
+    metrics["response_end/ended_by_max_length_count"] = float(clipped_mask.sum().item())
+    metrics["response_end/ended_by_max_length_ratio"] = float(clipped_mask.float().mean().item()) if batch_size else 0.0
+    metrics["response_end/ended_by_generation_stop_count"] = float(sum(ends_with_generation_stop))
+    metrics["response_end/ended_by_generation_stop_ratio"] = (
+        float(np.mean(ends_with_generation_stop)) if batch_size else 0.0
+    )
+    metrics["response_end/ended_by_im_end_count"] = float(sum(ends_with_im_end))
+    metrics["response_end/ended_by_im_end_ratio"] = float(np.mean(ends_with_im_end)) if batch_size else 0.0
+    metrics["response_end/ended_by_endoftext_count"] = float(sum(ends_with_endoftext))
+    metrics["response_end/ended_by_endoftext_ratio"] = float(np.mean(ends_with_endoftext)) if batch_size else 0.0
+    normal_ended = [stop and not bool(clipped_mask[idx].item()) for idx, stop in enumerate(ends_with_generation_stop)]
+    metrics["response_end/ended_normally_ratio"] = float(np.mean(normal_ended)) if batch_size else 0.0
+
+    for prefix, values in (
+        ("format/think_start_position", think_start_positions),
+        ("format/think_end_position", think_end_positions),
+        ("format/tokens_before_think_end", tokens_before_think_end),
+        ("format/tokens_after_think_end", tokens_after_think_end),
+        ("format/tokens_after_think_end_until_stop", tokens_after_think_end),
+    ):
+        if values:
+            _put_distribution_metrics(metrics, prefix, torch.tensor(values, dtype=torch.float32))
+
+    metrics["loss_mask/response_contains_im_end_count"] = float(sum(contains_im_end))
+    metrics["loss_mask/response_contains_endoftext_count"] = float(sum(contains_endoftext))
+    metrics["loss_mask/response_contains_generation_stop_count"] = float(sum(contains_generation_stop))
+    metrics["loss_mask/im_end_included_count"] = float(sum(im_end_included))
+    metrics["loss_mask/endoftext_included_count"] = float(sum(endoftext_included))
+    metrics["loss_mask/generation_stop_included_count"] = float(sum(generation_stop_included))
+    metrics["loss_mask/think_end_included_count"] = float(sum(think_end_included))
+    ended_count = max(sum(ends_with_generation_stop), 1)
+    metrics["loss_mask/generation_stop_included_ratio_among_ended"] = (
+        float(
+            sum(
+                stop and included
+                for stop, included in zip(ends_with_generation_stop, generation_stop_included, strict=True)
+            )
+        )
+        / ended_count
+    )
+    im_end_count = max(sum(ends_with_im_end), 1)
+    metrics["loss_mask/im_end_included_ratio_among_ended"] = (
+        float(sum(stop and included for stop, included in zip(ends_with_im_end, im_end_included, strict=True)))
+        / im_end_count
+    )
+    think_end_count = max(sum(has_think_end), 1)
+    metrics["loss_mask/think_end_included_ratio_among_has_think_end"] = float(sum(think_end_included)) / think_end_count
+
+    total_loss_tokens = int(response_mask_cpu.sum().item())
+    clipped_token_count = int(response_mask_cpu[clipped_mask].sum().item()) if clipped_mask.any() else 0
+    deep_tail_mask = torch.zeros_like(response_mask_cpu, dtype=torch.bool)
+    if response_width > 16000:
+        deep_tail_mask[:, 16000:] = response_mask_cpu[:, 16000:]
+    near_clipped_16k = lengths > 16000
+    metrics["loss_mask/clipped_token_count"] = float(clipped_token_count)
+    metrics["loss_mask/nonclipped_token_count"] = float(total_loss_tokens - clipped_token_count)
+    metrics["loss_mask/clipped_token_share"] = clipped_token_count / max(total_loss_tokens, 1)
+    metrics["loss_mask/near_clipped_16k_token_share"] = (
+        int(response_mask_cpu[near_clipped_16k].sum().item()) / max(total_loss_tokens, 1)
+        if near_clipped_16k.any()
+        else 0.0
+    )
+    metrics["loss_mask/deep_tail_16k_token_share"] = int(deep_tail_mask.sum().item()) / max(total_loss_tokens, 1)
+
+    for threshold in (4096, 8192, 12000, 16000, 20000):
+        no_think_end = torch.tensor([not value for value in has_think_end], dtype=torch.bool)
+        already_answering = torch.tensor(has_think_end, dtype=torch.bool)
+        reached = lengths > threshold
+        metrics[f"response/survival_no_think_end_by_{threshold // 1000}k"] = float(
+            (no_think_end & reached).sum().item()
+        ) / max(batch_size, 1)
+        if reached.any():
+            metrics[f"response/clip_given_no_think_end_by_{threshold // 1000}k"] = float(
+                (clipped_mask & no_think_end & reached).sum().item()
+            ) / max(int((no_think_end & reached).sum().item()), 1)
+            metrics[f"response/clip_given_already_answering_by_{threshold // 1000}k"] = float(
+                (clipped_mask & already_answering & reached).sum().item()
+            ) / max(int((already_answering & reached).sum().item()), 1)
+
+    return ResponsePhaseInfo(
+        metrics=metrics,
+        thinking_mask=thinking_mask & response_mask_cpu,
+        answering_mask=answering_mask & response_mask_cpu,
+        malformed_mask=malformed_mask & response_mask_cpu,
+        clipped_mask=clipped_mask,
+        carrier_mask=carrier_mask,
+    )
 
 
 def _head_tail_metrics(
@@ -506,6 +1228,13 @@ def compute_overlap_diagnostics(
                 bin_size=bin_size,
             )
         )
+        metrics.update(
+            compute_coarse_token_stats(
+                coverage.float(),
+                valid_topk_rows,
+                prefix=f"opd/overlap/top{k}",
+            )
+        )
 
     if sampled_teacher_logprobs is not None:
         if sampled_teacher_logprobs.ndim == 3 and sampled_teacher_logprobs.shape[-1] == 1:
@@ -520,14 +1249,27 @@ def compute_overlap_diagnostics(
         sampled_valid = response_mask & torch.isfinite(sampled_prob)
         sampled_values = sampled_prob[sampled_valid]
         _put_if_present(metrics, "opd/overlap/teacher_sampled_prob_mean", _safe_mean(sampled_values))
+        _put_if_present(metrics, "opd/overlap/teacher_sampled_prob_p01", _safe_quantile(sampled_values, 0.01))
         _put_if_present(metrics, "opd/overlap/teacher_sampled_prob_p10", _safe_quantile(sampled_values, 0.1))
         _put_if_present(metrics, "opd/overlap/teacher_sampled_prob_p50", _safe_quantile(sampled_values, 0.5))
+        _put_if_present(metrics, "distillation/teacher_sampled_prob/mean", _safe_mean(sampled_values))
+        _put_if_present(metrics, "distillation/teacher_sampled_prob/p01", _safe_quantile(sampled_values, 0.01))
+        _put_if_present(metrics, "distillation/teacher_sampled_prob/p10", _safe_quantile(sampled_values, 0.1))
+        _put_if_present(metrics, "distillation/teacher_sampled_prob/p50", _safe_quantile(sampled_values, 0.5))
         metrics.update(
             compute_binned_token_means(
                 sampled_prob,
                 sampled_valid,
                 bin_size=bin_size,
                 prefix="opd/overlap/teacher_sampled_prob_bin",
+            )
+        )
+        metrics.update(
+            compute_coarse_token_stats(
+                sampled_prob,
+                sampled_valid,
+                prefix="distillation/teacher_sampled_prob",
+                include_distribution=True,
             )
         )
 
@@ -652,6 +1394,13 @@ def compute_rethinking_opd_diagnostics(
                 bin_size=bin_size,
             )
         )
+        metrics.update(
+            compute_coarse_token_stats(
+                overlap_ratio,
+                valid_rows,
+                prefix=_topk_distillation_metric_key("overlap_ratio", k=k, configured_topk=topk),
+            )
+        )
 
         matched_teacher_logprobs = torch.where(
             matches,
@@ -668,6 +1417,35 @@ def compute_rethinking_opd_diagnostics(
             matched_teacher_logprobs,
             torch.full_like(matched_teacher_logprobs, float("-inf")),
         )
+        matched_student_logprobs = torch.where(
+            matches,
+            student_logprobs.unsqueeze(-1),
+            torch.full_like(matches, float("-inf"), dtype=student_logprobs.dtype),
+        ).amax(dim=-2)
+        teacher_on_student_coverage = torch.where(
+            torch.isfinite(matched_teacher_logprobs),
+            matched_teacher_logprobs.exp(),
+            torch.zeros_like(matched_teacher_logprobs),
+        ).sum(dim=-1)
+        student_on_teacher_coverage = torch.where(
+            torch.isfinite(matched_student_logprobs),
+            matched_student_logprobs.exp(),
+            torch.zeros_like(matched_student_logprobs),
+        ).sum(dim=-1)
+        for coverage_name, coverage_value in (
+            (f"distillation/coverage/teacher_on_student_top{k}", teacher_on_student_coverage),
+            (f"distillation/coverage/student_on_teacher_top{k}", student_on_teacher_coverage),
+        ):
+            _put_if_present(metrics, f"{coverage_name}/mean", _masked_mean(coverage_value, valid_rows))
+            metrics.update(
+                compute_coarse_token_stats(
+                    coverage_value,
+                    valid_rows,
+                    prefix=coverage_name,
+                    include_distribution=True,
+                )
+            )
+
         student_overlap_log_mass = torch.logsumexp(overlap_student_logprobs, dim=-1, keepdim=True)
         teacher_overlap_log_mass = torch.logsumexp(overlap_teacher_logprobs, dim=-1, keepdim=True)
         student_logp_bar = overlap_student_logprobs - student_overlap_log_mass
@@ -696,6 +1474,7 @@ def compute_rethinking_opd_diagnostics(
         student_entropy_approx = _topk_residual_bucket_entropy(student_logprobs, student_finite)
         teacher_entropy_approx = _topk_residual_bucket_entropy(teacher_logprobs, teacher_finite)
         entropy_gap_approx = (teacher_entropy_approx - student_entropy_approx).abs()
+        entropy_gap_signed = teacher_entropy_approx - student_entropy_approx
         _put_if_present(
             metrics,
             _topk_distillation_metric_key("entropy_student", k=k, configured_topk=topk),
@@ -719,8 +1498,250 @@ def compute_rethinking_opd_diagnostics(
                 prefix=_topk_distillation_metric_key("entropy_gap_bin", k=k, configured_topk=topk),
             )
         )
+        entropy_suffix = "" if int(k) == int(topk) else f"_top{k}"
+        for entropy_name, entropy_values in (
+            (f"opd/entropy/student{entropy_suffix}", student_entropy_approx),
+            (f"opd/entropy/teacher{entropy_suffix}", teacher_entropy_approx),
+            (f"opd/entropy/gap_abs{entropy_suffix}", entropy_gap_approx),
+            (f"opd/entropy/gap_signed{entropy_suffix}", entropy_gap_signed),
+        ):
+            metrics.update(
+                compute_binned_token_means(
+                    entropy_values,
+                    valid_rows,
+                    bin_size=bin_size,
+                    prefix=f"{entropy_name}_bin",
+                )
+            )
+            metrics.update(
+                compute_coarse_token_stats(
+                    entropy_values,
+                    valid_rows,
+                    prefix=entropy_name,
+                    include_distribution=True,
+                )
+            )
 
     metrics[f"{DISTILLATION_DIAGNOSTICS_PREFIX}/entropy_gap_residual_bucket_approximation"] = 1.0
+    return metrics
+
+
+def _gather_visible_topk_probability(
+    topk_ids: torch.Tensor,
+    topk_logprobs: torch.Tensor,
+    token_ids: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return sum probability and visibility mask for token ids present in returned top-k rows."""
+    if not token_ids:
+        probs = torch.zeros(topk_ids.shape[:2], dtype=topk_logprobs.dtype, device=topk_logprobs.device)
+        return probs, torch.zeros_like(probs, dtype=torch.bool)
+    target = torch.tensor(token_ids, dtype=topk_ids.dtype, device=topk_ids.device)
+    matches = (topk_ids.unsqueeze(-1) == target).any(dim=-1) & torch.isfinite(topk_logprobs)
+    probs = torch.where(matches, topk_logprobs.exp(), torch.zeros_like(topk_logprobs)).sum(dim=-1)
+    return probs, matches.any(dim=-1)
+
+
+def compute_special_token_topk_metrics(
+    *,
+    response_mask: torch.Tensor,
+    special_token_ids: SpecialTokenIds,
+    bin_size: int,
+    student_topk_ids: Optional[torch.Tensor] = None,
+    student_topk_logprobs: Optional[torch.Tensor] = None,
+    teacher_topk_ids: Optional[torch.Tensor] = None,
+    teacher_topk_logprobs: Optional[torch.Tensor] = None,
+    thinking_mask: Optional[torch.Tensor] = None,
+    answering_mask: Optional[torch.Tensor] = None,
+) -> dict[str, float]:
+    """Compute special-token probabilities when tokens are visible in returned top-k rows."""
+    metrics: dict[str, float] = {}
+    response_mask_cpu = response_mask.detach().bool().cpu()
+
+    def add_model_metrics(
+        *,
+        model_prefix: str,
+        topk_ids: Optional[torch.Tensor],
+        topk_logprobs: Optional[torch.Tensor],
+    ) -> None:
+        if topk_ids is None or topk_logprobs is None:
+            return
+        topk_ids_cpu = topk_ids.detach().cpu()
+        topk_logprobs_cpu = _to_cpu_float(topk_logprobs)
+        if topk_ids_cpu.shape != topk_logprobs_cpu.shape or topk_ids_cpu.shape[:2] != response_mask_cpu.shape:
+            raise ValueError(
+                f"{model_prefix} top-k tensors must align with response_mask, got "
+                f"{topk_ids_cpu.shape=}, {topk_logprobs_cpu.shape=}, {response_mask_cpu.shape=}."
+            )
+        token_groups = [(name, _unique_int_tuple([token_id])) for name, token_id in special_token_ids.token_items()]
+        token_groups.extend(
+            [
+                ("generation_stop_sum", special_token_ids.generation_stop_ids),
+                ("foreign_control_sum", special_token_ids.foreign_control_ids),
+            ]
+        )
+        for name, token_ids in token_groups:
+            if not token_ids:
+                continue
+            probs, visible = _gather_visible_topk_probability(topk_ids_cpu, topk_logprobs_cpu, token_ids)
+            valid = response_mask_cpu & visible
+            if name in {"generation_stop_sum", "foreign_control_sum"}:
+                base = f"{model_prefix}/prob_topk/group/{name}"
+            else:
+                base = f"{model_prefix}/prob_topk/token/{name}"
+            metrics[f"{base}/visible_token_fraction"] = float(valid.sum().item()) / max(
+                int(response_mask_cpu.sum().item()), 1
+            )
+            _put_if_present(metrics, f"{base}/mean", _masked_mean(probs, valid))
+            metrics.update(compute_binned_token_means(probs, valid, bin_size=bin_size, prefix=f"{base}_bin"))
+            metrics.update(compute_coarse_token_stats(probs, valid, prefix=base, include_distribution=True))
+
+        for phase_name, phase_mask in (("thinking", thinking_mask), ("answering", answering_mask)):
+            if phase_mask is None:
+                continue
+            phase_mask_cpu = phase_mask.detach().bool().cpu() & response_mask_cpu
+            if phase_name == "thinking" and special_token_ids.think_end is not None:
+                probs, visible = _gather_visible_topk_probability(
+                    topk_ids_cpu, topk_logprobs_cpu, _unique_int_tuple([special_token_ids.think_end])
+                )
+                valid = phase_mask_cpu & visible
+                _put_if_present(
+                    metrics,
+                    f"{model_prefix}/prob_phase/thinking/think_end/mean",
+                    _masked_mean(probs, valid),
+                )
+            if phase_name == "answering" and special_token_ids.generation_stop_ids:
+                probs, visible = _gather_visible_topk_probability(
+                    topk_ids_cpu, topk_logprobs_cpu, special_token_ids.generation_stop_ids
+                )
+                valid = phase_mask_cpu & visible
+                _put_if_present(
+                    metrics,
+                    f"{model_prefix}/prob_phase/answering/generation_stop_sum/mean",
+                    _masked_mean(probs, valid),
+                )
+                if special_token_ids.im_end is not None:
+                    im_end_probs, im_end_visible = _gather_visible_topk_probability(
+                        topk_ids_cpu, topk_logprobs_cpu, _unique_int_tuple([special_token_ids.im_end])
+                    )
+                    _put_if_present(
+                        metrics,
+                        f"{model_prefix}/prob_phase/answering/im_end/mean",
+                        _masked_mean(im_end_probs, phase_mask_cpu & im_end_visible),
+                    )
+
+    add_model_metrics(model_prefix="student", topk_ids=student_topk_ids, topk_logprobs=student_topk_logprobs)
+    add_model_metrics(model_prefix="teacher", topk_ids=teacher_topk_ids, topk_logprobs=teacher_topk_logprobs)
+    return metrics
+
+
+def compute_bad_tail_metrics(
+    *,
+    response_mask: torch.Tensor,
+    clipped_mask: torch.Tensor,
+    phase_carrier_mask: Optional[torch.Tensor] = None,
+    abs_gap: Optional[torch.Tensor] = None,
+    token_reward: Optional[torch.Tensor] = None,
+    teacher_sampled_prob: Optional[torch.Tensor] = None,
+    top16_overlap: Optional[torch.Tensor] = None,
+    student_entropy: Optional[torch.Tensor] = None,
+    teacher_entropy: Optional[torch.Tensor] = None,
+    min_position: int = BAD_TAIL_MIN_POSITION,
+    deep_position: int = BAD_TAIL_DEEP_POSITION,
+    extreme_position: int = BAD_TAIL_EXTREME_POSITION,
+    overlap_threshold: float = BAD_TAIL_OVERLAP_THRESHOLD,
+    teacher_prob_threshold: float = BAD_TAIL_TEACHER_PROB_THRESHOLD,
+    gap_threshold: float = BAD_TAIL_GAP_THRESHOLD,
+    reward_threshold: float = BAD_TAIL_REWARD_THRESHOLD,
+    entropy_threshold: float = BAD_TAIL_ENTROPY_THRESHOLD,
+) -> dict[str, float]:
+    """Aggregate bad-tail token mass and carrier-sample metrics."""
+    response_mask_cpu = response_mask.detach().bool().cpu()
+    batch_size, response_width = response_mask_cpu.shape
+    position = torch.arange(response_width).unsqueeze(0).expand(batch_size, -1)
+    tail_min = response_mask_cpu & (position >= int(min_position))
+    tail_deep = response_mask_cpu & (position >= int(deep_position))
+    tail_extreme = response_mask_cpu & (position >= int(extreme_position))
+    condition_masks: list[torch.Tensor] = []
+    severity = torch.zeros_like(response_mask_cpu, dtype=torch.float32)
+
+    def add_condition(condition: Optional[torch.Tensor]) -> None:
+        nonlocal severity
+        if condition is None:
+            return
+        condition_cpu = condition.detach().bool().cpu() & response_mask_cpu
+        condition_masks.append(condition_cpu)
+        severity = severity + condition_cpu.float()
+
+    if abs_gap is not None:
+        add_condition(_to_cpu_float(abs_gap) > float(gap_threshold))
+    if token_reward is not None:
+        add_condition(_to_cpu_float(token_reward) < float(reward_threshold))
+    if teacher_sampled_prob is not None:
+        add_condition(_to_cpu_float(teacher_sampled_prob) < float(teacher_prob_threshold))
+    if top16_overlap is not None:
+        add_condition(_to_cpu_float(top16_overlap) < float(overlap_threshold))
+    if student_entropy is not None:
+        add_condition(_to_cpu_float(student_entropy) > float(entropy_threshold))
+    if teacher_entropy is not None:
+        add_condition(_to_cpu_float(teacher_entropy) > float(entropy_threshold))
+
+    if condition_masks:
+        bad_condition = torch.stack(condition_masks, dim=0).any(dim=0)
+    else:
+        bad_condition = torch.zeros_like(response_mask_cpu, dtype=torch.bool)
+    bad_tail = bad_condition & tail_min
+    bad_tail_deep = bad_condition & tail_deep
+    bad_tail_extreme = bad_condition & tail_extreme
+    bad_tail_by_sample = bad_tail.any(dim=1)
+    clipped_mask_cpu = clipped_mask.detach().bool().cpu()
+    carrier_mask = bad_tail_by_sample.clone()
+    if phase_carrier_mask is not None:
+        carrier_mask = carrier_mask | phase_carrier_mask.detach().bool().cpu()
+    total_tokens = int(response_mask_cpu.sum().item())
+    bad_tail_tokens = int(bad_tail.sum().item())
+    carrier_tokens = int(response_mask_cpu[carrier_mask].sum().item()) if carrier_mask.any() else 0
+
+    metrics: dict[str, float] = {
+        "contagion/bad_tail_min_position": float(min_position),
+        "contagion/bad_tail_deep_position": float(deep_position),
+        "contagion/bad_tail_extreme_position": float(extreme_position),
+        "contagion/bad_tail_gap_threshold": float(gap_threshold),
+        "contagion/bad_tail_reward_threshold": float(reward_threshold),
+        "contagion/bad_tail_teacher_prob_threshold": float(teacher_prob_threshold),
+        "contagion/bad_tail_overlap_threshold": float(overlap_threshold),
+        "contagion/bad_tail_entropy_threshold": float(entropy_threshold),
+        "contagion/bad_tail_token_count": float(bad_tail_tokens),
+        "contagion/bad_tail_token_fraction": bad_tail_tokens / max(total_tokens, 1),
+        "contagion/bad_tail_loss_token_fraction": bad_tail_tokens / max(total_tokens, 1),
+        "contagion/bad_tail_12k_token_count": float(bad_tail_tokens),
+        "contagion/bad_tail_16k_token_count": float(bad_tail_deep.sum().item()),
+        "contagion/bad_tail_20k_token_count": float(bad_tail_extreme.sum().item()),
+        "contagion/bad_tail_sample_count": float(bad_tail_by_sample.sum().item()),
+        "contagion/bad_tail_sample_ratio": float(bad_tail_by_sample.float().mean().item()) if batch_size else 0.0,
+        "contagion/bad_tail_clipped_sample_count": float((bad_tail_by_sample & clipped_mask_cpu).sum().item()),
+        "contagion/bad_tail_nonclipped_sample_count": float((bad_tail_by_sample & ~clipped_mask_cpu).sum().item()),
+        "contagion/bad_tail_near_clipped_sample_count": float(
+            (bad_tail_by_sample & (response_mask_cpu.sum(dim=1) > int(deep_position))).sum().item()
+        ),
+        "contagion/carrier_sample_count": float(carrier_mask.sum().item()),
+        "contagion/carrier_sample_ratio": float(carrier_mask.float().mean().item()) if batch_size else 0.0,
+        "contagion/carrier_token_share": carrier_tokens / max(total_tokens, 1),
+        "contagion/carrier_loss_share": carrier_tokens / max(total_tokens, 1),
+        "contagion/current_bad_tail_mass": bad_tail_tokens / max(total_tokens, 1),
+        "contagion/current_bad_tail_loss_share": bad_tail_tokens / max(total_tokens, 1),
+        "contagion/current_carrier_ratio": float(carrier_mask.float().mean().item()) if batch_size else 0.0,
+    }
+    score_values = severity[bad_tail]
+    _put_if_present(metrics, "contagion/bad_tail_score_mean", _safe_mean(score_values))
+    _put_if_present(metrics, "contagion/bad_tail_score_p90", _safe_quantile(score_values, 0.90))
+    _put_if_present(metrics, "contagion/bad_tail_score_p99", _safe_quantile(score_values, 0.99))
+    if score_values.numel():
+        metrics["contagion/bad_tail_score_max"] = float(score_values.max().item())
+
+    susceptible = (~clipped_mask_cpu) & (response_mask_cpu.sum(dim=1) < int(min_position))
+    metrics["contagion/susceptible_sample_count"] = float(susceptible.sum().item())
+    if susceptible.any():
+        metrics["contagion/susceptible_length_mean"] = float(response_mask_cpu.sum(dim=1)[susceptible].float().mean())
     return metrics
 
 
@@ -740,6 +1761,16 @@ def compute_opd_diagnostics_metrics(
     rm_scores: Optional[torch.Tensor] = None,
     high_gap_threshold: float = 1.0,
     overlap_topk: Optional[int] = None,
+    special_token_ids: Optional[SpecialTokenIds] = None,
+    max_response_length: Optional[int] = None,
+    bad_tail_min_position: int = BAD_TAIL_MIN_POSITION,
+    bad_tail_deep_position: int = BAD_TAIL_DEEP_POSITION,
+    bad_tail_extreme_position: int = BAD_TAIL_EXTREME_POSITION,
+    bad_tail_overlap_threshold: float = BAD_TAIL_OVERLAP_THRESHOLD,
+    bad_tail_teacher_prob_threshold: float = BAD_TAIL_TEACHER_PROB_THRESHOLD,
+    bad_tail_gap_threshold: float = BAD_TAIL_GAP_THRESHOLD,
+    bad_tail_reward_threshold: float = BAD_TAIL_REWARD_THRESHOLD,
+    bad_tail_entropy_threshold: float = BAD_TAIL_ENTROPY_THRESHOLD,
 ) -> dict[str, float]:
     """Compute low-overhead OPD diagnostics from sampled-token tensors."""
     if student_logprobs.shape != response_mask.shape:
@@ -750,10 +1781,52 @@ def compute_opd_diagnostics_metrics(
     response_mask = response_mask.bool()
     metrics: dict[str, float] = {}
     response_lens = response_mask.sum(dim=1).detach().float().cpu()
+    max_response_length = int(max_response_length or response_mask.shape[1])
+    metrics.update(compute_bucket_denominator_metrics(response_mask, bin_size=bin_size))
     _put_if_present(metrics, "opd/response_len/mean", _safe_mean(response_lens))
     _put_if_present(metrics, "opd/response_len/p90", _safe_quantile(response_lens, 0.9))
     response_len_max = float(response_lens.max().item()) if response_lens.numel() else None
     _put_if_present(metrics, "opd/response_len/max", response_len_max)
+    phase_info: ResponsePhaseInfo | None = None
+    if response_ids is not None and special_token_ids is not None:
+        phase_info = compute_phase_and_special_token_metrics(
+            response_ids=response_ids,
+            response_mask=response_mask,
+            special_token_ids=special_token_ids,
+            max_response_length=max_response_length,
+        )
+        metrics.update(special_token_resolution_metrics(special_token_ids))
+        metrics.update(phase_info.metrics)
+
+    student_logprobs_cpu = _to_cpu_float(student_logprobs)
+    student_prob = student_logprobs_cpu.exp()
+    student_prob_valid = response_mask.detach().bool().cpu() & torch.isfinite(student_prob)
+    _put_if_present(metrics, "distillation/student_sampled_prob/mean", _masked_mean(student_prob, student_prob_valid))
+    _put_if_present(
+        metrics,
+        "distillation/student_sampled_prob/p10",
+        _masked_quantile(student_prob, student_prob_valid, 0.10),
+    )
+    _put_if_present(
+        metrics,
+        "distillation/student_sampled_prob/p50",
+        _masked_quantile(student_prob, student_prob_valid, 0.50),
+    )
+    metrics.update(
+        compute_coarse_token_stats(
+            student_prob,
+            student_prob_valid,
+            prefix="distillation/student_sampled_prob",
+            include_distribution=True,
+        )
+    )
+
+    abs_gap_for_bad_tail: torch.Tensor | None = None
+    token_reward_for_bad_tail: torch.Tensor | None = None
+    teacher_prob_for_bad_tail: torch.Tensor | None = None
+    top16_overlap_for_bad_tail: torch.Tensor | None = None
+    student_entropy_for_bad_tail: torch.Tensor | None = None
+    teacher_entropy_for_bad_tail: torch.Tensor | None = None
 
     if teacher_logprob_nonfinite_positions is not None:
         nonfinite_event_mask = positions_to_event_mask(
@@ -777,7 +1850,6 @@ def compute_opd_diagnostics_metrics(
         if teacher_logprobs.ndim == 3 and teacher_logprobs.shape[-1] == 1:
             teacher_logprobs = teacher_logprobs.squeeze(-1)
         if teacher_logprobs.shape == student_logprobs.shape:
-            student_logprobs_cpu = _to_cpu_float(student_logprobs)
             teacher_logprobs_cpu = _to_cpu_float(teacher_logprobs)
             response_mask_cpu = response_mask.detach().bool().cpu()
             gap_value_mask = (
@@ -794,6 +1866,9 @@ def compute_opd_diagnostics_metrics(
             valid_gap_response_mask = response_mask_cpu & gap_value_mask
             token_reward = teacher_logprobs_cpu - student_logprobs_cpu
             abs_gap = token_reward.abs()
+            abs_gap_for_bad_tail = abs_gap
+            token_reward_for_bad_tail = token_reward
+            teacher_prob_for_bad_tail = teacher_logprobs_cpu.exp()
             reward_values = _masked_values(token_reward, response_mask_cpu, gap_value_mask)
             abs_gap_values = _masked_values(abs_gap, response_mask_cpu, gap_value_mask)
             _put_if_present(metrics, "opd/reward/mean", _safe_mean(reward_values))
@@ -826,12 +1901,30 @@ def compute_opd_diagnostics_metrics(
                 )
             )
             metrics.update(
+                compute_coarse_token_stats(
+                    abs_gap,
+                    response_mask_cpu,
+                    prefix="opd/gap_abs",
+                    value_mask=gap_value_mask,
+                    include_distribution=True,
+                )
+            )
+            metrics.update(
                 compute_binned_token_means(
                     token_reward,
                     response_mask_cpu,
                     bin_size=bin_size,
                     prefix="opd/reward_bin",
                     value_mask=gap_value_mask,
+                )
+            )
+            metrics.update(
+                compute_coarse_token_stats(
+                    token_reward,
+                    response_mask_cpu,
+                    prefix="opd/reward",
+                    value_mask=gap_value_mask,
+                    include_distribution=True,
                 )
             )
             metrics.update(
@@ -854,6 +1947,28 @@ def compute_opd_diagnostics_metrics(
                 incorrect_mean = _safe_mean(seq_reward.detach().float().cpu()[~labels.detach().cpu()])
                 _put_if_present(metrics, "opd/reward/correct_mean", correct_mean)
                 _put_if_present(metrics, "opd/reward/incorrect_mean", incorrect_mean)
+
+    if rm_scores is not None:
+        scalar_token_reward = rm_scores.detach().float()
+        if scalar_token_reward.ndim == response_mask.ndim + 1:
+            scalar_token_reward = scalar_token_reward.sum(dim=-1)
+        if scalar_token_reward.shape == response_mask.shape:
+            scalar_reward_cpu = _to_cpu_float(scalar_token_reward)
+            reward_valid = response_mask.detach().bool().cpu() & torch.isfinite(scalar_reward_cpu)
+            reward_values = scalar_reward_cpu[reward_valid]
+            _put_distribution_metrics(metrics, "distillation/token_reward_direct", reward_values)
+            if reward_values.numel():
+                metrics["distillation/token_reward_direct/negative_ratio"] = float((reward_values < 0).float().mean())
+            metrics.update(
+                compute_coarse_token_stats(
+                    scalar_reward_cpu,
+                    reward_valid,
+                    prefix="distillation/token_reward_direct",
+                    include_distribution=True,
+                )
+            )
+            if token_reward_for_bad_tail is None:
+                token_reward_for_bad_tail = scalar_reward_cpu
 
     if (
         overlap_topk is not None
@@ -880,6 +1995,20 @@ def compute_opd_diagnostics_metrics(
         and teacher_topk_ids is not None
         and teacher_topk_logprobs is not None
     ):
+        available_for_bad_tail = min(16, student_topk_ids.shape[-1], teacher_topk_ids.shape[-1])
+        if available_for_bad_tail > 0:
+            student_ids16 = student_topk_ids[..., :available_for_bad_tail].detach().cpu()
+            teacher_ids16 = teacher_topk_ids[..., :available_for_bad_tail].detach().cpu()
+            student_lp16 = _to_cpu_float(student_topk_logprobs[..., :available_for_bad_tail])
+            teacher_lp16 = _to_cpu_float(teacher_topk_logprobs[..., :available_for_bad_tail])
+            student_finite16 = torch.isfinite(student_lp16)
+            teacher_finite16 = torch.isfinite(teacher_lp16)
+            matches16 = student_ids16.unsqueeze(-1) == teacher_ids16.unsqueeze(-2)
+            matches16 = matches16 & student_finite16.unsqueeze(-1) & teacher_finite16.unsqueeze(-2)
+            top16_overlap_for_bad_tail = matches16.any(dim=-1).sum(dim=-1).float() / float(available_for_bad_tail)
+            if entropy is None:
+                student_entropy_for_bad_tail = _topk_residual_bucket_entropy(student_lp16, student_finite16)
+            teacher_entropy_for_bad_tail = _topk_residual_bucket_entropy(teacher_lp16, teacher_finite16)
         metrics.update(
             compute_rethinking_opd_diagnostics(
                 response_mask=response_mask,
@@ -921,6 +2050,52 @@ def compute_opd_diagnostics_metrics(
         metrics.update(
             _head_tail_metrics(entropy_cpu, valid_entropy_response_mask, prefix="opd/entropy", bin_size=bin_size)
         )
+        metrics.update(
+            compute_coarse_token_stats(
+                entropy_cpu,
+                valid_entropy_response_mask,
+                prefix="opd/entropy/student",
+                include_distribution=True,
+            )
+        )
+        student_entropy_for_bad_tail = entropy_cpu
+
+    if special_token_ids is not None:
+        metrics.update(
+            compute_special_token_topk_metrics(
+                response_mask=response_mask,
+                special_token_ids=special_token_ids,
+                bin_size=bin_size,
+                student_topk_ids=student_topk_ids,
+                student_topk_logprobs=student_topk_logprobs,
+                teacher_topk_ids=teacher_topk_ids,
+                teacher_topk_logprobs=teacher_topk_logprobs,
+                thinking_mask=None if phase_info is None else phase_info.thinking_mask,
+                answering_mask=None if phase_info is None else phase_info.answering_mask,
+            )
+        )
+
+    metrics.update(
+        compute_bad_tail_metrics(
+            response_mask=response_mask,
+            clipped_mask=response_lens >= max_response_length,
+            phase_carrier_mask=None if phase_info is None else phase_info.carrier_mask,
+            abs_gap=abs_gap_for_bad_tail,
+            token_reward=token_reward_for_bad_tail,
+            teacher_sampled_prob=teacher_prob_for_bad_tail,
+            top16_overlap=top16_overlap_for_bad_tail,
+            student_entropy=student_entropy_for_bad_tail,
+            teacher_entropy=teacher_entropy_for_bad_tail,
+            min_position=bad_tail_min_position,
+            deep_position=bad_tail_deep_position,
+            extreme_position=bad_tail_extreme_position,
+            overlap_threshold=bad_tail_overlap_threshold,
+            teacher_prob_threshold=bad_tail_teacher_prob_threshold,
+            gap_threshold=bad_tail_gap_threshold,
+            reward_threshold=bad_tail_reward_threshold,
+            entropy_threshold=bad_tail_entropy_threshold,
+        )
+    )
 
     return metrics
 

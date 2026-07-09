@@ -264,6 +264,14 @@ class DistillationDiagnosticsConfig(BaseConfig):
     collect_topk_overlap: bool = False
     collect_rethinking_opd_metrics: bool = False
     topk: Optional[int] = None
+    bad_tail_min_position: int = 12000
+    bad_tail_deep_position: int = 16000
+    bad_tail_extreme_position: int = 20000
+    bad_tail_overlap_threshold: float = 0.5
+    bad_tail_teacher_prob_threshold: float = 0.2
+    bad_tail_gap_threshold: float = 1.0
+    bad_tail_reward_threshold: float = -2.0
+    bad_tail_entropy_threshold: float = 4.0
 
     def __post_init__(self):
         if self.position_bin_size <= 0:
@@ -280,6 +288,30 @@ class DistillationDiagnosticsConfig(BaseConfig):
             )
         if self.topk is not None and self.topk <= 0:
             raise ValueError("diagnostics.topk must be positive.")
+        if self.bad_tail_min_position < 0:
+            raise ValueError("diagnostics.bad_tail_min_position must be non-negative.")
+        if self.bad_tail_deep_position < self.bad_tail_min_position:
+            raise ValueError("diagnostics.bad_tail_deep_position must be >= bad_tail_min_position.")
+        if self.bad_tail_extreme_position < self.bad_tail_deep_position:
+            raise ValueError("diagnostics.bad_tail_extreme_position must be >= bad_tail_deep_position.")
+        for field_name in (
+            "bad_tail_overlap_threshold",
+            "bad_tail_teacher_prob_threshold",
+            "bad_tail_gap_threshold",
+            "bad_tail_reward_threshold",
+            "bad_tail_entropy_threshold",
+        ):
+            value = getattr(self, field_name)
+            if not math.isfinite(value):
+                raise ValueError(f"diagnostics.{field_name} must be finite, got {value!r}.")
+        if not 0 <= self.bad_tail_overlap_threshold <= 1:
+            raise ValueError("diagnostics.bad_tail_overlap_threshold must be in [0, 1].")
+        if not 0 <= self.bad_tail_teacher_prob_threshold <= 1:
+            raise ValueError("diagnostics.bad_tail_teacher_prob_threshold must be in [0, 1].")
+        if self.bad_tail_gap_threshold < 0:
+            raise ValueError("diagnostics.bad_tail_gap_threshold must be non-negative.")
+        if self.bad_tail_entropy_threshold < 0:
+            raise ValueError("diagnostics.bad_tail_entropy_threshold must be non-negative.")
 
 
 @dataclass
