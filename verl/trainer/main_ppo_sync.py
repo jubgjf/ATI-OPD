@@ -1497,14 +1497,14 @@ class PPOTrainer:
         global_steps: int,
         entropy: torch.Tensor,
         response_mask: torch.Tensor,
-    ) -> None:
+    ) -> dict[str, Any]:
         diagnostics_config = self._distillation_diagnostics_config()
         if diagnostics_config is None or not diagnostics_config.log_wandb_heatmap:
-            return
+            return {}
         if global_steps % diagnostics_config.heatmap_interval != 0:
-            return
+            return {}
         if getattr(self, "logger", None) is None or "wandb" not in getattr(self.logger, "logger", {}):
-            return
+            return {}
         if self.opd_diagnostics_tracker is None:
             self.opd_diagnostics_tracker = OpdDiagnosticsTracker(
                 history_steps=diagnostics_config.heatmap_history_steps,
@@ -1518,13 +1518,13 @@ class PPOTrainer:
         self.opd_diagnostics_tracker.add_entropy_row(global_steps, row)
         fig = self.opd_diagnostics_tracker.render_entropy_heatmap()
         if fig is None:
-            return
+            return {}
         import matplotlib.pyplot as plt
 
         try:
             import wandb
 
-            self.logger.log({"opd/entropy_heatmap": wandb.Image(fig)}, step=global_steps, backend=["wandb"])
+            return {"opd/entropy_heatmap": wandb.Image(fig)}
         finally:
             plt.close(fig)
 
@@ -1535,16 +1535,17 @@ class PPOTrainer:
         teacher_logprobs: torch.Tensor | None,
         teacher_logprob_nonfinite_positions: list[Any] | None,
         response_mask: torch.Tensor,
-    ) -> None:
+    ) -> dict[str, Any]:
         diagnostics_config = self._distillation_diagnostics_config()
         if diagnostics_config is None or not diagnostics_config.log_wandb_heatmap:
-            return
+            return {}
         if teacher_logprobs is None or (teacher_logprobs.ndim == 3 and teacher_logprobs.shape[-1] != 1):
-            return
+            return {}
         if global_steps % diagnostics_config.heatmap_interval != 0:
-            return
+            return {}
         if getattr(self, "logger", None) is None or "wandb" not in getattr(self.logger, "logger", {}):
-            return
+            return {}
+        metrics: dict[str, Any] = {}
         if self.opd_gap_tracker is None:
             self.opd_gap_tracker = OpdDiagnosticsTracker(
                 history_steps=diagnostics_config.heatmap_history_steps,
@@ -1559,13 +1560,13 @@ class PPOTrainer:
         self.opd_gap_tracker.add_gap_row(global_steps, row)
         fig = self.opd_gap_tracker.render_gap_heatmap()
         if fig is None:
-            return
+            return {}
         import matplotlib.pyplot as plt
 
         try:
             import wandb
 
-            self.logger.log({"opd/gap_abs_heatmap": wandb.Image(fig)}, step=global_steps, backend=["wandb"])
+            metrics["opd/gap_abs_heatmap"] = wandb.Image(fig)
         finally:
             plt.close(fig)
 
@@ -1587,12 +1588,12 @@ class PPOTrainer:
             try:
                 import wandb
 
-                self.logger.log({"opd/gap_abs_high_heatmap": wandb.Image(fig)}, step=global_steps, backend=["wandb"])
+                metrics["opd/gap_abs_high_heatmap"] = wandb.Image(fig)
             finally:
                 plt.close(fig)
 
         if teacher_logprob_nonfinite_positions is None:
-            return
+            return metrics
         if self.opd_teacher_logprob_nonfinite_tracker is None:
             self.opd_teacher_logprob_nonfinite_tracker = OpdDiagnosticsTracker(
                 history_steps=diagnostics_config.heatmap_history_steps,
@@ -1609,13 +1610,10 @@ class PPOTrainer:
             try:
                 import wandb
 
-                self.logger.log(
-                    {"opd/teacher_logprob_nonfinite_heatmap": wandb.Image(fig)},
-                    step=global_steps,
-                    backend=["wandb"],
-                )
+                metrics["opd/teacher_logprob_nonfinite_heatmap"] = wandb.Image(fig)
             finally:
                 plt.close(fig)
+        return metrics
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
         # 1. collect necessary fields from TransferQueue for computing metrics
@@ -1739,17 +1737,21 @@ class PPOTrainer:
                         response_mask=diagnostics_batch["response_mask"],
                     )
                 )
-            self._maybe_log_opd_entropy_heatmap(
-                global_steps=global_steps,
-                entropy=diagnostics_batch["entropy"],
-                response_mask=diagnostics_batch["response_mask"],
+            metrics.update(
+                self._maybe_log_opd_entropy_heatmap(
+                    global_steps=global_steps,
+                    entropy=diagnostics_batch["entropy"],
+                    response_mask=diagnostics_batch["response_mask"],
+                )
             )
-            self._maybe_log_opd_gap_heatmap(
-                global_steps=global_steps,
-                student_logprobs=diagnostics_batch["old_log_probs"],
-                teacher_logprobs=teacher_for_metrics,
-                teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
-                response_mask=diagnostics_batch["response_mask"],
+            metrics.update(
+                self._maybe_log_opd_gap_heatmap(
+                    global_steps=global_steps,
+                    student_logprobs=diagnostics_batch["old_log_probs"],
+                    teacher_logprobs=teacher_for_metrics,
+                    teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
+                    response_mask=diagnostics_batch["response_mask"],
+                )
             )
 
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))

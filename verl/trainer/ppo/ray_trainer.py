@@ -1893,18 +1893,20 @@ class RayPPOTrainer:
         teacher_logprobs: torch.Tensor | None,
         teacher_logprob_nonfinite_positions: list[Any] | None,
         response_mask: torch.Tensor,
-    ) -> None:
+    ) -> dict[str, Any]:
         diagnostics_config = self._distillation_diagnostics_config()
         if diagnostics_config is None or not diagnostics_config.log_wandb_heatmap:
-            return
+            return {}
         if global_steps % diagnostics_config.heatmap_interval != 0:
-            return
+            return {}
         if getattr(self, "logger", None) is None or "wandb" not in getattr(self.logger, "logger", {}):
-            return
+            return {}
 
         import matplotlib.pyplot as plt
 
         import wandb
+
+        metrics: dict[str, Any] = {}
 
         if entropy is not None:
             if self.opd_entropy_tracker is None:
@@ -1921,7 +1923,7 @@ class RayPPOTrainer:
             fig = self.opd_entropy_tracker.render_entropy_heatmap()
             if fig is not None:
                 try:
-                    self.logger.log({"opd/entropy_heatmap": wandb.Image(fig)}, step=global_steps, backend=["wandb"])
+                    metrics["opd/entropy_heatmap"] = wandb.Image(fig)
                 finally:
                     plt.close(fig)
 
@@ -1941,7 +1943,7 @@ class RayPPOTrainer:
             fig = self.opd_gap_tracker.render_gap_heatmap()
             if fig is not None:
                 try:
-                    self.logger.log({"opd/gap_abs_heatmap": wandb.Image(fig)}, step=global_steps, backend=["wandb"])
+                    metrics["opd/gap_abs_heatmap"] = wandb.Image(fig)
                 finally:
                     plt.close(fig)
 
@@ -1961,9 +1963,7 @@ class RayPPOTrainer:
             fig = self.opd_gap_high_tracker.render_gap_high_heatmap()
             if fig is not None:
                 try:
-                    self.logger.log(
-                        {"opd/gap_abs_high_heatmap": wandb.Image(fig)}, step=global_steps, backend=["wandb"]
-                    )
+                    metrics["opd/gap_abs_high_heatmap"] = wandb.Image(fig)
                 finally:
                     plt.close(fig)
 
@@ -1982,13 +1982,11 @@ class RayPPOTrainer:
             fig = self.opd_teacher_logprob_nonfinite_tracker.render_teacher_logprob_nonfinite_heatmap()
             if fig is not None:
                 try:
-                    self.logger.log(
-                        {"opd/teacher_logprob_nonfinite_heatmap": wandb.Image(fig)},
-                        step=global_steps,
-                        backend=["wandb"],
-                    )
+                    metrics["opd/teacher_logprob_nonfinite_heatmap"] = wandb.Image(fig)
                 finally:
                     plt.close(fig)
+
+        return metrics
 
     def _build_opd_diagnostics_inputs(
         self,
@@ -2105,7 +2103,7 @@ class RayPPOTrainer:
         batch: DataProto,
         entropy: torch.Tensor | None,
         global_steps: int,
-    ) -> dict[str, float]:
+    ) -> dict[str, Any]:
         diagnostics_inputs = self._build_opd_diagnostics_inputs(
             batch=batch,
             entropy=entropy,
@@ -2122,13 +2120,15 @@ class RayPPOTrainer:
         if intervention_kwargs is not None:
             metrics.update(compute_intervention_metrics(**intervention_kwargs))
 
-        self._maybe_log_opd_heatmaps(
-            global_steps=global_steps,
-            entropy=diagnostics_kwargs["entropy"],
-            student_logprobs=diagnostics_kwargs["student_logprobs"],
-            teacher_logprobs=teacher_response_logprobs,
-            teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
-            response_mask=diagnostics_kwargs["response_mask"],
+        metrics.update(
+            self._maybe_log_opd_heatmaps(
+                global_steps=global_steps,
+                entropy=diagnostics_kwargs["entropy"],
+                student_logprobs=diagnostics_kwargs["student_logprobs"],
+                teacher_logprobs=teacher_response_logprobs,
+                teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
+                response_mask=diagnostics_kwargs["response_mask"],
+            )
         )
         return metrics
 
@@ -2188,7 +2188,7 @@ class RayPPOTrainer:
         batch: DataProto,
         entropy: torch.Tensor | None,
         global_steps: int,
-    ) -> dict[str, float]:
+    ) -> dict[str, Any]:
         diagnostics_config = self._distillation_diagnostics_config()
         if diagnostics_config is None or not getattr(diagnostics_config, "async_metrics", False):
             return self._compute_opd_diagnostics_metrics(batch=batch, entropy=entropy, global_steps=global_steps)
@@ -2211,7 +2211,7 @@ class RayPPOTrainer:
         diagnostics_kwargs, intervention_kwargs, teacher_response_logprobs, teacher_logprob_nonfinite_positions = (
             diagnostics_inputs
         )
-        self._maybe_log_opd_heatmaps(
+        metrics = self._maybe_log_opd_heatmaps(
             global_steps=global_steps,
             entropy=diagnostics_kwargs["entropy"],
             student_logprobs=diagnostics_kwargs["student_logprobs"],
@@ -2232,12 +2232,15 @@ class RayPPOTrainer:
             snapshot_intervention_kwargs,
         )
         self._opd_diagnostics_futures.append((global_steps, future, time.perf_counter()))
-        return {
-            "opd/diagnostics_async/submitted": 1.0,
-            "opd/diagnostics_async/skipped_pending_full": 0.0,
-            "opd/diagnostics_async/pending": float(len(self._opd_diagnostics_futures)),
-            "opd/diagnostics_async/snapshot_seconds": snapshot_seconds,
-        }
+        metrics.update(
+            {
+                "opd/diagnostics_async/submitted": 1.0,
+                "opd/diagnostics_async/skipped_pending_full": 0.0,
+                "opd/diagnostics_async/pending": float(len(self._opd_diagnostics_futures)),
+                "opd/diagnostics_async/snapshot_seconds": snapshot_seconds,
+            }
+        )
+        return metrics
 
     def _update_critic(self, batch: DataProto) -> DataProto:
         batch_td = batch.to_tensordict()

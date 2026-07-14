@@ -32,6 +32,18 @@ MLFLOW_MAX_ATTEMPTS = 3
 MLFLOW_SLEEP_SECONDS = 5
 
 
+def _is_wandb_media_value(value: Any) -> bool:
+    value_type = type(value)
+    module = getattr(value_type, "__module__", "")
+    return module.startswith("wandb.") or module.startswith("wandb.sdk.")
+
+
+def _filter_wandb_media_for_backend(data: Any, backend: str) -> Any:
+    if backend in {"wandb", "vemlp_wandb"} or not isinstance(data, dict):
+        return data
+    return {key: value for key, value in data.items() if not _is_wandb_media_value(value)}
+
+
 class Tracking:
     """A unified tracking interface for logging experiment data to multiple backends.
 
@@ -182,7 +194,10 @@ class Tracking:
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                backend_data = _filter_wandb_media_for_backend(data, default_backend)
+                if isinstance(backend_data, dict) and not backend_data:
+                    continue
+                logger_instance.log(data=backend_data, step=step)
 
     def finish(self, exit_code=0):
         if getattr(self, "_finished", False):
