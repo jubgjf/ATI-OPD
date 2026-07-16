@@ -105,9 +105,8 @@ intervention:
   teacher_top_k: 20
   log_examples_per_worker: 2
 
-# Diagnostics for analyzing OPD behavior on long responses. These metrics use
-# tensors already produced by the training loop whenever possible, so the default
-# path is low overhead.
+# Diagnostics for analyzing OPD behavior on long responses. Repetition defaults
+# follow Stable-OPD's text-zlib definition on train/validation generations.
 diagnostics:
 
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
@@ -126,8 +125,13 @@ diagnostics:
   collect_intervention_metrics: true
   collect_topk_overlap: false
   collect_rethinking_opd_metrics: false
+  collect_repetition_metrics: true
+  collect_train_text_zlib_repetition: true
   # null: follow distillation_loss.topk; set explicitly to request a wider/narrower diagnostics top-k.
   topk: null
+  repetition_tail_chars: 10000
+  repetition_comp_ratio_threshold: 10.0
+  repetition_tail_token_window: 4096
   bad_tail_min_position: 12000
   bad_tail_deep_position: 16000
   bad_tail_extreme_position: 20000

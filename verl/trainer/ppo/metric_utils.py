@@ -16,6 +16,7 @@ Metrics related to the PPO trainer.
 """
 
 import logging
+import zlib
 from collections import defaultdict
 from functools import partial
 from typing import Any, Callable
@@ -28,6 +29,19 @@ from verl import DataProto
 from verl.utils.import_utils import deprecated
 
 logger = logging.getLogger(__name__)
+
+_FINISH_REASON_LENGTH = "length"
+_FINISH_REASON_STOP = "stop"
+_FINISH_REASON_EOS = "eos"
+_FINISH_REASON_ABORT = "abort"
+_FINISH_REASON_OTHER = "other"
+_FINISH_REASON_CATEGORIES = (
+    _FINISH_REASON_LENGTH,
+    _FINISH_REASON_EOS,
+    _FINISH_REASON_STOP,
+    _FINISH_REASON_ABORT,
+    _FINISH_REASON_OTHER,
+)
 
 
 @deprecated("verl.utils.metric.reduce_metrics")
@@ -92,6 +106,12 @@ def _safe_tensor_quantile(values: torch.Tensor, q: float) -> float:
     return torch.quantile(values.float(), q).detach().item()
 
 
+def _safe_np_quantile(values: np.ndarray, q: float) -> float:
+    if values.size == 0:
+        return float("nan")
+    return float(np.quantile(values.astype(np.float32), q))
+
+
 def _length_distribution_metrics(prefix: str, lengths: torch.Tensor) -> dict[str, Any]:
     lengths = lengths.detach().float()
     if lengths.numel() == 0:
@@ -108,6 +128,321 @@ def _length_distribution_metrics(prefix: str, lengths: torch.Tensor) -> dict[str
         f"{prefix}/p99": _safe_tensor_quantile(lengths, 0.99),
         f"{prefix}/max": torch.max(lengths).detach().item(),
     }
+
+
+def _length_distribution_metrics_from_values(prefix: str, lengths: list[int] | np.ndarray) -> dict[str, Any]:
+    values = np.asarray(lengths, dtype=np.float32)
+    if values.size == 0:
+        return {}
+    return {
+        f"{prefix}/count": float(values.size),
+        f"{prefix}/mean": float(values.mean()),
+        f"{prefix}/std": float(values.std()),
+        f"{prefix}/min": float(values.min()),
+        f"{prefix}/p50": _safe_np_quantile(values, 0.50),
+        f"{prefix}/p75": _safe_np_quantile(values, 0.75),
+        f"{prefix}/p90": _safe_np_quantile(values, 0.90),
+        f"{prefix}/p95": _safe_np_quantile(values, 0.95),
+        f"{prefix}/p99": _safe_np_quantile(values, 0.99),
+        f"{prefix}/max": float(values.max()),
+    }
+
+
+def _distribution_metrics_from_values(prefix: str, values: list[float] | np.ndarray) -> dict[str, float]:
+    values_np = np.asarray(values, dtype=np.float32)
+    values_np = values_np[np.isfinite(values_np)]
+    if values_np.size == 0:
+        return {}
+    return {
+        f"{prefix}/count": float(values_np.size),
+        f"{prefix}/mean": float(values_np.mean()),
+        f"{prefix}/std": float(values_np.std()),
+        f"{prefix}/min": float(values_np.min()),
+        f"{prefix}/p50": _safe_np_quantile(values_np, 0.50),
+        f"{prefix}/p75": _safe_np_quantile(values_np, 0.75),
+        f"{prefix}/p90": _safe_np_quantile(values_np, 0.90),
+        f"{prefix}/p95": _safe_np_quantile(values_np, 0.95),
+        f"{prefix}/p99": _safe_np_quantile(values_np, 0.99),
+        f"{prefix}/max": float(values_np.max()),
+    }
+
+
+def _as_list(values: Any) -> list[Any]:
+    if values is None:
+        return []
+    if isinstance(values, np.ndarray):
+        return values.tolist()
+    if isinstance(values, torch.Tensor):
+        return values.detach().cpu().tolist()
+    if isinstance(values, list):
+        return values
+    if isinstance(values, tuple):
+        return list(values)
+    return [values]
+
+
+def _normalize_finish_reason(value: Any) -> str:
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, dict):
+        value = value.get("type", value.get("finish_reason", value.get("reason")))
+    if value is None:
+        return _FINISH_REASON_OTHER
+    normalized = str(value).strip().lower()
+    if normalized == _FINISH_REASON_LENGTH:
+        return _FINISH_REASON_LENGTH
+    if normalized in {"eos", "eos_token", "end", "end_of_sequence"}:
+        return _FINISH_REASON_EOS
+    if normalized == _FINISH_REASON_STOP:
+        return _FINISH_REASON_STOP
+    if normalized in {"abort", "aborted", "cancel", "cancelled", "canceled"}:
+        return _FINISH_REASON_ABORT
+    return _FINISH_REASON_OTHER
+
+
+def _aligned_finish_reasons(finish_reasons: Any, size: int) -> list[str]:
+    reasons = [_normalize_finish_reason(value) for value in _as_list(finish_reasons)]
+    if not reasons:
+        return []
+    if len(reasons) < size:
+        reasons.extend([_FINISH_REASON_OTHER] * (size - len(reasons)))
+    return reasons[:size]
+
+
+def compute_finish_reason_metrics(finish_reasons: Any, prefix: str = "rollout/finish_reason") -> dict[str, float]:
+    """Compute normalized generation finish-reason rates."""
+    reasons = [_normalize_finish_reason(value) for value in _as_list(finish_reasons)]
+    if not reasons:
+        return {}
+    total = len(reasons)
+    return {f"{prefix}/{category}_rate": reasons.count(category) / total for category in _FINISH_REASON_CATEGORIES}
+
+
+def compute_truncation_flags(
+    response_lengths: torch.Tensor | np.ndarray | list[int],
+    max_response_length: int,
+    finish_reasons: Any = None,
+) -> np.ndarray:
+    """Return per-sample truncation flags, using finish_reason=length before length fallback."""
+    lengths = np.asarray(_as_list(response_lengths), dtype=np.float32)
+    if lengths.size == 0:
+        return np.asarray([], dtype=bool)
+    reasons = _aligned_finish_reasons(finish_reasons, int(lengths.size))
+    if reasons:
+        return np.asarray([reason == _FINISH_REASON_LENGTH for reason in reasons], dtype=bool)
+    return lengths == float(max_response_length)
+
+
+def _zlib_compression_ratio(payload: bytes) -> float:
+    if not payload:
+        return float("nan")
+    compressed = zlib.compress(payload)
+    if not compressed:
+        return float("nan")
+    return len(payload) / len(compressed)
+
+
+def text_zlib_compression_ratio(text: Any, tail_chars: int = 10000) -> tuple[float, bool]:
+    """Return tail compression ratio and eligibility for text-zlib repetition detection."""
+    if tail_chars <= 0:
+        raise ValueError(f"tail_chars must be positive, got {tail_chars}.")
+    text = "" if text is None else str(text)
+    if len(text) < tail_chars:
+        return float("nan"), False
+    tail = text[-tail_chars:]
+    return _zlib_compression_ratio(tail.encode("utf-8")), True
+
+
+def text_zlib_repetition_flags(
+    outputs: list[Any] | tuple[Any, ...],
+    *,
+    tail_chars: int = 10000,
+    threshold: float = 10.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute text-zlib repetition flags, compression ratios, and eligibility masks."""
+    if not np.isfinite(threshold):
+        raise ValueError(f"threshold must be finite, got {threshold}.")
+    flags: list[bool] = []
+    ratios: list[float] = []
+    eligible: list[bool] = []
+    for output in outputs:
+        ratio, is_eligible = text_zlib_compression_ratio(output, tail_chars=tail_chars)
+        ratios.append(ratio)
+        eligible.append(is_eligible)
+        flags.append(bool(is_eligible and np.isfinite(ratio) and ratio > threshold))
+    return np.asarray(flags, dtype=bool), np.asarray(ratios, dtype=np.float32), np.asarray(eligible, dtype=bool)
+
+
+def repetition_tail_mask_from_sample_flags(
+    response_mask: torch.Tensor,
+    repetition_flags: Any,
+    *,
+    tail_token_window: int = 4096,
+) -> torch.Tensor:
+    """Build a token tail mask for samples flagged as repetitive by a response-level detector."""
+    if tail_token_window <= 0:
+        raise ValueError(f"tail_token_window must be positive, got {tail_token_window}.")
+    response_mask_cpu = response_mask.detach().bool().cpu()
+    flags = np.asarray(_as_list(repetition_flags), dtype=bool).reshape(-1)
+    if flags.size != response_mask_cpu.shape[0]:
+        raise ValueError(
+            f"repetition_flags must match batch size, got {flags.size=} and batch={response_mask_cpu.shape[0]}."
+        )
+    tail_mask = torch.zeros_like(response_mask_cpu, dtype=torch.bool)
+    for idx, repeated in enumerate(flags):
+        if not repeated:
+            continue
+        valid_positions = torch.nonzero(response_mask_cpu[idx], as_tuple=False).flatten()
+        if valid_positions.numel() == 0:
+            continue
+        selected_positions = valid_positions[-min(tail_token_window, valid_positions.numel()) :]
+        tail_mask[idx, selected_positions] = True
+    return tail_mask
+
+
+def token_zlib_repetition_flags(
+    response_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    *,
+    tail_token_window: int = 4096,
+    threshold: float = 10.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, torch.Tensor]:
+    """Compute token-id zlib repetition flags and the repeated-tail token mask."""
+    if tail_token_window <= 0:
+        raise ValueError(f"tail_token_window must be positive, got {tail_token_window}.")
+    if not np.isfinite(threshold):
+        raise ValueError(f"threshold must be finite, got {threshold}.")
+    if response_ids.shape != response_mask.shape:
+        raise ValueError(
+            f"response_ids and response_mask must align, got {response_ids.shape=} and {response_mask.shape=}."
+        )
+    response_ids_cpu = response_ids.detach().cpu()
+    response_mask_cpu = response_mask.detach().bool().cpu()
+    tail_mask = torch.zeros_like(response_mask_cpu, dtype=torch.bool)
+    flags: list[bool] = []
+    ratios: list[float] = []
+    eligible: list[bool] = []
+    for idx in range(response_ids_cpu.shape[0]):
+        valid_positions = torch.nonzero(response_mask_cpu[idx], as_tuple=False).flatten()
+        if valid_positions.numel() < tail_token_window:
+            flags.append(False)
+            ratios.append(float("nan"))
+            eligible.append(False)
+            continue
+        selected_positions = valid_positions[-tail_token_window:]
+        token_values = response_ids_cpu[idx, selected_positions].to(dtype=torch.int64).numpy()
+        ratio = _zlib_compression_ratio(token_values.tobytes())
+        repeated = bool(np.isfinite(ratio) and ratio > threshold)
+        flags.append(repeated)
+        ratios.append(ratio)
+        eligible.append(True)
+        if repeated:
+            tail_mask[idx, selected_positions] = True
+    return (
+        np.asarray(flags, dtype=bool),
+        np.asarray(ratios, dtype=np.float32),
+        np.asarray(eligible, dtype=bool),
+        tail_mask,
+    )
+
+
+def compute_text_repetition_and_truncation_metrics(
+    *,
+    outputs: list[Any],
+    response_lengths: list[int] | None,
+    max_response_length: int | None,
+    finish_reasons: Any = None,
+    prefix: str = "val-aux",
+    tail_chars: int = 10000,
+    threshold: float = 10.0,
+) -> dict[str, float]:
+    """Compute validation-style text-zlib repetition, truncation, and response-length metrics."""
+    metrics, _, _, _ = compute_text_repetition_and_truncation_metrics_with_flags(
+        outputs=outputs,
+        response_lengths=response_lengths,
+        max_response_length=max_response_length,
+        finish_reasons=finish_reasons,
+        prefix=prefix,
+        tail_chars=tail_chars,
+        threshold=threshold,
+    )
+    return metrics
+
+
+def compute_text_repetition_and_truncation_metrics_with_flags(
+    *,
+    outputs: list[Any],
+    response_lengths: list[int] | None,
+    max_response_length: int | None,
+    finish_reasons: Any = None,
+    prefix: str = "val-aux",
+    tail_chars: int = 10000,
+    threshold: float = 10.0,
+) -> tuple[dict[str, float], np.ndarray, np.ndarray, np.ndarray]:
+    """Compute text-zlib metrics and return response-level repetition flags."""
+    metrics: dict[str, float] = {}
+    flags, ratios, eligible = text_zlib_repetition_flags(outputs, tail_chars=tail_chars, threshold=threshold)
+    if flags.size:
+        metrics[f"{prefix}/repetition_rate_zlib"] = float(flags.mean())
+        metrics[f"{prefix}/repetition_eligible_rate_zlib"] = float(eligible.mean())
+        metrics.update(_distribution_metrics_from_values(f"{prefix}/repetition_comp_ratio_zlib", ratios))
+
+    if response_lengths is not None:
+        metrics.update(_length_distribution_metrics_from_values(f"{prefix}/response_length", response_lengths))
+        if max_response_length is not None:
+            truncated = compute_truncation_flags(response_lengths, int(max_response_length), finish_reasons)
+            if truncated.size:
+                metrics[f"{prefix}/truncation_rate"] = float(truncated.mean())
+                if flags.size == truncated.size:
+                    metrics[f"{prefix}/truncation_repetition_joint_rate"] = float((truncated & flags).mean())
+                    truncated_count = int(truncated.sum())
+                    repetition_count = int(flags.sum())
+                    if truncated_count:
+                        metrics[f"{prefix}/repetition_given_truncation"] = (
+                            float((truncated & flags).sum()) / truncated_count
+                        )
+                    if repetition_count:
+                        metrics[f"{prefix}/truncation_given_repetition"] = (
+                            float((truncated & flags).sum()) / repetition_count
+                        )
+    return metrics, flags, ratios, eligible
+
+
+def compute_token_repetition_and_truncation_metrics(
+    *,
+    response_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    max_response_length: int,
+    finish_reasons: Any = None,
+    prefix: str = "rollout",
+    tail_token_window: int = 4096,
+    threshold: float = 10.0,
+) -> tuple[dict[str, float], torch.Tensor]:
+    """Compute rollout token-zlib repetition/truncation metrics and return the repeated-tail mask."""
+    flags, ratios, eligible, tail_mask = token_zlib_repetition_flags(
+        response_ids=response_ids,
+        response_mask=response_mask,
+        tail_token_window=tail_token_window,
+        threshold=threshold,
+    )
+    metrics: dict[str, float] = {}
+    if flags.size:
+        metrics[f"{prefix}/repetition_rate_token_zlib"] = float(flags.mean())
+        metrics[f"{prefix}/repetition_eligible_rate_token_zlib"] = float(eligible.mean())
+        metrics.update(_distribution_metrics_from_values(f"{prefix}/repetition_comp_ratio_token_zlib", ratios))
+    response_lengths = response_mask.detach().bool().sum(dim=1).cpu().numpy()
+    truncated = compute_truncation_flags(response_lengths, int(max_response_length), finish_reasons)
+    if truncated.size:
+        metrics[f"{prefix}/truncation_rate"] = float(truncated.mean())
+        if flags.size == truncated.size:
+            metrics[f"{prefix}/truncation_repetition_joint_rate"] = float((truncated & flags).mean())
+            truncated_count = int(truncated.sum())
+            repetition_count = int(flags.sum())
+            if truncated_count:
+                metrics[f"{prefix}/repetition_given_truncation"] = float((truncated & flags).sum()) / truncated_count
+            if repetition_count:
+                metrics[f"{prefix}/truncation_given_repetition"] = float((truncated & flags).sum()) / repetition_count
+    return metrics, tail_mask
 
 
 def _response_length_tail_metrics(response_length: torch.Tensor, max_response_length: int) -> dict[str, Any]:
@@ -329,6 +664,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     metrics.update(_response_length_tail_metrics(response_length, max_response_length))
     metrics.update(_length_distribution_metrics("prompt_length", prompt_length))
     metrics["prompt_length/max_prompt_length"] = float(max_prompt_length)
+    finish_reasons = batch.non_tensor_batch.get("finish_reason") if batch.non_tensor_batch is not None else None
+    metrics.update(compute_finish_reason_metrics(finish_reasons, prefix="rollout/finish_reason"))
+    truncated = compute_truncation_flags(response_length, max_response_length, finish_reasons)
+    if truncated.size:
+        metrics["rollout/truncation_rate"] = float(truncated.mean())
 
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:

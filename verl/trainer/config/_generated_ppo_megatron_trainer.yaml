@@ -890,7 +890,12 @@ distillation:
     collect_intervention_metrics: true
     collect_topk_overlap: false
     collect_rethinking_opd_metrics: false
+    collect_repetition_metrics: true
+    collect_train_text_zlib_repetition: true
     topk: null
+    repetition_tail_chars: 10000
+    repetition_comp_ratio_threshold: 10.0
+    repetition_tail_token_window: 4096
     bad_tail_min_position: 12000
     bad_tail_deep_position: 16000
     bad_tail_extreme_position: 20000

@@ -60,6 +60,7 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_text_repetition_and_truncation_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
@@ -982,13 +983,19 @@ class RayPPOTrainer:
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            prior_output_count = len(sample_outputs)
+            output_count = len(output_texts)
             sample_outputs.extend(output_texts)
             if "response_mask" in test_output_gen_batch.batch:
                 sample_response_lengths.extend(
                     [int(length) for length in test_output_gen_batch.batch["response_mask"].sum(dim=-1).cpu().tolist()]
                 )
             if "finish_reason" in test_output_gen_batch.non_tensor_batch:
+                if len(sample_finish_reasons) < prior_output_count:
+                    sample_finish_reasons.extend([None] * (prior_output_count - len(sample_finish_reasons)))
                 sample_finish_reasons.extend(test_output_gen_batch.non_tensor_batch["finish_reason"].tolist())
+            elif sample_finish_reasons:
+                sample_finish_reasons.extend([None] * output_count)
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -1075,6 +1082,20 @@ class RayPPOTrainer:
                 sample_outputs, reward_extra_infos_dict
             ).items():
                 metrics[f"{metric_prefix}-aux/{metric_name}"] = value
+            validation_max_response_length = int(
+                generation_max_tokens
+                if generation_max_tokens is not None
+                else self.config.actor_rollout_ref.rollout.response_length
+            )
+            metrics.update(
+                compute_text_repetition_and_truncation_metrics(
+                    outputs=sample_outputs,
+                    response_lengths=sample_response_lengths,
+                    max_response_length=validation_max_response_length,
+                    finish_reasons=sample_finish_reasons,
+                    prefix=f"{metric_prefix}-aux",
+                )
+            )
         return metrics
 
     def _val_metrics_update(
@@ -1884,6 +1905,18 @@ class RayPPOTrainer:
             return value.tolist()
         return list(value)
 
+    def _decode_response_texts_for_diagnostics(
+        self,
+        responses: torch.Tensor,
+        response_mask: torch.Tensor,
+    ) -> list[str]:
+        response_texts = []
+        response_mask = response_mask.detach().bool().cpu()
+        responses = responses.detach().cpu()
+        for response_ids, mask in zip(responses, response_mask, strict=True):
+            response_texts.append(self.tokenizer.decode(response_ids[mask].tolist(), skip_special_tokens=True))
+        return response_texts
+
     def _maybe_log_opd_heatmaps(
         self,
         *,
@@ -2035,9 +2068,13 @@ class RayPPOTrainer:
             teacher_logprob_nonfinite_positions = self._non_tensor_to_list(
                 batch.non_tensor_batch["teacher_logprob_nonfinite_positions"]
             )
+        response_texts = None
+        if getattr(diagnostics_config, "collect_train_text_zlib_repetition", False) and "responses" in batch.batch:
+            response_texts = self._decode_response_texts_for_diagnostics(batch.batch["responses"], response_mask)
         diagnostics_kwargs = {
             "student_logprobs": student_logprobs,
             "response_ids": batch.batch.get("responses", None),
+            "response_texts": response_texts,
             "teacher_logprobs": teacher_response_logprobs,
             "student_topk_ids": batch.batch.get("student_topk_ids", None) if collect_topk_diagnostics else None,
             "student_topk_logprobs": batch.batch.get("student_topk_logprobs", None)
@@ -2058,6 +2095,11 @@ class RayPPOTrainer:
             ),
             "special_token_ids": self.opd_special_token_ids,
             "max_response_length": batch.batch["responses"].shape[-1] if "responses" in batch.batch else None,
+            "collect_repetition_metrics": diagnostics_config.collect_repetition_metrics,
+            "collect_train_text_zlib_repetition": diagnostics_config.collect_train_text_zlib_repetition,
+            "repetition_tail_chars": diagnostics_config.repetition_tail_chars,
+            "repetition_comp_ratio_threshold": diagnostics_config.repetition_comp_ratio_threshold,
+            "repetition_tail_token_window": diagnostics_config.repetition_tail_token_window,
             "bad_tail_min_position": diagnostics_config.bad_tail_min_position,
             "bad_tail_deep_position": diagnostics_config.bad_tail_deep_position,
             "bad_tail_extreme_position": diagnostics_config.bad_tail_extreme_position,

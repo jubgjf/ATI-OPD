@@ -21,6 +21,12 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
+from verl.trainer.ppo.metric_utils import (
+    compute_text_repetition_and_truncation_metrics_with_flags,
+    compute_token_repetition_and_truncation_metrics,
+    repetition_tail_mask_from_sample_flags,
+)
+
 MAX_REASONABLE_ENTROPY = 32.0
 MAX_REASONABLE_LOGPROB_ABS = 1.0e4
 DISTILLATION_DIAGNOSTICS_PREFIX = "distillation"
@@ -1745,6 +1751,71 @@ def compute_bad_tail_metrics(
     return metrics
 
 
+def compute_repetition_advantage_metrics(
+    *,
+    repetition_tail_mask: torch.Tensor,
+    response_mask: torch.Tensor,
+    student_logprobs: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    value_mask: Optional[torch.Tensor] = None,
+) -> dict[str, float]:
+    """Compare reverse-KL advantage/logprobs on repetitive and non-repetitive response tokens."""
+    if teacher_logprobs.ndim == 3 and teacher_logprobs.shape[-1] == 1:
+        teacher_logprobs = teacher_logprobs.squeeze(-1)
+    if not (repetition_tail_mask.shape == response_mask.shape == student_logprobs.shape == teacher_logprobs.shape):
+        raise ValueError(
+            "repetition_tail_mask, response_mask, student_logprobs, and teacher_logprobs must align, got "
+            f"{repetition_tail_mask.shape=}, {response_mask.shape=}, {student_logprobs.shape=}, "
+            f"{teacher_logprobs.shape=}."
+        )
+    response_mask_cpu = response_mask.detach().bool().cpu()
+    repetition_tail_mask_cpu = repetition_tail_mask.detach().bool().cpu()
+    student_logprobs_cpu = _to_cpu_float(student_logprobs)
+    teacher_logprobs_cpu = _to_cpu_float(teacher_logprobs)
+    valid = response_mask_cpu & torch.isfinite(student_logprobs_cpu) & torch.isfinite(teacher_logprobs_cpu)
+    valid = (
+        valid
+        & (student_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
+        & (teacher_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
+    )
+    if value_mask is not None:
+        valid = valid & value_mask.detach().bool().cpu()
+    token_reward = teacher_logprobs_cpu - student_logprobs_cpu
+    repetition_mask = valid & repetition_tail_mask_cpu
+    nonrepetition_mask = valid & ~repetition_tail_mask_cpu
+    total_valid = int(valid.sum().item())
+    metrics: dict[str, float] = {}
+    if total_valid == 0:
+        return metrics
+
+    metrics["opd/repetition/token_fraction"] = int(repetition_mask.sum().item()) / total_valid
+    repetition_values = token_reward[repetition_mask]
+    nonrepetition_values = token_reward[nonrepetition_mask]
+    repetition_mean = _safe_mean(repetition_values)
+    nonrepetition_mean = _safe_mean(nonrepetition_values)
+    _put_if_present(metrics, "opd/repetition/advantage_mean", repetition_mean)
+    _put_if_present(metrics, "opd/nonrepetition/advantage_mean", nonrepetition_mean)
+    if repetition_mean is not None and nonrepetition_mean is not None and abs(nonrepetition_mean) > 1.0e-12:
+        metrics["opd/repetition/advantage_ratio"] = repetition_mean / nonrepetition_mean
+
+    total_abs_advantage = token_reward[valid].abs().sum()
+    if torch.isfinite(total_abs_advantage) and float(total_abs_advantage.item()) > 0:
+        metrics["opd/repetition/advantage_mass_share"] = float(
+            repetition_values.abs().sum().item() / total_abs_advantage.item()
+        )
+    _put_if_present(
+        metrics,
+        "opd/repetition/student_logprob_mean",
+        _safe_mean(student_logprobs_cpu[repetition_mask]),
+    )
+    _put_if_present(
+        metrics,
+        "opd/repetition/teacher_logprob_mean",
+        _safe_mean(teacher_logprobs_cpu[repetition_mask]),
+    )
+    return metrics
+
+
 def compute_opd_diagnostics_metrics(
     *,
     student_logprobs: torch.Tensor,
@@ -1759,10 +1830,16 @@ def compute_opd_diagnostics_metrics(
     teacher_logprob_nonfinite_positions: Optional[list[Any]] = None,
     entropy: Optional[torch.Tensor] = None,
     rm_scores: Optional[torch.Tensor] = None,
+    response_texts: Optional[list[Any]] = None,
     high_gap_threshold: float = 1.0,
     overlap_topk: Optional[int] = None,
     special_token_ids: Optional[SpecialTokenIds] = None,
     max_response_length: Optional[int] = None,
+    collect_repetition_metrics: bool = True,
+    collect_train_text_zlib_repetition: bool = False,
+    repetition_tail_chars: int = 10000,
+    repetition_comp_ratio_threshold: float = 10.0,
+    repetition_tail_token_window: int = 4096,
     bad_tail_min_position: int = BAD_TAIL_MIN_POSITION,
     bad_tail_deep_position: int = BAD_TAIL_DEEP_POSITION,
     bad_tail_extreme_position: int = BAD_TAIL_EXTREME_POSITION,
@@ -1787,6 +1864,35 @@ def compute_opd_diagnostics_metrics(
     _put_if_present(metrics, "opd/response_len/p90", _safe_quantile(response_lens, 0.9))
     response_len_max = float(response_lens.max().item()) if response_lens.numel() else None
     _put_if_present(metrics, "opd/response_len/max", response_len_max)
+    repetition_tail_mask: torch.Tensor | None = None
+    if collect_repetition_metrics and response_ids is not None:
+        repetition_metrics, repetition_tail_mask = compute_token_repetition_and_truncation_metrics(
+            response_ids=response_ids,
+            response_mask=response_mask,
+            max_response_length=max_response_length,
+            prefix="rollout",
+            tail_token_window=repetition_tail_token_window,
+            threshold=repetition_comp_ratio_threshold,
+        )
+        metrics.update(repetition_metrics)
+        if collect_train_text_zlib_repetition and response_texts is not None:
+            text_repetition_metrics, text_repetition_flags, _, _ = (
+                compute_text_repetition_and_truncation_metrics_with_flags(
+                    outputs=response_texts,
+                    response_lengths=[int(length) for length in response_lens.tolist()],
+                    max_response_length=max_response_length,
+                    prefix="rollout",
+                    tail_chars=repetition_tail_chars,
+                    threshold=repetition_comp_ratio_threshold,
+                )
+            )
+            metrics.update(text_repetition_metrics)
+            if text_repetition_flags.size == response_mask.shape[0]:
+                repetition_tail_mask = repetition_tail_mask_from_sample_flags(
+                    response_mask=response_mask,
+                    repetition_flags=text_repetition_flags,
+                    tail_token_window=repetition_tail_token_window,
+                )
     phase_info: ResponsePhaseInfo | None = None
     if response_ids is not None and special_token_ids is not None:
         phase_info = compute_phase_and_special_token_metrics(
@@ -1933,6 +2039,16 @@ def compute_opd_diagnostics_metrics(
             metrics.update(
                 _head_tail_metrics(token_reward, valid_gap_response_mask, prefix="opd/reward", bin_size=bin_size)
             )
+            if repetition_tail_mask is not None:
+                metrics.update(
+                    compute_repetition_advantage_metrics(
+                        repetition_tail_mask=repetition_tail_mask,
+                        response_mask=response_mask,
+                        student_logprobs=student_logprobs,
+                        teacher_logprobs=teacher_logprobs,
+                        value_mask=gap_value_mask,
+                    )
+                )
 
             if rm_scores is not None:
                 seq_reward = (token_reward * valid_gap_response_mask).sum(dim=1) / valid_gap_response_mask.sum(

@@ -266,7 +266,12 @@ class DistillationDiagnosticsConfig(BaseConfig):
     collect_intervention_metrics: bool = True
     collect_topk_overlap: bool = False
     collect_rethinking_opd_metrics: bool = False
+    collect_repetition_metrics: bool = True
+    collect_train_text_zlib_repetition: bool = True
     topk: Optional[int] = None
+    repetition_tail_chars: int = 10000
+    repetition_comp_ratio_threshold: float = 10.0
+    repetition_tail_token_window: int = 4096
     bad_tail_min_position: int = 12000
     bad_tail_deep_position: int = 16000
     bad_tail_extreme_position: int = 20000
@@ -295,6 +300,15 @@ class DistillationDiagnosticsConfig(BaseConfig):
             )
         if self.topk is not None and self.topk <= 0:
             raise ValueError("diagnostics.topk must be positive.")
+        if self.repetition_tail_chars <= 0:
+            raise ValueError("diagnostics.repetition_tail_chars must be positive.")
+        if self.repetition_tail_token_window <= 0:
+            raise ValueError("diagnostics.repetition_tail_token_window must be positive.")
+        if not math.isfinite(self.repetition_comp_ratio_threshold):
+            raise ValueError(
+                "diagnostics.repetition_comp_ratio_threshold must be finite, "
+                f"got {self.repetition_comp_ratio_threshold!r}."
+            )
         if self.bad_tail_min_position < 0:
             raise ValueError("diagnostics.bad_tail_min_position must be non-negative.")
         if self.bad_tail_deep_position < self.bad_tail_min_position:

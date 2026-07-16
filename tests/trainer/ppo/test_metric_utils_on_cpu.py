@@ -25,9 +25,15 @@ from verl.trainer.ppo.metric_utils import (
     bootstrap_metric,
     calc_maj_val,
     compute_data_metrics,
+    compute_finish_reason_metrics,
+    compute_text_repetition_and_truncation_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    compute_token_repetition_and_truncation_metrics,
+    compute_truncation_flags,
     process_validation_metrics,
+    repetition_tail_mask_from_sample_flags,
+    text_zlib_repetition_flags,
 )
 from verl.utils.metric import (
     reduce_metrics,
@@ -69,6 +75,129 @@ class TestReduceMetrics(unittest.TestCase):
         result = reduce_metrics(metrics)
 
         self.assertEqual(result["single"], 5.0)
+
+
+class TestLongSequenceStabilityMetrics(unittest.TestCase):
+    """Tests for long-sequence truncation and repetition diagnostics."""
+
+    def test_text_zlib_repetition_detects_repeated_long_tail(self):
+        outputs = [
+            "",
+            "short repeated repeated repeated",
+            "prefix " + ("abc123" * 400),
+            "".join(f"{idx:04x}" for idx in range(600)),
+            "推理步骤" * 500,
+            "<think>" + ("x" * 1200) + "</think>",
+        ]
+        flags, ratios, eligible = text_zlib_repetition_flags(outputs, tail_chars=256, threshold=8.0)
+
+        self.assertFalse(flags[0])
+        self.assertFalse(eligible[0])
+        self.assertFalse(flags[1])
+        self.assertFalse(eligible[1])
+        self.assertTrue(flags[2])
+        self.assertFalse(flags[3])
+        self.assertTrue(flags[4])
+        self.assertTrue(flags[5])
+        self.assertTrue(np.isnan(ratios[0]))
+        self.assertTrue(np.isnan(ratios[1]))
+
+    def test_finish_reason_and_truncation_metrics_prefer_strict_length_reason(self):
+        finish_reasons = ["length", "stop", "eos", "abort", None, {"type": "length"}, "cancelled", "weird"]
+        metrics = compute_finish_reason_metrics(finish_reasons)
+
+        self.assertEqual(metrics["rollout/finish_reason/length_rate"], 2 / 8)
+        self.assertEqual(metrics["rollout/finish_reason/stop_rate"], 1 / 8)
+        self.assertEqual(metrics["rollout/finish_reason/eos_rate"], 1 / 8)
+        self.assertEqual(metrics["rollout/finish_reason/abort_rate"], 2 / 8)
+        self.assertEqual(metrics["rollout/finish_reason/other_rate"], 2 / 8)
+
+        lengths = [100, 100, 100, 100, 100, 1, 100, 100]
+        strict_flags = compute_truncation_flags(lengths, max_response_length=100, finish_reasons=finish_reasons)
+        self.assertEqual(strict_flags.tolist(), [True, False, False, False, False, True, False, False])
+        fallback_flags = compute_truncation_flags(lengths, max_response_length=100)
+        self.assertEqual(fallback_flags.tolist(), [True, True, True, True, True, False, True, True])
+
+    def test_token_zlib_repetition_and_tail_mask_respect_padding(self):
+        repeated = [7] * 80
+        non_repeated = [((idx * 1103515245 + 12345) % 50000) for idx in range(80)]
+        short = [9] * 8
+        response_ids = torch.tensor(
+            [
+                repeated,
+                non_repeated,
+                short + [0] * (80 - len(short)),
+            ],
+            dtype=torch.long,
+        )
+        response_mask = torch.tensor(
+            [
+                [1] * 80,
+                [1] * 80,
+                [1] * len(short) + [0] * (80 - len(short)),
+            ],
+            dtype=torch.bool,
+        )
+        metrics, tail_mask = compute_token_repetition_and_truncation_metrics(
+            response_ids=response_ids,
+            response_mask=response_mask,
+            max_response_length=80,
+            tail_token_window=32,
+            threshold=10.0,
+        )
+
+        self.assertEqual(metrics["rollout/repetition_rate_token_zlib"], 1 / 3)
+        self.assertEqual(metrics["rollout/repetition_eligible_rate_token_zlib"], 2 / 3)
+        self.assertEqual(metrics["rollout/truncation_rate"], 2 / 3)
+        self.assertEqual(metrics["rollout/truncation_repetition_joint_rate"], 1 / 3)
+        self.assertEqual(int(tail_mask[0].sum().item()), 32)
+        self.assertEqual(int(tail_mask[1].sum().item()), 0)
+        self.assertEqual(int(tail_mask[2].sum().item()), 0)
+        self.assertFalse(tail_mask[2, len(short) :].any())
+
+        text_tail_mask = repetition_tail_mask_from_sample_flags(
+            response_mask=response_mask,
+            repetition_flags=[False, True, True],
+            tail_token_window=16,
+        )
+        self.assertEqual(int(text_tail_mask[0].sum().item()), 0)
+        self.assertEqual(int(text_tail_mask[1].sum().item()), 16)
+        self.assertEqual(int(text_tail_mask[2].sum().item()), len(short))
+        self.assertFalse(text_tail_mask[2, len(short) :].any())
+
+    def test_validation_text_repetition_and_truncation_metrics(self):
+        outputs = [
+            "ordinary solution " + "".join(f"{idx:04x}" for idx in range(200)),
+            "bad tail " + ("repeat" * 400),
+            "short",
+        ]
+        metrics = compute_text_repetition_and_truncation_metrics(
+            outputs=outputs,
+            response_lengths=[80, 100, 12],
+            max_response_length=100,
+            finish_reasons=["stop", "length", "stop"],
+            prefix="val-aux",
+            tail_chars=256,
+            threshold=8.0,
+        )
+
+        self.assertEqual(metrics["val-aux/response_length/mean"], 64.0)
+        self.assertEqual(metrics["val-aux/truncation_rate"], 1 / 3)
+        self.assertEqual(metrics["val-aux/repetition_rate_zlib"], 1 / 3)
+        self.assertEqual(metrics["val-aux/truncation_repetition_joint_rate"], 1 / 3)
+        self.assertEqual(metrics["val-aux/repetition_given_truncation"], 1.0)
+
+        teacher_metrics = compute_text_repetition_and_truncation_metrics(
+            outputs=outputs,
+            response_lengths=[80, 100, 12],
+            max_response_length=100,
+            finish_reasons=["stop", "length", "stop"],
+            prefix="teacher-val-aux",
+            tail_chars=256,
+            threshold=8.0,
+        )
+        self.assertEqual(teacher_metrics["teacher-val-aux/repetition_rate_zlib"], 1 / 3)
+        self.assertEqual(teacher_metrics["teacher-val-aux/truncation_repetition_joint_rate"], 1 / 3)
 
 
 class TestMetric(unittest.TestCase):

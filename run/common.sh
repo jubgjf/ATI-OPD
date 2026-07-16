@@ -169,7 +169,12 @@ run_npu_opd_job() {
     opd_diagnostics_enabled=${OPD_DIAGNOSTICS_ENABLED:-True}
     opd_diagnostics_collect_topk_overlap=${OPD_DIAGNOSTICS_COLLECT_TOPK_OVERLAP:-True}
     opd_diagnostics_collect_rethinking_opd=${OPD_DIAGNOSTICS_COLLECT_RETHINKING_OPD:-True}
+    opd_diagnostics_collect_repetition=${OPD_DIAGNOSTICS_COLLECT_REPETITION:-True}
+    opd_diagnostics_collect_train_text_zlib_repetition=${OPD_DIAGNOSTICS_COLLECT_TRAIN_TEXT_ZLIB_REPETITION:-True}
     opd_diagnostics_topk=${OPD_DIAGNOSTICS_TOPK:-16}
+    opd_diagnostics_repetition_tail_chars=${OPD_DIAGNOSTICS_REPETITION_TAIL_CHARS:-10000}
+    opd_diagnostics_repetition_comp_ratio_threshold=${OPD_DIAGNOSTICS_REPETITION_COMP_RATIO_THRESHOLD:-10.0}
+    opd_diagnostics_repetition_tail_token_window=${OPD_DIAGNOSTICS_REPETITION_TAIL_TOKEN_WINDOW:-4096}
     opd_diagnostics_position_bin_size=${OPD_DIAGNOSTICS_POSITION_BIN_SIZE:-512}
     opd_diagnostics_log_interval=${OPD_DIAGNOSTICS_LOG_INTERVAL:-5}
     opd_diagnostics_topk_log_interval=${OPD_DIAGNOSTICS_TOPK_LOG_INTERVAL:-10}
@@ -434,7 +439,12 @@ _submit_npu_verl_job() {
         "distillation.diagnostics.enabled=${opd_diagnostics_enabled}"
         "distillation.diagnostics.collect_topk_overlap=${opd_diagnostics_collect_topk_overlap}"
         "distillation.diagnostics.collect_rethinking_opd_metrics=${opd_diagnostics_collect_rethinking_opd}"
+        "distillation.diagnostics.collect_repetition_metrics=${opd_diagnostics_collect_repetition}"
+        "distillation.diagnostics.collect_train_text_zlib_repetition=${opd_diagnostics_collect_train_text_zlib_repetition}"
         "distillation.diagnostics.topk=${opd_diagnostics_topk}"
+        "distillation.diagnostics.repetition_tail_chars=${opd_diagnostics_repetition_tail_chars}"
+        "distillation.diagnostics.repetition_comp_ratio_threshold=${opd_diagnostics_repetition_comp_ratio_threshold}"
+        "distillation.diagnostics.repetition_tail_token_window=${opd_diagnostics_repetition_tail_token_window}"
         "distillation.diagnostics.position_bin_size=${opd_diagnostics_position_bin_size}"
         "distillation.diagnostics.log_interval=${opd_diagnostics_log_interval}"
         "distillation.diagnostics.topk_log_interval=${opd_diagnostics_topk_log_interval}"

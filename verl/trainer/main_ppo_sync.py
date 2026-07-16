@@ -1698,12 +1698,26 @@ class PPOTrainer:
                 teacher_for_metrics.ndim != 3 or teacher_for_metrics.shape[-1] == 1
             )
             with marked_timer("opd_diagnostics", timing_raw, color="green"):
+                response_texts = None
+                if (
+                    getattr(diagnostics_config, "collect_train_text_zlib_repetition", False)
+                    and "responses" in diagnostics_batch
+                ):
+                    response_texts = [
+                        self.tokenizer.decode(response_ids[mask.bool()].tolist(), skip_special_tokens=True)
+                        for response_ids, mask in zip(
+                            diagnostics_batch["responses"].detach().cpu(),
+                            diagnostics_batch["response_mask"].detach().cpu(),
+                            strict=True,
+                        )
+                    ]
                 metrics.update(
                     compute_opd_diagnostics_metrics(
                         student_logprobs=diagnostics_batch["old_log_probs"],
                         teacher_logprobs=teacher_for_metrics,
                         teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
                         response_ids=diagnostics_batch.get("responses", None),
+                        response_texts=response_texts,
                         entropy=diagnostics_batch["entropy"],
                         response_mask=diagnostics_batch["response_mask"],
                         rm_scores=diagnostics_batch.get("rm_scores", None),
@@ -1713,6 +1727,11 @@ class PPOTrainer:
                         max_response_length=(
                             diagnostics_batch["responses"].shape[-1] if "responses" in diagnostics_batch else None
                         ),
+                        collect_repetition_metrics=diagnostics_config.collect_repetition_metrics,
+                        collect_train_text_zlib_repetition=diagnostics_config.collect_train_text_zlib_repetition,
+                        repetition_tail_chars=diagnostics_config.repetition_tail_chars,
+                        repetition_comp_ratio_threshold=diagnostics_config.repetition_comp_ratio_threshold,
+                        repetition_tail_token_window=diagnostics_config.repetition_tail_token_window,
                         bad_tail_min_position=diagnostics_config.bad_tail_min_position,
                         bad_tail_deep_position=diagnostics_config.bad_tail_deep_position,
                         bad_tail_extreme_position=diagnostics_config.bad_tail_extreme_position,

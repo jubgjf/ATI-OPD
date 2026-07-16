@@ -31,6 +31,7 @@ from verl.trainer.distillation.diagnostics import (
     compute_opd_diagnostics_metrics,
     compute_overlap_diagnostics,
     compute_phase_and_special_token_metrics,
+    compute_repetition_advantage_metrics,
     compute_rethinking_opd_diagnostics,
     compute_teacher_logprob_nonfinite_heatmap_row,
     compute_topk_ladder,
@@ -296,6 +297,12 @@ def test_distillation_diagnostics_bad_tail_threshold_validation_on_cpu():
         DistillationDiagnosticsConfig(topk_log_interval=0)
     with pytest.raises(ValueError, match="async_max_pending"):
         DistillationDiagnosticsConfig(async_max_pending=0)
+    with pytest.raises(ValueError, match="repetition_tail_chars"):
+        DistillationDiagnosticsConfig(repetition_tail_chars=0)
+    with pytest.raises(ValueError, match="repetition_tail_token_window"):
+        DistillationDiagnosticsConfig(repetition_tail_token_window=0)
+    with pytest.raises(ValueError, match="repetition_comp_ratio_threshold"):
+        DistillationDiagnosticsConfig(repetition_comp_ratio_threshold=float("nan"))
 
 
 def test_distillation_overlap_diagnostics_topk_defaults_to_loss_topk_on_cpu():
@@ -400,6 +407,128 @@ def test_compute_opd_diagnostics_metrics_logs_late_gap_and_entropy_on_cpu():
     assert metrics["opd/teacher_logprob_nonfinite_bin/0000_0002"] == pytest.approx(1 / 4)
     assert metrics["opd/teacher_logprob_nonfinite_bin/0002_0004"] == 1.0
     assert "opd/reward/correct_auc" in metrics
+
+
+def test_compute_opd_diagnostics_metrics_logs_repetition_token_zlib_and_advantage_on_cpu():
+    response_ids = torch.tensor(
+        [
+            [7] * 16,
+            [((idx * 1103515245 + 12345) % 50000) for idx in range(16)],
+            [9, 9, 9, 9] + [0] * 12,
+        ],
+        dtype=torch.long,
+    )
+    response_mask = torch.tensor(
+        [
+            [1] * 16,
+            [1] * 16,
+            [1, 1, 1, 1] + [0] * 12,
+        ],
+        dtype=torch.bool,
+    )
+    student_logprobs = torch.full((3, 16), -2.0)
+    teacher_logprobs = torch.full((3, 16), -2.2)
+    teacher_logprobs[0, 8:16] = -0.5
+
+    metrics = compute_opd_diagnostics_metrics(
+        student_logprobs=student_logprobs,
+        teacher_logprobs=teacher_logprobs,
+        response_ids=response_ids,
+        response_mask=response_mask,
+        bin_size=4,
+        max_response_length=16,
+        repetition_tail_token_window=8,
+        repetition_comp_ratio_threshold=4.0,
+    )
+
+    assert metrics["rollout/repetition_rate_token_zlib"] == pytest.approx(1 / 3)
+    assert metrics["rollout/repetition_eligible_rate_token_zlib"] == pytest.approx(2 / 3)
+    assert metrics["rollout/truncation_rate"] == pytest.approx(2 / 3)
+    assert metrics["rollout/truncation_repetition_joint_rate"] == pytest.approx(1 / 3)
+    assert metrics["opd/repetition/token_fraction"] == pytest.approx(8 / 36)
+    assert metrics["opd/repetition/advantage_mean"] == pytest.approx(1.5)
+    assert metrics["opd/nonrepetition/advantage_mean"] == pytest.approx(-0.2)
+    assert metrics["opd/repetition/advantage_ratio"] == pytest.approx(-7.5)
+    assert metrics["opd/repetition/teacher_logprob_mean"] == pytest.approx(-0.5)
+    assert metrics["opd/repetition/student_logprob_mean"] == pytest.approx(-2.0)
+
+
+def test_compute_opd_diagnostics_metrics_uses_text_zlib_flags_for_repetition_advantage_on_cpu():
+    response_ids = torch.tensor(
+        [
+            [10, 11, 12, 13, 14, 15, 16, 17],
+            [20, 21, 22, 23, 24, 25, 26, 27],
+        ],
+        dtype=torch.long,
+    )
+    response_mask = torch.ones((2, 8), dtype=torch.bool)
+    student_logprobs = torch.full((2, 8), -2.0)
+    teacher_logprobs = torch.tensor(
+        [
+            [-1.0] * 8,
+            [-3.0] * 8,
+        ]
+    )
+
+    metrics = compute_opd_diagnostics_metrics(
+        student_logprobs=student_logprobs,
+        teacher_logprobs=teacher_logprobs,
+        response_ids=response_ids,
+        response_texts=[
+            "abc123" * 100,
+            "".join(f"{idx:04x}" for idx in range(100)),
+        ],
+        response_mask=response_mask,
+        bin_size=4,
+        max_response_length=8,
+        collect_train_text_zlib_repetition=True,
+        repetition_tail_chars=128,
+        repetition_comp_ratio_threshold=4.0,
+        repetition_tail_token_window=16,
+    )
+
+    assert metrics["rollout/repetition_rate_token_zlib"] == 0.0
+    assert metrics["rollout/repetition_rate_zlib"] == pytest.approx(0.5)
+    assert metrics["rollout/truncation_repetition_joint_rate"] == pytest.approx(0.5)
+    assert metrics["opd/repetition/token_fraction"] == pytest.approx(0.5)
+    assert metrics["opd/repetition/advantage_mean"] == pytest.approx(1.0)
+    assert metrics["opd/nonrepetition/advantage_mean"] == pytest.approx(-1.0)
+    assert metrics["opd/repetition/advantage_ratio"] == pytest.approx(-1.0)
+
+
+def test_repetition_advantage_metrics_handles_empty_groups_on_cpu():
+    response_mask = torch.tensor([[1, 1, 0], [1, 1, 0]], dtype=torch.bool)
+    repetition_tail_mask = torch.tensor([[1, 1, 0], [1, 1, 0]], dtype=torch.bool)
+    student_logprobs = torch.tensor([[-2.0, -2.0, 0.0], [-2.0, -2.0, 0.0]])
+    teacher_logprobs = torch.tensor([[-1.0, -3.0, 0.0], [-1.5, -2.5, 0.0]])
+
+    metrics = compute_repetition_advantage_metrics(
+        repetition_tail_mask=repetition_tail_mask,
+        response_mask=response_mask,
+        student_logprobs=student_logprobs,
+        teacher_logprobs=teacher_logprobs,
+    )
+
+    assert metrics["opd/repetition/token_fraction"] == 1.0
+    assert "opd/nonrepetition/advantage_mean" not in metrics
+    assert "opd/repetition/advantage_ratio" not in metrics
+    assert metrics["opd/repetition/advantage_mass_share"] == pytest.approx(1.0)
+
+    empty_metrics = compute_repetition_advantage_metrics(
+        repetition_tail_mask=torch.zeros_like(repetition_tail_mask),
+        response_mask=torch.zeros_like(response_mask),
+        student_logprobs=student_logprobs,
+        teacher_logprobs=teacher_logprobs,
+    )
+    assert empty_metrics == {}
+
+    with pytest.raises(ValueError, match="must align"):
+        compute_repetition_advantage_metrics(
+            repetition_tail_mask=repetition_tail_mask[:, :2],
+            response_mask=response_mask,
+            student_logprobs=student_logprobs,
+            teacher_logprobs=teacher_logprobs,
+        )
 
 
 def test_positions_to_event_mask_handles_missing_positions_on_cpu():
