@@ -124,11 +124,11 @@ run_npu_opd_job() {
     TEACHER_NNODES=${TEACHER_NNODES:-1}
     STUDENT_NGPUS_PER_NODE=${STUDENT_NGPUS_PER_NODE:-8}
     TEACHER_NGPUS_PER_NODE=${TEACHER_NGPUS_PER_NODE:-8}
-    student_tp=${STUDENT_TP:-4}
+    student_tp=${STUDENT_TP:-2}
     student_gpu_mem_util=${STUDENT_GPU_MEM_UTIL:-0.6}
-    teacher_tp=${TEACHER_TP:-4}
+    teacher_tp=${TEACHER_TP:-2}
     teacher_gpu_mem_util=${TEACHER_GPU_MEM_UTIL:-0.6}
-    sp_size=${SP_SIZE:-4}
+    sp_size=${SP_SIZE:-2}
     TEACHER_REPLICAS=${TEACHER_REPLICAS:-$((TEACHER_NNODES * TEACHER_NGPUS_PER_NODE / teacher_tp))}
 
     max_prompt_length=${MAX_PROMPT_LENGTH:-$((1 * 1024))}
