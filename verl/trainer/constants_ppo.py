@@ -44,6 +44,30 @@ PPO_RAY_RUNTIME_ENV = {
     },
 }
 
+WANDB_RAY_ENV_PASSTHROUGH = [
+    "WANDB_API_KEY",
+    "WANDB_BASE_URL",
+    "WANDB_CACHE_DIR",
+    "WANDB_CONFIG_MODE",
+    "WANDB_DIR",
+    "WANDB_DISABLED",
+    "WANDB_DISABLE_CODE",
+    "WANDB_DISABLE_GIT",
+    "WANDB_DISABLE_MACHINE_INFO",
+    "WANDB_DISABLE_STATS",
+    "WANDB_ENTITY",
+    "WANDB_INIT_TIMEOUT",
+    "WANDB_MODE",
+    "WANDB_PROJECT",
+    "WANDB_RESUME",
+    "WANDB_RUN_ID",
+    "WANDB_SAVE_REQUIREMENTS",
+    "WANDB_SERVICE_WAIT",
+    "WANDB_SILENT",
+    "WANDB_START_METHOD",
+    "WANDB__SERVICE_WAIT",
+]
+
 
 def get_ppo_ray_runtime_env():
     """
@@ -61,4 +85,7 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+    for key in WANDB_RAY_ENV_PASSTHROUGH:
+        if (value := os.environ.get(key)) is not None:
+            runtime_env["env_vars"][key] = value
     return runtime_env

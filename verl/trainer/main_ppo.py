@@ -304,6 +304,9 @@ class TaskRunner:
             collate_fn=collate_fn,
             train_sampler=train_sampler,
         )
+        # Initialize W&B before CUDA/vLLM-heavy workers are created. In Ray jobs,
+        # starting the W&B service after worker initialization can stall offline runs.
+        trainer.init_logger()
         # Initialize the workers of the trainer.
         trainer.init_workers()
 

@@ -44,6 +44,152 @@ def _filter_wandb_media_for_backend(data: Any, backend: str) -> Any:
     return {key: value for key, value in data.items() if not _is_wandb_media_value(value)}
 
 
+def _env_float(name: str) -> float | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a float, got {value!r}") from exc
+
+
+def _env_bool(name: str) -> bool | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    value_lower = value.lower()
+    if value_lower in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value_lower in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {value!r}")
+
+
+def _trainer_config_value(config: Any, key: str) -> Any:
+    if not config:
+        return None
+    try:
+        trainer_config = config["trainer"]
+    except (KeyError, TypeError):
+        return None
+    if hasattr(trainer_config, "get"):
+        return trainer_config.get(key, None)
+    return getattr(trainer_config, key, None)
+
+
+def _config_path_value(config: Any, path: str) -> Any:
+    current = config
+    for key in path.split("."):
+        if current is None:
+            return None
+        if isinstance(current, dict):
+            current = current.get(key)
+        elif hasattr(current, "get"):
+            current = current.get(key, None)
+        else:
+            current = getattr(current, key, None)
+    return current
+
+
+def _prepare_wandb_config(config: Any) -> Any:
+    config_mode = os.environ.get("WANDB_CONFIG_MODE", "full").lower()
+    if config_mode in {"full", ""}:
+        return config
+    if config_mode in {"none", "off", "disabled", "false", "0"}:
+        return None
+    if config_mode not in {"minimal", "summary"}:
+        raise ValueError(f"WANDB_CONFIG_MODE must be one of full, minimal, summary, none; got {config_mode!r}")
+
+    keys = [
+        "trainer.project_name",
+        "trainer.experiment_name",
+        "trainer.default_local_dir",
+        "trainer.total_training_steps",
+        "trainer.save_freq",
+        "trainer.test_freq",
+        "trainer.logger",
+        "data.train_files",
+        "data.val_files",
+        "data.train_batch_size",
+        "data.val_batch_size",
+        "data.max_prompt_length",
+        "data.max_response_length",
+        "actor_rollout_ref.model.path",
+        "actor_rollout_ref.rollout.n",
+        "actor_rollout_ref.rollout.tensor_model_parallel_size",
+        "actor_rollout_ref.rollout.max_model_len",
+        "distillation.enabled",
+        "distillation.use_actor_loss",
+        "distillation.teacher_models.teacher_model.model_path",
+        "distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size",
+        "distillation.distillation_loss.loss_mode",
+        "distillation.distillation_loss.topk",
+        "distillation.distillation_loss.top_k_strategy",
+        "distillation.distillation_loss.reward_weight_mode",
+        "distillation.intervention.enabled",
+        "distillation.diagnostics.enabled",
+        "distillation.diagnostics.async_metrics",
+        "distillation.diagnostics.log_interval",
+        "distillation.diagnostics.heatmap_interval",
+    ]
+    return {"_wandb_config_mode": config_mode} | {
+        key: value for key in keys if (value := _config_path_value(config, key)) is not None
+    }
+
+
+def _build_wandb_settings(wandb: Any, config: Any) -> Any | None:
+    settings_kwargs = {}
+
+    wandb_mode = os.environ.get("WANDB_MODE")
+    if wandb_mode:
+        settings_kwargs["mode"] = wandb_mode
+
+    wandb_dir = os.environ.get("WANDB_DIR")
+    if wandb_dir:
+        settings_kwargs["root_dir"] = wandb_dir
+
+    wandb_start_method = os.environ.get("WANDB_START_METHOD")
+    if wandb_start_method:
+        settings_kwargs["start_method"] = wandb_start_method
+
+    wandb_init_timeout = _env_float("WANDB_INIT_TIMEOUT")
+    if wandb_init_timeout is not None:
+        settings_kwargs["init_timeout"] = wandb_init_timeout
+
+    wandb_service_wait = _env_float("WANDB_SERVICE_WAIT") or _env_float("WANDB__SERVICE_WAIT")
+    if wandb_service_wait is not None:
+        settings_kwargs["x_service_wait"] = wandb_service_wait
+
+    wandb_proxy = _trainer_config_value(config, "wandb_proxy")
+    if wandb_proxy:
+        settings_kwargs["https_proxy"] = wandb_proxy
+
+    if settings_kwargs.get("mode") in {"offline", "dryrun", "disabled"}:
+        # In Ray/vLLM jobs, W&B is initialized after CUDA-heavy workers are created.
+        # Keep offline initialization light so it does not stall on metadata/code scans.
+        settings_kwargs.setdefault("disable_code", True)
+        settings_kwargs.setdefault("disable_git", True)
+        settings_kwargs.setdefault("x_disable_stats", True)
+        settings_kwargs.setdefault("x_disable_machine_info", True)
+        settings_kwargs.setdefault("x_save_requirements", False)
+
+    for env_name, setting_name in {
+        "WANDB_DISABLE_CODE": "disable_code",
+        "WANDB_DISABLE_GIT": "disable_git",
+        "WANDB_DISABLE_STATS": "x_disable_stats",
+        "WANDB_DISABLE_MACHINE_INFO": "x_disable_machine_info",
+        "WANDB_SAVE_REQUIREMENTS": "x_save_requirements",
+    }.items():
+        env_bool = _env_bool(env_name)
+        if env_bool is not None:
+            settings_kwargs[setting_name] = env_bool
+
+    if not settings_kwargs:
+        return None
+    return wandb.Settings(**settings_kwargs)
+
+
 class Tracking:
     """A unified tracking interface for logging experiment data to multiple backends.
 
@@ -86,11 +232,15 @@ class Tracking:
 
             import wandb
 
-            settings = None
-            if config and config["trainer"].get("wandb_proxy", None):
-                settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
+            settings = _build_wandb_settings(wandb, config)
             entity = os.environ.get("WANDB_ENTITY", None)
-            wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
+            wandb.init(
+                project=project_name,
+                name=experiment_name,
+                entity=entity,
+                config=_prepare_wandb_config(config),
+                settings=settings,
+            )
             self.logger["wandb"] = wandb
 
         if "trackio" in default_backend:

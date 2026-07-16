@@ -2269,16 +2269,14 @@ class RayPPOTrainer:
         critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
         return critic_output
 
-    def fit(self):
-        """
-        The training loop of PPO.
-        The driver process only need to call the compute functions of the worker group through RPC
-        to construct the PPO dataflow.
-        The light-weight advantage computation is done on the driver process.
-        """
+    def init_logger(self):
+        """Initialize and return the trainer logger."""
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
+
+        if getattr(self, "logger", None) is not None:
+            return self.logger
 
         logger = Tracking(
             project_name=self.config.trainer.project_name,
@@ -2287,6 +2285,16 @@ class RayPPOTrainer:
             config=OmegaConf.to_container(self.config, resolve=True),
         )
         self.logger = logger
+        return logger
+
+    def fit(self):
+        """
+        The training loop of PPO.
+        The driver process only need to call the compute functions of the worker group through RPC
+        to construct the PPO dataflow.
+        The light-weight advantage computation is done on the driver process.
+        """
+        logger = self.init_logger()
 
         self.global_steps = 0
 
