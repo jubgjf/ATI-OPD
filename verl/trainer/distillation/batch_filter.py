@@ -19,6 +19,7 @@ DISTILLATION_SUPERVISION_TENSOR_KEYS = (
     "teacher_ids",
     "teacher_sampled_logprobs",
     "teacher_sampled_ids",
+    "teacher_segment_mask",
 )
 
 

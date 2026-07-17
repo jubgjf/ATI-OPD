@@ -668,6 +668,7 @@ class _DirectInterventionWorker:
         teacher_segment_length: int = 2,
         max_interventions_per_sample: int = 1,
         train_on_teacher_segments: bool = False,
+        teacher_segment_loss_mode: str = "opd",
         min_trainable_tokens_after_repair: int = 1,
         gap_metric: str = "abs",
         gap_threshold: float = 1.0,
@@ -690,6 +691,7 @@ class _DirectInterventionWorker:
             gap_threshold=gap_threshold,
             max_interventions_per_sample=max_interventions_per_sample,
             train_on_teacher_segments=train_on_teacher_segments,
+            teacher_segment_loss_mode=teacher_segment_loss_mode,
             min_trainable_tokens_after_repair=min_trainable_tokens_after_repair,
             thinking_start_text=thinking_start_text,
             thinking_end_text=thinking_end_text,
@@ -797,7 +799,18 @@ async def test_agent_loop_postprocess_repairs_high_gap_segment_on_cpu():
 
 
 @pytest.mark.asyncio
-async def test_teacher_intervention_train_teacher_segments_drops_rollout_logprobs_batch_wide_on_cpu():
+@pytest.mark.parametrize(
+    ("teacher_segment_loss_mode", "expected_response_mask", "expected_teacher_segment_mask"),
+    [
+        ("opd", [1, 1, 1, 1, 1, 1, 0, 0], None),
+        ("sft", [1, 1, 0, 0, 1, 1, 0, 0], [0, 0, 1, 1, 0, 0, 0, 0]),
+    ],
+)
+async def test_teacher_intervention_train_teacher_segments_drops_rollout_logprobs_batch_wide_on_cpu(
+    teacher_segment_loss_mode,
+    expected_response_mask,
+    expected_teacher_segment_mask,
+):
     class _DummyWorker:
         _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
         _compute_position_ids = AgentLoopWorker._compute_position_ids
@@ -826,6 +839,7 @@ async def test_teacher_intervention_train_teacher_segments_drops_rollout_logprob
                 gap_threshold=1.0,
                 max_interventions_per_sample=1,
                 train_on_teacher_segments=True,
+                teacher_segment_loss_mode=teacher_segment_loss_mode,
                 log_examples_per_worker=0,
             )
             self.teacher_server_manager = _FakeInterventionTeacherManager()
@@ -876,11 +890,21 @@ async def test_teacher_intervention_train_teacher_segments_drops_rollout_logprob
     assert internal_untouched.extra_fields["teacher_intervention_count"] == 0
     torch.testing.assert_close(
         internal_intervened.response_mask[0],
-        torch.tensor([1, 1, 1, 1, 1, 1, 0, 0], dtype=torch.long),
+        torch.tensor(expected_response_mask, dtype=torch.long),
     )
+    if expected_teacher_segment_mask is None:
+        assert internal_intervened.teacher_segment_mask is None
+        assert internal_untouched.teacher_segment_mask is None
+    else:
+        torch.testing.assert_close(
+            internal_intervened.teacher_segment_mask[0],
+            torch.tensor(expected_teacher_segment_mask, dtype=torch.long),
+        )
+        torch.testing.assert_close(internal_untouched.teacher_segment_mask, torch.zeros(1, 8, dtype=torch.long))
 
     merged = AgentLoopWorker._postprocess(worker, inputs=[internal_intervened, internal_untouched])
     assert "rollout_log_probs" not in merged.batch.keys()
+    assert ("teacher_segment_mask" in merged.batch.keys()) is (expected_teacher_segment_mask is not None)
 
 
 @pytest.mark.asyncio
@@ -1462,6 +1486,119 @@ async def test_teacher_intervention_length_open_thinking_allows_student_suffix_o
     assert output.response_ids == [1, 2, 91, 40, 41]
     assert output.extra_fields["teacher_intervention_count"] == 1
     assert output.extra_fields["teacher_interventions"][0]["terminated"] is False
+
+
+@pytest.mark.asyncio
+async def test_teacher_intervention_sft_masks_only_inserted_teacher_tokens_on_cpu():
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[30], stop_reason="completed", finish_reason="length"),
+        high_gap_start=2,
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        train_on_teacher_segments=True,
+        teacher_segment_loss_mode="sft",
+    )
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "teacher-sft-mask"},
+    )
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert output.response_ids == [1, 2, 30, 40, 41]
+    assert output.response_mask == [1, 1, 0, 1, 1]
+    assert output.teacher_segment_mask == [0, 0, 1, 0, 0]
+    assert output.extra_fields["teacher_intervention_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_teacher_intervention_sft_emits_zero_mask_without_intervention_on_cpu():
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[30], stop_reason="completed", finish_reason="length"),
+        high_gap_start=99,
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=4,
+        train_on_teacher_segments=True,
+        teacher_segment_loss_mode="sft",
+    )
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4],
+        response_mask=[1, 1, 1, 1],
+        response_logprobs=[-0.1] * 4,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "teacher-sft-no-intervention"},
+    )
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert output.response_mask == [1, 1, 1, 1]
+    assert output.teacher_segment_mask == [0, 0, 0, 0]
+    assert output.extra_fields["teacher_intervention_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_teacher_intervention_sft_preserves_provenance_across_multiple_repairs_on_cpu():
+    class _SequentialGapTeacherManager(_FixedGapTeacherManager):
+        async def compute_teacher_logprobs_single(self, *args, **kwargs):
+            gap_starts = [2, 4, 99]
+            self.high_gap_start = gap_starts[min(len(self.scored_sequences), len(gap_starts) - 1)]
+            return await super().compute_teacher_logprobs_single(*args, **kwargs)
+
+    teacher_manager = _SequentialGapTeacherManager(
+        TeacherGenerationResult(token_ids=[30], stop_reason="completed", finish_reason="length"),
+        high_gap_width=1,
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=8,
+        student_segment_length=1,
+        teacher_segment_length=1,
+        max_interventions_per_sample=2,
+        train_on_teacher_segments=True,
+        teacher_segment_loss_mode="sft",
+    )
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "teacher-sft-multiple"},
+    )
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert output.response_ids == [1, 2, 30, 40, 30, 40, 41]
+    assert output.response_mask == [1, 1, 0, 1, 0, 1, 1]
+    assert output.teacher_segment_mask == [0, 0, 1, 0, 1, 0, 0]
+    assert output.extra_fields["teacher_intervention_count"] == 2
 
 
 @pytest.mark.asyncio

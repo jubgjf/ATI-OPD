@@ -799,6 +799,8 @@ distillation:
     gap_threshold: 1.0
     max_interventions_per_sample: 4
     train_on_teacher_segments: false
+    teacher_segment_loss_mode: opd
+    teacher_segment_sft_loss_coef: 1.0
     min_trainable_tokens_after_repair: 1
     protect_thinking_blocks: true
     thinking_start_text: <think>

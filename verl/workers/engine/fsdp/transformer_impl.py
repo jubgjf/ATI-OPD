@@ -615,6 +615,13 @@ class FSDPEngine(BaseEngine):
             batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
         )
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
+        teacher_segment_mask = data.get("teacher_segment_mask", None)
+        if teacher_segment_mask is not None:
+            batch_num_teacher_tokens = teacher_segment_mask.sum().to(get_device_id())
+            torch.distributed.all_reduce(
+                batch_num_teacher_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+            )
+            tu.assign_non_tensor(data, batch_num_teacher_tokens=batch_num_teacher_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
         micro_batches, indices = prepare_micro_batches(
@@ -1120,6 +1127,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
         token_reward_direct_topk = int(
             tu.get_non_tensor_data(data=micro_batch, key="token_reward_direct_topk", default=0) or 0
         )
+        teacher_segment_sft_enabled = bool(
+            tu.get_non_tensor_data(data=micro_batch, key="teacher_segment_sft_enabled", default=False)
+        )
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -1139,6 +1149,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         model_output = {}
         token_reward_direct_log_probs = None
+        response_token_log_probs = None
 
         if use_remove_padding:
             input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
@@ -1157,6 +1168,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 if calculate_entropy:
                     inplace_backward = False
                 if diagnostics_student_topk > 0:
+                    inplace_backward = False
+                if teacher_segment_sft_enabled and token_reward_direct_topk > 0:
                     inplace_backward = False
                 log_probs = logprobs_from_logits(
                     logits=logits_rmpad,
@@ -1261,6 +1274,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
             if pad_mode == DatasetPadMode.NO_PADDING:
                 output_offsets = output_args["output_offsets"]
                 # (bsz, j1), for each sample, is the length of each sample: [real_prompt length + real_response length]
+                if teacher_segment_sft_enabled and token_reward_direct_log_probs is not None:
+                    response_token_log_probs = tu.jagged_tensor_parts_from_values(
+                        log_probs,
+                        output_offsets,
+                        context="FSDP LM model_output['response_token_log_probs']",
+                    )
                 log_probs_for_output = (
                     token_reward_direct_log_probs if token_reward_direct_log_probs is not None else log_probs
                 )
@@ -1327,7 +1346,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
                     logits_rmpad = torch.cat(tu.safe_unbind_jagged_nested_tensor(logits, context="FSDP LM logits"))
                     input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
-                    log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+                    log_probs = logprobs_from_logits(
+                        logits=logits_rmpad,
+                        labels=input_ids_rmpad_rolled,
+                        inplace_backward=not (teacher_segment_sft_enabled and token_reward_direct_topk > 0),
+                    )
                     if token_reward_direct_topk > 0:
                         target_ids_rmpad = self._response_target_ids_rmpad(
                             micro_batch=micro_batch,
@@ -1340,6 +1363,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
                             target_ids_rmpad,
                         )
                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
+                    if teacher_segment_sft_enabled and token_reward_direct_log_probs is not None:
+                        response_token_log_probs = tu.jagged_tensor_parts_from_values(
+                            log_probs,
+                            output_offsets,
+                            context="FSDP LM model_output['response_token_log_probs']",
+                        )
                     log_probs_for_output = (
                         token_reward_direct_log_probs if token_reward_direct_log_probs is not None else log_probs
                     )
@@ -1406,6 +1435,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
         model_output["log_probs"] = log_probs
+        if response_token_log_probs is not None:
+            model_output["response_token_log_probs"] = response_token_log_probs
         if calculate_entropy:
             model_output["entropy"] = entropy
         if calculate_sum_pi_squared:

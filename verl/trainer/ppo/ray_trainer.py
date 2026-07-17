@@ -54,7 +54,7 @@ from verl.trainer.distillation.diagnostics import (
     extract_sampled_response_logprobs,
     resolve_special_token_ids,
 )
-from verl.trainer.distillation.losses import is_distillation_enabled
+from verl.trainer.distillation.losses import is_distillation_enabled, is_teacher_segment_sft_enabled
 from verl.trainer.distillation.token_reward import compute_only_student_topk_token_reward
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
@@ -1767,6 +1767,7 @@ class RayPPOTrainer:
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
         token_reward_direct_topk = self._token_reward_direct_topk()
+        teacher_segment_sft_enabled = is_teacher_segment_sft_enabled(self.distillation_config)
         distillation_use_topk = (
             self.distillation_config.distillation_loss.loss_settings.use_topk
             and getattr(self.distillation_config, "use_actor_loss", True)
@@ -1783,6 +1784,7 @@ class RayPPOTrainer:
             calculate_entropy=calculate_entropy,
             distillation_use_topk=distillation_use_topk,
             token_reward_direct_topk=token_reward_direct_topk,
+            teacher_segment_sft_enabled=teacher_segment_sft_enabled,
             global_batch_size=ppo_mini_batch_size,
             mini_batch_size=ppo_mini_batch_size,
             epochs=ppo_epochs,

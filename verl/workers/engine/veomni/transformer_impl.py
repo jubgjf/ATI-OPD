@@ -295,6 +295,13 @@ class VeOmniEngine(FSDPEngine):
             batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
         )
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
+        teacher_segment_mask = data.get("teacher_segment_mask", None)
+        if teacher_segment_mask is not None:
+            batch_num_teacher_tokens = teacher_segment_mask.sum().to(get_device_id())
+            torch.distributed.all_reduce(
+                batch_num_teacher_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+            )
+            tu.assign_non_tensor(data, batch_num_teacher_tokens=batch_num_teacher_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
         micro_batches, indices = prepare_micro_batches(

@@ -16,6 +16,23 @@ import pytest
 from omegaconf import OmegaConf
 
 from verl.trainer.distillation.config_validation import validate_distillation_intervention_training_config
+from verl.workers.config import DistillationInterventionConfig
+
+
+def test_teacher_segment_loss_config_defaults_to_legacy_opd_on_cpu():
+    config = DistillationInterventionConfig()
+
+    assert config.teacher_segment_loss_mode == "opd"
+    assert config.teacher_segment_sft_loss_coef == 1.0
+
+
+def test_teacher_segment_loss_config_validates_mode_and_coefficient_on_cpu():
+    with pytest.raises(ValueError, match="teacher_segment_loss_mode"):
+        DistillationInterventionConfig(teacher_segment_loss_mode="mixed")
+
+    for invalid_coef in (-1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="teacher_segment_sft_loss_coef"):
+            DistillationInterventionConfig(teacher_segment_sft_loss_coef=invalid_coef)
 
 
 def test_distillation_intervention_rejects_train_teacher_segments_with_bypass_mode_on_cpu():

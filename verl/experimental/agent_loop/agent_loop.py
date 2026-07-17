@@ -746,6 +746,7 @@ def _validate_intervention_state(
     response_logprobs: Optional[list[float]],
     gap_mask: list[int],
     response_length_limit: int,
+    teacher_segment_mask: Optional[list[int]] = None,
 ) -> None:
     if len(response_ids) > response_length_limit:
         raise RuntimeError(
@@ -770,6 +771,18 @@ def _validate_intervention_state(
     invalid_gap_mask = sorted({mask for mask in gap_mask if mask not in (0, 1)})
     if invalid_gap_mask:
         raise ValueError(f"Teacher intervention state {context} has non-binary gap_mask values: {invalid_gap_mask}.")
+    if teacher_segment_mask is not None:
+        if len(teacher_segment_mask) != len(response_ids):
+            raise RuntimeError(
+                f"Teacher intervention state {context} has misaligned teacher_segment_mask: "
+                f"len(teacher_segment_mask)={len(teacher_segment_mask)}, len(response_ids)={len(response_ids)}."
+            )
+        invalid_teacher_segment_mask = sorted({mask for mask in teacher_segment_mask if mask not in (0, 1)})
+        if invalid_teacher_segment_mask:
+            raise ValueError(
+                f"Teacher intervention state {context} has non-binary teacher_segment_mask values: "
+                f"{invalid_teacher_segment_mask}."
+            )
     if response_logprobs is not None:
         if len(response_logprobs) != len(response_ids):
             raise RuntimeError(
@@ -810,6 +823,8 @@ class AgentLoopOutput(BaseModel):
     """Response token ids including LLM generated token, tool response token."""
     response_mask: list[int]
     """Response mask, 1 for LLM generated token, 0 for tool response token."""
+    teacher_segment_mask: Optional[list[int]] = None
+    """Response-aligned mask, 1 only for teacher-inserted tokens supervised with SFT."""
     response_logprobs: Optional[list[float]] = None
     """Log probabilities for the response tokens."""
     routed_experts: Optional[Any] = None
@@ -834,6 +849,10 @@ class AgentLoopOutput(BaseModel):
         output["prompts"] = torch.tensor(output.pop("prompt_ids"), dtype=torch.int64)
         output["responses"] = torch.tensor(output.pop("response_ids"), dtype=torch.int64)
         output["response_mask"] = torch.tensor(output.pop("response_mask"), dtype=torch.int64)
+
+        teacher_segment_mask = output.pop("teacher_segment_mask", None)
+        if teacher_segment_mask is not None:
+            output["teacher_segment_mask"] = torch.tensor(teacher_segment_mask, dtype=torch.int64)
 
         response_logprobs = output.pop("response_logprobs", None)
         if response_logprobs is not None:
@@ -884,6 +903,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded position ids."""
     response_mask: torch.Tensor
     """Padded response mask."""
+    teacher_segment_mask: Optional[torch.Tensor] = None
+    """Padded response-aligned teacher SFT supervision mask."""
     attention_mask: torch.Tensor
     """Padded attention mask."""
     response_logprobs: Optional[torch.Tensor] = None
@@ -1522,6 +1543,20 @@ class AgentLoopWorker:
         if response_mask_output["input_ids"].dim() == 1:
             response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 
+        teacher_segment_mask = None
+        if output.teacher_segment_mask is not None:
+            teacher_segment_mask_output = self.tokenizer.pad(
+                {"input_ids": output.teacher_segment_mask},
+                padding="max_length",
+                max_length=self.rollout_config.response_length,
+                return_tensors="pt",
+                return_attention_mask=False,
+            )
+            teacher_segment_mask = teacher_segment_mask_output["input_ids"]
+            if teacher_segment_mask.dim() == 1:
+                teacher_segment_mask = teacher_segment_mask.unsqueeze(0)
+            teacher_segment_mask = teacher_segment_mask * response_output["attention_mask"]
+
         response_logprobs = None
         if output.response_logprobs is not None:
             pad_size = self.rollout_config.response_length - len(output.response_logprobs)
@@ -1617,6 +1652,7 @@ class AgentLoopWorker:
             input_ids=input_ids,
             position_ids=position_ids,
             response_mask=response_mask,
+            teacher_segment_mask=teacher_segment_mask,
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
@@ -1919,8 +1955,13 @@ class AgentLoopWorker:
             )
 
         intervention_config: DistillationInterventionConfig = self.teacher_intervention_config
+        use_teacher_segment_sft = bool(
+            intervention_config.train_on_teacher_segments and intervention_config.teacher_segment_loss_mode == "sft"
+        )
         min_trainable_tokens = int(getattr(intervention_config, "min_trainable_tokens_after_repair", 1))
         response_ids = list(output.response_ids[: self.rollout_config.response_length])
+        teacher_segment_mask = [0] * len(response_ids) if use_teacher_segment_sft else None
+        output.teacher_segment_mask = teacher_segment_mask
         if len(output.response_mask) < len(response_ids):
             raise RuntimeError(
                 "Teacher intervention requires response_mask to cover every response token, but got "
@@ -1959,6 +2000,7 @@ class AgentLoopWorker:
             response_logprobs=response_logprobs,
             gap_mask=gap_mask,
             response_length_limit=self.rollout_config.response_length,
+            teacher_segment_mask=teacher_segment_mask,
         )
 
         prompt_ids = list(output.prompt_ids)
@@ -2028,6 +2070,7 @@ class AgentLoopWorker:
             prefix_response_mask = response_mask[:start]
             prefix_response_logprobs = response_logprobs[:start]
             prefix_gap_mask = gap_mask[:start]
+            prefix_teacher_segment_mask = teacher_segment_mask[:start] if teacher_segment_mask is not None else None
             teacher_max_tokens = min(
                 intervention_config.teacher_segment_length,
                 self.rollout_config.response_length - len(prefix_response_ids),
@@ -2116,8 +2159,10 @@ class AgentLoopWorker:
                 finish_reason=teacher_generation.finish_reason,
                 eos_truncated=teacher_eos_truncated,
             )
-            teacher_segment_mask_value = 1 if intervention_config.train_on_teacher_segments else 0
-            teacher_segment_mask = [teacher_segment_mask_value] * len(teacher_segment_ids)
+            teacher_response_mask_value = int(
+                intervention_config.train_on_teacher_segments and intervention_config.teacher_segment_loss_mode == "opd"
+            )
+            teacher_response_mask = [teacher_response_mask_value] * len(teacher_segment_ids)
             # Placeholder values keep response_logprobs aligned. They are ignored when teacher tokens are masked,
             # and train_on_teacher_segments=True drops rollout logprobs so the actor recomputes them.
             teacher_segment_logprobs = [0.0] * len(teacher_segment_ids)
@@ -2133,7 +2178,7 @@ class AgentLoopWorker:
                 )
             candidate_response_ids = prefix_response_ids + teacher_segment_ids + student_suffix_result.token_ids
             candidate_response_mask = (
-                prefix_response_mask + teacher_segment_mask + [1] * len(student_suffix_result.token_ids)
+                prefix_response_mask + teacher_response_mask + [1] * len(student_suffix_result.token_ids)
             )
             candidate_response_logprobs = (
                 prefix_response_logprobs + teacher_segment_logprobs + student_suffix_result.logprobs
@@ -2141,6 +2186,13 @@ class AgentLoopWorker:
             candidate_gap_mask = (
                 prefix_gap_mask + [0] * len(teacher_segment_ids) + [1] * len(student_suffix_result.token_ids)
             )
+            candidate_teacher_segment_mask = None
+            if prefix_teacher_segment_mask is not None:
+                candidate_teacher_segment_mask = (
+                    prefix_teacher_segment_mask
+                    + [1] * len(teacher_segment_ids)
+                    + [0] * len(student_suffix_result.token_ids)
+                )
             _validate_intervention_state(
                 context=f"after repair attempt {attempt}",
                 response_ids=candidate_response_ids,
@@ -2148,6 +2200,7 @@ class AgentLoopWorker:
                 response_logprobs=candidate_response_logprobs,
                 gap_mask=candidate_gap_mask,
                 response_length_limit=self.rollout_config.response_length,
+                teacher_segment_mask=candidate_teacher_segment_mask,
             )
             thinking_state = AgentLoopWorker._teacher_intervention_thinking_state(
                 self,
@@ -2186,7 +2239,10 @@ class AgentLoopWorker:
                     student_suffix_tokens=len(student_suffix_result.token_ids),
                 )
                 break
-            if sum(candidate_response_mask) < min_trainable_tokens:
+            candidate_trainable_tokens = sum(candidate_response_mask)
+            if candidate_teacher_segment_mask is not None:
+                candidate_trainable_tokens += sum(candidate_teacher_segment_mask)
+            if candidate_trainable_tokens < min_trainable_tokens:
                 _record_skipped_intervention(
                     skipped_interventions,
                     reason="insufficient_trainable_tokens",
@@ -2204,6 +2260,7 @@ class AgentLoopWorker:
             response_mask = candidate_response_mask
             response_logprobs = candidate_response_logprobs
             gap_mask = candidate_gap_mask
+            teacher_segment_mask = candidate_teacher_segment_mask
             cached_teacher_result = None
             interventions.append(
                 {
@@ -2227,6 +2284,9 @@ class AgentLoopWorker:
         output.response_ids = response_ids[: self.rollout_config.response_length]
         output.response_mask = response_mask[: len(output.response_ids)]
         output.response_logprobs = response_logprobs[: len(output.response_ids)]
+        output.teacher_segment_mask = (
+            teacher_segment_mask[: len(output.response_ids)] if teacher_segment_mask is not None else None
+        )
         _validate_intervention_state(
             context="final",
             response_ids=output.response_ids,
@@ -2234,6 +2294,7 @@ class AgentLoopWorker:
             response_logprobs=output.response_logprobs,
             gap_mask=gap_mask[: len(output.response_ids)],
             response_length_limit=self.rollout_config.response_length,
+            teacher_segment_mask=output.teacher_segment_mask,
         )
         output.extra_fields["teacher_intervention_count"] = len(interventions)
         output.extra_fields["teacher_interventions"] = interventions
@@ -2318,6 +2379,7 @@ class AgentLoopWorker:
         position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
         optional_outputs = {}
         has_response_logprobs = _require_consistent_optional_field(inputs, "response_logprobs")
+        has_teacher_segment_mask = _require_consistent_optional_field(inputs, "teacher_segment_mask")
         has_routed_experts = _require_consistent_optional_field(inputs, "routed_experts")
         has_teacher_logprobs = _require_consistent_optional_field(inputs, "teacher_logprobs")
         has_teacher_ids = _require_consistent_optional_field(inputs, "teacher_ids")
@@ -2335,6 +2397,10 @@ class AgentLoopWorker:
             )
         if has_response_logprobs:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+        if has_teacher_segment_mask:
+            optional_outputs["teacher_segment_mask"] = torch.cat(
+                [input.teacher_segment_mask for input in inputs], dim=0
+            )
         if has_routed_experts:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if has_teacher_logprobs and has_teacher_ids:

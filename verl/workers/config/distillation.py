@@ -191,6 +191,8 @@ class DistillationInterventionConfig(BaseConfig):
     gap_threshold: float = 1.0
     max_interventions_per_sample: int = 4
     train_on_teacher_segments: bool = False
+    teacher_segment_loss_mode: str = "opd"
+    teacher_segment_sft_loss_coef: float = 1.0
     min_trainable_tokens_after_repair: int = 1
     protect_thinking_blocks: bool = True
     thinking_start_text: str = "<think>"
@@ -213,6 +215,15 @@ class DistillationInterventionConfig(BaseConfig):
             raise ValueError("teacher_segment_length must be positive.")
         if self.max_interventions_per_sample < 0:
             raise ValueError("max_interventions_per_sample must be non-negative.")
+        if self.teacher_segment_loss_mode not in {"opd", "sft"}:
+            raise ValueError(
+                f"teacher_segment_loss_mode must be one of {{'opd', 'sft'}}, got {self.teacher_segment_loss_mode!r}."
+            )
+        if not math.isfinite(self.teacher_segment_sft_loss_coef) or self.teacher_segment_sft_loss_coef < 0:
+            raise ValueError(
+                "teacher_segment_sft_loss_coef must be finite and non-negative, "
+                f"got {self.teacher_segment_sft_loss_coef!r}."
+            )
         if self.min_trainable_tokens_after_repair < 0:
             raise ValueError("min_trainable_tokens_after_repair must be non-negative.")
         if self.gap_aggregation not in {"mean", "max"}:

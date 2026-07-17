@@ -37,6 +37,7 @@ def _make_distillation_batch() -> DataProto:
             "input_ids": torch.arange(batch_size * seq_len).reshape(batch_size, seq_len),
             "attention_mask": torch.ones(batch_size, seq_len, dtype=torch.int64),
             "response_mask": torch.ones(batch_size, response_len, dtype=torch.int64),
+            "teacher_segment_mask": torch.zeros(batch_size, response_len, dtype=torch.int64),
             "position_ids": torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1),
             "teacher_logprobs": torch.full((batch_size, seq_len, 1), -0.1),
             "teacher_ids": torch.zeros(batch_size, seq_len, 1, dtype=torch.int32),
@@ -53,12 +54,14 @@ def test_inference_tensordict_filter_removes_teacher_supervision_without_mutatin
 
     assert "teacher_logprobs" not in filtered.keys()
     assert "teacher_ids" not in filtered.keys()
+    assert "teacher_segment_mask" not in filtered.keys()
     assert "input_ids" in filtered.keys()
     assert "attention_mask" in filtered.keys()
     assert "response_mask" in filtered.keys()
     assert "position_ids" in filtered.keys()
     assert "teacher_logprobs" in batch.batch.keys()
     assert "teacher_ids" in batch.batch.keys()
+    assert "teacher_segment_mask" in batch.batch.keys()
 
 
 @pytest.mark.parametrize("method_name", ["_compute_values", "_compute_ref_log_prob", "_compute_old_log_prob"])
@@ -82,6 +85,7 @@ def test_inference_paths_strip_teacher_supervision_before_padding(monkeypatch, m
     assert captured_keys is not None
     assert "teacher_logprobs" not in captured_keys
     assert "teacher_ids" not in captured_keys
+    assert "teacher_segment_mask" not in captured_keys
     assert {"input_ids", "attention_mask", "response_mask", "position_ids"} <= captured_keys
 
 
@@ -108,3 +112,4 @@ def test_update_actor_keeps_teacher_supervision_before_padding(monkeypatch):
     assert captured_keys is not None
     assert "teacher_logprobs" in captured_keys
     assert "teacher_ids" in captured_keys
+    assert "teacher_segment_mask" in captured_keys

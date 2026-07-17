@@ -20,6 +20,7 @@ from tensordict import TensorDict
 
 from verl.base_config import BaseConfig
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.utils import tensordict_utils as tu
 from verl.utils.metric import AggregationType, Metric
 from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
 from verl.workers.utils.losses import ppo_loss
@@ -41,6 +42,116 @@ def is_distillation_enabled(config: Optional[DistillationConfig]) -> bool:
     if config is None:
         return False
     return config.enabled
+
+
+def is_teacher_segment_sft_enabled(config: Optional[DistillationConfig]) -> bool:
+    """Return whether teacher-inserted rollout tokens use the auxiliary SFT objective."""
+    if config is None or not getattr(config, "enabled", True):
+        return False
+    intervention_config = getattr(config, "intervention", None)
+    return bool(
+        intervention_config is not None
+        and getattr(intervention_config, "enabled", False)
+        and getattr(intervention_config, "train_on_teacher_segments", False)
+        and getattr(intervention_config, "teacher_segment_loss_mode", "opd") == "sft"
+    )
+
+
+def _zero_from_model_output(model_output: dict[str, Any]) -> torch.Tensor:
+    """Build a graph-connected zero scalar from response-token model output."""
+    value = model_output.get("response_token_log_probs", model_output["log_probs"])
+    if isinstance(value, tu.JaggedTensorParts):
+        value = value.values
+    elif value.is_nested:
+        value = value.values()
+    return value.sum() * 0.0
+
+
+def _ppo_loss_or_zero(
+    config: ActorConfig,
+    model_output: dict[str, Any],
+    data: TensorDict,
+    dp_group=None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Avoid token-mean division by zero for a globally teacher-only batch."""
+    batch_num_tokens = tu.get_non_tensor_data(data, "batch_num_tokens", None)
+    if batch_num_tokens is None or batch_num_tokens > 0:
+        return ppo_loss(config, model_output, data, dp_group)
+
+    zero = _zero_from_model_output(model_output)
+    return zero, {
+        "actor/pg_loss": Metric(value=zero, aggregation=AggregationType.SUM),
+        "actor/empty_action_mask": Metric(value=zero.detach() + 1.0, aggregation=AggregationType.MEAN),
+    }
+
+
+def teacher_segment_sft_loss(
+    distillation_config: DistillationConfig,
+    model_output: dict[str, Any],
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute global teacher-token-mean NLL on inserted teacher segments only."""
+    teacher_segment_mask = data.get("teacher_segment_mask", None)
+    if teacher_segment_mask is None:
+        raise RuntimeError(
+            "Teacher-segment SFT is enabled, but the actor batch has no teacher_segment_mask. "
+            "The rollout path must emit a response-aligned mask for every sample."
+        )
+    if teacher_segment_mask.is_nested:
+        teacher_segment_mask = teacher_segment_mask.to_padded_tensor(0)
+    teacher_segment_mask = teacher_segment_mask.bool()
+    response_mask = data["response_mask"]
+    if response_mask.is_nested:
+        response_mask = response_mask.to_padded_tensor(0)
+    response_mask = response_mask.bool()
+    if response_mask.shape != teacher_segment_mask.shape:
+        raise ValueError(
+            "teacher_segment_mask must be response-aligned, "
+            f"but got response_mask.shape={tuple(response_mask.shape)} and "
+            f"teacher_segment_mask.shape={tuple(teacher_segment_mask.shape)}."
+        )
+    if (response_mask & teacher_segment_mask).any().item():
+        raise ValueError(
+            "Teacher-segment SFT requires teacher tokens to be excluded from response_mask so they cannot also "
+            "participate in OPD, PPO, task reward, entropy, or KL losses."
+        )
+
+    response_token_log_probs = model_output.get("response_token_log_probs", model_output["log_probs"])
+    response_token_log_probs = no_padding_2_padding(response_token_log_probs, data)
+    if response_token_log_probs.shape != teacher_segment_mask.shape:
+        raise ValueError(
+            "Teacher-segment SFT requires scalar current-policy log probabilities aligned to the response, "
+            f"but got log_probs.shape={tuple(response_token_log_probs.shape)} and "
+            f"teacher_segment_mask.shape={tuple(teacher_segment_mask.shape)}."
+        )
+
+    batch_num_teacher_tokens = tu.get_non_tensor_data(data, "batch_num_teacher_tokens", None)
+    dp_size = tu.get_non_tensor_data(data, "dp_size", 1)
+    if batch_num_teacher_tokens is None:
+        if dp_size > 1:
+            raise RuntimeError("batch_num_teacher_tokens is required for distributed teacher-segment SFT.")
+        batch_num_teacher_tokens = int(teacher_segment_mask.sum().item())
+
+    if batch_num_teacher_tokens > 0:
+        masked_log_prob_sum = torch.where(
+            teacher_segment_mask, response_token_log_probs, torch.zeros_like(response_token_log_probs)
+        ).sum()
+        loss = -masked_log_prob_sum / batch_num_teacher_tokens * dp_size
+    else:
+        loss = response_token_log_probs.sum() * 0.0
+
+    intervention_config = distillation_config.intervention
+    metrics = {
+        "distillation/teacher_segment_sft_loss": Metric(value=loss, aggregation=AggregationType.SUM),
+        "distillation/teacher_segment_sft_tokens": Metric(
+            value=loss.new_tensor(float(batch_num_teacher_tokens)), aggregation=AggregationType.MEAN
+        ),
+        "distillation/teacher_segment_sft_loss_coef": Metric(
+            value=loss.new_tensor(float(intervention_config.teacher_segment_sft_loss_coef)),
+            aggregation=AggregationType.MEAN,
+        ),
+    }
+    return loss, metrics
 
 
 @dataclass
@@ -219,20 +330,28 @@ def distillation_ppo_loss(
     if student_logits is not None:
         return compute_topk_loss(config, distillation_config, data, student_logits, data_format)
 
-    # Called as final policy loss
+    # Called as final policy loss. Actor-side OPD and token-reward OPD share this
+    # wrapper only when teacher-segment SFT needs to be composed with the base loss.
     distillation_loss_config = distillation_config.distillation_loss
-    distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
-    policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
-    if not distillation_loss_config.use_task_rewards:
-        policy_loss = 0.0
+    use_actor_loss = getattr(distillation_config, "use_actor_loss", True)
+    policy_loss, policy_metrics = _ppo_loss_or_zero(config, model_output, data, dp_group)
 
-    # Combine distillation with policy loss
-    policy_metrics.update(distill_metrics)
-    distillation_loss_coef = (
-        distillation_loss_config.distillation_loss_coef if distillation_loss_config.use_task_rewards else 1.0
-    )
-    policy_loss += distill_loss * distillation_loss_coef
-    policy_metrics["distillation/loss"] = Metric(value=distill_loss, aggregation=AggregationType.SUM)
+    if use_actor_loss:
+        distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
+        if not distillation_loss_config.use_task_rewards:
+            policy_loss = policy_loss * 0.0
+
+        policy_metrics.update(distill_metrics)
+        distillation_loss_coef = (
+            distillation_loss_config.distillation_loss_coef if distillation_loss_config.use_task_rewards else 1.0
+        )
+        policy_loss = policy_loss + distill_loss * distillation_loss_coef
+        policy_metrics["distillation/loss"] = Metric(value=distill_loss, aggregation=AggregationType.SUM)
+
+    if is_teacher_segment_sft_enabled(distillation_config):
+        sft_loss, sft_metrics = teacher_segment_sft_loss(distillation_config, model_output, data)
+        policy_loss = policy_loss + sft_loss * distillation_config.intervention.teacher_segment_sft_loss_coef
+        policy_metrics.update(sft_metrics)
 
     return policy_loss, policy_metrics
 
