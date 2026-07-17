@@ -24,6 +24,9 @@ def test_teacher_segment_loss_config_defaults_to_legacy_opd_on_cpu():
 
     assert config.teacher_segment_loss_mode == "opd"
     assert config.teacher_segment_sft_loss_coef == 1.0
+    assert config.gap_metric == "k3"
+    assert config.gap_threshold == 1.0
+    assert config.teacher_rejection_token_cap == 10.0
 
 
 def test_teacher_segment_loss_config_validates_mode_and_coefficient_on_cpu():
@@ -33,6 +36,18 @@ def test_teacher_segment_loss_config_validates_mode_and_coefficient_on_cpu():
     for invalid_coef in (-1.0, float("inf"), float("nan")):
         with pytest.raises(ValueError, match="teacher_segment_sft_loss_coef"):
             DistillationInterventionConfig(teacher_segment_sft_loss_coef=invalid_coef)
+
+
+def test_teacher_rejection_intervention_config_validates_token_cap_on_cpu():
+    config = DistillationInterventionConfig(gap_metric="teacher_rejection", teacher_rejection_token_cap=5.0)
+    assert config.teacher_rejection_token_cap == 5.0
+
+    for invalid_cap in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="teacher_rejection_token_cap"):
+            DistillationInterventionConfig(
+                gap_metric="teacher_rejection",
+                teacher_rejection_token_cap=invalid_cap,
+            )
 
 
 def test_distillation_intervention_rejects_train_teacher_segments_with_bypass_mode_on_cpu():

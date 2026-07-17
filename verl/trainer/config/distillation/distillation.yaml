@@ -89,8 +89,11 @@ intervention:
   segment_method: fixed_tokens
   student_segment_length: 128
   teacher_segment_length: 128
+  # teacher_rejection computes min(cap, max(0, student_logprob - teacher_logprob)) per sampled token.
   gap_metric: k3
   gap_distribution_topk: 16
+  # Per-token cap for gap_metric=teacher_rejection, before segment aggregation.
+  teacher_rejection_token_cap: 10.0
   gap_aggregation: mean
   gap_threshold: 1.0
   max_interventions_per_sample: 4

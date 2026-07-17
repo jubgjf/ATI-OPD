@@ -673,6 +673,7 @@ class _DirectInterventionWorker:
         gap_metric: str = "abs",
         gap_threshold: float = 1.0,
         gap_distribution_topk: int = 16,
+        teacher_rejection_token_cap: float = 10.0,
         topk: Optional[int] = None,
         thinking_start_text: str = "<think>",
         thinking_end_text: str = "</think>",
@@ -688,6 +689,7 @@ class _DirectInterventionWorker:
             teacher_segment_length=teacher_segment_length,
             gap_metric=gap_metric,
             gap_distribution_topk=gap_distribution_topk,
+            teacher_rejection_token_cap=teacher_rejection_token_cap,
             gap_threshold=gap_threshold,
             max_interventions_per_sample=max_interventions_per_sample,
             train_on_teacher_segments=train_on_teacher_segments,
@@ -1079,6 +1081,8 @@ async def test_teacher_intervention_teacher_stop_prevents_student_suffix_on_cpu(
     assert output.extra_fields["teacher_intervention_count"] == 1
     assert output.extra_fields["teacher_interventions"][0]["terminated"] is True
     assert output.extra_fields["teacher_interventions"][0]["student_suffix_tokens"] == 0
+    assert output.extra_fields["teacher_interventions"][0]["local_effect_pair_available"] is False
+    assert output.extra_fields["teacher_interventions"][0]["local_effect_unavailable_reason"] == "terminal_response"
 
 
 @pytest.mark.asyncio
@@ -1221,6 +1225,116 @@ def test_teacher_intervention_k1_gap_uses_teacher_minus_student_on_cpu():
 
     torch.testing.assert_close(gaps, torch.tensor([4.5, 3.75]))
     assert bad_segment == (0, 2, pytest.approx(4.125))
+
+
+@pytest.mark.parametrize(
+    ("metric", "expected"),
+    [
+        ("kl", [1.0, -0.5]),
+        ("k1", [1.0, -0.5]),
+        ("abs", [1.0, 0.5]),
+        ("mse", [0.5, 0.125]),
+        ("k2", [0.5, 0.125]),
+        ("low_var_kl", [np.e - 2.0, np.exp(-0.5) - 0.5]),
+        ("k3", [np.e - 2.0, np.exp(-0.5) - 0.5]),
+    ],
+)
+def test_teacher_intervention_legacy_sampled_gap_metrics_are_unchanged_on_cpu(metric, expected):
+    gaps = _compute_intervention_gap(
+        student_logprobs=torch.tensor([-2.0, -0.5]),
+        teacher_logprobs=torch.tensor([-1.0, -1.0]),
+        metric=metric,
+    )
+
+    torch.testing.assert_close(gaps, torch.tensor(expected, dtype=torch.float32))
+
+
+def test_teacher_intervention_teacher_rejection_gap_is_directional_and_capped_on_cpu():
+    gaps = _compute_intervention_gap(
+        student_logprobs=torch.tensor([-0.1, -5.0, -0.1]),
+        teacher_logprobs=torch.tensor([-5.0, -0.1, -100.0]),
+        metric="teacher_rejection",
+        teacher_rejection_token_cap=10.0,
+    )
+
+    torch.testing.assert_close(gaps, torch.tensor([4.9, 0.0, 10.0]))
+
+
+def test_teacher_intervention_teacher_rejection_respects_aggregation_and_strict_threshold_on_cpu():
+    gaps = torch.tensor([1.0, 3.0])
+    mean_config = DistillationInterventionConfig(
+        enabled=True,
+        student_segment_length=2,
+        gap_metric="teacher_rejection",
+        gap_aggregation="mean",
+        gap_threshold=2.0,
+    )
+    max_config = DistillationInterventionConfig(
+        enabled=True,
+        student_segment_length=2,
+        gap_metric="teacher_rejection",
+        gap_aggregation="max",
+        gap_threshold=2.0,
+    )
+
+    assert _select_intervention_segment(gaps, [1, 1], mean_config) is None
+    assert _select_intervention_segment(gaps, [1, 1], max_config) == (0, 2, pytest.approx(3.0))
+
+
+@pytest.mark.asyncio
+async def test_teacher_rejection_records_boundary_aligned_on_policy_local_effect_on_cpu():
+    class _ImprovingTeacherManager(_FixedGapTeacherManager):
+        async def compute_teacher_logprobs_single(self, *args, **kwargs):
+            if not self.scored_sequences:
+                self.high_gap_start = 0
+                self.high_gap_width = 4
+            else:
+                self.high_gap_start = 99
+            return await super().compute_teacher_logprobs_single(*args, **kwargs)
+
+    teacher_manager = _ImprovingTeacherManager(
+        TeacherGenerationResult(token_ids=[30], stop_reason="completed", finish_reason="length")
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        student_segment_length=2,
+        teacher_segment_length=1,
+        gap_metric="teacher_rejection",
+        gap_threshold=1.0,
+    )
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4],
+        response_mask=[1, 1, 1, 1],
+        response_logprobs=[-0.1] * 4,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "teacher-rejection-local-effect"},
+    )
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    intervention = output.extra_fields["teacher_interventions"][0]
+    assert output.response_ids == [30, 40, 41]
+    assert len(teacher_manager.scored_sequences) == 2
+    assert len(worker.llm_client.calls) == 1
+    assert intervention["local_effect_pair_available"] is True
+    assert intervention["local_effect_no_current_intervention_start"] == 2
+    assert intervention["local_effect_after_intervention_start"] == 1
+    assert intervention["local_effect_no_current_intervention_tokens"] == 2
+    assert intervention["local_effect_after_intervention_tokens"] == 2
+    assert intervention["local_effect_no_current_intervention_gap"] == pytest.approx(4.9)
+    assert intervention["local_effect_after_intervention_gap"] == pytest.approx(0.0)
+    assert intervention["local_effect_gap_reduction"] == pytest.approx(4.9)
+    assert intervention["local_effect_no_current_intervention_d"] == pytest.approx(4.9)
+    assert intervention["local_effect_after_intervention_d"] == pytest.approx(0.0)
+    assert intervention["local_effect_d_reduction"] == pytest.approx(4.9)
 
 
 def test_teacher_intervention_full_kl_uses_full_vocab_support_on_cpu():
@@ -1599,6 +1713,10 @@ async def test_teacher_intervention_sft_preserves_provenance_across_multiple_rep
     assert output.response_mask == [1, 1, 0, 1, 0, 1, 1]
     assert output.teacher_segment_mask == [0, 0, 1, 0, 1, 0, 0]
     assert output.extra_fields["teacher_intervention_count"] == 2
+    first_intervention, second_intervention = output.extra_fields["teacher_interventions"]
+    assert first_intervention["local_effect_pair_available"] is True
+    assert second_intervention["local_effect_pair_available"] is False
+    assert second_intervention["local_effect_unavailable_reason"] == "no_no_current_intervention_tokens"
 
 
 @pytest.mark.asyncio

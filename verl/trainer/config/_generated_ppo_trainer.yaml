@@ -815,6 +815,7 @@ distillation:
     teacher_segment_length: 128
     gap_metric: k3
     gap_distribution_topk: 16
+    teacher_rejection_token_cap: 10.0
     gap_aggregation: mean
     gap_threshold: 1.0
     max_interventions_per_sample: 4

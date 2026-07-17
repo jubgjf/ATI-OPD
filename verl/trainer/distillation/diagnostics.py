@@ -2439,6 +2439,9 @@ def compute_intervention_metrics(
     rewrite_exact_position_overlaps = []
     rewrite_lcs_ratios = []
     rewrite_length_ratios = []
+    local_effect_pairs: list[dict[str, float]] = []
+    local_effect_total = 0
+    local_effect_unavailable_reasons: dict[str, int] = {}
     valid_lengths = valid_lengths_tensor.tolist()
     for sample_idx, sample_interventions in enumerate(interventions):
         if sample_interventions is None:
@@ -2446,6 +2449,7 @@ def compute_intervention_metrics(
         for item_idx, item in enumerate(sample_interventions):
             if not isinstance(item, dict):
                 continue
+            local_effect_total += 1
             teacher_tokens += int(item.get("teacher_tokens", 0) or 0)
             suffix_tokens += int(item.get("student_suffix_tokens", 0) or 0)
             score = item.get("score")
@@ -2467,6 +2471,24 @@ def compute_intervention_metrics(
                 rewrite_exact_position_overlaps.append(rewrite_metrics["rewrite_exact_position_overlap"])
                 rewrite_lcs_ratios.append(rewrite_metrics["rewrite_lcs_ratio"])
                 rewrite_length_ratios.append(rewrite_metrics["rewrite_length_ratio"])
+            local_effect_fields = {
+                "gap_before": item.get("local_effect_no_current_intervention_gap"),
+                "gap_after": item.get("local_effect_after_intervention_gap"),
+                "gap_reduction": item.get("local_effect_gap_reduction"),
+                "d_before": item.get("local_effect_no_current_intervention_d"),
+                "d_after": item.get("local_effect_after_intervention_d"),
+                "d_reduction": item.get("local_effect_d_reduction"),
+                "tokens_before": item.get("local_effect_no_current_intervention_tokens"),
+                "tokens_after": item.get("local_effect_after_intervention_tokens"),
+            }
+            pair_complete = bool(item.get("local_effect_pair_available", False)) and all(
+                value is not None for value in local_effect_fields.values()
+            )
+            if pair_complete:
+                local_effect_pairs.append({key: float(value) for key, value in local_effect_fields.items()})
+            else:
+                reason = str(item.get("local_effect_unavailable_reason", "metadata_unavailable"))
+                local_effect_unavailable_reasons[reason] = local_effect_unavailable_reasons.get(reason, 0) + 1
             if item_idx == 0:
                 start = int(item.get("start", 0) or 0)
                 first_positions.append(start)
@@ -2490,6 +2512,43 @@ def compute_intervention_metrics(
         metrics["opd_intervention/rewrite_lcs_ratio_mean"] = float(np.mean(rewrite_lcs_ratios))
     if rewrite_length_ratios:
         metrics["opd_intervention/rewrite_length_ratio_mean"] = float(np.mean(rewrite_length_ratios))
+
+    metrics["opd_intervention/local_effect/pair_count"] = float(len(local_effect_pairs))
+    metrics["opd_intervention/local_effect/pair_fraction"] = (
+        len(local_effect_pairs) / local_effect_total if local_effect_total else 0.0
+    )
+    if local_effect_pairs:
+        gap_before = np.asarray([item["gap_before"] for item in local_effect_pairs], dtype=np.float32)
+        gap_after = np.asarray([item["gap_after"] for item in local_effect_pairs], dtype=np.float32)
+        gap_reduction = np.asarray([item["gap_reduction"] for item in local_effect_pairs], dtype=np.float32)
+        d_before = np.asarray([item["d_before"] for item in local_effect_pairs], dtype=np.float32)
+        d_after = np.asarray([item["d_after"] for item in local_effect_pairs], dtype=np.float32)
+        d_reduction = np.asarray([item["d_reduction"] for item in local_effect_pairs], dtype=np.float32)
+        metrics.update(
+            {
+                "opd_intervention/local_effect/gap/no_current_intervention_mean": float(gap_before.mean()),
+                "opd_intervention/local_effect/gap/after_intervention_mean": float(gap_after.mean()),
+                "opd_intervention/local_effect/gap/reduction_mean": float(gap_reduction.mean()),
+                "opd_intervention/local_effect/gap/reduction_p50": float(np.quantile(gap_reduction, 0.50)),
+                "opd_intervention/local_effect/gap/reduction_p90": float(np.quantile(gap_reduction, 0.90)),
+                "opd_intervention/local_effect/gap/improved_fraction": float((gap_reduction > 0).mean()),
+                "opd_intervention/local_effect/teacher_rejection/no_current_intervention_mean": float(d_before.mean()),
+                "opd_intervention/local_effect/teacher_rejection/after_intervention_mean": float(d_after.mean()),
+                "opd_intervention/local_effect/teacher_rejection/reduction_mean": float(d_reduction.mean()),
+                "opd_intervention/local_effect/teacher_rejection/reduction_p50": float(np.quantile(d_reduction, 0.50)),
+                "opd_intervention/local_effect/teacher_rejection/reduction_p90": float(np.quantile(d_reduction, 0.90)),
+                "opd_intervention/local_effect/teacher_rejection/improved_fraction": float((d_reduction > 0).mean()),
+                "opd_intervention/local_effect/no_current_intervention_tokens_mean": float(
+                    np.mean([item["tokens_before"] for item in local_effect_pairs])
+                ),
+                "opd_intervention/local_effect/after_intervention_tokens_mean": float(
+                    np.mean([item["tokens_after"] for item in local_effect_pairs])
+                ),
+            }
+        )
+    unavailable_denom = max(sum(local_effect_unavailable_reasons.values()), 1)
+    for reason, count in local_effect_unavailable_reasons.items():
+        metrics[f"opd_intervention/local_effect/unavailable_reason/{reason}"] = count / unavailable_denom
 
     skipped_counts = []
     skipped_reason_counts: dict[str, int] = {}

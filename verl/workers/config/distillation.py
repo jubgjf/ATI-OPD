@@ -187,6 +187,7 @@ class DistillationInterventionConfig(BaseConfig):
     teacher_segment_length: int = 128
     gap_metric: str = "k3"
     gap_distribution_topk: int = 16
+    teacher_rejection_token_cap: float = 10.0
     gap_aggregation: str = "mean"
     gap_threshold: float = 1.0
     max_interventions_per_sample: int = 4
@@ -237,6 +238,7 @@ class DistillationInterventionConfig(BaseConfig):
             "k2",
             "low_var_kl",
             "k3",
+            "teacher_rejection",
             "topk_kl",
             "topk_distribution_kl",
             "topk_dist_kl",
@@ -248,6 +250,10 @@ class DistillationInterventionConfig(BaseConfig):
             raise ValueError(f"Unsupported gap_metric: {self.gap_metric!r}.")
         if self.gap_distribution_topk <= 0:
             raise ValueError("gap_distribution_topk must be positive.")
+        if not math.isfinite(self.teacher_rejection_token_cap) or self.teacher_rejection_token_cap <= 0:
+            raise ValueError(
+                f"teacher_rejection_token_cap must be finite and positive, got {self.teacher_rejection_token_cap!r}."
+            )
         if not math.isfinite(self.gap_threshold):
             raise ValueError(f"gap_threshold must be finite, got {self.gap_threshold!r}.")
         if not math.isfinite(self.teacher_temperature) or self.teacher_temperature < 0:

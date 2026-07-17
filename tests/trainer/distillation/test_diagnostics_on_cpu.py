@@ -880,3 +880,56 @@ def test_compute_intervention_metrics_counts_zero_trainable_samples_on_cpu():
 
     assert metrics["opd_intervention/zero_trainable_sample_fraction"] == 0.5
     assert metrics["opd_intervention/trainable_token_fraction"] == 1 / 6
+
+
+def test_compute_intervention_metrics_aggregates_paired_local_effect_on_cpu():
+    interventions = [
+        [
+            {
+                "start": 4,
+                "score": 2.0,
+                "teacher_tokens": 2,
+                "student_suffix_tokens": 8,
+                "local_effect_pair_available": True,
+                "local_effect_no_current_intervention_gap": 3.0,
+                "local_effect_after_intervention_gap": 1.0,
+                "local_effect_gap_reduction": 2.0,
+                "local_effect_no_current_intervention_d": 2.5,
+                "local_effect_after_intervention_d": 1.5,
+                "local_effect_d_reduction": 1.0,
+                "local_effect_no_current_intervention_tokens": 4,
+                "local_effect_after_intervention_tokens": 3,
+            },
+            {
+                "start": 12,
+                "score": 2.5,
+                "teacher_tokens": 2,
+                "student_suffix_tokens": 0,
+                "local_effect_pair_available": False,
+                "local_effect_no_current_intervention_gap": 2.0,
+                "local_effect_no_current_intervention_d": 1.0,
+                "local_effect_no_current_intervention_tokens": 2,
+                "local_effect_after_intervention_tokens": 0,
+                "local_effect_unavailable_reason": "terminal_response",
+            },
+        ]
+    ]
+
+    metrics = compute_intervention_metrics(
+        intervention_counts=[2],
+        interventions=interventions,
+        intervention_skipped=[[]],
+        response_mask=torch.ones((1, 16), dtype=torch.bool),
+    )
+
+    assert metrics["opd_intervention/local_effect/pair_count"] == 1.0
+    assert metrics["opd_intervention/local_effect/pair_fraction"] == 0.5
+    assert metrics["opd_intervention/local_effect/gap/no_current_intervention_mean"] == 3.0
+    assert metrics["opd_intervention/local_effect/gap/after_intervention_mean"] == 1.0
+    assert metrics["opd_intervention/local_effect/gap/reduction_mean"] == 2.0
+    assert metrics["opd_intervention/local_effect/gap/improved_fraction"] == 1.0
+    assert metrics["opd_intervention/local_effect/teacher_rejection/reduction_mean"] == 1.0
+    assert metrics["opd_intervention/local_effect/teacher_rejection/improved_fraction"] == 1.0
+    assert metrics["opd_intervention/local_effect/no_current_intervention_tokens_mean"] == 4.0
+    assert metrics["opd_intervention/local_effect/after_intervention_tokens_mean"] == 3.0
+    assert metrics["opd_intervention/local_effect/unavailable_reason/terminal_response"] == 1.0

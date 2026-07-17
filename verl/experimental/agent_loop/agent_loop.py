@@ -97,6 +97,14 @@ class _StudentSuffixGenerationResult:
     eos_truncated: bool = False
 
 
+@dataclass(frozen=True)
+class _InterventionScoreResult:
+    """Active per-token risk plus reusable named feature components."""
+
+    active_scores: torch.Tensor
+    components: dict[str, torch.Tensor]
+
+
 @dataclass
 class _ThinkingBlockState:
     valid: bool = True
@@ -108,6 +116,8 @@ def _compute_intervention_gap(
     student_logprobs: torch.Tensor,
     teacher_logprobs: torch.Tensor,
     metric: str,
+    *,
+    teacher_rejection_token_cap: float = 10.0,
 ) -> torch.Tensor:
     """Compute per-token teacher/student gap for intervention gating."""
     metric = metric.lower()
@@ -123,7 +133,49 @@ def _compute_intervention_gap(
         kl = (teacher_logprobs - student_logprobs).clamp(min=-20, max=20)
         ratio = torch.exp(kl)
         return (ratio - kl - 1).clamp(min=-10, max=10)
+    if metric == "teacher_rejection":
+        if not math.isfinite(teacher_rejection_token_cap) or teacher_rejection_token_cap <= 0:
+            raise ValueError(
+                f"teacher_rejection_token_cap must be finite and positive, got {teacher_rejection_token_cap!r}."
+            )
+        return (student_logprobs - teacher_logprobs).clamp(min=0, max=teacher_rejection_token_cap)
     raise NotImplementedError(f"Unsupported teacher intervention gap metric: {metric}")
+
+
+def _compose_intervention_score(
+    *,
+    student_logprobs: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    metric: str,
+    teacher_rejection_token_cap: float,
+    distribution_scores: Optional[torch.Tensor] = None,
+) -> _InterventionScoreResult:
+    """Build the active intervention risk and named components from aligned token scores."""
+    teacher_rejection = _compute_intervention_gap(
+        student_logprobs=student_logprobs,
+        teacher_logprobs=teacher_logprobs,
+        metric="teacher_rejection",
+        teacher_rejection_token_cap=teacher_rejection_token_cap,
+    )
+    metric = metric.lower()
+    if distribution_scores is None:
+        active_scores = _compute_intervention_gap(
+            student_logprobs=student_logprobs,
+            teacher_logprobs=teacher_logprobs,
+            metric=metric,
+            teacher_rejection_token_cap=teacher_rejection_token_cap,
+        )
+    else:
+        active_scores = distribution_scores.float()
+    if active_scores.shape != teacher_rejection.shape:
+        raise RuntimeError(
+            "Teacher intervention active risk and teacher-rejection component are misaligned: "
+            f"active_scores.shape={tuple(active_scores.shape)}, "
+            f"teacher_rejection.shape={tuple(teacher_rejection.shape)}."
+        )
+    components = {"teacher_rejection": teacher_rejection}
+    components.setdefault(metric, active_scores)
+    return _InterventionScoreResult(active_scores=active_scores, components=components)
 
 
 def _teacher_response_logprobs(
@@ -722,20 +774,152 @@ def _select_intervention_segment(
         raise ValueError(f"Teacher intervention response_mask contains non-binary values: {invalid_mask_values}.")
     if not torch.isfinite(gaps.float()).all():
         raise RuntimeError("Teacher intervention gap computation produced NaN/Inf values.")
-    response_mask_tensor = torch.tensor(response_mask, dtype=torch.bool)
     for start in range(0, gaps.numel(), segment_len):
         end = min(start + segment_len, gaps.numel())
-        segment_mask = response_mask_tensor[start:end]
-        if not segment_mask.any():
+        score, _ = _aggregate_intervention_span(
+            scores=gaps,
+            response_mask=response_mask,
+            start=start,
+            end=end,
+            aggregation=intervention_config.gap_aggregation,
+        )
+        if score is None:
             continue
-        segment_gaps = gaps[start:end][segment_mask]
-        if intervention_config.gap_aggregation == "max":
-            score = segment_gaps.max().item()
-        else:
-            score = segment_gaps.mean().item()
         if score > intervention_config.gap_threshold:
             return start, end, score
     return None
+
+
+def _aggregate_intervention_span(
+    *,
+    scores: torch.Tensor,
+    response_mask: list[int],
+    start: int,
+    end: int,
+    aggregation: str,
+) -> tuple[Optional[float], int]:
+    """Aggregate valid token scores within one response span."""
+    if len(response_mask) != scores.numel():
+        raise RuntimeError(
+            "Teacher intervention span mask is not aligned with score values: "
+            f"len(response_mask)={len(response_mask)}, num_scores={scores.numel()}."
+        )
+    if start < 0 or end < start or end > scores.numel():
+        raise ValueError(f"Invalid teacher intervention span [{start}, {end}) for {scores.numel()} token scores.")
+    if aggregation not in {"mean", "max"}:
+        raise ValueError(f"Unsupported teacher intervention score aggregation: {aggregation!r}.")
+    span_mask = torch.tensor(response_mask[start:end], dtype=torch.bool, device=scores.device)
+    valid_count = int(span_mask.sum().item())
+    if valid_count == 0:
+        return None, 0
+    values = scores[start:end][span_mask]
+    score = values.max() if aggregation == "max" else values.mean()
+    return float(score.item()), valid_count
+
+
+def _initialize_local_effect_metadata(
+    *,
+    score_result: _InterventionScoreResult,
+    response_mask: list[int],
+    no_intervention_start: int,
+    segment_length: int,
+    gap_metric: str,
+    gap_aggregation: str,
+) -> dict[str, Any]:
+    """Capture the next-segment baseline before applying the current intervention."""
+    no_intervention_end = min(no_intervention_start + segment_length, score_result.active_scores.numel())
+    active_gap, valid_tokens = _aggregate_intervention_span(
+        scores=score_result.active_scores,
+        response_mask=response_mask,
+        start=no_intervention_start,
+        end=no_intervention_end,
+        aggregation=gap_aggregation,
+    )
+    teacher_rejection, rejection_tokens = _aggregate_intervention_span(
+        scores=score_result.components["teacher_rejection"],
+        response_mask=response_mask,
+        start=no_intervention_start,
+        end=no_intervention_end,
+        aggregation="mean",
+    )
+    if rejection_tokens != valid_tokens:
+        raise RuntimeError(
+            "Teacher intervention local-effect components used different baseline token counts: "
+            f"active={valid_tokens}, teacher_rejection={rejection_tokens}."
+        )
+    metadata: dict[str, Any] = {
+        "local_effect_gap_metric": str(gap_metric).lower(),
+        "local_effect_pair_available": False,
+        "local_effect_no_current_intervention_start": no_intervention_start,
+        "local_effect_no_current_intervention_tokens": valid_tokens,
+    }
+    if active_gap is not None:
+        metadata["local_effect_no_current_intervention_gap"] = active_gap
+    if teacher_rejection is not None:
+        metadata["local_effect_no_current_intervention_d"] = teacher_rejection
+    if valid_tokens == 0:
+        metadata["local_effect_unavailable_reason"] = "no_no_current_intervention_tokens"
+    return metadata
+
+
+def _finalize_local_effect_metadata(
+    *,
+    metadata: dict[str, Any],
+    score_result: _InterventionScoreResult,
+    response_mask: list[int],
+    after_intervention_start: int,
+    segment_length: int,
+    gap_aggregation: str,
+) -> None:
+    """Pair a repaired suffix segment with its already-recorded pre-intervention baseline."""
+    after_intervention_end = min(after_intervention_start + segment_length, score_result.active_scores.numel())
+    active_gap, valid_tokens = _aggregate_intervention_span(
+        scores=score_result.active_scores,
+        response_mask=response_mask,
+        start=after_intervention_start,
+        end=after_intervention_end,
+        aggregation=gap_aggregation,
+    )
+    teacher_rejection, rejection_tokens = _aggregate_intervention_span(
+        scores=score_result.components["teacher_rejection"],
+        response_mask=response_mask,
+        start=after_intervention_start,
+        end=after_intervention_end,
+        aggregation="mean",
+    )
+    if rejection_tokens != valid_tokens:
+        raise RuntimeError(
+            "Teacher intervention local-effect components used different repaired token counts: "
+            f"active={valid_tokens}, teacher_rejection={rejection_tokens}."
+        )
+    metadata["local_effect_after_intervention_start"] = after_intervention_start
+    metadata["local_effect_after_intervention_tokens"] = valid_tokens
+    if active_gap is not None:
+        metadata["local_effect_after_intervention_gap"] = active_gap
+    if teacher_rejection is not None:
+        metadata["local_effect_after_intervention_d"] = teacher_rejection
+
+    before_gap = metadata.get("local_effect_no_current_intervention_gap")
+    before_d = metadata.get("local_effect_no_current_intervention_d")
+    if before_gap is not None and active_gap is not None:
+        metadata["local_effect_gap_reduction"] = float(before_gap) - active_gap
+    if before_d is not None and teacher_rejection is not None:
+        metadata["local_effect_d_reduction"] = float(before_d) - teacher_rejection
+
+    pair_available = "local_effect_gap_reduction" in metadata and "local_effect_d_reduction" in metadata
+    metadata["local_effect_pair_available"] = pair_available
+    if pair_available:
+        metadata.pop("local_effect_unavailable_reason", None)
+    elif valid_tokens == 0:
+        metadata["local_effect_unavailable_reason"] = "no_after_intervention_tokens"
+    else:
+        metadata.setdefault("local_effect_unavailable_reason", "incomplete_local_effect_pair")
+
+
+def _mark_local_effect_unavailable(metadata: dict[str, Any], reason: str) -> None:
+    metadata["local_effect_pair_available"] = False
+    metadata.setdefault("local_effect_after_intervention_tokens", 0)
+    metadata["local_effect_unavailable_reason"] = reason
 
 
 def _validate_intervention_state(
@@ -2010,6 +2194,7 @@ class AgentLoopWorker:
         base_request_id = output.extra_fields.get("rollout_request_id") or uuid4().hex
         cached_teacher_result = None
         eos_token_ids = _tokenizer_eos_token_ids(self.tokenizer)
+        pending_local_effect: Optional[tuple[dict[str, Any], int]] = None
 
         for attempt in range(intervention_config.max_interventions_per_sample + 1):
             teacher_result = await self._score_sequence_for_intervention(
@@ -2020,6 +2205,19 @@ class AgentLoopWorker:
                 routing_key=routing_key,
             )
             cached_teacher_result = teacher_result
+            teacher_response_logprobs = _teacher_response_logprobs(
+                teacher_logprobs=_teacher_gap_logprobs(teacher_result),
+                prompt_len=len(prompt_ids),
+                response_len=len(response_ids),
+            )
+            student_response_logprobs = torch.tensor(response_logprobs[: len(response_ids)], dtype=torch.float32)
+            if teacher_response_logprobs.shape != student_response_logprobs.shape:
+                raise ValueError(
+                    "Teacher intervention scoring produced misaligned logprobs: "
+                    f"{teacher_response_logprobs.shape=} vs {student_response_logprobs.shape=}, "
+                    f"prompt_len={len(prompt_ids)}, response_len={len(response_ids)}, attempt={attempt}."
+                )
+            distribution_scores = None
             if _uses_intervention_distribution_gap(intervention_config.gap_metric):
                 student_result = await self._score_student_sequence_for_intervention(
                     request_id=f"{base_request_id}:student-score:{attempt}",
@@ -2027,7 +2225,7 @@ class AgentLoopWorker:
                     response_ids=response_ids,
                     output=output,
                 )
-                gaps = _compute_distribution_intervention_gap(
+                distribution_scores = _compute_distribution_intervention_gap(
                     student_result=student_result,
                     teacher_result=teacher_result,
                     prompt_len=len(prompt_ids),
@@ -2036,24 +2234,25 @@ class AgentLoopWorker:
                     tokenizer=self.tokenizer,
                     log_prob_floor=_logprob_floor_from_distillation_config(self.distillation_config),
                 )
-            else:
-                teacher_response_logprobs = _teacher_response_logprobs(
-                    teacher_logprobs=_teacher_gap_logprobs(teacher_result),
-                    prompt_len=len(prompt_ids),
-                    response_len=len(response_ids),
+            score_result = _compose_intervention_score(
+                student_logprobs=student_response_logprobs,
+                teacher_logprobs=teacher_response_logprobs,
+                metric=intervention_config.gap_metric,
+                teacher_rejection_token_cap=float(getattr(intervention_config, "teacher_rejection_token_cap", 10.0)),
+                distribution_scores=distribution_scores,
+            )
+            if pending_local_effect is not None:
+                pending_metadata, after_intervention_start = pending_local_effect
+                _finalize_local_effect_metadata(
+                    metadata=pending_metadata,
+                    score_result=score_result,
+                    response_mask=gap_mask,
+                    after_intervention_start=after_intervention_start,
+                    segment_length=intervention_config.student_segment_length,
+                    gap_aggregation=intervention_config.gap_aggregation,
                 )
-                student_response_logprobs = torch.tensor(response_logprobs[: len(response_ids)], dtype=torch.float32)
-                if teacher_response_logprobs.shape != student_response_logprobs.shape:
-                    raise ValueError(
-                        "Teacher intervention scoring produced misaligned logprobs: "
-                        f"{teacher_response_logprobs.shape=} vs {student_response_logprobs.shape=}, "
-                        f"prompt_len={len(prompt_ids)}, response_len={len(response_ids)}, attempt={attempt}."
-                    )
-                gaps = _compute_intervention_gap(
-                    student_logprobs=student_response_logprobs,
-                    teacher_logprobs=teacher_response_logprobs,
-                    metric=intervention_config.gap_metric,
-                )
+                pending_local_effect = None
+            gaps = score_result.active_scores
             bad_segment = _select_intervention_segment(gaps, gap_mask, intervention_config)
             if bad_segment is None or len(interventions) >= intervention_config.max_interventions_per_sample:
                 break
@@ -2064,6 +2263,14 @@ class AgentLoopWorker:
                 response_ids,
                 start,
                 end,
+            )
+            local_effect_metadata = _initialize_local_effect_metadata(
+                score_result=score_result,
+                response_mask=gap_mask,
+                no_intervention_start=end,
+                segment_length=intervention_config.student_segment_length,
+                gap_metric=intervention_config.gap_metric,
+                gap_aggregation=intervention_config.gap_aggregation,
             )
             original_student_segment_ids = response_ids[start:end]
             prefix_response_ids = response_ids[:start]
@@ -2262,24 +2469,30 @@ class AgentLoopWorker:
             gap_mask = candidate_gap_mask
             teacher_segment_mask = candidate_teacher_segment_mask
             cached_teacher_result = None
-            interventions.append(
-                {
-                    "attempt": attempt,
-                    "start": start,
-                    "end": end,
-                    "score": score,
-                    "teacher_tokens": len(teacher_segment_ids),
-                    "student_suffix_tokens": len(student_suffix_result.token_ids),
-                    "teacher_stop_reason": teacher_generation.stop_reason,
-                    "teacher_finish_reason": teacher_generation.finish_reason,
-                    "student_suffix_stop_reason": student_suffix_result.stop_reason,
-                    "student_suffix_finish_reason": student_suffix_result.finish_reason,
-                    "terminated": candidate_terminal,
-                    **rewrite_overlap_metrics,
-                }
-            )
+            intervention_item = {
+                "attempt": attempt,
+                "start": start,
+                "end": end,
+                "score": score,
+                "teacher_tokens": len(teacher_segment_ids),
+                "student_suffix_tokens": len(student_suffix_result.token_ids),
+                "teacher_stop_reason": teacher_generation.stop_reason,
+                "teacher_finish_reason": teacher_generation.finish_reason,
+                "student_suffix_stop_reason": student_suffix_result.stop_reason,
+                "student_suffix_finish_reason": student_suffix_result.finish_reason,
+                "terminated": candidate_terminal,
+                **rewrite_overlap_metrics,
+                **local_effect_metadata,
+            }
+            interventions.append(intervention_item)
             if candidate_terminal:
+                _mark_local_effect_unavailable(intervention_item, "terminal_response")
                 break
+            pending_local_effect = (intervention_item, start + len(teacher_segment_ids))
+
+        if pending_local_effect is not None:
+            pending_metadata, _ = pending_local_effect
+            _mark_local_effect_unavailable(pending_metadata, "repaired_response_not_rescored")
 
         output.response_ids = response_ids[: self.rollout_config.response_length]
         output.response_mask = response_mask[: len(output.response_ids)]
