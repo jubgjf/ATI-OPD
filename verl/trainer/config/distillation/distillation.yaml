@@ -124,6 +124,7 @@ diagnostics:
   log_interval: 1
   topk_log_interval: 10
   async_metrics: false
+  # Compatibility-only: structured async diagnostics allow exactly one task in the current source step.
   async_max_pending: 1
   heatmap_interval: 10
   heatmap_history_steps: 80

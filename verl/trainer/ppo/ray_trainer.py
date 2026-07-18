@@ -25,6 +25,7 @@ import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pprint import pprint
 from typing import Any, Optional
 
@@ -98,8 +99,9 @@ def _has_answer_pattern(text: Any) -> bool:
 
 def _snapshot_diagnostics_value(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
-    return value
+        snapshot = value.detach()
+        return snapshot.clone() if snapshot.device.type == "cpu" else snapshot.cpu()
+    return copy.deepcopy(value)
 
 
 def _snapshot_diagnostics_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -116,6 +118,13 @@ def _compute_opd_diagnostics_background_metrics(
         metrics.update(compute_intervention_metrics(**intervention_kwargs))
     metrics["opd/diagnostics_async/worker_compute_seconds"] = time.perf_counter() - start_time
     return metrics
+
+
+@dataclass(slots=True)
+class _PendingOpdDiagnostics:
+    source_step: int
+    future: Future[dict[str, float]]
+    submitted_at: float
 
 
 def _has_boxed_pattern(text: Any) -> bool:
@@ -659,7 +668,7 @@ class RayPPOTrainer:
         self.opd_teacher_logprob_nonfinite_tracker: OpdDiagnosticsTracker | None = None
         self.opd_special_token_ids = resolve_special_token_ids(self.tokenizer)
         self._opd_diagnostics_executor: ThreadPoolExecutor | None = None
-        self._opd_diagnostics_futures: list[tuple[int, Future[dict[str, float]], float]] = []
+        self._opd_diagnostics_task: _PendingOpdDiagnostics | None = None
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
@@ -833,7 +842,8 @@ class RayPPOTrainer:
         generations_to_log: int | None = None,
         generation_logger: ValidationGenerationsLogger | None = None,
         sample_records: list[dict[str, Any]] | None = None,
-    ):
+        defer_wandb: bool = False,
+    ) -> dict[str, Any]:
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
         generations_to_log = (
@@ -842,7 +852,7 @@ class RayPPOTrainer:
         generation_logger = generation_logger or self.validation_generations_logger
 
         if generations_to_log == 0:
-            return
+            return {}
 
         import numpy as np
 
@@ -858,7 +868,12 @@ class RayPPOTrainer:
         samples = samples[:generations_to_log]
 
         # Log to each configured logger
-        generation_logger.log(self.config.trainer.logger, samples, self.global_steps)
+        return generation_logger.log(
+            self.config.trainer.logger,
+            samples,
+            self.global_steps,
+            defer_wandb=defer_wandb,
+        )
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
@@ -1041,13 +1056,14 @@ class RayPPOTrainer:
             if include_format_metrics
             else None
         )
-        self._maybe_log_val_generations(
+        validation_media = self._maybe_log_val_generations(
             inputs=sample_inputs,
             outputs=sample_outputs,
             scores=sample_scores,
             generations_to_log=log_generations,
             generation_logger=validation_generations_logger,
             sample_records=sample_records,
+            defer_wandb=not merged,
         )
 
         # dump generations
@@ -1096,6 +1112,7 @@ class RayPPOTrainer:
                     prefix=f"{metric_prefix}-aux",
                 )
             )
+        metrics.update(validation_media)
         return metrics
 
     def _val_metrics_update(
@@ -2181,50 +2198,50 @@ class RayPPOTrainer:
             self._opd_diagnostics_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="opd-diagnostics")
         return self._opd_diagnostics_executor
 
-    def _drain_opd_diagnostics_futures(self, *, block: bool = False) -> dict[str, float]:
-        if not self._opd_diagnostics_futures:
+    def _finish_opd_diagnostics_for_step(
+        self,
+        task: _PendingOpdDiagnostics | None,
+        *,
+        expected_step: int,
+    ) -> dict[str, float]:
+        if task is None:
             return {}
+        if task.source_step != int(expected_step):
+            raise RuntimeError(
+                "Async OPD diagnostics source step does not match the step being committed: "
+                f"source_step={task.source_step}, expected_step={expected_step}."
+            )
+        active_task = getattr(self, "_opd_diagnostics_task", None)
+        if active_task is not task:
+            raise RuntimeError("Async OPD diagnostics task is not the trainer's active task.")
 
-        pending: list[tuple[int, Future[dict[str, float]], float]] = []
-        completed = 0
-        failed = 0
-        for step, future, submitted_at in self._opd_diagnostics_futures:
-            if not block and not future.done():
-                pending.append((step, future, submitted_at))
-                continue
-            try:
-                result = future.result()
-                result["opd/diagnostics_async/wall_seconds"] = time.perf_counter() - submitted_at
-                log_step = max(int(step), int(getattr(self, "global_steps", step)))
-                result["opd/diagnostics_async/source_step"] = float(step)
-                result["opd/diagnostics_async/result_delay_steps"] = float(log_step - int(step))
-                if getattr(self, "logger", None) is not None:
-                    self.logger.log(data=result, step=log_step)
-                completed += 1
-            except Exception as exc:
-                failed += 1
-                print(f"Async OPD diagnostics failed for step {step}: {exc}")
-                if getattr(self, "logger", None) is not None:
-                    log_step = max(int(step), int(getattr(self, "global_steps", step)))
-                    self.logger.log(
-                        data={
-                            "opd/diagnostics_async/failed": 1.0,
-                            "opd/diagnostics_async/source_step": float(step),
-                        },
-                        step=log_step,
-                    )
+        join_started_at = time.perf_counter()
+        try:
+            result = task.future.result()
+        except Exception as exc:
+            raise RuntimeError(f"Async OPD diagnostics failed for source step {task.source_step}.") from exc
+        finally:
+            self._opd_diagnostics_task = None
 
-        self._opd_diagnostics_futures = pending
-        return {
-            "opd/diagnostics_async/completed": float(completed),
-            "opd/diagnostics_async/failed": float(failed),
-            "opd/diagnostics_async/pending": float(len(pending)),
-        }
+        finished_at = time.perf_counter()
+        result.update(
+            {
+                "opd/diagnostics_async/completed": 1.0,
+                "opd/diagnostics_async/failed": 0.0,
+                "opd/diagnostics_async/pending": 0.0,
+                "opd/diagnostics_async/source_step": float(task.source_step),
+                "opd/diagnostics_async/result_delay_steps": 0.0,
+                "opd/diagnostics_async/wall_seconds": finished_at - task.submitted_at,
+                "opd/diagnostics_async/join_wait_seconds": finished_at - join_started_at,
+            }
+        )
+        return result
 
     def _shutdown_opd_diagnostics_executor(self) -> None:
         if self._opd_diagnostics_executor is not None:
             self._opd_diagnostics_executor.shutdown(wait=True)
             self._opd_diagnostics_executor = None
+        self._opd_diagnostics_task = None
 
     def _submit_or_compute_opd_diagnostics_metrics(
         self,
@@ -2232,10 +2249,10 @@ class RayPPOTrainer:
         batch: DataProto,
         entropy: torch.Tensor | None,
         global_steps: int,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], _PendingOpdDiagnostics | None]:
         diagnostics_config = self._distillation_diagnostics_config()
         if diagnostics_config is None or not getattr(diagnostics_config, "async_metrics", False):
-            return self._compute_opd_diagnostics_metrics(batch=batch, entropy=entropy, global_steps=global_steps)
+            return self._compute_opd_diagnostics_metrics(batch=batch, entropy=entropy, global_steps=global_steps), None
 
         diagnostics_inputs = self._build_opd_diagnostics_inputs(
             batch=batch,
@@ -2243,14 +2260,14 @@ class RayPPOTrainer:
             global_steps=global_steps,
         )
         if diagnostics_inputs is None:
-            return {}
+            return {}, None
 
-        if len(self._opd_diagnostics_futures) >= diagnostics_config.async_max_pending:
-            return {
-                "opd/diagnostics_async/submitted": 0.0,
-                "opd/diagnostics_async/skipped_pending_full": 1.0,
-                "opd/diagnostics_async/pending": float(len(self._opd_diagnostics_futures)),
-            }
+        if getattr(self, "_opd_diagnostics_task", None) is not None:
+            active_step = self._opd_diagnostics_task.source_step
+            raise RuntimeError(
+                "Cannot submit OPD diagnostics while another source step is pending: "
+                f"active_source_step={active_step}, requested_source_step={global_steps}."
+            )
 
         diagnostics_kwargs, intervention_kwargs, teacher_response_logprobs, teacher_logprob_nonfinite_positions = (
             diagnostics_inputs
@@ -2263,6 +2280,7 @@ class RayPPOTrainer:
             teacher_logprob_nonfinite_positions=teacher_logprob_nonfinite_positions,
             response_mask=diagnostics_kwargs["response_mask"],
         )
+        metrics["opd/gap_abs/available"] = 1.0 if teacher_response_logprobs is not None else 0.0
 
         snapshot_start = time.perf_counter()
         snapshot_kwargs = _snapshot_diagnostics_kwargs(diagnostics_kwargs)
@@ -2270,21 +2288,27 @@ class RayPPOTrainer:
             _snapshot_diagnostics_kwargs(intervention_kwargs) if intervention_kwargs is not None else None
         )
         snapshot_seconds = time.perf_counter() - snapshot_start
+        submitted_at = time.perf_counter()
         future = self._ensure_opd_diagnostics_executor().submit(
             _compute_opd_diagnostics_background_metrics,
             snapshot_kwargs,
             snapshot_intervention_kwargs,
         )
-        self._opd_diagnostics_futures.append((global_steps, future, time.perf_counter()))
+        task = _PendingOpdDiagnostics(
+            source_step=int(global_steps),
+            future=future,
+            submitted_at=submitted_at,
+        )
+        self._opd_diagnostics_task = task
         metrics.update(
             {
                 "opd/diagnostics_async/submitted": 1.0,
                 "opd/diagnostics_async/skipped_pending_full": 0.0,
-                "opd/diagnostics_async/pending": float(len(self._opd_diagnostics_futures)),
+                "opd/diagnostics_async/pending_after_submit": 1.0,
                 "opd/diagnostics_async/snapshot_seconds": snapshot_seconds,
             }
         )
-        return metrics
+        return metrics, task
 
     def _update_critic(self, batch: DataProto) -> DataProto:
         batch_td = batch.to_tensordict()
@@ -2332,14 +2356,25 @@ class RayPPOTrainer:
         return logger
 
     def fit(self):
+        """Run training with deterministic logger and diagnostics cleanup."""
+        logger = self.init_logger()
+        exit_code = 0
+        try:
+            return self._fit_impl(logger)
+        except BaseException:
+            exit_code = 1
+            raise
+        finally:
+            self._shutdown_opd_diagnostics_executor()
+            logger.finish(exit_code=exit_code)
+
+    def _fit_impl(self, logger):
         """
         The training loop of PPO.
         The driver process only need to call the compute functions of the worker group through RPC
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
-        logger = self.init_logger()
-
         self.global_steps = 0
 
         # load checkpoint and update weights before doing anything
@@ -2354,13 +2389,13 @@ class RayPPOTrainer:
             val_metrics = self._validate(include_format_metrics=True)
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
+            initial_metrics = dict(val_metrics)
             teacher_val_metrics = self._validate_teacher_before_train()
             if teacher_val_metrics:
                 pprint(f"Initial teacher validation metrics: {teacher_val_metrics}")
-                logger.log(data=teacher_val_metrics, step=self.global_steps)
+                initial_metrics.update(teacher_val_metrics)
+            logger.log(data=initial_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
-                logger.finish()
                 return
 
         if self.config.actor_rollout_ref.rollout.skip.get("enable", False):
@@ -2390,7 +2425,7 @@ class RayPPOTrainer:
                 metrics = {}
                 timing_raw = {}
                 opd_entropy = None
-                metrics.update(self._drain_opd_diagnostics_futures(block=False))
+                opd_diagnostics_task = None
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -2615,14 +2650,11 @@ class RayPPOTrainer:
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        with marked_timer("opd_diagnostics", timing_raw, color="green"):
-                            metrics.update(
-                                self._submit_or_compute_opd_diagnostics_metrics(
-                                    batch=batch,
-                                    entropy=opd_entropy,
-                                    global_steps=self.global_steps,
-                                )
+                        with marked_timer("opd_diagnostics_submit", timing_raw, color="green"):
+                            diagnostics_metrics, opd_diagnostics_task = self._submit_or_compute_opd_diagnostics_metrics(
+                                batch=batch, entropy=opd_entropy, global_steps=self.global_steps
                             )
+                            metrics.update(diagnostics_metrics)
                         for diagnostics_key in ("student_topk_ids", "student_topk_logprobs"):
                             if diagnostics_key in batch.batch and not self._uses_token_reward_direct():
                                 batch.batch.pop(diagnostics_key)
@@ -2728,6 +2760,22 @@ class RayPPOTrainer:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
+                if opd_diagnostics_task is not None:
+                    with marked_timer("opd_diagnostics_join", timing_raw, color="green"):
+                        metrics.update(
+                            self._finish_opd_diagnostics_for_step(
+                                opd_diagnostics_task,
+                                expected_step=self.global_steps,
+                            )
+                        )
+
+                diagnostics_submit_seconds = timing_raw.get("opd_diagnostics_submit", 0.0)
+                diagnostics_join_seconds = timing_raw.get("opd_diagnostics_join", 0.0)
+                timing_raw["opd_diagnostics"] = diagnostics_submit_seconds + diagnostics_join_seconds
+                # The submit work is already inside timing_raw["step"]. The join happens after
+                # the core step/validation overlap and is the only additional blocking cost.
+                timing_raw["step"] += diagnostics_join_seconds
+
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (
                         self.global_steps + 1 in self.config.global_profiler.steps
@@ -2782,11 +2830,8 @@ class RayPPOTrainer:
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
-                    self._drain_opd_diagnostics_futures(block=True)
-                    self._shutdown_opd_diagnostics_executor()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
-                    logger.finish()
                     return
 
                 # this is experimental and may be changed/removed in the future

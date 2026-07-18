@@ -24,6 +24,7 @@ else
 fi
 
 RAY_API_SERVER_ADDRESS=${RAY_API_SERVER_ADDRESS:-http://127.0.0.1:8191}
+RAY_SUBMISSION_ID=${RAY_SUBMISSION_ID:-}
 RAY_NO_WAIT=${RAY_NO_WAIT:-0}
 DRY_RUN=${DRY_RUN:-0}
 RUN_PREFLIGHT=${RUN_PREFLIGHT:-1}
@@ -127,7 +128,6 @@ OPD_DIAGNOSTICS_POSITION_BIN_SIZE=${OPD_DIAGNOSTICS_POSITION_BIN_SIZE:-32}
 OPD_DIAGNOSTICS_LOG_INTERVAL=${OPD_DIAGNOSTICS_LOG_INTERVAL:-1}
 OPD_DIAGNOSTICS_TOPK_LOG_INTERVAL=${OPD_DIAGNOSTICS_TOPK_LOG_INTERVAL:-1}
 OPD_DIAGNOSTICS_ASYNC_METRICS=${OPD_DIAGNOSTICS_ASYNC_METRICS:-False}
-OPD_DIAGNOSTICS_ASYNC_MAX_PENDING=${OPD_DIAGNOSTICS_ASYNC_MAX_PENDING:-1}
 OPD_DIAGNOSTICS_HEATMAP_INTERVAL=${OPD_DIAGNOSTICS_HEATMAP_INTERVAL:-1}
 OPD_DIAGNOSTICS_HEATMAP_HISTORY_STEPS=${OPD_DIAGNOSTICS_HEATMAP_HISTORY_STEPS:-8}
 OPD_DIAGNOSTICS_LOG_WANDB_HEATMAP=${OPD_DIAGNOSTICS_LOG_WANDB_HEATMAP:-False}
@@ -155,10 +155,14 @@ TEACHER_INTERVENTION_TOP_K=${TEACHER_INTERVENTION_TOP_K:-20}
 
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
 TEACHER_VAL_BEFORE_TRAIN=${TEACHER_VAL_BEFORE_TRAIN:-False}
+LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-0}
 TRAINER_LOGGER=${TRAINER_LOGGER:-'["console"]'}
 PROJECT_NAME=${PROJECT_NAME:-DMPD-debug}
 WANDB_MODE=${WANDB_MODE:-disabled}
 WANDB_DISABLED=${WANDB_DISABLED:-true}
+WANDB_DIR=${WANDB_DIR:-}
+WANDB_ENTITY=${WANDB_ENTITY:-}
+WANDB_CONFIG_MODE=${WANDB_CONFIG_MODE:-full}
 
 EXPERIMENT_TIMESTAMP=${EXPERIMENT_TIMESTAMP:-$(date +"%Y%m%d-%H%M%S")}
 EXPERIMENT_BASE_NAME=${EXPERIMENT_NAME:-"debug-${DEBUG_MODE}"}
@@ -282,6 +286,7 @@ COMMON_OVERRIDES=(
     "trainer.val_before_train=${VAL_BEFORE_TRAIN}"
     "trainer.teacher_val_before_train=${TEACHER_VAL_BEFORE_TRAIN}"
     "trainer.teacher_val_max_samples=${VAL_MAX_SAMPLES}"
+    "trainer.log_val_generations=${LOG_VAL_GENERATIONS}"
     "trainer.save_freq=${SAVE_FREQ}"
     "trainer.test_freq=${TEST_FREQ}"
     "trainer.total_epochs=${TOTAL_EPOCHS}"
@@ -321,7 +326,6 @@ COMMON_OVERRIDES=(
     "distillation.diagnostics.log_interval=${OPD_DIAGNOSTICS_LOG_INTERVAL}"
     "distillation.diagnostics.topk_log_interval=${OPD_DIAGNOSTICS_TOPK_LOG_INTERVAL}"
     "distillation.diagnostics.async_metrics=${OPD_DIAGNOSTICS_ASYNC_METRICS}"
-    "distillation.diagnostics.async_max_pending=${OPD_DIAGNOSTICS_ASYNC_MAX_PENDING}"
     "distillation.diagnostics.heatmap_interval=${OPD_DIAGNOSTICS_HEATMAP_INTERVAL}"
     "distillation.diagnostics.heatmap_history_steps=${OPD_DIAGNOSTICS_HEATMAP_HISTORY_STEPS}"
     "distillation.diagnostics.log_wandb_heatmap=${OPD_DIAGNOSTICS_LOG_WANDB_HEATMAP}"
@@ -366,6 +370,7 @@ REMOTE_CMD='set -euo pipefail
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 export WANDB_MODE='"$WANDB_MODE"'
 export WANDB_DISABLED='"$WANDB_DISABLED"'
+export WANDB_CONFIG_MODE='"$WANDB_CONFIG_MODE"'
 export HYDRA_FULL_ERROR=1
 export RAY_DEDUP_LOGS=0
 export RAY_USAGE_STATS_ENABLED=0
@@ -383,6 +388,16 @@ test -d '"$(printf "%q" "$STUDENT_MODEL")"' || { echo "Missing STUDENT_MODEL='"$
 test -d '"$(printf "%q" "$TEACHER_MODEL")"' || { echo "Missing TEACHER_MODEL='"$TEACHER_MODEL"'" >&2; exit 2; }
 test -d '"$(printf "%q" "$CHAT_TEMPLATE_MODEL")"' || { echo "Missing CHAT_TEMPLATE_MODEL='"$CHAT_TEMPLATE_MODEL"'" >&2; exit 2; }
 '
+
+if [[ -n "$WANDB_DIR" ]]; then
+    REMOTE_CMD+="export WANDB_DIR=$(printf "%q" "$WANDB_DIR")
+mkdir -p $(printf "%q" "$WANDB_DIR")
+"
+fi
+if [[ -n "$WANDB_ENTITY" ]]; then
+    REMOTE_CMD+="export WANDB_ENTITY=$(printf "%q" "$WANDB_ENTITY")
+"
+fi
 
 if [[ "$RUN_PREFLIGHT" == "1" ]]; then
     REMOTE_CMD+="${REMOTE_PYTHON} -c $(printf "%q" "$PREFLIGHT_CODE")
@@ -413,7 +428,8 @@ cat <<EOF
   chat template:${CHAT_TEMPLATE_MODEL:-disabled}
   attention:    ${ATTN_IMPLEMENTATION}, vllm backend ${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}
   diagnostics:  log every ${OPD_DIAGNOSTICS_LOG_INTERVAL}, topk every ${OPD_DIAGNOSTICS_TOPK_LOG_INTERVAL}, repetition=${OPD_DIAGNOSTICS_COLLECT_REPETITION}, async=${OPD_DIAGNOSTICS_ASYNC_METRICS}
-  wandb/ckpt:   WANDB_MODE=${WANDB_MODE}, save_freq=${SAVE_FREQ}
+  wandb/ckpt:   WANDB_MODE=${WANDB_MODE}, WANDB_DIR=${WANDB_DIR:-default}, save_freq=${SAVE_FREQ}
+  val logging:  test_freq=${TEST_FREQ}, samples=${VAL_MAX_SAMPLES}, table_rows=${LOG_VAL_GENERATIONS}
 EOF
 
 if [[ "$DRY_RUN" == "1" ]]; then
@@ -422,6 +438,9 @@ if [[ "$DRY_RUN" == "1" ]]; then
 fi
 
 RAY_JOB_ARGS=(job submit --working-dir .)
+if [[ -n "$RAY_SUBMISSION_ID" ]]; then
+    RAY_JOB_ARGS+=(--submission-id "$RAY_SUBMISSION_ID")
+fi
 if [[ "$RAY_NO_WAIT" == "1" ]]; then
     RAY_JOB_ARGS+=(--no-wait)
 fi

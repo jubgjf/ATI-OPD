@@ -275,6 +275,7 @@ class DistillationDiagnosticsConfig(BaseConfig):
     log_interval: int = 1
     topk_log_interval: int = 10
     async_metrics: bool = False
+    # Compatibility-only under structured per-step async diagnostics. Cross-step queues are unsupported.
     async_max_pending: int = 1
     heatmap_interval: int = 10
     heatmap_history_steps: int = 80
@@ -305,8 +306,11 @@ class DistillationDiagnosticsConfig(BaseConfig):
             raise ValueError("diagnostics.log_interval must be positive.")
         if self.topk_log_interval <= 0:
             raise ValueError("diagnostics.topk_log_interval must be positive.")
-        if self.async_max_pending <= 0:
-            raise ValueError("diagnostics.async_max_pending must be positive.")
+        if self.async_max_pending != 1:
+            raise ValueError(
+                "diagnostics.async_max_pending must be 1 because async diagnostics are joined before "
+                "the source training step is committed."
+            )
         if self.heatmap_interval <= 0:
             raise ValueError("diagnostics.heatmap_interval must be positive.")
         if self.heatmap_history_steps <= 0:

@@ -295,8 +295,9 @@ def test_distillation_diagnostics_bad_tail_threshold_validation_on_cpu():
         DistillationDiagnosticsConfig(bad_tail_min_position=8, bad_tail_deep_position=4)
     with pytest.raises(ValueError, match="topk_log_interval"):
         DistillationDiagnosticsConfig(topk_log_interval=0)
-    with pytest.raises(ValueError, match="async_max_pending"):
-        DistillationDiagnosticsConfig(async_max_pending=0)
+    for async_max_pending in (-1, 0, 2):
+        with pytest.raises(ValueError, match="async_max_pending"):
+            DistillationDiagnosticsConfig(async_max_pending=async_max_pending)
     with pytest.raises(ValueError, match="repetition_tail_chars"):
         DistillationDiagnosticsConfig(repetition_tail_chars=0)
     with pytest.raises(ValueError, match="repetition_tail_token_window"):

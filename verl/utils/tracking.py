@@ -44,6 +44,16 @@ def _filter_wandb_media_for_backend(data: Any, backend: str) -> Any:
     return {key: value for key, value in data.items() if not _is_wandb_media_value(value)}
 
 
+def _as_integral_step(value: Any, *, name: str) -> int:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be an integer step, got {value!r}.") from exc
+    if normalized != value:
+        raise ValueError(f"{name} must be an integer step, got {value!r}.")
+    return normalized
+
+
 def _env_float(name: str) -> float | None:
     value = os.environ.get(name)
     if value is None or value == "":
@@ -226,6 +236,7 @@ class Tracking:
 
         self.logger = {}
         self._finished = False
+        self._last_step: int | None = None
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import os
@@ -342,12 +353,27 @@ class Tracking:
             self.logger["file"] = FileLogger(project_name, experiment_name)
 
     def log(self, data, step, backend=None):
+        normalized_step = _as_integral_step(step, name="Tracking.log(step)")
+        if self._last_step is not None and normalized_step < self._last_step:
+            raise ValueError(
+                "Tracking steps must be monotonically non-decreasing: "
+                f"last_step={self._last_step}, requested_step={normalized_step}."
+            )
+        if isinstance(data, dict) and (source_step := data.get("opd/diagnostics_async/source_step")) is not None:
+            normalized_source_step = _as_integral_step(source_step, name="opd/diagnostics_async/source_step")
+            if normalized_source_step != normalized_step:
+                raise ValueError(
+                    "opd/diagnostics_async/source_step="
+                    f"{normalized_source_step} does not match Tracking.log(step={normalized_step})."
+                )
+
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 backend_data = _filter_wandb_media_for_backend(data, default_backend)
                 if isinstance(backend_data, dict) and not backend_data:
                     continue
                 logger_instance.log(data=backend_data, step=step)
+        self._last_step = normalized_step
 
     def finish(self, exit_code=0):
         if getattr(self, "_finished", False):
@@ -555,9 +581,10 @@ class ValidationGenerationsLogger:
     experiment_name: str = None
     table_name: str = "val/generations"
 
-    def log(self, loggers, samples, step):
+    def log(self, loggers, samples, step, *, defer_wandb: bool = False) -> dict[str, Any]:
+        deferred_media: dict[str, Any] = {}
         if "wandb" in loggers:
-            self.log_generations_to_wandb(samples, step)
+            deferred_media.update(self.log_generations_to_wandb(samples, step, defer=defer_wandb))
         if "swanlab" in loggers:
             self.log_generations_to_swanlab(samples, step)
         if "mlflow" in loggers:
@@ -571,17 +598,19 @@ class ValidationGenerationsLogger:
         if "vemlp_wandb" in loggers:
             self.log_generations_to_vemlp_wandb(samples, step)
 
+        return deferred_media
+
     def log_generations_to_vemlp_wandb(self, samples, step):
         from volcengine_ml_platform import wandb as vemlp_wandb
 
         self._log_generations_to_wandb(samples, step, vemlp_wandb)
 
-    def log_generations_to_wandb(self, samples, step):
+    def log_generations_to_wandb(self, samples, step, *, defer: bool = False) -> dict[str, Any]:
         import wandb
 
-        self._log_generations_to_wandb(samples, step, wandb)
+        return self._log_generations_to_wandb(samples, step, wandb, defer=defer)
 
-    def _log_generations_to_wandb(self, samples, step, wandb):
+    def _log_generations_to_wandb(self, samples, step, wandb, *, defer: bool = False) -> dict[str, Any]:
         """Log samples to wandb as a table"""
 
         fields = self._sample_fields(samples)
@@ -594,10 +623,10 @@ class ValidationGenerationsLogger:
             for sample_index, sample in enumerate(samples):
                 new_table.add_data(step, sample_index, *self._sample_to_values(sample, fields))
 
-            if wandb.run is not None:
+            if wandb.run is not None and not defer:
                 wandb.log({self.table_name: new_table}, step=step)
             self.validation_table = new_table
-            return
+            return {self.table_name: new_table} if wandb.run is not None and defer else {}
 
         # Create column names for all samples
         columns = ["step"] + sum([[f"{field}_{i + 1}" for field in fields] for i in range(len(samples))], [])
@@ -619,9 +648,10 @@ class ValidationGenerationsLogger:
         new_table.add_data(*row_data)
 
         # Update reference and log
-        if wandb.run is not None:
+        if wandb.run is not None and not defer:
             wandb.log({self.table_name: new_table}, step=step)
         self.validation_table = new_table
+        return {self.table_name: new_table} if wandb.run is not None and defer else {}
 
     def log_generations_to_swanlab(self, samples, step):
         """Log samples to swanlab as text"""
