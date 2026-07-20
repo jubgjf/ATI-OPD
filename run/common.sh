@@ -128,7 +128,7 @@ run_npu_opd_job() {
     student_gpu_mem_util=${STUDENT_GPU_MEM_UTIL:-0.6}
     teacher_tp=${TEACHER_TP:-2}
     teacher_gpu_mem_util=${TEACHER_GPU_MEM_UTIL:-0.6}
-    sp_size=${SP_SIZE:-2}
+    sp_size=${SP_SIZE:-4}
     TEACHER_REPLICAS=${TEACHER_REPLICAS:-$((TEACHER_NNODES * TEACHER_NGPUS_PER_NODE / teacher_tp))}
 
     max_prompt_length=${MAX_PROMPT_LENGTH:-$((1 * 1024))}
@@ -148,6 +148,11 @@ run_npu_opd_job() {
     val_top_k=${VAL_TOP_K:-$rollout_top_k}
     val_do_sample=${VAL_DO_SAMPLE:-True}
     val_n=${VAL_N:-16}
+    test_temperature=${TEST_TEMPERATURE:-0.7}
+    test_top_p=${TEST_TOP_P:-0.95}
+    test_top_k=${TEST_TOP_K:-$rollout_top_k}
+    test_do_sample=${TEST_DO_SAMPLE:-True}
+    test_n=${TEST_N:-16}
 
     actor_lr=${ACTOR_LR:-1e-6}
     train_batch_size=${TRAIN_BATCH_SIZE:-64}
@@ -156,6 +161,10 @@ run_npu_opd_job() {
     train_max_samples=${TRAIN_MAX_SAMPLES:--1}
     val_max_samples=${VAL_MAX_SAMPLES:-256}
     val_batch_size=${VAL_BATCH_SIZE:-256}
+    test_benchmark_root=${TEST_BENCHMARK_ROOT:-$DATASET_DIR/datasets}
+    test_benchmarks=${TEST_BENCHMARKS:-"['math-ai/aime24','math-ai/aime25','math-ai/amc23']"}
+    test_benchmark_max_samples=${TEST_BENCHMARK_MAX_SAMPLES:--1}
+    test_benchmark_batch_size=${TEST_BENCHMARK_BATCH_SIZE:-256}
     data_seed=${DATA_SEED:--42}
 
     distillation_loss_mode=${DISTILLATION_LOSS_MODE:-k1}
@@ -205,6 +214,7 @@ run_npu_opd_job() {
     trainer_logger=${TRAINER_LOGGER:-'["console","wandb"]'}
     trainer_device=${TRAINER_DEVICE:-npu}
     val_before_train=${VAL_BEFORE_TRAIN:-True}
+    test_before_train=${TEST_BEFORE_TRAIN:-True}
     teacher_val_before_train=${TEACHER_VAL_BEFORE_TRAIN:-False}
     distillation_enabled=${DISTILLATION_ENABLED:-True}
 
@@ -216,6 +226,9 @@ run_npu_opd_job() {
     total_epochs=${TOTAL_EPOCHS:-1}
     save_freq=${SAVE_FREQ:-20}
     test_freq=${TEST_FREQ:-10}
+    test_benchmarks_freq=${TEST_BENCHMARKS_FREQ:-20}
+    test_benchmarks_max_response_length=${TEST_BENCHMARKS_MAX_RESPONSE_LENGTH:-$max_response_length}
+    log_test_generations=${LOG_TEST_GENERATIONS:-0}
     resume_required=${RESUME_REQUIRED:-False}
 
     export WANDB_MODE=${WANDB_MODE:-online}
@@ -362,6 +375,10 @@ _submit_npu_verl_job() {
         "data.val_batch_size=${val_batch_size}"
         "data.train_max_samples=${train_max_samples}"
         "data.val_max_samples=${val_max_samples}"
+        "data.test_benchmarks.root=${test_benchmark_root}"
+        "data.test_benchmarks.names=${test_benchmarks}"
+        "data.test_benchmarks.batch_size=${test_benchmark_batch_size}"
+        "data.test_benchmarks.max_samples_per_benchmark=${test_benchmark_max_samples}"
         "data.max_prompt_length=${max_prompt_length}"
         "data.max_response_length=${max_response_length}"
         "data.filter_overlong_prompts=${filter_overlong_prompts}"
@@ -400,6 +417,11 @@ _submit_npu_verl_job() {
         "actor_rollout_ref.rollout.val_kwargs.top_k=${val_top_k}"
         "actor_rollout_ref.rollout.val_kwargs.do_sample=${val_do_sample}"
         "actor_rollout_ref.rollout.val_kwargs.n=${val_n}"
+        "actor_rollout_ref.rollout.test_kwargs.temperature=${test_temperature}"
+        "actor_rollout_ref.rollout.test_kwargs.top_p=${test_top_p}"
+        "actor_rollout_ref.rollout.test_kwargs.top_k=${test_top_k}"
+        "actor_rollout_ref.rollout.test_kwargs.do_sample=${test_do_sample}"
+        "actor_rollout_ref.rollout.test_kwargs.n=${test_n}"
         "reward.reward_manager.name=${reward_manager_name}"
         "trainer.balance_batch=True"
         "trainer.logger=${trainer_logger}"
@@ -410,11 +432,15 @@ _submit_npu_verl_job() {
         "trainer.device=${trainer_device}"
         "trainer.default_local_dir=${default_local_dir}"
         "trainer.val_before_train=${val_before_train}"
+        "trainer.test_before_train=${test_before_train}"
         "trainer.teacher_val_before_train=${teacher_val_before_train}"
         "trainer.teacher_val_max_samples=${val_max_samples}"
         "trainer.log_teacher_val_generations=${val_batch_size}"
+        "trainer.log_test_generations=${log_test_generations}"
         "trainer.save_freq=${save_freq}"
         "trainer.test_freq=${test_freq}"
+        "trainer.test_benchmarks_freq=${test_benchmarks_freq}"
+        "trainer.test_benchmarks_max_response_length=${test_benchmarks_max_response_length}"
         "trainer.total_epochs=${total_epochs}"
         "distillation.enabled=${distillation_enabled}"
         "distillation.use_actor_loss=${distillation_use_actor_loss}"

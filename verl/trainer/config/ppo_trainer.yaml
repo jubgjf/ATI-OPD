@@ -133,6 +133,9 @@ trainer:
   # Number of generations to log during validation
   log_val_generations: 0
 
+  # Number of generations to log during benchmark testing
+  log_test_generations: 0
+
   # Run a small teacher validation pass at step 0 when val_before_train and distillation are enabled
   teacher_val_before_train: true
 
@@ -147,6 +150,9 @@ trainer:
 
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
+
+  # Directory for logging benchmark test data; no dump if null
+  test_data_dir: null
 
   # Number of nodes used in the training
   nnodes: 1
@@ -176,11 +182,20 @@ trainer:
   # Whether to run validation before training begins
   val_before_train: True
 
+  # Whether to run configured test benchmarks before training begins
+  test_before_train: False
+
   # Whether to run validation only
   val_only: False
 
   # Validation frequency (in training iterations)
   test_freq: -1
+
+  # Test benchmark frequency (in training iterations)
+  test_benchmarks_freq: -1
+
+  # Optional benchmark response-token limit; null uses rollout.response_length
+  test_benchmarks_max_response_length: null
 
   # Number of iterations to warm up the critic before updating policy
   critic_warmup: 0

@@ -75,6 +75,11 @@ VAL_TOP_P=${VAL_TOP_P:-0.95}
 VAL_TOP_K=${VAL_TOP_K:-$ROLLOUT_TOP_K}
 VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
 VAL_N=${VAL_N:-2}
+TEST_TEMPERATURE=${TEST_TEMPERATURE:-0.7}
+TEST_TOP_P=${TEST_TOP_P:-0.95}
+TEST_TOP_K=${TEST_TOP_K:-$ROLLOUT_TOP_K}
+TEST_DO_SAMPLE=${TEST_DO_SAMPLE:-True}
+TEST_N=${TEST_N:-16}
 ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
 TEACHER_ENFORCE_EAGER=${TEACHER_ENFORCE_EAGER:-False}
 SKIP_TOKENIZER_INIT=${SKIP_TOKENIZER_INIT:-True}
@@ -86,11 +91,18 @@ PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$TRAIN_BATCH_SIZE}
 VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-8}
 TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:-16}
 VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:-256}
+TEST_BENCHMARK_ROOT=${TEST_BENCHMARK_ROOT:-$DATASET_ROOT}
+TEST_BENCHMARKS=${TEST_BENCHMARKS:-"['aime24','aime25','amc23']"}
+TEST_BENCHMARK_MAX_SAMPLES=${TEST_BENCHMARK_MAX_SAMPLES:--1}
+TEST_BENCHMARK_BATCH_SIZE=${TEST_BENCHMARK_BATCH_SIZE:-16}
 DATA_SEED=${DATA_SEED:--42}
 DATA_TRUNCATION=${DATA_TRUNCATION:-error}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-2}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
+TRAINER_VAL_ONLY=${TRAINER_VAL_ONLY:-False}
 TEST_FREQ=${TEST_FREQ:--1}
+TEST_BENCHMARKS_FREQ=${TEST_BENCHMARKS_FREQ:--1}
+TEST_BENCHMARKS_MAX_RESPONSE_LENGTH=${TEST_BENCHMARKS_MAX_RESPONSE_LENGTH:-$MAX_RESPONSE_LENGTH}
 SAVE_FREQ=${SAVE_FREQ:--1}
 ACTOR_LR=${ACTOR_LR:-1e-6}
 PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-$(( (MAX_MODEL_LEN + 127) / 128 * 128 ))}
@@ -154,8 +166,10 @@ TEACHER_INTERVENTION_TOP_P=${TEACHER_INTERVENTION_TOP_P:-0.95}
 TEACHER_INTERVENTION_TOP_K=${TEACHER_INTERVENTION_TOP_K:-20}
 
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
+TEST_BEFORE_TRAIN=${TEST_BEFORE_TRAIN:-False}
 TEACHER_VAL_BEFORE_TRAIN=${TEACHER_VAL_BEFORE_TRAIN:-False}
 LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-0}
+LOG_TEST_GENERATIONS=${LOG_TEST_GENERATIONS:-0}
 TRAINER_LOGGER=${TRAINER_LOGGER:-'["console"]'}
 PROJECT_NAME=${PROJECT_NAME:-DMPD-debug}
 WANDB_MODE=${WANDB_MODE:-disabled}
@@ -230,6 +244,10 @@ COMMON_OVERRIDES=(
     "data.val_batch_size=${VAL_BATCH_SIZE}"
     "data.train_max_samples=${TRAIN_MAX_SAMPLES}"
     "data.val_max_samples=${VAL_MAX_SAMPLES}"
+    "data.test_benchmarks.root=${TEST_BENCHMARK_ROOT}"
+    "data.test_benchmarks.names=${TEST_BENCHMARKS}"
+    "data.test_benchmarks.batch_size=${TEST_BENCHMARK_BATCH_SIZE}"
+    "data.test_benchmarks.max_samples_per_benchmark=${TEST_BENCHMARK_MAX_SAMPLES}"
     "data.max_prompt_length=${MAX_PROMPT_LENGTH}"
     "data.max_response_length=${MAX_RESPONSE_LENGTH}"
     "data.filter_overlong_prompts=True"
@@ -273,6 +291,11 @@ COMMON_OVERRIDES=(
     "actor_rollout_ref.rollout.val_kwargs.top_p=${VAL_TOP_P}"
     "actor_rollout_ref.rollout.val_kwargs.top_k=${VAL_TOP_K}"
     "actor_rollout_ref.rollout.val_kwargs.n=${VAL_N}"
+    "actor_rollout_ref.rollout.test_kwargs.temperature=${TEST_TEMPERATURE}"
+    "actor_rollout_ref.rollout.test_kwargs.do_sample=${TEST_DO_SAMPLE}"
+    "actor_rollout_ref.rollout.test_kwargs.top_p=${TEST_TOP_P}"
+    "actor_rollout_ref.rollout.test_kwargs.top_k=${TEST_TOP_K}"
+    "actor_rollout_ref.rollout.test_kwargs.n=${TEST_N}"
     "reward.reward_manager.name=naive"
     "critic.enable=False"
     "trainer.balance_batch=True"
@@ -284,11 +307,16 @@ COMMON_OVERRIDES=(
     "trainer.device=cuda"
     "trainer.default_local_dir=${DEFAULT_LOCAL_DIR}"
     "trainer.val_before_train=${VAL_BEFORE_TRAIN}"
+    "trainer.test_before_train=${TEST_BEFORE_TRAIN}"
     "trainer.teacher_val_before_train=${TEACHER_VAL_BEFORE_TRAIN}"
     "trainer.teacher_val_max_samples=${VAL_MAX_SAMPLES}"
     "trainer.log_val_generations=${LOG_VAL_GENERATIONS}"
+    "trainer.log_test_generations=${LOG_TEST_GENERATIONS}"
     "trainer.save_freq=${SAVE_FREQ}"
     "trainer.test_freq=${TEST_FREQ}"
+    "trainer.test_benchmarks_freq=${TEST_BENCHMARKS_FREQ}"
+    "trainer.test_benchmarks_max_response_length=${TEST_BENCHMARKS_MAX_RESPONSE_LENGTH}"
+    "trainer.val_only=${TRAINER_VAL_ONLY}"
     "trainer.total_epochs=${TOTAL_EPOCHS}"
     "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}"
     "distillation.enabled=True"
@@ -423,13 +451,14 @@ cat <<EOF
   data train:   ${TRAIN_FILE}
   data val:     ${VAL_FILE}
   gpu split:    student ${STUDENT_GPUS}g tp=${STUDENT_TP}, teacher ${TEACHER_GPUS}g tp=${TEACHER_TP}
-  steps:        ${TOTAL_TRAINING_STEPS}
+  steps:        ${TOTAL_TRAINING_STEPS} (val_only=${TRAINER_VAL_ONLY})
   max lengths:  prompt ${MAX_PROMPT_LENGTH}, response ${MAX_RESPONSE_LENGTH}, model ${MAX_MODEL_LEN}
   chat template:${CHAT_TEMPLATE_MODEL:-disabled}
   attention:    ${ATTN_IMPLEMENTATION}, vllm backend ${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}
   diagnostics:  log every ${OPD_DIAGNOSTICS_LOG_INTERVAL}, topk every ${OPD_DIAGNOSTICS_TOPK_LOG_INTERVAL}, repetition=${OPD_DIAGNOSTICS_COLLECT_REPETITION}, async=${OPD_DIAGNOSTICS_ASYNC_METRICS}
   wandb/ckpt:   WANDB_MODE=${WANDB_MODE}, WANDB_DIR=${WANDB_DIR:-default}, save_freq=${SAVE_FREQ}
   val logging:  test_freq=${TEST_FREQ}, samples=${VAL_MAX_SAMPLES}, table_rows=${LOG_VAL_GENERATIONS}
+  benchmarks:   before_train=${TEST_BEFORE_TRAIN}, freq=${TEST_BENCHMARKS_FREQ}, n=${TEST_N}, names=${TEST_BENCHMARKS}
 EOF
 
 if [[ "$DRY_RUN" == "1" ]]; then

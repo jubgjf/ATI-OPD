@@ -289,6 +289,7 @@ class TaskRunner:
             is_train=False,
             max_samples=config.data.get("val_max_samples", -1),
         )
+        test_benchmark_dataset = create_math_benchmark_dataset(config)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
@@ -301,6 +302,7 @@ class TaskRunner:
             ray_worker_group_cls=ray_worker_group_cls,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
+            test_benchmark_dataset=test_benchmark_dataset,
             collate_fn=collate_fn,
             train_sampler=train_sampler,
         )
@@ -342,6 +344,36 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
     )
 
     return dataset
+
+
+def create_math_benchmark_dataset(config):
+    """Create the optional math benchmark dataset used by in-training test evaluation."""
+    test_before_train = bool(config.trainer.get("test_before_train", False))
+    test_benchmarks_freq = int(config.trainer.get("test_benchmarks_freq", -1))
+    if not test_before_train and test_benchmarks_freq <= 0:
+        return None
+
+    benchmark_config = config.data.get("test_benchmarks", None)
+    if benchmark_config is None:
+        raise ValueError(
+            "Benchmark testing is enabled but data.test_benchmarks is missing. Configure its root and names fields."
+        )
+
+    dataset_root = benchmark_config.get("root", None)
+    benchmark_names = benchmark_config.get("names", [])
+    if not dataset_root:
+        raise ValueError("Benchmark testing is enabled but data.test_benchmarks.root is empty.")
+    if not benchmark_names:
+        raise ValueError("Benchmark testing is enabled but data.test_benchmarks.names is empty.")
+
+    from verl.utils.dataset.math_benchmark_dataset import MathBenchmarkDataset
+
+    return MathBenchmarkDataset(
+        dataset_root=dataset_root,
+        benchmarks=benchmark_names,
+        reward_data_source=benchmark_config.get("reward_data_source", "math_dapo"),
+        max_samples_per_benchmark=int(benchmark_config.get("max_samples_per_benchmark", -1)),
+    )
 
 
 def create_rl_sampler(data_config, dataset):

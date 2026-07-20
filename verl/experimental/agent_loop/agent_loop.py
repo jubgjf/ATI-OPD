@@ -1542,9 +1542,16 @@ class AgentLoopWorker:
 
         # override sampling params for validation
         if validate:
-            sampling_params["top_p"] = config.val_kwargs.top_p
-            sampling_params["top_k"] = config.val_kwargs.top_k
-            sampling_params["temperature"] = config.val_kwargs.temperature
+            evaluation_mode = batch.meta_info.get("evaluation_mode", "val")
+            if evaluation_mode not in {"val", "test"}:
+                raise ValueError(f"evaluation_mode must be 'val' or 'test', got {evaluation_mode!r}.")
+            evaluation_config = config.test_kwargs if evaluation_mode == "test" else config.val_kwargs
+            sampling_params["top_p"] = evaluation_config.top_p
+            sampling_params["top_k"] = evaluation_config.top_k
+            sampling_params["temperature"] = evaluation_config.temperature
+            do_sample = batch.meta_info.get("do_sample", evaluation_config.do_sample)
+            if not bool(do_sample):
+                apply_greedy_sampling_params(sampling_params)
         _apply_generation_max_tokens(sampling_params, batch.meta_info)
 
         # by default, we assume it's a single turn agent

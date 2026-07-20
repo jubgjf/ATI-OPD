@@ -28,13 +28,6 @@ from typing import Any
 import pandas as pd
 from transformers import AutoConfig, AutoTokenizer
 
-from verl.trainer.main_math_benchmark_eval import (
-    VLLMServer,
-    count_tokens,
-    ensure_checkpoint_merged,
-    extract_choice_generation,
-    request_chat_completions,
-)
 from verl.utils.evaluation.math_benchmark import (
     CheckpointInfo,
     append_jsonl_record,
@@ -44,6 +37,13 @@ from verl.utils.evaluation.math_benchmark import (
     render_prompt_with_chat_template,
     score_completion,
     write_json_atomic,
+)
+from verl.utils.evaluation.standalone_generation import (
+    VLLMServer,
+    count_tokens,
+    ensure_checkpoint_merged,
+    extract_choice_generation,
+    request_chat_completions,
 )
 
 logger = logging.getLogger(__name__)

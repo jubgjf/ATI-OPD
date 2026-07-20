@@ -55,6 +55,10 @@ class HFRollout(BaseRollout):
         # make sampling args can be overridden by inputs
         do_sample = prompts.meta_info.get("do_sample", self.config.do_sample)
         is_validate = prompts.meta_info.get("validate", False)
+        evaluation_mode = prompts.meta_info.get("evaluation_mode", "val")
+        if evaluation_mode not in {"val", "test"}:
+            raise ValueError(f"evaluation_mode must be 'val' or 'test', got {evaluation_mode!r}.")
+        evaluation_config = self.config.test_kwargs if evaluation_mode == "test" else self.config.val_kwargs
 
         temperature = prompts.meta_info.get("temperature", self.config.temperature)
         response_length = prompts.meta_info.get("response_length", self.config.response_length)
@@ -68,13 +72,13 @@ class HFRollout(BaseRollout):
                 "num_beams": 1,
             }
         elif is_validate:
-            # do validate and do sample -> use val_kwargs
+            # do validation/benchmark testing and do sample -> use the matching kwargs
             kwargs = {
                 "do_sample": True,
                 "num_beams": 1,
-                "top_k": max(0, self.config.val_kwargs.top_k),  # to be compatible with vllm
-                "top_p": self.config.val_kwargs.top_p,
-                "temperature": self.config.val_kwargs.temperature,
+                "top_k": max(0, evaluation_config.top_k),  # to be compatible with vllm
+                "top_p": evaluation_config.top_p,
+                "temperature": evaluation_config.temperature,
                 "num_return_sequences": 1,  # if validate, already repeat in ray_trainer
             }
         else:

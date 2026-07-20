@@ -265,6 +265,13 @@ actor_rollout_ref:
       temperature: 0
       'n': 1
       do_sample: false
+    test_kwargs:
+      _target_: verl.workers.config.SamplingConfig
+      top_k: -1
+      top_p: 1.0
+      temperature: 0
+      'n': 1
+      do_sample: false
     multi_turn:
       _target_: verl.workers.config.MultiTurnConfig
       enable: false
@@ -421,6 +428,12 @@ data:
   val_files: ~/data/rlhf/gsm8k/test.parquet
   train_max_samples: -1
   val_max_samples: -1
+  test_benchmarks:
+    root: null
+    names: []
+    batch_size: null
+    max_samples_per_benchmark: -1
+    reward_data_source: math_dapo
   prompt_key: prompt
   reward_fn_key: data_source
   max_prompt_length: 512
@@ -875,11 +888,13 @@ trainer:
   - console
   - wandb
   log_val_generations: 0
+  log_test_generations: 0
   teacher_val_before_train: true
   teacher_val_max_samples: 256
   log_teacher_val_generations: 32
   rollout_data_dir: null
   validation_data_dir: null
+  test_data_dir: null
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1
@@ -887,8 +902,11 @@ trainer:
   resume_mode: auto
   resume_from_path: null
   val_before_train: true
+  test_before_train: false
   val_only: false
   test_freq: -1
+  test_benchmarks_freq: -1
+  test_benchmarks_max_response_length: null
   critic_warmup: 0
   default_hdfs_dir: null
   del_local_ckpt_after_load: false

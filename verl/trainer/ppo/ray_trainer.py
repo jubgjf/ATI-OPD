@@ -603,6 +603,7 @@ class RayPPOTrainer:
         processor=None,
         train_dataset: Optional[Dataset] = None,
         val_dataset: Optional[Dataset] = None,
+        test_benchmark_dataset: Optional[Dataset] = None,
         collate_fn=None,
         train_sampler: Optional[Sampler] = None,
         device_name=None,
@@ -654,6 +655,11 @@ class RayPPOTrainer:
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
+        self.test_benchmark_generations_logger = ValidationGenerationsLogger(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            table_name="test/generations",
+        )
         self.teacher_validation_generations_logger = ValidationGenerationsLogger(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -683,11 +689,24 @@ class RayPPOTrainer:
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
 
-        self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        self._create_dataloader(
+            train_dataset,
+            val_dataset,
+            collate_fn,
+            train_sampler,
+            test_benchmark_dataset=test_benchmark_dataset,
+        )
 
         self.checkpoint_manager = None
 
-    def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
+    def _create_dataloader(
+        self,
+        train_dataset,
+        val_dataset,
+        collate_fn,
+        train_sampler: Optional[Sampler],
+        test_benchmark_dataset=None,
+    ):
         """
         Creates the train and validation dataloaders.
         """
@@ -743,6 +762,25 @@ class RayPPOTrainer:
             collate_fn=collate_fn,
         )
 
+        self.test_benchmark_dataset = test_benchmark_dataset
+        self.test_benchmark_dataloader = None
+        if test_benchmark_dataset is not None:
+            benchmark_config = self.config.data.test_benchmarks
+            test_batch_size = benchmark_config.get("batch_size", None)
+            if test_batch_size is None:
+                test_batch_size = len(test_benchmark_dataset)
+            test_batch_size = int(test_batch_size)
+            if test_batch_size <= 0:
+                raise ValueError(f"data.test_benchmarks.batch_size must be positive or null, got {test_batch_size}.")
+            self.test_benchmark_dataloader = StatefulDataLoader(
+                dataset=test_benchmark_dataset,
+                batch_size=test_batch_size,
+                num_workers=num_workers,
+                shuffle=False,
+                drop_last=False,
+                collate_fn=collate_fn,
+            )
+
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
         assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
 
@@ -750,6 +788,11 @@ class RayPPOTrainer:
             f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
             f"{len(self.val_dataloader)}"
         )
+        if self.test_benchmark_dataloader is not None:
+            print(
+                "Size of test benchmark dataloader: "
+                f"{len(self.test_benchmark_dataloader)} ({len(self.test_benchmark_dataset)} problems)"
+            )
 
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
 
@@ -902,8 +945,10 @@ class RayPPOTrainer:
     def _validate(
         self,
         merged: bool = False,
+        dataloader=None,
         generation_manager=None,
         metric_prefix: str = "val",
+        evaluation_mode: str = "val",
         max_samples: int | None = None,
         log_generations: int | None = None,
         validation_generations_logger: ValidationGenerationsLogger | None = None,
@@ -914,8 +959,18 @@ class RayPPOTrainer:
         do_sample: bool | None = None,
         generation_max_tokens: int | None = None,
     ):
+        if evaluation_mode not in {"val", "test"}:
+            raise ValueError(f"evaluation_mode must be 'val' or 'test', got {evaluation_mode!r}.")
+        dataloader = self.val_dataloader if dataloader is None else dataloader
         generation_manager = generation_manager or self.async_rollout_manager
-        repeat_times = repeat_times or self.config.actor_rollout_ref.rollout.val_kwargs.n
+        sampling_config = (
+            self.config.actor_rollout_ref.rollout.test_kwargs
+            if evaluation_mode == "test"
+            else self.config.actor_rollout_ref.rollout.val_kwargs
+        )
+        repeat_times = int(sampling_config.n) if repeat_times is None else int(repeat_times)
+        if repeat_times <= 0:
+            raise ValueError(f"Evaluation repeat_times must be positive, got {repeat_times}.")
         if generation_max_tokens is not None:
             generation_max_tokens = int(generation_max_tokens)
             if generation_max_tokens <= 0:
@@ -937,7 +992,7 @@ class RayPPOTrainer:
         sample_finish_reasons = []
         processed_samples = 0
 
-        for test_data in self.val_dataloader:
+        for test_data in dataloader:
             test_batch = DataProto.from_single_dict(test_data)
             if max_samples is not None:
                 remaining = max_samples - processed_samples
@@ -965,10 +1020,9 @@ class RayPPOTrainer:
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
                 "recompute_log_prob": False,
-                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample
-                if do_sample is None
-                else do_sample,
+                "do_sample": sampling_config.do_sample if do_sample is None else do_sample,
                 "validate": True,
+                "evaluation_mode": evaluation_mode,
                 "global_steps": self.global_steps,
             }
             if generation_max_tokens is not None:
@@ -1143,6 +1197,40 @@ class RayPPOTrainer:
             metric_dict[f"{metric_prefix}-aux/num_turns/mean"] = sample_turns.mean()
 
         return metric_dict
+
+    def _validate_test_benchmarks(self) -> dict[str, Any]:
+        """Run the configured benchmark datasets through the student validation path."""
+        if self.test_benchmark_dataloader is None:
+            raise RuntimeError(
+                "Test benchmark evaluation was requested, but the benchmark dataloader is not initialized."
+            )
+
+        generation_max_tokens = self.config.trainer.get("test_benchmarks_max_response_length", None)
+        if generation_max_tokens is None:
+            generation_max_tokens = int(self.config.actor_rollout_ref.rollout.response_length)
+        else:
+            generation_max_tokens = int(generation_max_tokens)
+        if generation_max_tokens > int(self.config.actor_rollout_ref.rollout.response_length):
+            raise ValueError(
+                "trainer.test_benchmarks_max_response_length cannot exceed "
+                "actor_rollout_ref.rollout.response_length; increase the rollout/model limits together. "
+                f"Got {generation_max_tokens} > {self.config.actor_rollout_ref.rollout.response_length}."
+            )
+
+        test_data_dir = self.config.trainer.get("test_data_dir", None)
+        metrics = self._validate(
+            dataloader=self.test_benchmark_dataloader,
+            metric_prefix="test",
+            evaluation_mode="test",
+            log_generations=int(self.config.trainer.get("log_test_generations", 0)),
+            validation_generations_logger=self.test_benchmark_generations_logger,
+            validation_data_dir=test_data_dir or "",
+            dump_filename_prefix="test_benchmarks",
+            include_format_metrics=True,
+            generation_max_tokens=generation_max_tokens,
+        )
+        assert metrics, f"{metrics=}"
+        return metrics
 
     def _make_teacher_validation_config(self):
         return copy.deepcopy(self.config)
@@ -2383,20 +2471,31 @@ class RayPPOTrainer:
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
+        # Perform validation and optional benchmark testing before training.
+        initial_metrics = {}
         if self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate(include_format_metrics=True)
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            initial_metrics = dict(val_metrics)
+            initial_metrics.update(val_metrics)
             teacher_val_metrics = self._validate_teacher_before_train()
             if teacher_val_metrics:
                 pprint(f"Initial teacher validation metrics: {teacher_val_metrics}")
                 initial_metrics.update(teacher_val_metrics)
+
+        if self.config.trainer.get("test_before_train", False):
+            test_benchmark_metrics = self._validate_test_benchmarks()
+            pprint(f"Initial test benchmark metrics: {test_benchmark_metrics}")
+            initial_metrics.update(test_benchmark_metrics)
+
+        if initial_metrics:
             logger.log(data=initial_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
+        if self.config.trainer.get("val_only", False):
+            if not initial_metrics:
+                raise ValueError(
+                    "trainer.val_only=True requires trainer.val_before_train or trainer.test_before_train."
+                )
+            return
 
         if self.config.actor_rollout_ref.rollout.skip.get("enable", False):
             rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
@@ -2408,6 +2507,7 @@ class RayPPOTrainer:
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
+        last_test_benchmark_metrics = None
         self.max_steps_duration = 0
 
         prev_step_profile = False
@@ -2760,6 +2860,14 @@ class RayPPOTrainer:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
+                test_benchmarks_freq = int(self.config.trainer.get("test_benchmarks_freq", -1))
+                if test_benchmarks_freq > 0 and (is_last_step or self.global_steps % test_benchmarks_freq == 0):
+                    with marked_timer("test_benchmarks", timing_raw, color="green"):
+                        test_benchmark_metrics = self._validate_test_benchmarks()
+                        if is_last_step:
+                            last_test_benchmark_metrics = test_benchmark_metrics
+                    metrics.update(test_benchmark_metrics)
+
                 if opd_diagnostics_task is not None:
                     with marked_timer("opd_diagnostics_join", timing_raw, color="green"):
                         metrics.update(
@@ -2831,6 +2939,7 @@ class RayPPOTrainer:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
+                    pprint(f"Final test benchmark metrics: {last_test_benchmark_metrics}")
                     progress_bar.close()
                     return
 
