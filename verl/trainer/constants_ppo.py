@@ -74,9 +74,9 @@ def get_ppo_ray_runtime_env():
     A filter function to return the PPO Ray runtime environment.
     To avoid repeat of some environment variables that are already set.
     """
-    working_dir = (
-        json.loads(os.environ.get(RAY_JOB_CONFIG_JSON_ENV_VAR, "{}")).get("runtime_env", {}).get("working_dir", None)
-    )
+    job_runtime_env = json.loads(os.environ.get(RAY_JOB_CONFIG_JSON_ENV_VAR, "{}")).get("runtime_env", {})
+    working_dir = job_runtime_env.get("working_dir")
+    job_env_vars = job_runtime_env.get("env_vars", {})
 
     runtime_env = {
         "env_vars": PPO_RAY_RUNTIME_ENV["env_vars"].copy(),
@@ -86,6 +86,6 @@ def get_ppo_ray_runtime_env():
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
     for key in WANDB_RAY_ENV_PASSTHROUGH:
-        if (value := os.environ.get(key)) is not None:
+        if key not in job_env_vars and (value := os.environ.get(key)) is not None:
             runtime_env["env_vars"][key] = value
     return runtime_env
