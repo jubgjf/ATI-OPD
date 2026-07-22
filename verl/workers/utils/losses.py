@@ -84,6 +84,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     # select fields and convert to padded tensor
     fields = ["response_mask", "old_log_probs", "advantages"]
+    batch_num_policy_tokens = tu.get(data, "batch_num_policy_tokens", None)
+    if "policy_loss_mask" in data:
+        fields.append("policy_loss_mask")
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
@@ -91,6 +94,38 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
+    policy_loss_mask = data.get("policy_loss_mask", None)
+    local_policy_tokens = None
+    if policy_loss_mask is not None:
+        policy_loss_mask = policy_loss_mask.to(bool)
+        if policy_loss_mask.shape != response_mask.shape:
+            raise ValueError(
+                "policy_loss_mask must be response-aligned, "
+                f"but got policy_loss_mask.shape={tuple(policy_loss_mask.shape)} and "
+                f"response_mask.shape={tuple(response_mask.shape)}."
+            )
+        if (policy_loss_mask & ~response_mask).any().item():
+            raise ValueError("policy_loss_mask must be a subset of response_mask.")
+        if batch_num_policy_tokens is None:
+            raise RuntimeError("batch_num_policy_tokens is required when policy_loss_mask is present.")
+        batch_num_policy_tokens = int(batch_num_policy_tokens)
+        if batch_num_policy_tokens < 0:
+            raise ValueError(f"batch_num_policy_tokens must be non-negative, got {batch_num_policy_tokens}.")
+        local_policy_tokens = int(policy_loss_mask.sum().item())
+        if batch_num_policy_tokens < local_policy_tokens:
+            raise ValueError(
+                "batch_num_policy_tokens cannot be smaller than this rank's active policy-token count, "
+                f"got global={batch_num_policy_tokens} and local={local_policy_tokens}."
+            )
+        full_batch_num_tokens = config.global_batch_info["batch_num_tokens"]
+        if full_batch_num_tokens is not None and batch_num_policy_tokens > full_batch_num_tokens:
+            raise ValueError(
+                "batch_num_policy_tokens cannot exceed the full response-token count, "
+                f"got policy={batch_num_policy_tokens} and response={full_batch_num_tokens}."
+            )
+    else:
+        policy_loss_mask = response_mask
+
     # compute policy loss
     old_log_prob = data["old_log_probs"]
     advantages = data["advantages"]
@@ -101,15 +136,29 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
-    pg_loss, pg_metrics = policy_loss_fn(
-        old_log_prob=old_log_prob,
-        log_prob=log_prob,
-        advantages=advantages,
-        response_mask=response_mask,
-        loss_agg_mode=loss_agg_mode,
-        config=config,
-        rollout_is_weights=rollout_is_weights,
-    )
+    full_batch_num_tokens = config.global_batch_info["batch_num_tokens"]
+    if batch_num_policy_tokens == 0 or (batch_num_policy_tokens is not None and local_policy_tokens == 0):
+        pg_loss = log_prob.sum() * 0.0
+        pg_metrics = {
+            "actor/pg_clipfrac": 0.0,
+            "actor/ppo_kl": 0.0,
+            "actor/pg_clipfrac_lower": 0.0,
+        }
+    else:
+        if batch_num_policy_tokens is not None:
+            config.global_batch_info["batch_num_tokens"] = batch_num_policy_tokens
+        try:
+            pg_loss, pg_metrics = policy_loss_fn(
+                old_log_prob=old_log_prob,
+                log_prob=log_prob,
+                advantages=advantages,
+                response_mask=policy_loss_mask,
+                loss_agg_mode=loss_agg_mode,
+                config=config,
+                rollout_is_weights=rollout_is_weights,
+            )
+        finally:
+            config.global_batch_info["batch_num_tokens"] = full_batch_num_tokens
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
     # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower

@@ -37,7 +37,13 @@ from verl.trainer.distillation import (
 )
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_name, get_torch_device, is_npu_available, set_expandable_segments
+from verl.utils.device import (
+    get_device_id,
+    get_device_name,
+    get_torch_device,
+    is_npu_available,
+    set_expandable_segments,
+)
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
@@ -60,6 +66,22 @@ from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _global_policy_token_count(
+    policy_loss_mask: torch.Tensor,
+    *,
+    dp_size: int,
+    dp_group,
+    device=None,
+) -> int:
+    """Count active policy tokens for one PPO mini-batch across data-parallel ranks."""
+    count = policy_loss_mask.sum()
+    if device is not None:
+        count = count.to(device)
+    if dp_size > 1:
+        torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+    return int(count.item())
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -287,6 +309,15 @@ class TrainingWorker(Worker, DistProfilerExtension):
             total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
+                if "policy_loss_mask" in mini_batch_td:
+                    batch_num_policy_tokens = _global_policy_token_count(
+                        mini_batch_td["policy_loss_mask"],
+                        dp_size=self.engine.get_data_parallel_size(),
+                        dp_group=self.engine.get_data_parallel_group(),
+                        device=get_device_id(),
+                    )
+                    tu.assign_non_tensor(mini_batch_td, batch_num_policy_tokens=batch_num_policy_tokens)
+
                 # add global token num
                 if "input_ids" in mini_batch_td:
                     global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)

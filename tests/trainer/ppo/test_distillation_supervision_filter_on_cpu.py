@@ -113,3 +113,70 @@ def test_update_actor_keeps_teacher_supervision_before_padding(monkeypatch):
     assert "teacher_logprobs" in captured_keys
     assert "teacher_ids" in captured_keys
     assert "teacher_segment_mask" in captured_keys
+
+
+def _make_actor_update_trainer(*, horizon_mode="fixed", intervention_enabled=False):
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.distillation_config = SimpleNamespace(
+        enabled=True,
+        use_actor_loss=False,
+        intervention=SimpleNamespace(enabled=intervention_enabled),
+        distillation_loss=SimpleNamespace(horizon=SimpleNamespace(mode=horizon_mode)),
+    )
+    trainer.config = SimpleNamespace(
+        algorithm=SimpleNamespace(adv_estimator="token_reward_direct"),
+        actor_rollout_ref=SimpleNamespace(
+            actor=SimpleNamespace(policy_loss={"loss_mode": "vanilla"}, loss_agg_mode="token-mean"),
+            rollout=SimpleNamespace(multi_turn=SimpleNamespace(enable=False), temperature=1.0),
+        ),
+    )
+    return trainer
+
+
+@pytest.mark.parametrize("horizon_mode", ["fixed", "progressive"])
+def test_update_actor_copies_horizon_mask_to_actor_local_policy_mask_on_cpu(monkeypatch, horizon_mode):
+    captured_policy_mask = None
+
+    def fake_left_right_2_no_padding(batch_td):
+        nonlocal captured_policy_mask
+        captured_policy_mask = batch_td["policy_loss_mask"].clone()
+        raise StopBeforeWorker
+
+    monkeypatch.setattr(ray_trainer_module, "left_right_2_no_padding", fake_left_right_2_no_padding)
+
+    batch = _make_distillation_batch()
+    horizon_mask = torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.int64)
+    batch.batch["distillation_loss_mask"] = horizon_mask
+
+    with pytest.raises(StopBeforeWorker):
+        _make_actor_update_trainer(horizon_mode=horizon_mode)._update_actor(batch)
+
+    assert torch.equal(captured_policy_mask, horizon_mask)
+    assert "policy_loss_mask" not in batch.batch
+
+
+@pytest.mark.parametrize(
+    ("horizon_mode", "intervention_enabled"),
+    [("full", False), ("fixed", True), ("progressive", True)],
+)
+def test_update_actor_does_not_add_policy_mask_outside_topd_popd_on_cpu(
+    monkeypatch, horizon_mode, intervention_enabled
+):
+    captured_keys = None
+
+    def fake_left_right_2_no_padding(batch_td):
+        nonlocal captured_keys
+        captured_keys = set(batch_td.keys())
+        raise StopBeforeWorker
+
+    monkeypatch.setattr(ray_trainer_module, "left_right_2_no_padding", fake_left_right_2_no_padding)
+
+    batch = _make_distillation_batch()
+    batch.batch["distillation_loss_mask"] = torch.ones(2, 3, dtype=torch.int64)
+
+    with pytest.raises(StopBeforeWorker):
+        _make_actor_update_trainer(horizon_mode=horizon_mode, intervention_enabled=intervention_enabled)._update_actor(
+            batch
+        )
+
+    assert "policy_loss_mask" not in captured_keys

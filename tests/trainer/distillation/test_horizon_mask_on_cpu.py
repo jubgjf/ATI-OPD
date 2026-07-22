@@ -14,12 +14,14 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from tensordict import TensorDict
 
 from verl import DataProto
 from verl.trainer.distillation import losses as distillation_losses_module
 from verl.trainer.ppo.ray_trainer import (
+    RayPPOTrainer,
     apply_distillation_horizon_mask,
     build_distillation_prefix_mask,
     compute_distillation_horizon_tokens,
@@ -166,3 +168,51 @@ def test_empty_distillation_loss_mask_returns_zero_loss_on_cpu(monkeypatch):
 
     assert loss.item() == 0.0
     assert metrics["distillation/mask_empty"].aggregate() == 1.0
+
+
+def _make_horizon_policy_trainer(
+    *,
+    horizon_mode="fixed",
+    adv_estimator="token_reward_direct",
+    intervention_enabled=False,
+    use_actor_loss=False,
+    policy_loss_mode="vanilla",
+    loss_agg_mode="token-mean",
+):
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.distillation_config = SimpleNamespace(
+        enabled=True,
+        use_actor_loss=use_actor_loss,
+        intervention=SimpleNamespace(enabled=intervention_enabled),
+        distillation_loss=SimpleNamespace(horizon=SimpleNamespace(mode=horizon_mode)),
+    )
+    trainer.config = SimpleNamespace(
+        algorithm=SimpleNamespace(adv_estimator=adv_estimator),
+        actor_rollout_ref=SimpleNamespace(
+            actor=SimpleNamespace(
+                policy_loss={"loss_mode": policy_loss_mode},
+                loss_agg_mode=loss_agg_mode,
+            )
+        ),
+    )
+    return trainer
+
+
+def test_horizon_policy_loss_normalization_gate_accepts_topd_and_popd_on_cpu():
+    assert _make_horizon_policy_trainer(horizon_mode="fixed")._uses_horizon_policy_loss_normalization()
+    assert _make_horizon_policy_trainer(horizon_mode="progressive")._uses_horizon_policy_loss_normalization()
+
+
+def test_horizon_policy_loss_normalization_gate_isolates_other_paths_on_cpu():
+    assert not _make_horizon_policy_trainer(horizon_mode="full")._uses_horizon_policy_loss_normalization()
+    assert not _make_horizon_policy_trainer(intervention_enabled=True)._uses_horizon_policy_loss_normalization()
+    assert not _make_horizon_policy_trainer(adv_estimator="grpo")._uses_horizon_policy_loss_normalization()
+
+
+def test_horizon_policy_loss_normalization_gate_rejects_unsupported_actor_loss_on_cpu():
+    with pytest.raises(NotImplementedError, match="loss_mode='vanilla'"):
+        _make_horizon_policy_trainer(policy_loss_mode="dppo_tv")._uses_horizon_policy_loss_normalization()
+    with pytest.raises(NotImplementedError, match="loss_agg_mode='token-mean'"):
+        _make_horizon_policy_trainer(loss_agg_mode="seq-mean-token-mean")._uses_horizon_policy_loss_normalization()
+    with pytest.raises(ValueError, match="use_actor_loss=False"):
+        _make_horizon_policy_trainer(use_actor_loss=True)._uses_horizon_policy_loss_normalization()

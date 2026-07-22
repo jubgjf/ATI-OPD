@@ -1866,6 +1866,15 @@ class RayPPOTrainer:
         batch.meta_info["temperature"] = rollout_config.temperature
         # update actor
         batch_td = batch.to_tensordict()
+        if self._uses_horizon_policy_loss_normalization():
+            if "distillation_loss_mask" not in batch_td:
+                raise RuntimeError(
+                    "TOPD/POPD policy-loss normalization requires distillation_loss_mask to be attached "
+                    "before the actor update."
+                )
+            # Keep the horizon mask actor-local. response_mask remains the full rollout mask for
+            # old/reference log-probabilities, entropy, KL, rewards, and diagnostics.
+            batch_td["policy_loss_mask"] = batch_td["distillation_loss_mask"].clone()
         # step 2: convert from padding to no-padding
         batch_td = left_right_2_no_padding(batch_td)
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
@@ -1920,6 +1929,47 @@ class RayPPOTrainer:
         adv_estimator = self.config.algorithm.adv_estimator
         adv_estimator = getattr(adv_estimator, "value", adv_estimator)
         return str(adv_estimator) == "token_reward_direct"
+
+    def _uses_horizon_policy_loss_normalization(self) -> bool:
+        """Return whether this actor update is the supported TOPD/POPD policy-loss path."""
+        distillation_config = getattr(self, "distillation_config", None)
+        if not is_distillation_enabled(distillation_config):
+            return False
+
+        intervention_config = getattr(distillation_config, "intervention", None)
+        if intervention_config is not None and bool(getattr(intervention_config, "enabled", False)):
+            return False
+
+        loss_config = distillation_config.distillation_loss
+        horizon_mode = str(_get_horizon_config_value(loss_config.horizon, "mode", "full")).lower()
+        if horizon_mode not in {"fixed", "progressive"}:
+            return False
+
+        adv_estimator = self.config.algorithm.adv_estimator
+        adv_estimator = getattr(adv_estimator, "value", adv_estimator)
+        if str(adv_estimator) != "token_reward_direct":
+            return False
+
+        if getattr(distillation_config, "use_actor_loss", True):
+            raise ValueError(
+                "TOPD/POPD policy-loss normalization requires distillation.use_actor_loss=False when "
+                "ADV_ESTIMATOR=token_reward_direct."
+            )
+
+        actor_config = self.config.actor_rollout_ref.actor
+        policy_loss_config = actor_config.policy_loss
+        policy_loss_mode = policy_loss_config.get("loss_mode", "vanilla")
+        if policy_loss_mode != "vanilla":
+            raise NotImplementedError(
+                "TOPD/POPD policy-loss normalization currently supports only "
+                f"actor.policy_loss.loss_mode='vanilla', got {policy_loss_mode!r}."
+            )
+        if actor_config.loss_agg_mode != "token-mean":
+            raise NotImplementedError(
+                "TOPD/POPD policy-loss normalization currently supports only "
+                f"actor.loss_agg_mode='token-mean', got {actor_config.loss_agg_mode!r}."
+            )
+        return True
 
     def _token_reward_direct_topk(self) -> int:
         if not self._uses_token_reward_direct():
@@ -2043,7 +2093,6 @@ class RayPPOTrainer:
             return {}
 
         import matplotlib.pyplot as plt
-
         import wandb
 
         metrics: dict[str, Any] = {}
