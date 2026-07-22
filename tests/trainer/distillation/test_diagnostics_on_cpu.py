@@ -829,6 +829,8 @@ def test_compute_intervention_metrics_on_cpu():
                 "rewrite_exact_position_overlap": 0.5,
                 "rewrite_lcs_ratio": 0.75,
                 "rewrite_length_ratio": 1.0,
+                "teacher_rejection_persistence_score": 1.25,
+                "teacher_rejection_persistence_tokens": 64,
             },
             {
                 "start": 16,
@@ -867,6 +869,9 @@ def test_compute_intervention_metrics_on_cpu():
     assert metrics["opd_intervention/rewrite_exact_position_overlap_mean"] == pytest.approx(0.25)
     assert metrics["opd_intervention/rewrite_lcs_ratio_mean"] == pytest.approx((0.75 + 2 / 3) / 2)
     assert metrics["opd_intervention/rewrite_length_ratio_mean"] == pytest.approx((1.0 + 2 / 3) / 2)
+    assert metrics["opd_intervention/persistence/score_mean"] == pytest.approx(1.25)
+    assert metrics["opd_intervention/persistence/score_min"] == pytest.approx(1.25)
+    assert metrics["opd_intervention/persistence/valid_tokens_mean"] == pytest.approx(64.0)
 
 
 def test_compute_intervention_metrics_counts_zero_trainable_samples_on_cpu():

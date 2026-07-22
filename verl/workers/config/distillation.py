@@ -190,6 +190,10 @@ class DistillationInterventionConfig(BaseConfig):
     teacher_rejection_token_cap: float = 10.0
     gap_aggregation: str = "mean"
     gap_threshold: float = 1.0
+    teacher_rejection_persistence_enabled: bool = False
+    teacher_rejection_persistence_window_tokens: int = 64
+    teacher_rejection_persistence_threshold: Optional[float] = None
+    teacher_rejection_persistence_min_valid_tokens: int = 32
     max_interventions_per_sample: int = 4
     train_on_teacher_segments: bool = False
     teacher_segment_loss_mode: str = "opd"
@@ -256,6 +260,25 @@ class DistillationInterventionConfig(BaseConfig):
             )
         if not math.isfinite(self.gap_threshold):
             raise ValueError(f"gap_threshold must be finite, got {self.gap_threshold!r}.")
+        if self.teacher_rejection_persistence_window_tokens <= 0:
+            raise ValueError("teacher_rejection_persistence_window_tokens must be positive.")
+        if self.teacher_rejection_persistence_min_valid_tokens <= 0:
+            raise ValueError("teacher_rejection_persistence_min_valid_tokens must be positive.")
+        if self.teacher_rejection_persistence_min_valid_tokens > self.teacher_rejection_persistence_window_tokens:
+            raise ValueError(
+                "teacher_rejection_persistence_min_valid_tokens must not exceed "
+                "teacher_rejection_persistence_window_tokens."
+            )
+        if self.teacher_rejection_persistence_threshold is not None and (
+            not math.isfinite(self.teacher_rejection_persistence_threshold)
+            or self.teacher_rejection_persistence_threshold < 0
+        ):
+            raise ValueError("teacher_rejection_persistence_threshold must be finite and non-negative when set.")
+        if self.teacher_rejection_persistence_enabled and gap_metric != "teacher_rejection":
+            raise ValueError(
+                "teacher_rejection_persistence_enabled=true requires gap_metric='teacher_rejection', "
+                f"got {self.gap_metric!r}."
+            )
         if not math.isfinite(self.teacher_temperature) or self.teacher_temperature < 0:
             raise ValueError(f"teacher_temperature must be finite and non-negative, got {self.teacher_temperature!r}.")
         if not math.isfinite(self.teacher_top_p) or not 0 < self.teacher_top_p <= 1:

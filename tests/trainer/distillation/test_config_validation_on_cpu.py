@@ -27,6 +27,10 @@ def test_teacher_segment_loss_config_defaults_to_legacy_opd_on_cpu():
     assert config.gap_metric == "k3"
     assert config.gap_threshold == 1.0
     assert config.teacher_rejection_token_cap == 10.0
+    assert config.teacher_rejection_persistence_enabled is False
+    assert config.teacher_rejection_persistence_window_tokens == 64
+    assert config.teacher_rejection_persistence_threshold is None
+    assert config.teacher_rejection_persistence_min_valid_tokens == 32
 
 
 def test_teacher_segment_loss_config_validates_mode_and_coefficient_on_cpu():
@@ -48,6 +52,37 @@ def test_teacher_rejection_intervention_config_validates_token_cap_on_cpu():
                 gap_metric="teacher_rejection",
                 teacher_rejection_token_cap=invalid_cap,
             )
+
+
+def test_teacher_rejection_persistence_config_validates_on_cpu():
+    config = DistillationInterventionConfig(
+        gap_metric="teacher_rejection",
+        teacher_rejection_persistence_enabled=True,
+        teacher_rejection_persistence_window_tokens=32,
+        teacher_rejection_persistence_threshold=0.5,
+        teacher_rejection_persistence_min_valid_tokens=16,
+    )
+    assert config.teacher_rejection_persistence_enabled is True
+
+    with pytest.raises(ValueError, match="requires gap_metric='teacher_rejection'"):
+        DistillationInterventionConfig(teacher_rejection_persistence_enabled=True)
+
+    for field, value in (
+        ("teacher_rejection_persistence_window_tokens", 0),
+        ("teacher_rejection_persistence_min_valid_tokens", 0),
+        ("teacher_rejection_persistence_threshold", -0.1),
+        ("teacher_rejection_persistence_threshold", float("inf")),
+        ("teacher_rejection_persistence_threshold", float("nan")),
+    ):
+        with pytest.raises(ValueError, match=field):
+            DistillationInterventionConfig(gap_metric="teacher_rejection", **{field: value})
+
+    with pytest.raises(ValueError, match="must not exceed"):
+        DistillationInterventionConfig(
+            gap_metric="teacher_rejection",
+            teacher_rejection_persistence_window_tokens=16,
+            teacher_rejection_persistence_min_valid_tokens=17,
+        )
 
 
 def test_distillation_intervention_rejects_train_teacher_segments_with_bypass_mode_on_cpu():

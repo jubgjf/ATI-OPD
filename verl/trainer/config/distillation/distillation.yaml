@@ -96,6 +96,14 @@ intervention:
   teacher_rejection_token_cap: 10.0
   gap_aggregation: mean
   gap_threshold: 1.0
+  # Optional second-stage confirmation for gap_metric=teacher_rejection. The
+  # local trigger remains unchanged; when enabled, the capped mean rejection
+  # over the following window must also cross the persistence threshold.
+  teacher_rejection_persistence_enabled: false
+  teacher_rejection_persistence_window_tokens: 64
+  # null reuses gap_threshold.
+  teacher_rejection_persistence_threshold: null
+  teacher_rejection_persistence_min_valid_tokens: 32
   max_interventions_per_sample: 4
   train_on_teacher_segments: false
   # Training objective for teacher-inserted tokens when train_on_teacher_segments=true.

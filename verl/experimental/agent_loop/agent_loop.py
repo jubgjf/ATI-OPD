@@ -760,7 +760,7 @@ def _select_intervention_segment(
     response_mask: list[int],
     intervention_config: DistillationInterventionConfig,
 ) -> Optional[tuple[int, int, float]]:
-    """Return the first fixed-token segment whose aggregate gap crosses the threshold."""
+    """Return the first fixed-token segment that passes local and optional persistence gates."""
     segment_len = intervention_config.student_segment_length
     if segment_len <= 0:
         raise ValueError(f"student_segment_length must be positive, got {segment_len}.")
@@ -785,8 +785,19 @@ def _select_intervention_segment(
         )
         if score is None:
             continue
-        if score > intervention_config.gap_threshold:
-            return start, end, score
+        if score <= intervention_config.gap_threshold:
+            continue
+        if bool(getattr(intervention_config, "teacher_rejection_persistence_enabled", False)):
+            persistence_score, _ = _compute_teacher_rejection_persistence(
+                gaps=gaps,
+                response_mask=response_mask,
+                candidate_end=end,
+                intervention_config=intervention_config,
+            )
+            persistence_threshold = _teacher_rejection_persistence_threshold(intervention_config)
+            if persistence_score is None or persistence_score <= persistence_threshold:
+                continue
+        return start, end, score
     return None
 
 
@@ -815,6 +826,35 @@ def _aggregate_intervention_span(
     values = scores[start:end][span_mask]
     score = values.max() if aggregation == "max" else values.mean()
     return float(score.item()), valid_count
+
+
+def _teacher_rejection_persistence_threshold(intervention_config: DistillationInterventionConfig) -> float:
+    threshold = intervention_config.teacher_rejection_persistence_threshold
+    return float(intervention_config.gap_threshold if threshold is None else threshold)
+
+
+def _compute_teacher_rejection_persistence(
+    *,
+    gaps: torch.Tensor,
+    response_mask: list[int],
+    candidate_end: int,
+    intervention_config: DistillationInterventionConfig,
+) -> tuple[Optional[float], int]:
+    """Aggregate realized future teacher rejection after a local candidate segment."""
+    future_end = min(
+        candidate_end + intervention_config.teacher_rejection_persistence_window_tokens,
+        gaps.numel(),
+    )
+    score, valid_tokens = _aggregate_intervention_span(
+        scores=gaps,
+        response_mask=response_mask,
+        start=candidate_end,
+        end=future_end,
+        aggregation="mean",
+    )
+    if valid_tokens < intervention_config.teacher_rejection_persistence_min_valid_tokens:
+        return None, valid_tokens
+    return score, valid_tokens
 
 
 def _initialize_local_effect_metadata(
@@ -2265,6 +2305,28 @@ class AgentLoopWorker:
                 break
 
             start, end, score = bad_segment
+            persistence_metadata: dict[str, Any] = {}
+            if bool(getattr(intervention_config, "teacher_rejection_persistence_enabled", False)):
+                persistence_score, persistence_tokens = _compute_teacher_rejection_persistence(
+                    gaps=gaps,
+                    response_mask=gap_mask,
+                    candidate_end=end,
+                    intervention_config=intervention_config,
+                )
+                if persistence_score is None:
+                    raise RuntimeError(
+                        "Teacher intervention selected a segment without enough valid persistence tokens."
+                    )
+                persistence_metadata = {
+                    "teacher_rejection_persistence_score": persistence_score,
+                    "teacher_rejection_persistence_tokens": persistence_tokens,
+                    "teacher_rejection_persistence_window_tokens": (
+                        intervention_config.teacher_rejection_persistence_window_tokens
+                    ),
+                    "teacher_rejection_persistence_threshold": _teacher_rejection_persistence_threshold(
+                        intervention_config
+                    ),
+                }
             start, end = AgentLoopWorker._expand_teacher_intervention_segment_for_token_patterns(
                 self,
                 response_ids,
@@ -2488,6 +2550,7 @@ class AgentLoopWorker:
                 "student_suffix_stop_reason": student_suffix_result.stop_reason,
                 "student_suffix_finish_reason": student_suffix_result.finish_reason,
                 "terminated": candidate_terminal,
+                **persistence_metadata,
                 **rewrite_overlap_metrics,
                 **local_effect_metadata,
             }

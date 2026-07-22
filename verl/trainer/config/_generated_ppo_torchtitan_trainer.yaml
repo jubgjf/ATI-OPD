@@ -811,6 +811,10 @@ distillation:
     teacher_rejection_token_cap: 10.0
     gap_aggregation: mean
     gap_threshold: 1.0
+    teacher_rejection_persistence_enabled: false
+    teacher_rejection_persistence_window_tokens: 64
+    teacher_rejection_persistence_threshold: null
+    teacher_rejection_persistence_min_valid_tokens: 32
     max_interventions_per_sample: 4
     train_on_teacher_segments: false
     teacher_segment_loss_mode: opd

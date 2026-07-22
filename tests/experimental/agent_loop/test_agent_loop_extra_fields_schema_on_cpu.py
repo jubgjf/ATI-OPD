@@ -1281,6 +1281,74 @@ def test_teacher_intervention_teacher_rejection_respects_aggregation_and_strict_
     assert _select_intervention_segment(gaps, [1, 1], max_config) == (0, 2, pytest.approx(3.0))
 
 
+def test_teacher_rejection_without_persistence_keeps_legacy_local_trigger_on_cpu():
+    config = DistillationInterventionConfig(
+        enabled=True,
+        student_segment_length=2,
+        gap_metric="teacher_rejection",
+        gap_threshold=1.0,
+        teacher_rejection_persistence_enabled=False,
+    )
+
+    assert _select_intervention_segment(torch.tensor([2.0, 2.0]), [1, 1], config) == (
+        0,
+        2,
+        pytest.approx(2.0),
+    )
+
+
+def test_persistent_teacher_rejection_skips_transient_alert_and_finds_later_drift_on_cpu():
+    config = DistillationInterventionConfig(
+        enabled=True,
+        student_segment_length=2,
+        gap_metric="teacher_rejection",
+        gap_threshold=1.0,
+        teacher_rejection_persistence_enabled=True,
+        teacher_rejection_persistence_window_tokens=2,
+        teacher_rejection_persistence_threshold=1.0,
+        teacher_rejection_persistence_min_valid_tokens=2,
+    )
+    gaps = torch.tensor([2.0, 2.0, 0.0, 0.0, 3.0, 3.0, 2.0, 2.0])
+
+    assert _select_intervention_segment(gaps, [1] * 8, config) == (4, 6, pytest.approx(3.0))
+
+
+def test_persistent_teacher_rejection_requires_strict_future_threshold_on_cpu():
+    config = DistillationInterventionConfig(
+        enabled=True,
+        student_segment_length=2,
+        gap_metric="teacher_rejection",
+        gap_threshold=1.0,
+        teacher_rejection_persistence_enabled=True,
+        teacher_rejection_persistence_window_tokens=2,
+        teacher_rejection_persistence_threshold=None,
+        teacher_rejection_persistence_min_valid_tokens=2,
+    )
+
+    assert _select_intervention_segment(torch.tensor([2.0, 2.0, 1.0, 1.0]), [1] * 4, config) is None
+    assert _select_intervention_segment(torch.tensor([2.0, 2.0, 1.1, 1.1]), [1] * 4, config) == (
+        0,
+        2,
+        pytest.approx(2.0),
+    )
+
+
+def test_persistent_teacher_rejection_requires_minimum_valid_future_tokens_on_cpu():
+    config = DistillationInterventionConfig(
+        enabled=True,
+        student_segment_length=2,
+        gap_metric="teacher_rejection",
+        gap_threshold=1.0,
+        teacher_rejection_persistence_enabled=True,
+        teacher_rejection_persistence_window_tokens=2,
+        teacher_rejection_persistence_threshold=1.0,
+        teacher_rejection_persistence_min_valid_tokens=2,
+    )
+    gaps = torch.tensor([2.0, 2.0, 3.0, 3.0])
+
+    assert _select_intervention_segment(gaps, [1, 1, 1, 0], config) is None
+
+
 @pytest.mark.asyncio
 async def test_teacher_rejection_records_boundary_aligned_on_policy_local_effect_on_cpu():
     class _ImprovingTeacherManager(_FixedGapTeacherManager):

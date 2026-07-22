@@ -2436,6 +2436,8 @@ def compute_intervention_metrics(
     first_positions = []
     first_position_fracs = []
     scores = []
+    persistence_scores = []
+    persistence_tokens = []
     rewrite_exact_position_overlaps = []
     rewrite_lcs_ratios = []
     rewrite_length_ratios = []
@@ -2455,6 +2457,10 @@ def compute_intervention_metrics(
             score = item.get("score")
             if score is not None:
                 scores.append(float(score))
+            persistence_score = item.get("teacher_rejection_persistence_score")
+            if persistence_score is not None:
+                persistence_scores.append(float(persistence_score))
+                persistence_tokens.append(float(item.get("teacher_rejection_persistence_tokens", 0) or 0))
             if {
                 "rewrite_exact_position_overlap",
                 "rewrite_lcs_ratio",
@@ -2504,6 +2510,10 @@ def compute_intervention_metrics(
     if scores:
         metrics["opd_intervention/gap_score_mean"] = float(np.mean(scores))
         metrics["opd_intervention/gap_score_max"] = float(np.max(scores))
+    if persistence_scores:
+        metrics["opd_intervention/persistence/score_mean"] = float(np.mean(persistence_scores))
+        metrics["opd_intervention/persistence/score_min"] = float(np.min(persistence_scores))
+        metrics["opd_intervention/persistence/valid_tokens_mean"] = float(np.mean(persistence_tokens))
     if rewrite_exact_position_overlaps:
         metrics["opd_intervention/rewrite_exact_position_overlap_mean"] = float(
             np.mean(rewrite_exact_position_overlaps)
