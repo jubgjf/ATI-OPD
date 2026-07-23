@@ -42,20 +42,31 @@ import time
 import zlib
 from array import array
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
 from transformers import AutoTokenizer
 
-from verl.utils.evaluation.math_benchmark import build_math_chat_messages, load_benchmark_samples, score_completion
+from verl.utils.evaluation.math_benchmark import (
+    build_math_chat_messages,
+    find_benchmark_data_files,
+    load_benchmark_samples,
+    score_completion,
+)
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
 
 SCHEMA_VERSION = 2
 GENERATION_SCHEMA_VERSION = 2
-DEFAULT_BENCHMARKS = ["math-ai/aime24", "math-ai/aime25", "math-ai/amc23"]
+DEFAULT_BENCHMARKS = [
+    "math-ai/aime24",
+    "math-ai/aime25",
+    "math-ai/amc23",
+    "meituan-longcat/AMO-Bench",
+]
 DEFAULT_LENGTH_BIN_EDGES = [0, 1024, 2048, 4096, 8192, 12000, 16000, 20000, 23000]
 DEFAULT_BOOTSTRAP_METRICS = [
     "acc",
@@ -115,6 +126,9 @@ class Problem:
     problem: str
     ground_truth: str
     prompt_token_ids: list[int]
+    question_id: int | str | None = None
+    answer_type: str | None = None
+    grader: str | None = None
 
 
 @dataclass(frozen=True)
@@ -131,6 +145,9 @@ class RolloutTask:
     prompt_token_ids: list[int]
     rollout_index: int
     seed: int | None
+    question_id: int | str | None = None
+    answer_type: str | None = None
+    grader: str | None = None
 
 
 def json_default(value: Any) -> Any:
@@ -355,14 +372,9 @@ def _file_descriptor(path: Path, *, content_hash: bool) -> dict[str, Any]:
 
 
 def _dataset_files(dataset_root: str | Path, raw_benchmark_path: str) -> list[Path]:
-    directory = Path(dataset_root).expanduser().resolve() / normalize_benchmark_path(raw_benchmark_path)
-    jsonl_path = directory / "test.jsonl"
-    if jsonl_path.is_file():
-        return [jsonl_path]
-    parquet_files = sorted(directory.glob("test*.parquet")) or sorted(directory.glob("*.parquet"))
-    if not parquet_files:
-        raise FileNotFoundError(f"No local jsonl/parquet benchmark files found under {directory}")
-    return parquet_files
+    return [
+        path.resolve() for path in find_benchmark_data_files(dataset_root, normalize_benchmark_path(raw_benchmark_path))
+    ]
 
 
 def _tokenizer_files(model_dir: str | Path) -> list[Path]:
@@ -534,6 +546,10 @@ def apply_chat_template(tokenizer: Any, messages: list[dict[str, str]], enable_t
     except TypeError:
         kwargs.pop("enable_thinking", None)
         token_ids = tokenizer.apply_chat_template(messages, **kwargs)
+    if isinstance(token_ids, Mapping):
+        if "input_ids" not in token_ids:
+            raise ValueError(f"Chat template returned a mapping without input_ids: {sorted(token_ids)}")
+        token_ids = token_ids["input_ids"]
     if hasattr(token_ids, "tolist"):
         token_ids = token_ids.tolist()
     if token_ids and isinstance(token_ids[0], list):
@@ -563,7 +579,11 @@ def prepare_tasks(args: argparse.Namespace, tokenizer: Any) -> tuple[list[Proble
     tasks: list[RolloutTask] = []
     dataset_records: list[dict[str, Any]] = []
     for question_index, sample in enumerate(samples):
-        messages = build_math_chat_messages(sample.problem, idx=question_index)
+        messages = build_math_chat_messages(
+            sample.problem,
+            idx=question_index,
+            use_raw_prompt=bool(getattr(sample, "use_raw_prompt", False)),
+        )
         prompt_token_ids = apply_chat_template(tokenizer, messages, args.enable_thinking)
         if len(prompt_token_ids) > args.max_prompt_tokens:
             raise ValueError(
@@ -579,6 +599,9 @@ def prepare_tasks(args: argparse.Namespace, tokenizer: Any) -> tuple[list[Proble
             problem=str(sample.problem),
             ground_truth=str(sample.ground_truth),
             prompt_token_ids=prompt_token_ids,
+            question_id=getattr(sample, "question_id", None),
+            answer_type=getattr(sample, "answer_type", None),
+            grader=getattr(sample, "grader", None),
         )
         problems.append(problem)
         dataset_records.append(
@@ -586,6 +609,9 @@ def prepare_tasks(args: argparse.Namespace, tokenizer: Any) -> tuple[list[Proble
                 "sample_id": problem.sample_id,
                 "problem": problem.problem,
                 "ground_truth": problem.ground_truth,
+                "question_id": problem.question_id,
+                "answer_type": problem.answer_type,
+                "grader": problem.grader,
             }
         )
         for rollout_index in range(args.rollout_n):
@@ -611,6 +637,9 @@ def prepare_tasks(args: argparse.Namespace, tokenizer: Any) -> tuple[list[Proble
                     prompt_token_ids=prompt_token_ids,
                     rollout_index=rollout_index,
                     seed=seed,
+                    question_id=problem.question_id,
+                    answer_type=problem.answer_type,
+                    grader=problem.grader,
                 )
             )
     return problems, tasks, payload_fingerprint(dataset_records)
@@ -962,12 +991,22 @@ async def evaluate_one(
         "benchmark_path": task.benchmark_path,
         "question_index": task.question_index,
         "sample_id": task.sample_id,
+        "question_id": task.question_id,
+        "answer_type": task.answer_type,
+        "grader": task.grader,
         "rollout_index": task.rollout_index,
         "seed": task.seed,
         "problem": task.problem,
         "ground_truth": task.ground_truth,
         "problem_fingerprint": payload_fingerprint(
-            {"sample_id": task.sample_id, "problem": task.problem, "ground_truth": task.ground_truth}
+            {
+                "sample_id": task.sample_id,
+                "problem": task.problem,
+                "ground_truth": task.ground_truth,
+                "question_id": task.question_id,
+                "answer_type": task.answer_type,
+                "grader": task.grader,
+            }
         ),
         "prompt_token_ids": task.prompt_token_ids,
     }
@@ -1017,6 +1056,13 @@ async def evaluate_one(
             finish_reason=finish_reason,
             response_token_count=response_tokens,
             verifier=args.verifier,
+            extra_info={
+                "benchmark": task.benchmark_name,
+                "benchmark_path": task.benchmark_path,
+                "question_id": task.question_id,
+                "answer_type": task.answer_type,
+                "grader": task.grader,
+            },
         )
         eos_success = finish_reason in {"stop", "eos"}
         repetition = text_repetition_metrics(
@@ -1059,6 +1105,7 @@ async def evaluate_one(
             "has_boxed_pattern": bool(scored.has_boxed_pattern),
             "accepted_answer_format": bool(scored.has_accepted_answer_format),
             "verified_by": str(scored.verified_by),
+            "math_verify_score": scored.math_verify_score,
             "repetition": repetition,
             "generation_return_token_ids_fallback": request_fallback,
             "student_scoring_return_token_ids_fallback": scoring_fallback,
@@ -2694,7 +2741,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--base-seed", type=int, default=42)
     generate.add_argument("--print-every", type=int, default=50)
     generate.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True)
-    generate.add_argument("--verifier", choices=["math_dapo", "math_verify", "hybrid"], default="math_dapo")
+    generate.add_argument("--verifier", choices=["math_dapo", "math_verify", "hybrid"], default="math_verify")
     add_analysis_arguments(generate)
     generate.add_argument("--overwrite", action="store_true")
 

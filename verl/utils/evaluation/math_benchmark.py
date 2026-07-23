@@ -40,6 +40,8 @@ except Exception:  # pragma: no cover - defensive fallback for stripped installs
 PROMPT_FIELDS = ("problem", "question", "prompt", "input")
 ANSWER_FIELDS = ("answer", "solution", "ground_truth", "final_answer")
 THINK_END_TAGS = ("</think>", "<|end_of_thought|>")
+AMO_BENCH_P_SIZE = 39
+AMO_BENCH_P_ANSWER_TYPES = frozenset({"number", "set", "variable"})
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,10 @@ class EvalSample:
     sample_id: str
     problem: str
     ground_truth: str
+    question_id: int | str | None = None
+    answer_type: str | None = None
+    grader: str | None = None
+    use_raw_prompt: bool = False
 
 
 @dataclass(frozen=True)
@@ -126,15 +132,27 @@ def _extract_answer(row: dict[str, Any], idx: int) -> str:
     raise ValueError(f"Benchmark row {idx} must contain one of answer fields: {', '.join(ANSWER_FIELDS)}")
 
 
-def _row_to_sample(row: dict[str, Any], benchmark: str, idx: int) -> EvalSample:
-    sample_id = row.get("id", idx)
+def _row_to_sample(row: dict[str, Any], benchmark: str, idx: int, *, is_amo_bench: bool) -> EvalSample:
+    question_id = row.get("question_id")
+    if _is_missing(question_id):
+        question_id = None
+    sample_id = row.get("id", question_id if question_id is not None else idx)
     if _is_missing(sample_id):
         sample_id = idx
+    answer_type = row.get("answer_type")
+    if _is_missing(answer_type):
+        answer_type = None
+    elif answer_type is not None:
+        answer_type = str(answer_type).strip().lower()
     return EvalSample(
         benchmark=benchmark,
         sample_id=str(sample_id),
         problem=_extract_prompt(row, idx),
         ground_truth=_extract_answer(row, idx),
+        question_id=question_id,
+        answer_type=answer_type,
+        grader="amo_bench" if is_amo_bench else None,
+        use_raw_prompt=is_amo_bench,
     )
 
 
@@ -152,34 +170,97 @@ def _load_jsonl_dataset(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def is_amo_bench(benchmark: str | Path) -> bool:
+    """Return whether a benchmark path identifies the official AMO-Bench dataset."""
+    normalized_name = Path(str(benchmark).rstrip("/")).name.casefold().replace("_", "-")
+    return normalized_name == "amo-bench"
+
+
+def find_benchmark_data_files(dataset_root: str | Path, benchmark: str) -> list[Path]:
+    """Find local benchmark files, including Hugging Face's common ``data/`` layout."""
+    benchmark_dir = Path(dataset_root).expanduser() / benchmark
+    if not benchmark_dir.exists():
+        raise FileNotFoundError(f"Benchmark dataset directory does not exist: {benchmark_dir}")
+
+    for relative_jsonl in (Path("test.jsonl"), Path("data/test.jsonl")):
+        jsonl_path = benchmark_dir / relative_jsonl
+        if jsonl_path.is_file():
+            return [jsonl_path]
+
+    search_patterns = ("test*.parquet", "*.parquet")
+    for relative_dir in (Path("."), Path("data")):
+        directory = benchmark_dir / relative_dir
+        if not directory.is_dir():
+            continue
+        for pattern in search_patterns:
+            parquet_files = sorted(directory.glob(pattern))
+            if parquet_files:
+                return parquet_files
+
+    raise FileNotFoundError(f"No local jsonl/parquet benchmark files found under {benchmark_dir}")
+
+
+def _filter_amo_bench_p_rows(rows: list[dict[str, Any]], benchmark: str) -> list[dict[str, Any]]:
+    """Select and validate the official 39-problem parser-based AMO-Bench-P subset."""
+    missing_answer_type = [idx for idx, row in enumerate(rows) if _is_missing(row.get("answer_type"))]
+    if missing_answer_type:
+        raise ValueError(
+            f"{benchmark} must provide answer_type for every row so AMO-Bench-P can exclude description questions; "
+            f"missing at row indices {missing_answer_type[:10]}."
+        )
+
+    parser_rows = [row for row in rows if str(row["answer_type"]).strip().lower() in AMO_BENCH_P_ANSWER_TYPES]
+    unsupported_types = sorted(
+        {
+            str(row["answer_type"]).strip().lower()
+            for row in rows
+            if str(row["answer_type"]).strip().lower() not in AMO_BENCH_P_ANSWER_TYPES | {"description"}
+        }
+    )
+    if unsupported_types:
+        raise ValueError(f"{benchmark} contains unsupported answer types: {unsupported_types!r}.")
+    if len(parser_rows) != AMO_BENCH_P_SIZE:
+        raise ValueError(
+            f"{benchmark} must contain exactly {AMO_BENCH_P_SIZE} parser-graded questions after excluding "
+            f"answer_type='description', but found {len(parser_rows)}."
+        )
+    return parser_rows
+
+
 def load_benchmark_samples(
     dataset_root: str | Path,
     benchmark: str,
     *,
     max_samples: int | None = None,
 ) -> list[EvalSample]:
-    benchmark_dir = Path(dataset_root).expanduser() / benchmark
-    if not benchmark_dir.exists():
-        raise FileNotFoundError(f"Benchmark dataset directory does not exist: {benchmark_dir}")
+    data_files = find_benchmark_data_files(dataset_root, benchmark)
+    rows: list[dict[str, Any]] = []
+    for data_file in data_files:
+        if data_file.suffix == ".jsonl":
+            rows.extend(_load_jsonl_dataset(data_file))
+        else:
+            rows.extend(pd.read_parquet(data_file).to_dict(orient="records"))
 
-    jsonl_path = benchmark_dir / "test.jsonl"
-    if jsonl_path.exists():
-        rows = _load_jsonl_dataset(jsonl_path)
-    else:
-        parquet_files = sorted(benchmark_dir.glob("test*.parquet")) or sorted(benchmark_dir.glob("*.parquet"))
-        if not parquet_files:
-            raise FileNotFoundError(f"No local jsonl/parquet benchmark files found under {benchmark_dir}")
-        rows = []
-        for parquet_file in parquet_files:
-            rows.extend(pd.read_parquet(parquet_file).to_dict(orient="records"))
+    amo_bench = is_amo_bench(benchmark)
+    if amo_bench:
+        rows = _filter_amo_bench_p_rows(rows, benchmark)
 
-    samples = [_row_to_sample(row, benchmark=benchmark, idx=idx) for idx, row in enumerate(rows)]
+    samples = [
+        _row_to_sample(row, benchmark=benchmark, idx=idx, is_amo_bench=amo_bench) for idx, row in enumerate(rows)
+    ]
     if max_samples is not None and max_samples >= 0:
         samples = samples[:max_samples]
     return samples
 
 
-def build_math_chat_messages(problem: str, idx: int = 0) -> list[dict[str, str]]:
+def build_math_chat_messages(
+    problem: str,
+    idx: int = 0,
+    *,
+    use_raw_prompt: bool = False,
+) -> list[dict[str, str]]:
+    if use_raw_prompt:
+        return [{"role": "user", "content": str(problem).strip()}]
     return build_qwen3_boxed_prompt(problem, idx)
 
 
@@ -210,6 +291,7 @@ def score_completion(
     content: str | None = None,
     verifier: str = "hybrid",
     math_verify_timeout: float = 30.0,
+    extra_info: dict[str, Any] | None = None,
 ) -> ScoredCompletion:
     final_content = split_final_content(text, reasoning_content=reasoning_content, content=content)
     if verifier not in {"math_dapo", "math_verify", "hybrid"}:
@@ -224,7 +306,13 @@ def score_completion(
     math_verify_score = None
     if verifier == "math_verify" or (verifier == "hybrid" and not acc):
         math_verify_score = float(
-            math_verify.compute_score(final_content, ground_truth, timeout_score=0.0, timeout=math_verify_timeout)
+            math_verify.compute_score(
+                final_content,
+                ground_truth,
+                timeout_score=0.0,
+                timeout=math_verify_timeout,
+                extra_info=extra_info,
+            )
         )
         if verifier == "math_verify":
             acc = math_verify_score > 0.0

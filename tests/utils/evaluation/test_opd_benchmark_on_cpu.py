@@ -65,6 +65,19 @@ def test_prepare_tasks_uses_order_independent_seed_on_cpu(monkeypatch):
     assert seeds[("a", 0)] == benchmark.stable_seed(42, "math-ai/aime24", "a", 0)
 
 
+def test_apply_chat_template_accepts_transformers_mapping_result_on_cpu():
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            del messages, kwargs
+            return {"input_ids": [[10, 11, 12]]}
+
+    assert benchmark.apply_chat_template(
+        FakeTokenizer(),
+        [{"role": "user", "content": "question"}],
+        enable_thinking=True,
+    ) == [10, 11, 12]
+
+
 def test_validate_hf_checkpoint_requires_every_indexed_shard_and_tokenizer_on_cpu(tmp_path):
     model_dir = tmp_path / "model"
     model_dir.mkdir()

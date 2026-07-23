@@ -39,6 +39,23 @@ def _write_benchmarks(dataset_root):
     )
 
 
+def _write_amo_bench(dataset_root):
+    description_ids = {2, 24, 25, 26, 27, 38, 39, 40, 41, 42, 46}
+    benchmark_dir = dataset_root / "meituan-longcat" / "AMO-Bench" / "data"
+    benchmark_dir.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "question_id": question_id,
+                "prompt": f"AMO prompt {question_id} with its own final-answer instruction.",
+                "answer": rf"\boxed{{{question_id}}}",
+                "answer_type": "description" if question_id in description_ids else "number",
+            }
+            for question_id in range(1, 51)
+        ]
+    ).to_parquet(benchmark_dir / "test-00000-of-00001.parquet")
+
+
 def test_math_benchmark_dataset_builds_stable_validation_rows_on_cpu(tmp_path):
     dataset_root = tmp_path / "datasets"
     _write_benchmarks(dataset_root)
@@ -57,8 +74,27 @@ def test_math_benchmark_dataset_builds_stable_validation_rows_on_cpu(tmp_path):
     assert aime_row["data_source"] == "aime24"
     assert amc_row["data_source"] == "amc23"
     assert amc_row["reward_model"]["ground_truth"] == "27"
-    assert amc_row["extra_info"]["reward_data_source"] == "math_dapo"
+    assert amc_row["extra_info"]["reward_data_source"] == "math_verify"
     assert "put your final answer within \\boxed{}" in aime_row["raw_prompt"][0]["content"]
+
+
+def test_math_benchmark_dataset_preserves_amo_metadata_and_prompt_on_cpu(tmp_path):
+    dataset_root = tmp_path / "datasets"
+    _write_amo_bench(dataset_root)
+
+    dataset = MathBenchmarkDataset(
+        dataset_root=dataset_root,
+        benchmarks=["meituan-longcat/AMO-Bench"],
+    )
+
+    assert len(dataset) == 39
+    row = dataset[0]
+    assert row["uid"] == "AMO-Bench:1"
+    assert row["raw_prompt"] == [{"role": "user", "content": "AMO prompt 1 with its own final-answer instruction."}]
+    assert row["extra_info"]["question_id"] == 1
+    assert row["extra_info"]["answer_type"] == "number"
+    assert row["extra_info"]["grader"] == "amo_bench"
+    assert row["extra_info"]["reward_data_source"] == "math_verify"
 
 
 def test_math_benchmark_dataset_uses_nested_directory_basename_for_metrics_on_cpu(tmp_path):

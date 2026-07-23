@@ -162,7 +162,9 @@ run_npu_opd_job() {
     val_max_samples=${VAL_MAX_SAMPLES:-256}
     val_batch_size=${VAL_BATCH_SIZE:-256}
     test_benchmark_root=${TEST_BENCHMARK_ROOT:-$DATASET_DIR/datasets}
-    test_benchmarks=${TEST_BENCHMARKS:-"['math-ai/aime24','math-ai/aime25','math-ai/amc23']"}
+    validation_reward_data_source=${VALIDATION_REWARD_DATA_SOURCE:-math_verify}
+    test_benchmarks=${TEST_BENCHMARKS:-"['math-ai/aime24','math-ai/aime25','math-ai/amc23','meituan-longcat/AMO-Bench']"}
+    test_benchmark_reward_data_source=${TEST_BENCHMARK_REWARD_DATA_SOURCE:-math_verify}
     test_benchmark_max_samples=${TEST_BENCHMARK_MAX_SAMPLES:--1}
     test_benchmark_batch_size=${TEST_BENCHMARK_BATCH_SIZE:-256}
     data_seed=${DATA_SEED:--42}
@@ -233,6 +235,7 @@ run_npu_opd_job() {
 
     export WANDB_MODE=${WANDB_MODE:-online}
     export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
+    export WANDB_DIR=${WORKSPACE}
     case "$resume_required" in
         True) export WANDB_RESUME=must ;;
         False) ;;
@@ -375,10 +378,12 @@ _submit_npu_verl_job() {
         "data.val_batch_size=${val_batch_size}"
         "data.train_max_samples=${train_max_samples}"
         "data.val_max_samples=${val_max_samples}"
+        "data.validation_reward_data_source=${validation_reward_data_source}"
         "data.test_benchmarks.root=${test_benchmark_root}"
         "data.test_benchmarks.names=${test_benchmarks}"
         "data.test_benchmarks.batch_size=${test_benchmark_batch_size}"
         "data.test_benchmarks.max_samples_per_benchmark=${test_benchmark_max_samples}"
+        "data.test_benchmarks.reward_data_source=${test_benchmark_reward_data_source}"
         "data.max_prompt_length=${max_prompt_length}"
         "data.max_response_length=${max_response_length}"
         "data.filter_overlong_prompts=${filter_overlong_prompts}"

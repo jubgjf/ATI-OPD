@@ -371,7 +371,7 @@ def create_math_benchmark_dataset(config):
     return MathBenchmarkDataset(
         dataset_root=dataset_root,
         benchmarks=benchmark_names,
-        reward_data_source=benchmark_config.get("reward_data_source", "math_dapo"),
+        reward_data_source=benchmark_config.get("reward_data_source", "math_verify"),
         max_samples_per_benchmark=int(benchmark_config.get("max_samples_per_benchmark", -1)),
     )
 

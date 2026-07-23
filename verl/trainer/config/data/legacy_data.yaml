@@ -23,13 +23,18 @@ train_max_samples: -1
 # select the specified number of samples from val dataset
 val_max_samples: -1
 
+# Reward implementation used only for validation data. The original data_source
+# remains unchanged for metric grouping and training rewards.
+validation_reward_data_source: math_verify
+
 # Configuration for optional math benchmark evaluation during training.
 test_benchmarks:
 
   # Root directory containing one subdirectory per benchmark.
   root: null
 
-  # Benchmark paths relative to root, for example [math-ai/aime24, math-ai/aime25, math-ai/amc23].
+  # Benchmark paths relative to root, for example
+  # [math-ai/aime24, math-ai/aime25, math-ai/amc23, meituan-longcat/AMO-Bench].
   # The final directory name is used in metrics, such as test-core/aime24/acc/mean@16.
   names: []
 
@@ -40,7 +45,7 @@ test_benchmarks:
   max_samples_per_benchmark: -1
 
   # Reward implementation used while retaining the benchmark name for metric grouping.
-  reward_data_source: math_dapo
+  reward_data_source: math_verify
 
 # The field in the dataset where the prompt is located. Default is 'prompt'.
 prompt_key: prompt

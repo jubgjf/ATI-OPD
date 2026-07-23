@@ -93,6 +93,33 @@ from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+def _with_reward_data_source(
+    extra_infos: Any,
+    *,
+    count: int,
+    reward_data_source: str,
+) -> np.ndarray:
+    """Copy per-sample metadata and override only the evaluation reward implementation."""
+    if extra_infos is None:
+        values = [{} for _ in range(count)]
+    else:
+        values = list(extra_infos)
+        if len(values) != count:
+            raise ValueError(f"Expected {count} extra_info entries, got {len(values)}.")
+
+    copied = []
+    for index, value in enumerate(values):
+        if value is None:
+            info = {}
+        elif isinstance(value, dict):
+            info = dict(value)
+        else:
+            raise TypeError(f"extra_info entry {index} must be a dict or None, got {type(value).__name__}.")
+        info["reward_data_source"] = reward_data_source
+        copied.append(info)
+    return np.asarray(copied, dtype=object)
+
+
 def _has_answer_pattern(text: Any) -> bool:
     return math_dapo.has_answer_label(text)
 
@@ -1001,6 +1028,15 @@ class RayPPOTrainer:
                 if len(test_batch) > remaining:
                     test_batch = test_batch[:remaining]
                 processed_samples += len(test_batch)
+
+            if evaluation_mode == "val":
+                validation_reward_data_source = self.config.data.get("validation_reward_data_source", None)
+                if validation_reward_data_source:
+                    test_batch.non_tensor_batch["extra_info"] = _with_reward_data_source(
+                        test_batch.non_tensor_batch.get("extra_info"),
+                        count=len(test_batch),
+                        reward_data_source=str(validation_reward_data_source),
+                    )
 
             if "uid" not in test_batch.non_tensor_batch:
                 test_batch.non_tensor_batch["uid"] = np.array(

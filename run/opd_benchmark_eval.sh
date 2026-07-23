@@ -5,7 +5,7 @@
 # Machine/bootstrap environment
 # ==============================================================================
 
-load_external_train_config() {
+_load_external_train_config() {
     local train_config_path=${TRAIN_CONFIG_PATH:-/opt/huawei/algorithm/train.config}
     if [[ ! -s "${train_config_path}" ]]; then
         echo "No non-empty train config found at ${train_config_path}; skip external env loading."
@@ -97,7 +97,7 @@ DATASET_ROOT=${DATASET_ROOT:-${DATASET_DIR}/datasets}
 TEACHER_MODEL=${TEACHER_MODEL:-${DATASET_DIR}/models/hbx/JustRL-DeepSeek-1.5B}
 CHAT_TEMPLATE_MODEL=${CHAT_TEMPLATE_MODEL:-${TEACHER_MODEL}}
 
-BENCHMARKS_TEXT=${BENCHMARKS_TEXT:-"math-ai/aime24 math-ai/aime25 math-ai/amc23"}
+BENCHMARKS_TEXT=${BENCHMARKS_TEXT:-"math-ai/aime24 math-ai/aime25 math-ai/amc23 meituan-longcat/AMO-Bench"}
 read -r -a BENCHMARKS <<< "${BENCHMARKS_TEXT}"
 
 RESULT_ROOT=${RESULT_ROOT:-${WORKSPACE}/eval-results/${EXP_NAME}}
@@ -116,7 +116,7 @@ TOP_K=${TOP_K:--1}
 MAX_PROMPT_TOKENS=${MAX_PROMPT_TOKENS:-1024}
 MAX_COMPLETION_TOKENS=${MAX_COMPLETION_TOKENS:-$((23 * 1024))}
 BASE_SEED=${BASE_SEED:-42}
-VERIFIER=${VERIFIER:-math_dapo}
+VERIFIER=${VERIFIER:-math_verify}
 ENABLE_THINKING=${ENABLE_THINKING:-1}
 TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE:-0}
 REQUIRE_EXACT_TOKEN_IDS=${REQUIRE_EXACT_TOKEN_IDS:-1}

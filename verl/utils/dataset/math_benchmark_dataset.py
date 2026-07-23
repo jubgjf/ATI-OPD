@@ -46,6 +46,10 @@ class _BenchmarkRecord:
     problem: str
     ground_truth: str
     index: int
+    question_id: int | str | None = None
+    answer_type: str | None = None
+    grader: str | None = None
+    use_raw_prompt: bool = False
 
 
 class MathBenchmarkDataset(Dataset):
@@ -63,7 +67,7 @@ class MathBenchmarkDataset(Dataset):
         *,
         dataset_root: str | Path,
         benchmarks: Sequence[str],
-        reward_data_source: str = "math_dapo",
+        reward_data_source: str = "math_verify",
         max_samples_per_benchmark: int = -1,
     ) -> None:
         root = Path(dataset_root).expanduser()
@@ -110,6 +114,10 @@ class MathBenchmarkDataset(Dataset):
                         problem=sample.problem,
                         ground_truth=sample.ground_truth,
                         index=len(self.records),
+                        question_id=sample.question_id,
+                        answer_type=sample.answer_type,
+                        grader=sample.grader,
+                        use_raw_prompt=sample.use_raw_prompt,
                     )
                 )
 
@@ -119,17 +127,28 @@ class MathBenchmarkDataset(Dataset):
     def __getitem__(self, item: int) -> dict[str, Any]:
         record = self.records[item]
         uid = f"{record.benchmark}:{record.sample_id}"
+        extra_info = {
+            "index": record.index,
+            "benchmark": record.benchmark,
+            "benchmark_path": record.benchmark_path,
+            "sample_id": record.sample_id,
+            "reward_data_source": self.reward_data_source,
+        }
+        if record.question_id is not None:
+            extra_info["question_id"] = record.question_id
+        if record.answer_type is not None:
+            extra_info["answer_type"] = record.answer_type
+        if record.grader is not None:
+            extra_info["grader"] = record.grader
         return {
-            "raw_prompt": build_math_chat_messages(record.problem, idx=record.index),
+            "raw_prompt": build_math_chat_messages(
+                record.problem,
+                idx=record.index,
+                use_raw_prompt=record.use_raw_prompt,
+            ),
             "data_source": record.benchmark,
             "reward_model": {"style": "rule", "ground_truth": record.ground_truth},
-            "extra_info": {
-                "index": record.index,
-                "benchmark": record.benchmark,
-                "benchmark_path": record.benchmark_path,
-                "sample_id": record.sample_id,
-                "reward_data_source": self.reward_data_source,
-            },
+            "extra_info": extra_info,
             "uid": uid,
             "index": record.index,
             "tools_kwargs": {},

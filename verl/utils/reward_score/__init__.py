@@ -68,6 +68,14 @@ def default_compute_score(
         from . import math_dapo
 
         res = math_dapo.compute_score(solution_str, ground_truth)
+    elif reward_data_source == "math_verify":
+        from . import math_dapo, math_verify
+
+        verified_score = math_verify.compute_score(solution_str, ground_truth, extra_info=extra_info)
+        res = math_dapo.compute_score(solution_str, ground_truth)
+        res["score"] = float(verified_score)
+        res["acc"] = bool(verified_score > 0.0)
+        res["math_verify_score"] = float(verified_score)
     elif reward_data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",

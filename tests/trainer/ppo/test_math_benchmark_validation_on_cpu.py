@@ -15,7 +15,23 @@
 import numpy as np
 from omegaconf import OmegaConf
 
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer, _with_reward_data_source
+
+
+def test_validation_reward_override_copies_metadata_and_uses_math_verify_on_cpu():
+    original = np.array([{"index": 1}, None], dtype=object)
+
+    overridden = _with_reward_data_source(
+        original,
+        count=2,
+        reward_data_source="math_verify",
+    )
+
+    assert overridden.tolist() == [
+        {"index": 1, "reward_data_source": "math_verify"},
+        {"reward_data_source": "math_verify"},
+    ]
+    assert original[0] == {"index": 1}
 
 
 def test_math_benchmark_metrics_use_test_core_and_mean_at_16_on_cpu():

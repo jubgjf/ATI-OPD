@@ -474,12 +474,13 @@ data:
   val_files: ~/data/rlhf/gsm8k/test.parquet
   train_max_samples: -1
   val_max_samples: -1
+  validation_reward_data_source: math_verify
   test_benchmarks:
     root: null
     names: []
     batch_size: null
     max_samples_per_benchmark: -1
-    reward_data_source: math_dapo
+    reward_data_source: math_verify
   prompt_key: prompt
   reward_fn_key: data_source
   max_prompt_length: 512

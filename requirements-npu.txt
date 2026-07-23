@@ -15,6 +15,7 @@ tensordict>=0.8.0,<=0.10.0,!=0.9.0
 ray[default]
 wandb
 mathruler
+math-verify==0.9.0
 torchdata
 einops
 qwen_vl_utils
