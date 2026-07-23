@@ -231,31 +231,21 @@ ensure_hf_checkpoint() {
         return 1
     fi
 
-    local merge_dir="${actor_dir}/.huggingface.merge.${BASHPID}"
-    if [[ -e "${merge_dir}" ]]; then
-        echo "ERROR: temporary merge target already exists: ${merge_dir}" >&2
-        return 1
-    fi
     echo "[checkpoint] converting step=${step}: ${actor_dir} -> ${hf_dir}"
     if ! python -m verl.model_merger merge \
         --backend fsdp \
         --local_dir "${actor_dir}" \
-        --target_dir "${merge_dir}"
+        --target_dir "${hf_dir}"
     then
-        echo "ERROR: checkpoint conversion failed; partial output retained at ${merge_dir}" >&2
+        echo "ERROR: checkpoint conversion failed; partial output may remain at ${hf_dir}" >&2
         return 1
     fi
-    if ! hf_checkpoint_ready "${merge_dir}"; then
-        echo "ERROR: converted checkpoint is incomplete; retained at ${merge_dir}" >&2
+    if ! hf_checkpoint_ready "${hf_dir}"; then
+        echo "ERROR: converted checkpoint is incomplete: ${hf_dir}" >&2
         return 1
     fi
-    if [[ -e "${hf_dir}" ]]; then
-        local backup_dir="${hf_dir}.incomplete.$(date +%Y%m%d-%H%M%S)"
-        mv -- "${hf_dir}" "${backup_dir}"
-        echo "[checkpoint] moved incomplete checkpoint to ${backup_dir}"
-    fi
-    mv -- "${merge_dir}" "${hf_dir}"
-    hf_checkpoint_ready "${hf_dir}"
+    echo "[checkpoint] step=${step}: Hugging Face checkpoint converted"
+    return 0
 }
 
 
