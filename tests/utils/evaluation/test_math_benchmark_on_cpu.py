@@ -22,7 +22,6 @@ from verl.utils.evaluation.math_benchmark import (
     score_completion,
     split_final_content,
 )
-from verl.utils.evaluation.standalone_generation import extract_choice_generation
 
 
 def test_load_benchmark_samples_normalizes_local_schemas_on_cpu(tmp_path):
@@ -51,22 +50,3 @@ def test_math_response_helpers_ignore_thinking_answer_on_cpu():
     assert scored.acc is True
     assert scored.pred == "204"
     assert normalize_ground_truth("70.0") == "70"
-
-
-def test_extract_chat_choice_generation_on_cpu():
-    generation = extract_choice_generation(
-        {
-            "message": {
-                "role": "assistant",
-                "reasoning_content": "work",
-                "content": r"final answer is \boxed{204}",
-            },
-            "finish_reason": "stop",
-        }
-    )
-
-    assert generation == {
-        "text": "work\n" + r"final answer is \boxed{204}",
-        "reasoning_content": "work",
-        "content": r"final answer is \boxed{204}",
-    }

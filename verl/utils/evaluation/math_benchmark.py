@@ -18,9 +18,8 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -67,55 +66,6 @@ class ScoredCompletion:
     has_accepted_answer_format: bool
     verified_by: str
     math_verify_score: float | None
-
-
-@dataclass(frozen=True)
-class CheckpointInfo:
-    step: int
-    path: Path
-    actor_dir: Path
-    hf_dir: Path
-
-
-def _json_default(value: Any) -> Any:
-    if isinstance(value, Path):
-        return str(value)
-    if hasattr(value, "item"):
-        try:
-            return value.item()
-        except Exception:
-            pass
-    if hasattr(value, "__dataclass_fields__") and not isinstance(value, type):
-        return asdict(value)
-    return str(value)
-
-
-def append_jsonl_record(path: str | Path, record: dict[str, Any], *, fsync: bool = True) -> None:
-    jsonl_path = Path(path)
-    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-    with jsonl_path.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(record, ensure_ascii=False, default=_json_default))
-        file.write("\n")
-        file.flush()
-        if fsync:
-            os.fsync(file.fileno())
-
-
-def write_json_atomic(path: str | Path, payload: dict[str, Any]) -> None:
-    output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as file:
-        json.dump(payload, file, ensure_ascii=False, indent=2, default=_json_default)
-        file.write("\n")
-        file.flush()
-        os.fsync(file.fileno())
-    tmp_path.replace(output_path)
-
-
-def parse_step_from_checkpoint_name(name: str) -> int | None:
-    match = re.fullmatch(r"global_step_(\d+)", name)
-    return None if match is None else int(match.group(1))
 
 
 def _is_missing(value: Any) -> bool:
@@ -233,22 +183,6 @@ def build_math_chat_messages(problem: str, idx: int = 0) -> list[dict[str, str]]
     return build_qwen3_boxed_prompt(problem, idx)
 
 
-def render_prompt_with_chat_template(
-    tokenizer: Any,
-    messages: list[dict[str, str]],
-    *,
-    enable_thinking: bool | None = True,
-) -> str:
-    kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
-    if enable_thinking is not None:
-        kwargs["enable_thinking"] = enable_thinking
-    try:
-        return tokenizer.apply_chat_template(messages, **kwargs)
-    except TypeError:
-        kwargs.pop("enable_thinking", None)
-        return tokenizer.apply_chat_template(messages, **kwargs)
-
-
 def split_final_content(
     text: str | None,
     *,
@@ -315,11 +249,3 @@ def score_completion(
         verified_by=verified_by,
         math_verify_score=math_verify_score,
     )
-
-
-def hf_model_ready(hf_dir: str | Path) -> bool:
-    path = Path(hf_dir)
-    if not (path / "config.json").exists():
-        return False
-    patterns = ("*.safetensors", "pytorch_model*.bin", "model*.bin")
-    return any(any(path.glob(pattern)) for pattern in patterns)
