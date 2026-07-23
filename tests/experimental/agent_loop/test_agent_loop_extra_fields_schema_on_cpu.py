@@ -496,6 +496,133 @@ class _FakeRepairStudentClient:
         return TokenOutput(token_ids=[40, 41], log_probs=[-0.2, -0.2])
 
 
+class _CandidateSelectionStudentClient(_FakeRepairStudentClient):
+    def __init__(self, student_nll_by_token: Optional[dict[int, float]] = None):
+        super().__init__()
+        self.student_nll_by_token = student_nll_by_token or {}
+
+    async def generate(
+        self,
+        request_id: str,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    ) -> TokenOutput:
+        if "prompt_logprobs" not in sampling_params:
+            return await super().generate(
+                request_id=request_id,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
+        del image_data, video_data, audio_data, mm_processor_kwargs
+        self.calls.append(
+            {"request_id": request_id, "prompt_ids": list(prompt_ids), "sampling_params": sampling_params}
+        )
+        width = max(int(sampling_params["prompt_logprobs"]), 1)
+        ids = torch.zeros((len(prompt_ids), width), dtype=torch.int32)
+        logprobs = torch.full((len(prompt_ids), width), -0.1, dtype=torch.float32)
+        sampled_ids = torch.zeros((len(prompt_ids), 1), dtype=torch.int32)
+        sampled_logprobs = torch.full((len(prompt_ids), 1), -0.1, dtype=torch.float32)
+        for row in range(max(len(prompt_ids) - 1, 0)):
+            target_id = int(prompt_ids[row + 1])
+            sampled_ids[row, 0] = target_id
+            ids[row, 0] = target_id
+            sampled_logprobs[row, 0] = -float(self.student_nll_by_token.get(target_id, 0.1))
+            logprobs[row, 0] = sampled_logprobs[row, 0]
+        return TokenOutput(
+            token_ids=[0],
+            extra_fields={
+                "prompt_ids": ids.tolist(),
+                "prompt_logprobs": logprobs.tolist(),
+                "sampled_prompt_ids": sampled_ids.tolist(),
+                "sampled_prompt_logprobs": sampled_logprobs.tolist(),
+            },
+        )
+
+
+class _CandidateSelectionTeacherManager:
+    def __init__(
+        self,
+        candidates: list[list[int]],
+        *,
+        teacher_nll_by_token: Optional[dict[int, float]] = None,
+        high_gap_start: int = 0,
+        high_gap_width: int = 2,
+    ):
+        self.candidates = candidates
+        self.teacher_nll_by_token = teacher_nll_by_token or {}
+        self.high_gap_start = high_gap_start
+        self.high_gap_width = high_gap_width
+        self.generated_prefixes: list[list[int]] = []
+        self.generation_request_ids: list[str] = []
+        self.score_request_ids: list[str] = []
+
+    async def generate_teacher_segment_single(
+        self,
+        prefix_ids: list[int],
+        max_tokens: int,
+        multi_modal_data: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        routing_key: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> TeacherGenerationResult:
+        del multi_modal_data, mm_processor_kwargs, routing_key
+        request_id = request_id or ""
+        candidate_index = int(request_id.rsplit(":", 1)[-1])
+        self.generated_prefixes.append(list(prefix_ids))
+        self.generation_request_ids.append(request_id)
+        return TeacherGenerationResult(
+            token_ids=list(self.candidates[candidate_index][:max_tokens]),
+            finish_reason="length",
+        )
+
+    async def compute_teacher_logprobs_single(
+        self,
+        sequence_ids: list[int],
+        multi_modal_data: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        routing_key: Optional[str] = None,
+        request_id: Optional[str] = None,
+        prompt_logprobs: Optional[int] = None,
+    ) -> TeacherLogprobScoringResult:
+        del multi_modal_data, mm_processor_kwargs, routing_key
+        request_id = request_id or ""
+        self.score_request_ids.append(request_id)
+        width = max(int(prompt_logprobs or 0), 1)
+        ids = torch.zeros((len(sequence_ids), width), dtype=torch.int32)
+        logprobs = torch.full((len(sequence_ids), width), -0.1, dtype=torch.float32)
+        sampled_ids = torch.zeros((len(sequence_ids), 1), dtype=torch.int32)
+        sampled_logprobs = torch.full((len(sequence_ids), 1), -0.1, dtype=torch.float32)
+        for row in range(max(len(sequence_ids) - 1, 0)):
+            target_id = int(sequence_ids[row + 1])
+            sampled_ids[row, 0] = target_id
+            ids[row, 0] = target_id
+            sampled_logprobs[row, 0] = -float(self.teacher_nll_by_token.get(target_id, 0.1))
+            logprobs[row, 0] = sampled_logprobs[row, 0]
+        if ":teacher-score:" in request_id:
+            response_start = 1
+            for response_index in range(
+                self.high_gap_start,
+                min(self.high_gap_start + self.high_gap_width, len(sequence_ids) - 2),
+            ):
+                sampled_logprobs[response_start + response_index, 0] = -5.0
+                logprobs[response_start + response_index, 0] = -5.0
+        return TeacherLogprobScoringResult(
+            ids=ids,
+            logprobs=logprobs,
+            sampled_ids=sampled_ids,
+            sampled_logprobs=sampled_logprobs,
+        )
+
+
 class _DistributionGapStudentClient(_FakeRepairStudentClient):
     async def generate(
         self,
@@ -651,11 +778,19 @@ class _FixedGapTeacherManager:
 
 
 class _DirectInterventionWorker:
+    _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
+    _compute_position_ids = AgentLoopWorker._compute_position_ids
+    _get_mm_processor_kwargs = AgentLoopWorker._get_mm_processor_kwargs
+    _compute_score = AgentLoopWorker._compute_score
     _teacher_routing_key = AgentLoopWorker._teacher_routing_key
     _score_sequence_for_intervention = AgentLoopWorker._score_sequence_for_intervention
     _score_student_sequence_for_intervention = AgentLoopWorker._score_student_sequence_for_intervention
+    _ensure_teacher_nll_calibration_state = AgentLoopWorker._ensure_teacher_nll_calibration_state
+    _current_teacher_nll_threshold = AgentLoopWorker._current_teacher_nll_threshold
+    _generate_and_select_teacher_candidate = AgentLoopWorker._generate_and_select_teacher_candidate
     _generate_student_suffix = AgentLoopWorker._generate_student_suffix
     _maybe_repair_with_teacher = AgentLoopWorker._maybe_repair_with_teacher
+    _compute_teacher_logprobs = AgentLoopWorker._compute_teacher_logprobs
     teacher_key = "data_source"
     distillation_enabled = True
 
@@ -674,14 +809,28 @@ class _DirectInterventionWorker:
         gap_threshold: float = 1.0,
         gap_distribution_topk: int = 16,
         teacher_rejection_token_cap: float = 10.0,
+        teacher_rejection_persistence_enabled: bool = False,
+        teacher_rejection_persistence_window_tokens: int = 64,
+        teacher_rejection_persistence_threshold: Optional[float] = None,
+        teacher_rejection_persistence_min_valid_tokens: int = 32,
         topk: Optional[int] = None,
         thinking_start_text: str = "<think>",
         thinking_end_text: str = "</think>",
         log_examples_per_worker: int = 0,
         diagnostics_topk: Optional[int] = None,
+        outcome_aware_candidate_selection_enabled: bool = False,
+        teacher_candidate_count: int = 4,
+        teacher_nll_calibration_quantile: float = 0.75,
+        teacher_nll_calibration_window: int = 16,
+        teacher_nll_calibration_min_samples: int = 2,
+        teacher_nll_initial_threshold: Optional[float] = None,
+        teacher_nll_healthy_probe_probability: float = 0.0,
     ):
         self.tokenizer = _FakeTokenizer()
-        self.rollout_config = OmegaConf.create({"response_length": response_length})
+        self.rollout_config = OmegaConf.create({"prompt_length": 4, "response_length": response_length})
+        self.processor = None
+        self.mm_processor_kwargs = {}
+        self.reward_loop_worker_handles = None
         self.teacher_intervention_enabled = True
         self.teacher_intervention_config = DistillationInterventionConfig(
             enabled=True,
@@ -690,6 +839,10 @@ class _DirectInterventionWorker:
             gap_metric=gap_metric,
             gap_distribution_topk=gap_distribution_topk,
             teacher_rejection_token_cap=teacher_rejection_token_cap,
+            teacher_rejection_persistence_enabled=teacher_rejection_persistence_enabled,
+            teacher_rejection_persistence_window_tokens=teacher_rejection_persistence_window_tokens,
+            teacher_rejection_persistence_threshold=teacher_rejection_persistence_threshold,
+            teacher_rejection_persistence_min_valid_tokens=teacher_rejection_persistence_min_valid_tokens,
             gap_threshold=gap_threshold,
             max_interventions_per_sample=max_interventions_per_sample,
             train_on_teacher_segments=train_on_teacher_segments,
@@ -697,6 +850,13 @@ class _DirectInterventionWorker:
             min_trainable_tokens_after_repair=min_trainable_tokens_after_repair,
             thinking_start_text=thinking_start_text,
             thinking_end_text=thinking_end_text,
+            outcome_aware_candidate_selection_enabled=outcome_aware_candidate_selection_enabled,
+            teacher_candidate_count=teacher_candidate_count,
+            teacher_nll_calibration_quantile=teacher_nll_calibration_quantile,
+            teacher_nll_calibration_window=teacher_nll_calibration_window,
+            teacher_nll_calibration_min_samples=teacher_nll_calibration_min_samples,
+            teacher_nll_initial_threshold=teacher_nll_initial_threshold,
+            teacher_nll_healthy_probe_probability=teacher_nll_healthy_probe_probability,
             log_examples_per_worker=log_examples_per_worker,
         )
         self.teacher_server_manager = teacher_manager
@@ -714,6 +874,274 @@ class _DirectInterventionWorker:
         )
         self._teacher_intervention_logged_samples = 0
         self._teacher_intervention_logged_step = None
+        self._teacher_nll_healthy_history = None
+
+
+def _outcome_gated_intervention_output(*, request_id: str, raw_correct: bool) -> AgentLoopOutput:
+    return AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        reward_score=1.0 if raw_correct else 0.0,
+        metrics=AgentLoopMetrics(),
+        extra_fields={
+            "rollout_request_id": request_id,
+            "teacher_intervention_outcome": {
+                "enabled": True,
+                "raw_correct": raw_correct,
+                "trigger_detected": False,
+                "repair_executed": False,
+            },
+        },
+    )
+
+
+class _SequenceAwareRewardMethod:
+    def __init__(self):
+        self.responses: list[list[int]] = []
+
+    async def remote(self, data: DataProto) -> dict[str, Any]:
+        response_ids = data.batch["responses"][0].tolist()
+        self.responses.append(response_ids)
+        correct = float(31 in response_ids)
+        return {
+            "reward_score": correct,
+            "reward_extra_info": {"acc": correct},
+        }
+
+
+class _SequenceAwareRewardHandle:
+    def __init__(self):
+        self.compute_score = _SequenceAwareRewardMethod()
+
+
+@pytest.mark.asyncio
+async def test_outcome_aware_postprocess_scores_raw_then_repaired_answer_on_cpu():
+    teacher_manager = _CandidateSelectionTeacherManager(
+        [[30, 30], [31, 31], [32, 32], [33, 33]],
+        teacher_nll_by_token={30: 0.1, 31: 0.2, 32: 0.3, 33: 0.8},
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        outcome_aware_candidate_selection_enabled=True,
+        teacher_nll_initial_threshold=0.5,
+    )
+    worker.llm_client = _CandidateSelectionStudentClient(student_nll_by_token={30: 0.4, 31: 0.1, 32: 0.2, 33: 0.05})
+    reward_handle = _SequenceAwareRewardHandle()
+    worker.reward_loop_worker_handles = [reward_handle]
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "raw-final-reward"},
+    )
+
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        data_source="openai/gsm8k",
+    )
+
+    assert reward_handle.compute_score.responses == [[1, 2, 3, 4, 5, 6], [31, 31, 40, 41]]
+    assert internal.reward_score == 1.0
+    outcome = internal.extra_fields["teacher_intervention_outcome"]
+    assert outcome["raw_correct"] is False
+    assert outcome["final_correct"] is True
+    assert outcome["repair_effective"] is True
+    assert outcome["repair_ineffective"] is False
+    assert internal.extra_fields["teacher_interventions"][0]["sample_outcome_summary"] is True
+
+
+@pytest.mark.asyncio
+async def test_outcome_aware_candidate_selection_filters_then_uses_rank_sum_on_cpu():
+    teacher_manager = _CandidateSelectionTeacherManager(
+        [[30, 30], [31, 31], [32, 32], [33, 33]],
+        teacher_nll_by_token={30: 0.1, 31: 0.2, 32: 0.3, 33: 0.8},
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        outcome_aware_candidate_selection_enabled=True,
+        teacher_nll_initial_threshold=0.5,
+    )
+    worker.llm_client = _CandidateSelectionStudentClient(student_nll_by_token={30: 0.4, 31: 0.1, 32: 0.2, 33: 0.05})
+    output = _outcome_gated_intervention_output(request_id="candidate-rank", raw_correct=False)
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert output.response_ids == [31, 31, 40, 41]
+    assert len(teacher_manager.generation_request_ids) == 4
+    student_candidate_calls = [
+        call for call in worker.llm_client.calls if ":student-candidate-score:" in call["request_id"]
+    ]
+    assert len(student_candidate_calls) == 3
+    intervention = output.extra_fields["teacher_interventions"][0]
+    assert intervention["candidate_count_requested"] == 4
+    assert intervention["candidate_count_teacher_nll_valid"] == 4
+    assert intervention["candidate_count_threshold_eligible"] == 3
+    assert intervention["candidate_count_rankable"] == 3
+    assert intervention["selected_candidate_index"] == 1
+    assert intervention["selected_teacher_rank"] == 2
+    assert intervention["selected_student_rank"] == 1
+    assert intervention["selected_rank_sum"] == 3
+    assert output.reward_score is None
+    assert output.extra_fields["teacher_intervention_outcome"]["reward_recompute_required"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gap_metric", "persistence_enabled"),
+    [
+        ("k3", False),
+        ("teacher_rejection", False),
+        ("teacher_rejection", True),
+    ],
+)
+async def test_outcome_aware_selection_preserves_existing_trigger_modes_on_cpu(
+    gap_metric: str,
+    persistence_enabled: bool,
+):
+    teacher_manager = _CandidateSelectionTeacherManager(
+        [[30], [31], [32], [33]],
+        teacher_nll_by_token={30: 0.1, 31: 0.2, 32: 0.3, 33: 0.4},
+        high_gap_width=4,
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        gap_metric=gap_metric,
+        outcome_aware_candidate_selection_enabled=True,
+        teacher_nll_initial_threshold=1.0,
+        teacher_rejection_persistence_enabled=persistence_enabled,
+        teacher_rejection_persistence_window_tokens=2,
+        teacher_rejection_persistence_threshold=1.0,
+        teacher_rejection_persistence_min_valid_tokens=2,
+    )
+    worker.llm_client = _CandidateSelectionStudentClient(student_nll_by_token={30: 0.1, 31: 0.2, 32: 0.3, 33: 0.4})
+    output = _outcome_gated_intervention_output(
+        request_id=f"trigger-{gap_metric}-{persistence_enabled}",
+        raw_correct=False,
+    )
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert output.extra_fields["teacher_intervention_count"] == 1
+    if persistence_enabled:
+        assert output.extra_fields["teacher_interventions"][0]["teacher_rejection_persistence_tokens"] == 2
+
+
+@pytest.mark.asyncio
+async def test_outcome_aware_candidate_selection_waits_for_healthy_calibration_on_cpu():
+    teacher_manager = _CandidateSelectionTeacherManager(
+        [[30], [31], [32], [33]],
+        teacher_nll_by_token={30: 0.1, 31: 0.2, 32: 0.3, 33: 0.4},
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        outcome_aware_candidate_selection_enabled=True,
+        teacher_nll_initial_threshold=None,
+    )
+    worker.llm_client = _CandidateSelectionStudentClient()
+    output = _outcome_gated_intervention_output(request_id="calibration-not-ready", raw_correct=False)
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert output.response_ids == [1, 2, 3, 4, 5, 6]
+    assert output.extra_fields["teacher_intervention_count"] == 0
+    skipped = output.extra_fields["teacher_intervention_skipped"][0]
+    assert skipped["reason"] == "teacher_nll_calibration_not_ready"
+    assert skipped["teacher_nll_threshold"] is None
+    assert skipped["teacher_nll_threshold_source"] == "unavailable"
+    assert not any(":student-candidate-score:" in call["request_id"] for call in worker.llm_client.calls)
+
+
+@pytest.mark.asyncio
+async def test_outcome_aware_candidate_selection_skips_when_all_candidates_fail_nll_gate_on_cpu():
+    teacher_manager = _CandidateSelectionTeacherManager(
+        [[30], [31], [32], [33]],
+        teacher_nll_by_token={30: 0.2, 31: 0.3, 32: 0.4, 33: 0.5},
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        outcome_aware_candidate_selection_enabled=True,
+        teacher_nll_initial_threshold=0.1,
+    )
+    worker.llm_client = _CandidateSelectionStudentClient()
+    output = _outcome_gated_intervention_output(request_id="all-above-threshold", raw_correct=False)
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert output.extra_fields["teacher_intervention_count"] == 0
+    skipped = output.extra_fields["teacher_intervention_skipped"][0]
+    assert skipped["reason"] == "teacher_candidates_above_nll_threshold"
+    assert skipped["candidate_count_threshold_eligible"] == 0
+    assert not any(":student-candidate-score:" in call["request_id"] for call in worker.llm_client.calls)
+
+
+@pytest.mark.asyncio
+async def test_outcome_correct_sample_is_never_rewritten_and_can_shadow_calibrate_on_cpu():
+    teacher_manager = _CandidateSelectionTeacherManager(
+        [[30], [31], [32], [33]],
+        teacher_nll_by_token={30: 0.4, 31: 0.2, 32: 0.3, 33: 0.5},
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        outcome_aware_candidate_selection_enabled=True,
+        teacher_nll_healthy_probe_probability=1.0,
+    )
+    worker.llm_client = _CandidateSelectionStudentClient()
+    output = _outcome_gated_intervention_output(request_id="healthy-shadow", raw_correct=True)
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert output.response_ids == [1, 2, 3, 4, 5, 6]
+    assert output.extra_fields["teacher_intervention_count"] == 0
+    skipped = output.extra_fields["teacher_intervention_skipped"][0]
+    assert skipped["reason"] == "outcome_correct"
+    assert skipped["healthy_calibration_probe"] is True
+    assert skipped["healthy_calibration_updated"] is True
+    assert list(worker._teacher_nll_healthy_history) == pytest.approx([0.2])
+    assert not any(":student-candidate-score:" in call["request_id"] for call in worker.llm_client.calls)
 
 
 @pytest.mark.asyncio

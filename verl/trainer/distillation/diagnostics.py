@@ -2414,6 +2414,7 @@ def compute_intervention_metrics(
     intervention_counts: list[Any],
     interventions: list[Any],
     intervention_skipped: list[Any] | None = None,
+    intervention_outcomes: list[Any] | None = None,
     response_mask: torch.Tensor,
 ) -> dict[str, float]:
     """Aggregate teacher-intervention metadata collected during rollout."""
@@ -2586,6 +2587,130 @@ def compute_intervention_metrics(
     skipped_denom = max(int(skipped_array.sum()), 1)
     for reason, count in skipped_reason_counts.items():
         metrics[f"opd_intervention/skipped_reason/{reason}"] = count / skipped_denom
+
+    outcomes = [item for item in (intervention_outcomes or []) if isinstance(item, dict) and item.get("enabled")]
+    if outcomes:
+        outcome_count = len(outcomes)
+        raw_correct = sum(bool(item.get("raw_correct", False)) for item in outcomes)
+        trigger_detected = sum(bool(item.get("trigger_detected", False)) for item in outcomes)
+        repair_executed = sum(bool(item.get("repair_executed", False)) for item in outcomes)
+        repair_effective = sum(bool(item.get("repair_effective", False)) for item in outcomes)
+        repair_ineffective = sum(bool(item.get("repair_ineffective", False)) for item in outcomes)
+        raw_wrong = outcome_count - raw_correct
+        metrics.update(
+            {
+                "opd_intervention/outcome/sample_count": float(outcome_count),
+                "opd_intervention/outcome/raw_correct_count": float(raw_correct),
+                "opd_intervention/outcome/raw_correct_fraction": raw_correct / outcome_count,
+                "opd_intervention/outcome/raw_wrong_count": float(raw_wrong),
+                "opd_intervention/outcome/trigger_count": float(trigger_detected),
+                "opd_intervention/outcome/trigger_fraction": trigger_detected / outcome_count,
+                "opd_intervention/outcome/repair_executed_count": float(repair_executed),
+                "opd_intervention/outcome/repair_effective_count": float(repair_effective),
+                "opd_intervention/outcome/repair_ineffective_count": float(repair_ineffective),
+                "opd_intervention/outcome/repair_effective_fraction": (
+                    repair_effective / repair_executed if repair_executed else 0.0
+                ),
+                "opd_intervention/outcome/repair_ineffective_fraction": (
+                    repair_ineffective / repair_executed if repair_executed else 0.0
+                ),
+                "opd_intervention/outcome/repair_coverage_of_raw_wrong": (
+                    repair_executed / raw_wrong if raw_wrong else 0.0
+                ),
+                "opd_intervention/outcome/correct_yield_from_raw_wrong": (
+                    repair_effective / raw_wrong if raw_wrong else 0.0
+                ),
+            }
+        )
+
+    candidate_records: list[dict[str, Any]] = []
+    for sample_items in list(interventions) + list(intervention_skipped or []):
+        if isinstance(sample_items, dict):
+            sample_items = [sample_items]
+        if not isinstance(sample_items, list | tuple):
+            continue
+        candidate_records.extend(
+            item
+            for item in sample_items
+            if isinstance(item, dict) and bool(item.get("candidate_selection_enabled", False))
+        )
+    if candidate_records:
+        metrics["opd_intervention/candidates/set_count"] = float(len(candidate_records))
+        for field, metric_name in (
+            ("candidate_count_requested", "requested"),
+            ("candidate_count_generated", "generated"),
+            ("candidate_count_teacher_nll_valid", "teacher_nll_valid"),
+            ("candidate_count_threshold_eligible", "threshold_eligible"),
+            ("candidate_count_rankable", "rankable"),
+            ("candidate_unique_count", "unique"),
+        ):
+            values = [float(item[field]) for item in candidate_records if item.get(field) is not None]
+            if values:
+                metrics[f"opd_intervention/candidates/{metric_name}_count"] = float(np.sum(values))
+                metrics[f"opd_intervention/candidates/{metric_name}_mean"] = float(np.mean(values))
+        duplicate_fractions = [
+            float(item["candidate_duplicate_fraction"])
+            for item in candidate_records
+            if item.get("candidate_duplicate_fraction") is not None
+        ]
+        if duplicate_fractions:
+            metrics["opd_intervention/candidates/duplicate_fraction_mean"] = float(np.mean(duplicate_fractions))
+        thresholds = [
+            float(item["teacher_nll_threshold"])
+            for item in candidate_records
+            if item.get("teacher_nll_threshold") is not None
+        ]
+        if thresholds:
+            metrics["opd_intervention/candidates/teacher_nll_threshold_mean"] = float(np.mean(thresholds))
+            metrics["opd_intervention/candidates/teacher_nll_threshold_min"] = float(np.min(thresholds))
+            metrics["opd_intervention/candidates/teacher_nll_threshold_max"] = float(np.max(thresholds))
+        calibration_counts = [
+            float(item["teacher_nll_calibration_count_before"])
+            for item in candidate_records
+            if item.get("teacher_nll_calibration_count_before") is not None
+        ]
+        if calibration_counts:
+            metrics["opd_intervention/candidates/calibration_count_mean"] = float(np.mean(calibration_counts))
+            metrics["opd_intervention/candidates/calibration_count_max"] = float(np.max(calibration_counts))
+        selected_teacher_nlls = [
+            float(item["selected_teacher_nll"])
+            for item in candidate_records
+            if item.get("selected_teacher_nll") is not None
+        ]
+        selected_student_nlls = [
+            float(item["selected_student_nll"])
+            for item in candidate_records
+            if item.get("selected_student_nll") is not None
+        ]
+        if selected_teacher_nlls:
+            metrics["opd_intervention/candidates/selected_teacher_nll_mean"] = float(np.mean(selected_teacher_nlls))
+        if selected_student_nlls:
+            metrics["opd_intervention/candidates/selected_student_nll_mean"] = float(np.mean(selected_student_nlls))
+        calibration_probes = [item for item in candidate_records if bool(item.get("healthy_calibration_probe", False))]
+        metrics["opd_intervention/candidates/healthy_calibration_probe_count"] = float(len(calibration_probes))
+        metrics["opd_intervention/candidates/healthy_calibration_update_count"] = float(
+            sum(bool(item.get("healthy_calibration_updated", False)) for item in calibration_probes)
+        )
+        threshold_source_counts: dict[str, int] = {}
+        invalid_candidate_reason_counts: dict[str, int] = {}
+        invalid_candidate_total = 0
+        for item in candidate_records:
+            threshold_source = item.get("teacher_nll_threshold_source")
+            if threshold_source is not None:
+                threshold_source = str(threshold_source)
+                threshold_source_counts[threshold_source] = threshold_source_counts.get(threshold_source, 0) + 1
+            for candidate in item.get("teacher_candidates", []):
+                if not isinstance(candidate, dict) or candidate.get("invalid_reason") is None:
+                    continue
+                reason = str(candidate["invalid_reason"])
+                invalid_candidate_reason_counts[reason] = invalid_candidate_reason_counts.get(reason, 0) + 1
+                invalid_candidate_total += 1
+        for source, count in threshold_source_counts.items():
+            metrics[f"opd_intervention/candidates/threshold_source/{source}"] = count / len(candidate_records)
+        invalid_candidate_denom = max(invalid_candidate_total, 1)
+        metrics["opd_intervention/candidates/invalid_count"] = float(invalid_candidate_total)
+        for reason, count in invalid_candidate_reason_counts.items():
+            metrics[f"opd_intervention/candidates/invalid_reason/{reason}"] = count / invalid_candidate_denom
     return metrics
 
 

@@ -888,6 +888,93 @@ def test_compute_intervention_metrics_counts_zero_trainable_samples_on_cpu():
     assert metrics["opd_intervention/trainable_token_fraction"] == 1 / 6
 
 
+def test_compute_intervention_metrics_aggregates_outcome_and_candidate_selection_on_cpu():
+    interventions = [
+        [
+            {
+                "start": 0,
+                "teacher_tokens": 2,
+                "student_suffix_tokens": 4,
+                "candidate_selection_enabled": True,
+                "candidate_count_requested": 4,
+                "candidate_count_generated": 4,
+                "candidate_count_teacher_nll_valid": 4,
+                "candidate_count_threshold_eligible": 2,
+                "candidate_count_rankable": 2,
+                "candidate_unique_count": 3,
+                "candidate_duplicate_fraction": 0.25,
+                "teacher_nll_threshold": 0.5,
+                "teacher_nll_threshold_source": "rolling_healthy_quantile",
+                "teacher_nll_calibration_count_before": 32,
+                "selected_teacher_nll": 0.2,
+                "selected_student_nll": 0.3,
+                "teacher_candidates": [
+                    {"index": 0, "invalid_reason": None},
+                    {"index": 1, "invalid_reason": "student_nll_scoring_failed:RuntimeError"},
+                ],
+            }
+        ],
+        [],
+    ]
+    skipped = [
+        [],
+        [
+            {
+                "reason": "teacher_candidates_above_nll_threshold",
+                "candidate_selection_enabled": True,
+                "candidate_count_requested": 4,
+                "candidate_count_generated": 4,
+                "candidate_count_teacher_nll_valid": 4,
+                "candidate_count_threshold_eligible": 0,
+                "candidate_unique_count": 4,
+                "candidate_duplicate_fraction": 0.0,
+                "teacher_nll_threshold": 0.4,
+                "teacher_nll_threshold_source": "rolling_healthy_quantile",
+                "teacher_nll_calibration_count_before": 31,
+                "teacher_candidates": [],
+            }
+        ],
+    ]
+    outcomes = [
+        {
+            "enabled": True,
+            "raw_correct": False,
+            "trigger_detected": True,
+            "repair_executed": True,
+            "repair_effective": True,
+            "repair_ineffective": False,
+        },
+        {
+            "enabled": True,
+            "raw_correct": False,
+            "trigger_detected": True,
+            "repair_executed": False,
+            "repair_effective": False,
+            "repair_ineffective": False,
+        },
+    ]
+
+    metrics = compute_intervention_metrics(
+        intervention_counts=[1, 0],
+        interventions=interventions,
+        intervention_skipped=skipped,
+        intervention_outcomes=outcomes,
+        response_mask=torch.ones((2, 8), dtype=torch.bool),
+    )
+
+    assert metrics["opd_intervention/outcome/sample_count"] == 2
+    assert metrics["opd_intervention/outcome/raw_wrong_count"] == 2
+    assert metrics["opd_intervention/outcome/repair_executed_count"] == 1
+    assert metrics["opd_intervention/outcome/repair_effective_count"] == 1
+    assert metrics["opd_intervention/outcome/repair_effective_fraction"] == 1.0
+    assert metrics["opd_intervention/outcome/repair_coverage_of_raw_wrong"] == 0.5
+    assert metrics["opd_intervention/candidates/set_count"] == 2
+    assert metrics["opd_intervention/candidates/requested_count"] == 8
+    assert metrics["opd_intervention/candidates/threshold_eligible_count"] == 2
+    assert metrics["opd_intervention/candidates/teacher_nll_threshold_mean"] == pytest.approx(0.45)
+    assert metrics["opd_intervention/candidates/invalid_count"] == 1
+
+
 def test_compute_intervention_metrics_aggregates_paired_local_effect_on_cpu():
     interventions = [
         [

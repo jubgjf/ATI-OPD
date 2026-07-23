@@ -206,6 +206,17 @@ class DistillationInterventionConfig(BaseConfig):
     teacher_temperature: float = 0.6
     teacher_top_p: float = 0.95
     teacher_top_k: int = 20
+    # Opt-in outcome-aware candidate selection. Keeping this disabled preserves
+    # the legacy one-teacher-segment intervention path exactly.
+    outcome_aware_candidate_selection_enabled: bool = False
+    outcome_correctness_key: str = "acc"
+    outcome_correctness_threshold: float = 0.5
+    teacher_candidate_count: int = 4
+    teacher_nll_calibration_quantile: float = 0.75
+    teacher_nll_calibration_window: int = 256
+    teacher_nll_calibration_min_samples: int = 16
+    teacher_nll_initial_threshold: Optional[float] = None
+    teacher_nll_healthy_probe_probability: float = 0.1
     log_examples_per_worker: int = 2
 
     def __post_init__(self):
@@ -285,6 +296,44 @@ class DistillationInterventionConfig(BaseConfig):
             raise ValueError(f"teacher_top_p must be in (0, 1], got {self.teacher_top_p!r}.")
         if self.teacher_top_k < -1:
             raise ValueError(f"teacher_top_k must be -1 or non-negative, got {self.teacher_top_k!r}.")
+        if self.outcome_aware_candidate_selection_enabled and not self.enabled:
+            raise ValueError(
+                "outcome_aware_candidate_selection_enabled=true requires distillation.intervention.enabled=true."
+            )
+        if not str(self.outcome_correctness_key).strip():
+            raise ValueError("outcome_correctness_key must be a non-empty string.")
+        if not math.isfinite(self.outcome_correctness_threshold):
+            raise ValueError(
+                f"outcome_correctness_threshold must be finite, got {self.outcome_correctness_threshold!r}."
+            )
+        if self.teacher_candidate_count <= 0:
+            raise ValueError("teacher_candidate_count must be positive.")
+        if (
+            not math.isfinite(self.teacher_nll_calibration_quantile)
+            or not 0 < self.teacher_nll_calibration_quantile < 1
+        ):
+            raise ValueError(
+                "teacher_nll_calibration_quantile must be finite and in (0, 1), "
+                f"got {self.teacher_nll_calibration_quantile!r}."
+            )
+        if self.teacher_nll_calibration_window <= 0:
+            raise ValueError("teacher_nll_calibration_window must be positive.")
+        if self.teacher_nll_calibration_min_samples <= 0:
+            raise ValueError("teacher_nll_calibration_min_samples must be positive.")
+        if self.teacher_nll_calibration_min_samples > self.teacher_nll_calibration_window:
+            raise ValueError("teacher_nll_calibration_min_samples must not exceed teacher_nll_calibration_window.")
+        if self.teacher_nll_initial_threshold is not None and (
+            not math.isfinite(self.teacher_nll_initial_threshold) or self.teacher_nll_initial_threshold < 0
+        ):
+            raise ValueError("teacher_nll_initial_threshold must be finite and non-negative when set.")
+        if (
+            not math.isfinite(self.teacher_nll_healthy_probe_probability)
+            or not 0 <= self.teacher_nll_healthy_probe_probability <= 1
+        ):
+            raise ValueError(
+                "teacher_nll_healthy_probe_probability must be finite and in [0, 1], "
+                f"got {self.teacher_nll_healthy_probe_probability!r}."
+            )
         if self.log_examples_per_worker < 0:
             raise ValueError("log_examples_per_worker must be non-negative.")
 

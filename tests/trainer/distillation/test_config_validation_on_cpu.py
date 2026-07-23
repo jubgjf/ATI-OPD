@@ -31,6 +31,14 @@ def test_teacher_segment_loss_config_defaults_to_legacy_opd_on_cpu():
     assert config.teacher_rejection_persistence_window_tokens == 64
     assert config.teacher_rejection_persistence_threshold is None
     assert config.teacher_rejection_persistence_min_valid_tokens == 32
+    assert config.outcome_aware_candidate_selection_enabled is False
+    assert config.outcome_correctness_key == "acc"
+    assert config.teacher_candidate_count == 4
+    assert config.teacher_nll_calibration_quantile == 0.75
+    assert config.teacher_nll_calibration_window == 256
+    assert config.teacher_nll_calibration_min_samples == 16
+    assert config.teacher_nll_initial_threshold is None
+    assert config.teacher_nll_healthy_probe_probability == 0.1
 
 
 def test_teacher_segment_loss_config_validates_mode_and_coefficient_on_cpu():
@@ -83,6 +91,44 @@ def test_teacher_rejection_persistence_config_validates_on_cpu():
             teacher_rejection_persistence_window_tokens=16,
             teacher_rejection_persistence_min_valid_tokens=17,
         )
+
+
+def test_outcome_aware_candidate_selection_config_validates_on_cpu():
+    config = DistillationInterventionConfig(
+        enabled=True,
+        outcome_aware_candidate_selection_enabled=True,
+        gap_metric="teacher_rejection",
+        teacher_candidate_count=4,
+        teacher_nll_calibration_quantile=0.8,
+        teacher_nll_calibration_window=64,
+        teacher_nll_calibration_min_samples=8,
+        teacher_nll_initial_threshold=2.0,
+        teacher_nll_healthy_probe_probability=0.25,
+    )
+    assert config.outcome_aware_candidate_selection_enabled is True
+
+    with pytest.raises(ValueError, match="requires distillation.intervention.enabled=true"):
+        DistillationInterventionConfig(outcome_aware_candidate_selection_enabled=True)
+    with pytest.raises(ValueError, match="outcome_correctness_key"):
+        DistillationInterventionConfig(outcome_correctness_key="")
+    with pytest.raises(ValueError, match="teacher_candidate_count"):
+        DistillationInterventionConfig(teacher_candidate_count=0)
+    for quantile in (0.0, 1.0, float("nan")):
+        with pytest.raises(ValueError, match="teacher_nll_calibration_quantile"):
+            DistillationInterventionConfig(teacher_nll_calibration_quantile=quantile)
+    with pytest.raises(ValueError, match="teacher_nll_calibration_window"):
+        DistillationInterventionConfig(teacher_nll_calibration_window=0)
+    with pytest.raises(ValueError, match="must not exceed"):
+        DistillationInterventionConfig(
+            teacher_nll_calibration_window=4,
+            teacher_nll_calibration_min_samples=5,
+        )
+    for threshold in (-0.1, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="teacher_nll_initial_threshold"):
+            DistillationInterventionConfig(teacher_nll_initial_threshold=threshold)
+    for probability in (-0.1, 1.1, float("nan")):
+        with pytest.raises(ValueError, match="teacher_nll_healthy_probe_probability"):
+            DistillationInterventionConfig(teacher_nll_healthy_probe_probability=probability)
 
 
 def test_distillation_intervention_rejects_train_teacher_segments_with_bypass_mode_on_cpu():

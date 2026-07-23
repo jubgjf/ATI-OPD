@@ -9,6 +9,7 @@
 #   DEBUG_MODE=popd bash run/debug.sh
 #   DEBUG_MODE=vanilla TOTAL_TRAINING_STEPS=1 bash run/debug.sh
 #   DEBUG_MODE=popd TEACHER_GPUS=1 TEACHER_TP=1 bash run/debug.sh
+#   DEBUG_MODE=outcome-nll-rank TEACHER_GPUS=1 TEACHER_TP=1 bash run/debug.sh
 #
 # The job disables W&B and checkpoint saves by default.
 
@@ -166,6 +167,19 @@ TEACHER_INTERVENTION_MIN_TRAINABLE_TOKENS=${TEACHER_INTERVENTION_MIN_TRAINABLE_T
 TEACHER_INTERVENTION_TEMPERATURE=${TEACHER_INTERVENTION_TEMPERATURE:-0.6}
 TEACHER_INTERVENTION_TOP_P=${TEACHER_INTERVENTION_TOP_P:-0.95}
 TEACHER_INTERVENTION_TOP_K=${TEACHER_INTERVENTION_TOP_K:-20}
+TEACHER_INTERVENTION_GAP_AGGREGATION=${TEACHER_INTERVENTION_GAP_AGGREGATION:-mean}
+TEACHER_INTERVENTION_PERSISTENCE_ENABLED=${TEACHER_INTERVENTION_PERSISTENCE_ENABLED:-False}
+TEACHER_INTERVENTION_PERSISTENCE_WINDOW=${TEACHER_INTERVENTION_PERSISTENCE_WINDOW:-64}
+TEACHER_INTERVENTION_PERSISTENCE_THRESHOLD=${TEACHER_INTERVENTION_PERSISTENCE_THRESHOLD:-null}
+TEACHER_INTERVENTION_PERSISTENCE_MIN_TOKENS=${TEACHER_INTERVENTION_PERSISTENCE_MIN_TOKENS:-32}
+OUTCOME_CORRECTNESS_KEY=${OUTCOME_CORRECTNESS_KEY:-acc}
+OUTCOME_CORRECTNESS_THRESHOLD=${OUTCOME_CORRECTNESS_THRESHOLD:-0.5}
+TEACHER_CANDIDATE_COUNT=${TEACHER_CANDIDATE_COUNT:-4}
+TEACHER_NLL_CALIBRATION_QUANTILE=${TEACHER_NLL_CALIBRATION_QUANTILE:-0.75}
+TEACHER_NLL_CALIBRATION_WINDOW=${TEACHER_NLL_CALIBRATION_WINDOW:-256}
+TEACHER_NLL_CALIBRATION_MIN_SAMPLES=${TEACHER_NLL_CALIBRATION_MIN_SAMPLES:-16}
+TEACHER_NLL_INITIAL_THRESHOLD=${TEACHER_NLL_INITIAL_THRESHOLD:-null}
+TEACHER_NLL_HEALTHY_PROBE_PROBABILITY=${TEACHER_NLL_HEALTHY_PROBE_PROBABILITY:-0.1}
 
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
 TEST_BEFORE_TRAIN=${TEST_BEFORE_TRAIN:-False}
@@ -230,8 +244,40 @@ case "$DEBUG_MODE" in
             "distillation.intervention.teacher_top_k=${TEACHER_INTERVENTION_TOP_K}"
         )
         ;;
+    outcome-nll-rank | dmpd-outcome)
+        MODE_NAME=outcome-nll-rank
+        MODE_OVERRIDES=(
+            "distillation.distillation_loss.horizon.mode=full"
+            "distillation.intervention.enabled=True"
+            "distillation.intervention.student_segment_length=${TEACHER_INTERVENTION_SEGMENT_LENGTH}"
+            "distillation.intervention.teacher_segment_length=${TEACHER_INTERVENTION_TEACHER_LENGTH}"
+            "distillation.intervention.gap_metric=${TEACHER_INTERVENTION_GAP_METRIC}"
+            "distillation.intervention.gap_distribution_topk=${TEACHER_INTERVENTION_GAP_DISTRIBUTION_TOPK}"
+            "distillation.intervention.gap_aggregation=${TEACHER_INTERVENTION_GAP_AGGREGATION}"
+            "distillation.intervention.gap_threshold=${TEACHER_INTERVENTION_GAP_THRESHOLD}"
+            "distillation.intervention.teacher_rejection_persistence_enabled=${TEACHER_INTERVENTION_PERSISTENCE_ENABLED}"
+            "distillation.intervention.teacher_rejection_persistence_window_tokens=${TEACHER_INTERVENTION_PERSISTENCE_WINDOW}"
+            "distillation.intervention.teacher_rejection_persistence_threshold=${TEACHER_INTERVENTION_PERSISTENCE_THRESHOLD}"
+            "distillation.intervention.teacher_rejection_persistence_min_valid_tokens=${TEACHER_INTERVENTION_PERSISTENCE_MIN_TOKENS}"
+            "distillation.intervention.max_interventions_per_sample=${TEACHER_INTERVENTION_MAX_COUNT}"
+            "distillation.intervention.train_on_teacher_segments=${TEACHER_INTERVENTION_TRAIN_TEACHER}"
+            "distillation.intervention.min_trainable_tokens_after_repair=${TEACHER_INTERVENTION_MIN_TRAINABLE_TOKENS}"
+            "distillation.intervention.teacher_temperature=${TEACHER_INTERVENTION_TEMPERATURE}"
+            "distillation.intervention.teacher_top_p=${TEACHER_INTERVENTION_TOP_P}"
+            "distillation.intervention.teacher_top_k=${TEACHER_INTERVENTION_TOP_K}"
+            "distillation.intervention.outcome_aware_candidate_selection_enabled=True"
+            "distillation.intervention.outcome_correctness_key=${OUTCOME_CORRECTNESS_KEY}"
+            "distillation.intervention.outcome_correctness_threshold=${OUTCOME_CORRECTNESS_THRESHOLD}"
+            "distillation.intervention.teacher_candidate_count=${TEACHER_CANDIDATE_COUNT}"
+            "distillation.intervention.teacher_nll_calibration_quantile=${TEACHER_NLL_CALIBRATION_QUANTILE}"
+            "distillation.intervention.teacher_nll_calibration_window=${TEACHER_NLL_CALIBRATION_WINDOW}"
+            "distillation.intervention.teacher_nll_calibration_min_samples=${TEACHER_NLL_CALIBRATION_MIN_SAMPLES}"
+            "distillation.intervention.teacher_nll_initial_threshold=${TEACHER_NLL_INITIAL_THRESHOLD}"
+            "distillation.intervention.teacher_nll_healthy_probe_probability=${TEACHER_NLL_HEALTHY_PROBE_PROBABILITY}"
+        )
+        ;;
     *)
-        echo "Unsupported DEBUG_MODE=${DEBUG_MODE}. Use vanilla, topd, popd, or dmpd." >&2
+        echo "Unsupported DEBUG_MODE=${DEBUG_MODE}. Use vanilla, topd, popd, dmpd, or outcome-nll-rank." >&2
         exit 2
         ;;
 esac

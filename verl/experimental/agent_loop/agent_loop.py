@@ -28,11 +28,13 @@ and is designed to be fully replaceable by other agent frameworks such as:
 """
 
 import asyncio
+import hashlib
 import logging
 import math
 import os
 import random
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Optional
 from uuid import uuid4
@@ -110,6 +112,103 @@ class _ThinkingBlockState:
     valid: bool = True
     open: bool = False
     reason: Optional[str] = None
+
+
+@dataclass
+class _TeacherRepairCandidate:
+    index: int
+    generation: TeacherGenerationResult
+    token_ids: list[int]
+    eos_truncated: bool
+    teacher_nll: Optional[float] = None
+    student_nll: Optional[float] = None
+    teacher_rank: Optional[int] = None
+    student_rank: Optional[int] = None
+    rank_sum: Optional[int] = None
+    invalid_reason: Optional[str] = None
+
+
+@dataclass
+class _TeacherCandidateSelectionResult:
+    candidate: Optional[_TeacherRepairCandidate]
+    metadata: dict[str, Any]
+    skip_reason: Optional[str] = None
+
+
+def _as_single_float(value: Any, *, context: str) -> float:
+    """Normalize a reward-manager scalar without silently reducing a batch."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise RuntimeError(f"{context} must contain exactly one value, got shape={tuple(value.shape)}.")
+        value = value.detach().cpu().item()
+    elif isinstance(value, np.ndarray):
+        if value.size != 1:
+            raise RuntimeError(f"{context} must contain exactly one value, got shape={value.shape}.")
+        value = value.reshape(-1)[0].item()
+    elif isinstance(value, list | tuple):
+        if len(value) != 1:
+            raise RuntimeError(f"{context} must contain exactly one value, got len={len(value)}.")
+        return _as_single_float(value[0], context=context)
+    elif isinstance(value, np.generic):
+        value = value.item()
+    try:
+        scalar = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{context} must be numeric, got {value!r}.") from exc
+    if not math.isfinite(scalar):
+        raise RuntimeError(f"{context} must be finite, got {scalar!r}.")
+    return scalar
+
+
+def _extract_outcome_correctness(
+    output: "AgentLoopOutput",
+    intervention_config: DistillationInterventionConfig,
+) -> tuple[bool, float]:
+    reward_extra_info = output.extra_fields.get("reward_extra_info")
+    if not isinstance(reward_extra_info, dict):
+        raise RuntimeError(
+            "Outcome-aware teacher intervention requires reward_extra_info from the reward manager, "
+            "but it was unavailable. Configure an async reward loop that returns the correctness field "
+            f"{intervention_config.outcome_correctness_key!r}."
+        )
+    correctness_key = str(intervention_config.outcome_correctness_key)
+    if correctness_key not in reward_extra_info:
+        raise RuntimeError(
+            "Outcome-aware teacher intervention could not find its correctness signal: "
+            f"reward_extra_info has keys={sorted(reward_extra_info)}, expected {correctness_key!r}."
+        )
+    correctness_value = _as_single_float(
+        reward_extra_info[correctness_key],
+        context=f"reward_extra_info[{correctness_key!r}]",
+    )
+    return correctness_value > float(intervention_config.outcome_correctness_threshold), correctness_value
+
+
+def _stable_fraction(key: str) -> float:
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False) / float(1 << 64)
+
+
+def _rank_min(values: dict[int, float]) -> dict[int, int]:
+    """Rank smaller finite values first, assigning equal values the same minimum rank."""
+    ordered = sorted(values.items(), key=lambda item: (item[1], item[0]))
+    ranks: dict[int, int] = {}
+    previous_value: Optional[float] = None
+    previous_rank = 0
+    for ordinal, (index, value) in enumerate(ordered, start=1):
+        rank = previous_rank if previous_value is not None and value == previous_value else ordinal
+        ranks[index] = rank
+        previous_value = value
+        previous_rank = rank
+    return ranks
+
+
+def _stable_choice(indices: list[int], *, key: str) -> int:
+    if not indices:
+        raise ValueError("_stable_choice requires at least one index.")
+    ordered = sorted(indices)
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    return ordered[int.from_bytes(digest[:8], byteorder="big", signed=False) % len(ordered)]
 
 
 def _compute_intervention_gap(
@@ -1379,6 +1478,7 @@ class AgentLoopWorker:
         self._teacher_intervention_logged_step = None
         self._teacher_intervention_thinking_start_pattern: list[int] = []
         self._teacher_intervention_thinking_end_pattern: list[int] = []
+        self._teacher_nll_healthy_history: deque[float] = deque()
         if self.distillation_enabled:
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 
@@ -1392,6 +1492,10 @@ class AgentLoopWorker:
             self.teacher_intervention_enabled = self.teacher_intervention_config.enabled
             self._validate_teacher_intervention_compatibility()
             self._init_teacher_intervention_token_patterns()
+            if self.teacher_intervention_config.outcome_aware_candidate_selection_enabled:
+                self._teacher_nll_healthy_history = deque(
+                    maxlen=self.teacher_intervention_config.teacher_nll_calibration_window
+                )
 
         # Load tools once per worker; each trajectory just reuses self.tools.
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
@@ -1700,6 +1804,29 @@ class AgentLoopWorker:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
         if getattr(self, "teacher_intervention_enabled", False):
+            outcome_aware_selection = bool(
+                self.teacher_intervention_config is not None
+                and self.teacher_intervention_config.outcome_aware_candidate_selection_enabled
+            )
+            if outcome_aware_selection and not validate:
+                # The raw student answer must be judged before any token is
+                # rewritten. This call is a no-op if a custom AgentLoop already
+                # populated the reward.
+                await self._compute_score([output], kwargs=kwargs)
+                raw_correct, raw_correctness_value = _extract_outcome_correctness(
+                    output,
+                    self.teacher_intervention_config,
+                )
+                output.extra_fields["teacher_intervention_outcome"] = {
+                    "enabled": True,
+                    "correctness_key": self.teacher_intervention_config.outcome_correctness_key,
+                    "correctness_threshold": float(self.teacher_intervention_config.outcome_correctness_threshold),
+                    "raw_reward_score": output.reward_score,
+                    "raw_correctness_value": raw_correctness_value,
+                    "raw_correct": raw_correct,
+                    "trigger_detected": False,
+                    "repair_executed": False,
+                }
             await self._maybe_repair_with_teacher(
                 output,
                 validate=validate,
@@ -1836,6 +1963,45 @@ class AgentLoopWorker:
             ),
         )
         await self._compute_score([output], kwargs=kwargs)
+        if (
+            getattr(self, "teacher_intervention_enabled", False)
+            and self.teacher_intervention_config is not None
+            and self.teacher_intervention_config.outcome_aware_candidate_selection_enabled
+            and not validate
+        ):
+            final_correct, final_correctness_value = _extract_outcome_correctness(
+                output,
+                self.teacher_intervention_config,
+            )
+            outcome_metadata = output.extra_fields["teacher_intervention_outcome"]
+            intervention_count = int(output.extra_fields.get("teacher_intervention_count", 0) or 0)
+            raw_correct = bool(outcome_metadata["raw_correct"])
+            outcome_metadata.update(
+                {
+                    "final_reward_score": output.reward_score,
+                    "final_correctness_value": final_correctness_value,
+                    "final_correct": final_correct,
+                    "repair_executed": intervention_count > 0,
+                    "repair_effective": intervention_count > 0 and not raw_correct and final_correct,
+                    "repair_ineffective": intervention_count > 0 and not raw_correct and not final_correct,
+                }
+            )
+            interventions = output.extra_fields.get("teacher_interventions") or []
+            if interventions:
+                # Outcome effectiveness is sample-level. Attach it only to the
+                # first intervention so aggregation does not double-count
+                # samples with multiple repairs.
+                interventions[0].update(
+                    {
+                        "sample_outcome_summary": True,
+                        "raw_correctness_value": outcome_metadata["raw_correctness_value"],
+                        "raw_correct": raw_correct,
+                        "final_correctness_value": final_correctness_value,
+                        "final_correct": final_correct,
+                        "repair_effective": outcome_metadata["repair_effective"],
+                        "repair_ineffective": outcome_metadata["repair_ineffective"],
+                    }
+                )
         await self._compute_teacher_logprobs(
             output,
             prompt_ids=output.prompt_ids,
@@ -2101,6 +2267,363 @@ class AgentLoopWorker:
             context="Student intervention",
         )
 
+    def _ensure_teacher_nll_calibration_state(self) -> deque[float]:
+        config: DistillationInterventionConfig = self.teacher_intervention_config
+        window = int(config.teacher_nll_calibration_window)
+        history = getattr(self, "_teacher_nll_healthy_history", None)
+        if not isinstance(history, deque) or history.maxlen != window:
+            existing = list(history or [])[-window:]
+            history = deque(existing, maxlen=window)
+            self._teacher_nll_healthy_history = history
+        return history
+
+    def _current_teacher_nll_threshold(self) -> tuple[Optional[float], str, int]:
+        config: DistillationInterventionConfig = self.teacher_intervention_config
+        history = AgentLoopWorker._ensure_teacher_nll_calibration_state(self)
+        count = len(history)
+        if count >= int(config.teacher_nll_calibration_min_samples):
+            threshold = float(
+                np.quantile(
+                    np.asarray(history, dtype=np.float64),
+                    config.teacher_nll_calibration_quantile,
+                )
+            )
+            return threshold, "rolling_healthy_quantile", count
+        if config.teacher_nll_initial_threshold is not None:
+            return float(config.teacher_nll_initial_threshold), "initial", count
+        return None, "unavailable", count
+
+    @staticmethod
+    def _candidate_mean_nll(
+        result: TeacherLogprobScoringResult,
+        *,
+        prefix_len: int,
+        candidate_ids: list[int],
+        context: str,
+    ) -> float:
+        if not candidate_ids:
+            raise ValueError(f"{context} cannot score an empty candidate.")
+        sampled_logprobs = _teacher_response_logprobs(
+            teacher_logprobs=_teacher_gap_logprobs(result),
+            prompt_len=prefix_len,
+            response_len=len(candidate_ids),
+        )
+        sampled_ids = result.sampled_ids
+        if sampled_ids is None and result.ids.ndim == 2 and result.ids.shape[-1] == 1:
+            sampled_ids = result.ids
+        if sampled_ids is not None:
+            start = prefix_len - 1
+            end = start + len(candidate_ids)
+            aligned_ids = sampled_ids[start:end, 0].detach().cpu().tolist()
+            if aligned_ids != candidate_ids:
+                raise RuntimeError(
+                    f"{context} prompt-logprob token ids are misaligned with the candidate: "
+                    f"expected={candidate_ids[:8]}, got={aligned_ids[:8]}, candidate_len={len(candidate_ids)}."
+                )
+        nll = float((-sampled_logprobs.float()).mean().item())
+        if not math.isfinite(nll):
+            raise RuntimeError(f"{context} produced a non-finite mean NLL: {nll!r}.")
+        return max(nll, 0.0)
+
+    async def _generate_and_select_teacher_candidate(
+        self,
+        *,
+        prefix_ids: list[int],
+        max_tokens: int,
+        output: AgentLoopOutput,
+        routing_key: Optional[str],
+        base_request_id: str,
+        attempt: int,
+        calibration_only: bool,
+    ) -> _TeacherCandidateSelectionResult:
+        """Generate K candidates, NLL-filter them, then select by teacher/student rank sum."""
+        config: DistillationInterventionConfig = self.teacher_intervention_config
+        candidate_count = int(config.teacher_candidate_count)
+        threshold, threshold_source, calibration_count_before = AgentLoopWorker._current_teacher_nll_threshold(self)
+        generation_results = await asyncio.gather(
+            *[
+                self.teacher_server_manager.generate_teacher_segment_single(
+                    prefix_ids=prefix_ids,
+                    max_tokens=max_tokens,
+                    multi_modal_data=output.multi_modal_data,
+                    mm_processor_kwargs=output.mm_processor_kwargs,
+                    routing_key=routing_key,
+                    request_id=f"{base_request_id}:teacher-candidate:{attempt}:{candidate_index}",
+                )
+                for candidate_index in range(candidate_count)
+            ],
+            return_exceptions=True,
+        )
+
+        eos_token_ids = _tokenizer_eos_token_ids(self.tokenizer)
+        candidates: list[_TeacherRepairCandidate] = []
+        generation_failures: dict[int, str] = {}
+        for candidate_index, raw_result in enumerate(generation_results):
+            if isinstance(raw_result, BaseException):
+                generation_failures[candidate_index] = f"generation_exception:{type(raw_result).__name__}"
+                logger.warning(
+                    "Teacher candidate generation failed for request_id=%s, attempt=%d, candidate=%d: %s",
+                    base_request_id,
+                    attempt,
+                    candidate_index,
+                    raw_result,
+                )
+                continue
+            generation = _coerce_teacher_generation_result(raw_result)
+            candidate = _TeacherRepairCandidate(
+                index=candidate_index,
+                generation=generation,
+                token_ids=[],
+                eos_truncated=False,
+            )
+            if _generation_was_aborted(
+                stop_reason=generation.stop_reason,
+                finish_reason=generation.finish_reason,
+            ):
+                candidate.invalid_reason = "generation_aborted"
+            else:
+                candidate.token_ids, _, candidate.eos_truncated = _truncate_generation_at_eos(
+                    list(generation.token_ids),
+                    None,
+                    eos_token_ids=eos_token_ids,
+                )
+                if len(candidate.token_ids) > max_tokens:
+                    candidate.invalid_reason = "generation_exceeded_token_budget"
+                elif not candidate.token_ids:
+                    candidate.invalid_reason = "generation_empty"
+                elif _invalid_token_ids_for_tokenizer(candidate.token_ids, self.tokenizer):
+                    candidate.invalid_reason = "generation_invalid_token_ids"
+            candidates.append(candidate)
+
+        async def score_teacher_nll(candidate: _TeacherRepairCandidate) -> None:
+            if candidate.invalid_reason is not None:
+                return
+            try:
+                teacher_result = await self._score_sequence_for_intervention(
+                    request_id=f"{base_request_id}:teacher-candidate-score:{attempt}:{candidate.index}",
+                    prompt_ids=prefix_ids,
+                    response_ids=candidate.token_ids,
+                    output=output,
+                    routing_key=routing_key,
+                )
+                candidate.teacher_nll = AgentLoopWorker._candidate_mean_nll(
+                    teacher_result,
+                    prefix_len=len(prefix_ids),
+                    candidate_ids=candidate.token_ids,
+                    context=f"Teacher candidate {candidate.index}",
+                )
+            except Exception as exc:
+                candidate.invalid_reason = f"teacher_nll_scoring_failed:{type(exc).__name__}"
+                logger.warning(
+                    "Teacher candidate NLL scoring failed for request_id=%s, attempt=%d, candidate=%d: %s",
+                    base_request_id,
+                    attempt,
+                    candidate.index,
+                    exc,
+                )
+
+        await asyncio.gather(*(score_teacher_nll(candidate) for candidate in candidates))
+        teacher_scored_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.invalid_reason is None and candidate.teacher_nll is not None
+        ]
+        unique_candidate_count = len({tuple(candidate.token_ids) for candidate in teacher_scored_candidates})
+
+        metadata: dict[str, Any] = {
+            "candidate_selection_enabled": True,
+            "candidate_count_requested": candidate_count,
+            "candidate_count_generated": candidate_count - len(generation_failures),
+            "candidate_count_teacher_nll_valid": len(teacher_scored_candidates),
+            "candidate_unique_count": unique_candidate_count,
+            "candidate_duplicate_fraction": (
+                1.0 - unique_candidate_count / len(teacher_scored_candidates) if teacher_scored_candidates else 0.0
+            ),
+            "teacher_nll_threshold": threshold,
+            "teacher_nll_threshold_source": threshold_source,
+            "teacher_nll_calibration_quantile": float(config.teacher_nll_calibration_quantile),
+            "teacher_nll_calibration_count_before": calibration_count_before,
+            "candidate_generation_failures": generation_failures,
+        }
+
+        if calibration_only:
+            if teacher_scored_candidates:
+                healthy_min_nll = min(candidate.teacher_nll for candidate in teacher_scored_candidates)
+                history = AgentLoopWorker._ensure_teacher_nll_calibration_state(self)
+                history.append(float(healthy_min_nll))
+                threshold_after, threshold_source_after, calibration_count_after = (
+                    AgentLoopWorker._current_teacher_nll_threshold(self)
+                )
+                metadata.update(
+                    {
+                        "healthy_calibration_updated": True,
+                        "healthy_calibration_min_teacher_nll": float(healthy_min_nll),
+                        "teacher_nll_calibration_count_after": calibration_count_after,
+                        "teacher_nll_threshold_after": threshold_after,
+                        "teacher_nll_threshold_source_after": threshold_source_after,
+                    }
+                )
+            else:
+                metadata.update(
+                    {
+                        "healthy_calibration_updated": False,
+                        "teacher_nll_calibration_count_after": calibration_count_before,
+                    }
+                )
+            metadata["teacher_candidates"] = [
+                {
+                    "index": candidate.index,
+                    "token_count": len(candidate.token_ids),
+                    "teacher_nll": candidate.teacher_nll,
+                    "invalid_reason": candidate.invalid_reason,
+                }
+                for candidate in candidates
+            ]
+            return _TeacherCandidateSelectionResult(candidate=None, metadata=metadata)
+
+        if not teacher_scored_candidates:
+            metadata["candidate_count_threshold_eligible"] = 0
+            metadata["teacher_candidates"] = [
+                {
+                    "index": candidate.index,
+                    "token_count": len(candidate.token_ids),
+                    "teacher_nll": candidate.teacher_nll,
+                    "invalid_reason": candidate.invalid_reason,
+                }
+                for candidate in candidates
+            ]
+            return _TeacherCandidateSelectionResult(
+                candidate=None,
+                metadata=metadata,
+                skip_reason="teacher_candidates_all_invalid",
+            )
+        if threshold is None:
+            metadata["candidate_count_threshold_eligible"] = 0
+            metadata["teacher_candidates"] = [
+                {
+                    "index": candidate.index,
+                    "token_count": len(candidate.token_ids),
+                    "teacher_nll": candidate.teacher_nll,
+                    "invalid_reason": candidate.invalid_reason,
+                }
+                for candidate in candidates
+            ]
+            return _TeacherCandidateSelectionResult(
+                candidate=None,
+                metadata=metadata,
+                skip_reason="teacher_nll_calibration_not_ready",
+            )
+
+        threshold_eligible = [
+            candidate for candidate in teacher_scored_candidates if candidate.teacher_nll <= threshold
+        ]
+        metadata["candidate_count_threshold_eligible"] = len(threshold_eligible)
+        if not threshold_eligible:
+            metadata["teacher_candidates"] = [
+                {
+                    "index": candidate.index,
+                    "token_count": len(candidate.token_ids),
+                    "teacher_nll": candidate.teacher_nll,
+                    "invalid_reason": candidate.invalid_reason,
+                }
+                for candidate in candidates
+            ]
+            return _TeacherCandidateSelectionResult(
+                candidate=None,
+                metadata=metadata,
+                skip_reason="teacher_candidates_above_nll_threshold",
+            )
+
+        async def score_student_nll(candidate: _TeacherRepairCandidate) -> None:
+            try:
+                student_result = await self._score_student_sequence_for_intervention(
+                    request_id=f"{base_request_id}:student-candidate-score:{attempt}:{candidate.index}",
+                    prompt_ids=prefix_ids,
+                    response_ids=candidate.token_ids,
+                    output=output,
+                )
+                candidate.student_nll = AgentLoopWorker._candidate_mean_nll(
+                    student_result,
+                    prefix_len=len(prefix_ids),
+                    candidate_ids=candidate.token_ids,
+                    context=f"Student candidate {candidate.index}",
+                )
+            except Exception as exc:
+                candidate.invalid_reason = f"student_nll_scoring_failed:{type(exc).__name__}"
+                logger.warning(
+                    "Student candidate NLL scoring failed for request_id=%s, attempt=%d, candidate=%d: %s",
+                    base_request_id,
+                    attempt,
+                    candidate.index,
+                    exc,
+                )
+
+        await asyncio.gather(*(score_student_nll(candidate) for candidate in threshold_eligible))
+        rankable = [
+            candidate
+            for candidate in threshold_eligible
+            if candidate.invalid_reason is None and candidate.student_nll is not None
+        ]
+        metadata["candidate_count_rankable"] = len(rankable)
+        if not rankable:
+            metadata["teacher_candidates"] = [
+                {
+                    "index": candidate.index,
+                    "token_count": len(candidate.token_ids),
+                    "teacher_nll": candidate.teacher_nll,
+                    "student_nll": candidate.student_nll,
+                    "invalid_reason": candidate.invalid_reason,
+                }
+                for candidate in candidates
+            ]
+            return _TeacherCandidateSelectionResult(
+                candidate=None,
+                metadata=metadata,
+                skip_reason="teacher_candidates_student_nll_invalid",
+            )
+
+        teacher_ranks = _rank_min({candidate.index: float(candidate.teacher_nll) for candidate in rankable})
+        student_ranks = _rank_min({candidate.index: float(candidate.student_nll) for candidate in rankable})
+        for candidate in rankable:
+            candidate.teacher_rank = teacher_ranks[candidate.index]
+            candidate.student_rank = student_ranks[candidate.index]
+            candidate.rank_sum = candidate.teacher_rank + candidate.student_rank
+        best_rank_sum = min(candidate.rank_sum for candidate in rankable)
+        tied_indices = [candidate.index for candidate in rankable if candidate.rank_sum == best_rank_sum]
+        selected_index = _stable_choice(
+            tied_indices,
+            key=f"{base_request_id}:teacher-candidate-tie:{attempt}",
+        )
+        selected_candidate = next(candidate for candidate in rankable if candidate.index == selected_index)
+        metadata.update(
+            {
+                "selected_candidate_index": selected_index,
+                "selected_teacher_nll": selected_candidate.teacher_nll,
+                "selected_student_nll": selected_candidate.student_nll,
+                "selected_teacher_rank": selected_candidate.teacher_rank,
+                "selected_student_rank": selected_candidate.student_rank,
+                "selected_rank_sum": selected_candidate.rank_sum,
+                "selected_tie_count": len(tied_indices),
+                "teacher_candidates": [
+                    {
+                        "index": candidate.index,
+                        "token_count": len(candidate.token_ids),
+                        "teacher_nll": candidate.teacher_nll,
+                        "student_nll": candidate.student_nll,
+                        "teacher_rank": candidate.teacher_rank,
+                        "student_rank": candidate.student_rank,
+                        "rank_sum": candidate.rank_sum,
+                        "threshold_eligible": (
+                            candidate.teacher_nll is not None and candidate.teacher_nll <= threshold
+                        ),
+                        "invalid_reason": candidate.invalid_reason,
+                    }
+                    for candidate in candidates
+                ],
+            }
+        )
+        return _TeacherCandidateSelectionResult(candidate=selected_candidate, metadata=metadata)
+
     async def _generate_student_suffix(
         self,
         *,
@@ -2186,6 +2709,14 @@ class AgentLoopWorker:
             )
 
         intervention_config: DistillationInterventionConfig = self.teacher_intervention_config
+        outcome_aware_selection = bool(intervention_config.outcome_aware_candidate_selection_enabled)
+        outcome_metadata = output.extra_fields.get("teacher_intervention_outcome")
+        if outcome_aware_selection and not isinstance(outcome_metadata, dict):
+            raise RuntimeError(
+                "Outcome-aware teacher intervention requires the raw outcome gate to run before repair. "
+                "Call _agent_loop_postprocess instead of invoking _maybe_repair_with_teacher directly, or provide "
+                "teacher_intervention_outcome metadata in a focused test."
+            )
         use_teacher_segment_sft = bool(
             intervention_config.train_on_teacher_segments and intervention_config.teacher_segment_loss_mode == "sft"
         )
@@ -2305,6 +2836,9 @@ class AgentLoopWorker:
                 break
 
             start, end, score = bad_segment
+            if outcome_aware_selection:
+                outcome_metadata["trigger_detected"] = True
+                outcome_metadata["trigger_count"] = int(outcome_metadata.get("trigger_count", 0)) + 1
             persistence_metadata: dict[str, Any] = {}
             if bool(getattr(intervention_config, "teacher_rejection_persistence_enabled", False)):
                 persistence_score, persistence_tokens = _compute_teacher_rejection_persistence(
@@ -2363,69 +2897,139 @@ class AgentLoopWorker:
                 )
                 break
 
-            teacher_generation = _coerce_teacher_generation_result(
-                await self.teacher_server_manager.generate_teacher_segment_single(
+            candidate_selection_metadata: dict[str, Any] = {}
+            if outcome_aware_selection:
+                raw_correct = bool(outcome_metadata["raw_correct"])
+                if raw_correct:
+                    configured_probe_probability = float(intervention_config.teacher_nll_healthy_probe_probability)
+                    _, _, calibration_count = AgentLoopWorker._current_teacher_nll_threshold(self)
+                    calibration_warmup = calibration_count < intervention_config.teacher_nll_calibration_min_samples
+                    probe_probability = 1.0 if calibration_warmup else configured_probe_probability
+                    should_probe = (
+                        _stable_fraction(f"{base_request_id}:healthy-teacher-nll-probe:{attempt}") < probe_probability
+                    )
+                    candidate_selection_metadata = {
+                        "healthy_calibration_probe": should_probe,
+                        "healthy_calibration_warmup": calibration_warmup,
+                        "healthy_calibration_probe_probability": configured_probe_probability,
+                        "healthy_calibration_effective_probe_probability": probe_probability,
+                    }
+                    if should_probe:
+                        calibration_result = await self._generate_and_select_teacher_candidate(
+                            prefix_ids=prompt_ids + prefix_response_ids,
+                            max_tokens=teacher_max_tokens,
+                            output=output,
+                            routing_key=routing_key,
+                            base_request_id=base_request_id,
+                            attempt=attempt,
+                            calibration_only=True,
+                        )
+                        candidate_selection_metadata.update(calibration_result.metadata)
+                    _record_skipped_intervention(
+                        skipped_interventions,
+                        reason="outcome_correct",
+                        attempt=attempt,
+                        start=start,
+                        end=end,
+                        candidate_response_ids=response_ids,
+                        candidate_response_mask=response_mask,
+                    )
+                    skipped_interventions[-1].update(candidate_selection_metadata)
+                    outcome_metadata["skip_reason"] = "outcome_correct"
+                    outcome_metadata["healthy_calibration_probe"] = should_probe
+                    break
+
+                selection_result = await self._generate_and_select_teacher_candidate(
                     prefix_ids=prompt_ids + prefix_response_ids,
                     max_tokens=teacher_max_tokens,
-                    multi_modal_data=output.multi_modal_data,
-                    mm_processor_kwargs=output.mm_processor_kwargs,
+                    output=output,
                     routing_key=routing_key,
-                    request_id=f"{base_request_id}:teacher-generate:{attempt}",
-                )
-            )
-            if _generation_was_aborted(
-                stop_reason=teacher_generation.stop_reason,
-                finish_reason=teacher_generation.finish_reason,
-            ):
-                _record_skipped_intervention(
-                    skipped_interventions,
-                    reason="teacher_generation_aborted",
+                    base_request_id=base_request_id,
                     attempt=attempt,
-                    start=start,
-                    end=end,
-                    candidate_response_ids=prefix_response_ids,
-                    candidate_response_mask=prefix_response_mask,
-                    teacher_tokens=len(teacher_generation.token_ids),
+                    calibration_only=False,
                 )
-                break
-            teacher_segment_ids, _, teacher_eos_truncated = _truncate_generation_at_eos(
-                list(teacher_generation.token_ids),
-                None,
-                eos_token_ids=eos_token_ids,
-            )
-            if len(teacher_segment_ids) > teacher_max_tokens:
-                raise RuntimeError(
-                    "Teacher intervention generation returned more tokens than requested: "
-                    f"len(teacher_segment_ids)={len(teacher_segment_ids)}, "
-                    f"teacher_max_tokens={teacher_max_tokens}. "
-                    "The rollout backend should return generated tokens only and respect sampling max_tokens."
+                candidate_selection_metadata = selection_result.metadata
+                if selection_result.candidate is None:
+                    skip_reason = selection_result.skip_reason or "teacher_candidate_selection_failed"
+                    _record_skipped_intervention(
+                        skipped_interventions,
+                        reason=skip_reason,
+                        attempt=attempt,
+                        start=start,
+                        end=end,
+                        candidate_response_ids=prefix_response_ids,
+                        candidate_response_mask=prefix_response_mask,
+                    )
+                    skipped_interventions[-1].update(candidate_selection_metadata)
+                    outcome_metadata["skip_reason"] = skip_reason
+                    break
+                teacher_generation = selection_result.candidate.generation
+                teacher_segment_ids = list(selection_result.candidate.token_ids)
+                teacher_eos_truncated = selection_result.candidate.eos_truncated
+            else:
+                teacher_generation = _coerce_teacher_generation_result(
+                    await self.teacher_server_manager.generate_teacher_segment_single(
+                        prefix_ids=prompt_ids + prefix_response_ids,
+                        max_tokens=teacher_max_tokens,
+                        multi_modal_data=output.multi_modal_data,
+                        mm_processor_kwargs=output.mm_processor_kwargs,
+                        routing_key=routing_key,
+                        request_id=f"{base_request_id}:teacher-generate:{attempt}",
+                    )
                 )
-            if not teacher_segment_ids:
-                _record_skipped_intervention(
-                    skipped_interventions,
-                    reason="teacher_generation_empty",
-                    attempt=attempt,
-                    start=start,
-                    end=end,
-                    candidate_response_ids=prefix_response_ids,
-                    candidate_response_mask=prefix_response_mask,
+                if _generation_was_aborted(
+                    stop_reason=teacher_generation.stop_reason,
+                    finish_reason=teacher_generation.finish_reason,
+                ):
+                    _record_skipped_intervention(
+                        skipped_interventions,
+                        reason="teacher_generation_aborted",
+                        attempt=attempt,
+                        start=start,
+                        end=end,
+                        candidate_response_ids=prefix_response_ids,
+                        candidate_response_mask=prefix_response_mask,
+                        teacher_tokens=len(teacher_generation.token_ids),
+                    )
+                    break
+                teacher_segment_ids, _, teacher_eos_truncated = _truncate_generation_at_eos(
+                    list(teacher_generation.token_ids),
+                    None,
+                    eos_token_ids=eos_token_ids,
                 )
-                break
-            invalid_teacher_token_ids = _invalid_token_ids_for_tokenizer(teacher_segment_ids, self.tokenizer)
-            if invalid_teacher_token_ids:
-                _record_skipped_intervention(
-                    skipped_interventions,
-                    reason="teacher_generation_invalid_token_ids",
-                    attempt=attempt,
-                    start=start,
-                    end=end,
-                    candidate_response_ids=prefix_response_ids,
-                    candidate_response_mask=prefix_response_mask,
-                    teacher_tokens=len(teacher_segment_ids),
-                )
-                skipped_interventions[-1]["invalid_token_ids"] = invalid_teacher_token_ids[:8]
-                skipped_interventions[-1]["tokenizer_vocab_size"] = _tokenizer_vocab_size(self.tokenizer)
-                break
+                if len(teacher_segment_ids) > teacher_max_tokens:
+                    raise RuntimeError(
+                        "Teacher intervention generation returned more tokens than requested: "
+                        f"len(teacher_segment_ids)={len(teacher_segment_ids)}, "
+                        f"teacher_max_tokens={teacher_max_tokens}. "
+                        "The rollout backend should return generated tokens only and respect sampling max_tokens."
+                    )
+                if not teacher_segment_ids:
+                    _record_skipped_intervention(
+                        skipped_interventions,
+                        reason="teacher_generation_empty",
+                        attempt=attempt,
+                        start=start,
+                        end=end,
+                        candidate_response_ids=prefix_response_ids,
+                        candidate_response_mask=prefix_response_mask,
+                    )
+                    break
+                invalid_teacher_token_ids = _invalid_token_ids_for_tokenizer(teacher_segment_ids, self.tokenizer)
+                if invalid_teacher_token_ids:
+                    _record_skipped_intervention(
+                        skipped_interventions,
+                        reason="teacher_generation_invalid_token_ids",
+                        attempt=attempt,
+                        start=start,
+                        end=end,
+                        candidate_response_ids=prefix_response_ids,
+                        candidate_response_mask=prefix_response_mask,
+                        teacher_tokens=len(teacher_segment_ids),
+                    )
+                    skipped_interventions[-1]["invalid_token_ids"] = invalid_teacher_token_ids[:8]
+                    skipped_interventions[-1]["tokenizer_vocab_size"] = _tokenizer_vocab_size(self.tokenizer)
+                    break
             rewrite_overlap_metrics = compute_rewrite_overlap_metrics(original_student_segment_ids, teacher_segment_ids)
 
             teacher_terminal = _generation_is_terminal(
@@ -2553,8 +3157,11 @@ class AgentLoopWorker:
                 **persistence_metadata,
                 **rewrite_overlap_metrics,
                 **local_effect_metadata,
+                **candidate_selection_metadata,
             }
             interventions.append(intervention_item)
+            if outcome_aware_selection:
+                outcome_metadata["repair_executed"] = True
             if candidate_terminal:
                 _mark_local_effect_unavailable(intervention_item, "terminal_response")
                 break
@@ -2563,6 +3170,13 @@ class AgentLoopWorker:
         if pending_local_effect is not None:
             pending_metadata, _ = pending_local_effect
             _mark_local_effect_unavailable(pending_metadata, "repaired_response_not_rescored")
+
+        if outcome_aware_selection and interventions:
+            # The reward currently belongs to the untouched on-policy answer.
+            # Force _agent_loop_postprocess to score the repaired response.
+            output.reward_score = None
+            output.extra_fields.pop("reward_extra_info", None)
+            outcome_metadata["reward_recompute_required"] = True
 
         output.response_ids = response_ids[: self.rollout_config.response_length]
         output.response_mask = response_mask[: len(output.response_ids)]

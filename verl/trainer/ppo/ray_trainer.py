@@ -2326,6 +2326,11 @@ class RayPPOTrainer:
                     "intervention_skipped": self._non_tensor_to_list(
                         batch.non_tensor_batch["teacher_intervention_skipped"]
                     ),
+                    "intervention_outcomes": (
+                        self._non_tensor_to_list(batch.non_tensor_batch["teacher_intervention_outcome"])
+                        if "teacher_intervention_outcome" in batch.non_tensor_batch
+                        else None
+                    ),
                     "response_mask": response_mask,
                 }
 

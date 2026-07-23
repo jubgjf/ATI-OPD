@@ -828,6 +828,15 @@ distillation:
     teacher_temperature: 0.6
     teacher_top_p: 0.95
     teacher_top_k: 20
+    outcome_aware_candidate_selection_enabled: false
+    outcome_correctness_key: acc
+    outcome_correctness_threshold: 0.5
+    teacher_candidate_count: 4
+    teacher_nll_calibration_quantile: 0.75
+    teacher_nll_calibration_window: 256
+    teacher_nll_calibration_min_samples: 16
+    teacher_nll_initial_threshold: null
+    teacher_nll_healthy_probe_probability: 0.1
     log_examples_per_worker: 2
   diagnostics:
     _target_: verl.workers.config.DistillationDiagnosticsConfig
