@@ -31,6 +31,8 @@ distillation_loss:
   topk: 32
 
   # Top-k support strategy for token-reward OPD.
+  # only_stu keeps the historical teacher/student Top-K intersection approximation.
+  # only_stu_rethinking_style queries exact teacher log-probs for every student Top-K id.
   top_k_strategy: only_stu
 
   # Weighting scheme when reducing top-k token rewards to one scalar token reward.

@@ -208,9 +208,19 @@ class vLLMColocateWorkerExtension:
         instance._is_modelopt_qat = _is_modelopt_qat
         return instance
 
-    def monkey_patch_model(self, vocab_size: int):
+    def monkey_patch_model(self, vocab_size: int, enable_target_prompt_logprobs: bool = False):
         # patch compute_logits to avoid sampling OOV token
         monkey_patch_compute_logits(self.model_runner.model, vocab_size)
+
+        if enable_target_prompt_logprobs:
+            # Install this only for an opted-in rethinking-style teacher.
+            # Legacy only_stu workers therefore execute the exact pre-existing
+            # runner method, rather than merely delegating through a wrapper.
+            from verl.workers.rollout.vllm_rollout.target_prompt_logprobs import (
+                patch_vllm_model_runner_target_prompt_logprobs,
+            )
+
+            patch_vllm_model_runner_target_prompt_logprobs(self.model_runner)
         # patch weight loader to support MoE model
         patch_vllm_moe_model_weight_loader(self.model_runner.model)
 

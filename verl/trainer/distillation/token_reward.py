@@ -173,3 +173,111 @@ def compute_only_student_topk_token_reward(
         metrics["distillation/token_reward_direct/active_token_fraction"] = 0.0
 
     return topk_rewards, metrics
+
+
+def compute_rethinking_only_student_topk_token_reward(
+    *,
+    student_topk_logprobs: torch.Tensor,
+    teacher_on_student_topk_logprobs: torch.Tensor,
+    response_mask: torch.Tensor,
+    reward_mask: Optional[torch.Tensor] = None,
+    topk: Optional[int] = None,
+    reward_weight_mode: str = "student_p",
+    log_prob_min_clamp: Optional[float] = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute THUNLP/OPD-style rewards on the complete student Top-K support.
+
+    Unlike the repository's legacy ``only_stu`` approximation, the teacher
+    values supplied here were gathered directly from the teacher's full
+    distribution for every student candidate.  No candidate is dropped merely
+    because it falls outside the teacher's own Top-K.
+    """
+    if student_topk_logprobs.ndim != 3:
+        raise ValueError(
+            "student_topk_logprobs must have shape [batch, response_len, topk], "
+            f"got {tuple(student_topk_logprobs.shape)}."
+        )
+    if teacher_on_student_topk_logprobs.shape != student_topk_logprobs.shape:
+        raise ValueError(
+            "teacher_on_student_topk_logprobs must align with student_topk_logprobs, "
+            f"got teacher={tuple(teacher_on_student_topk_logprobs.shape)}, "
+            f"student={tuple(student_topk_logprobs.shape)}."
+        )
+    if response_mask.shape != student_topk_logprobs.shape[:2]:
+        raise ValueError(
+            "response_mask must align with top-k tensors, "
+            f"got response_mask={tuple(response_mask.shape)}, "
+            f"topk={tuple(student_topk_logprobs.shape)}."
+        )
+
+    available_topk = student_topk_logprobs.shape[-1]
+    if topk is not None:
+        if topk <= 0:
+            raise ValueError(f"topk must be positive, got {topk}.")
+        available_topk = min(available_topk, int(topk))
+    if available_topk <= 0:
+        empty_rewards = response_mask.new_zeros((*response_mask.shape, 0), dtype=torch.float32)
+        return empty_rewards, {
+            "distillation/token_reward_direct/available_topk": 0.0,
+            "distillation/token_reward_direct/teacher_on_student_topk_coverage": 0.0,
+            "distillation/token_reward_direct/nonempty_token_fraction": 0.0,
+            "distillation/token_reward_direct/rethinking_style": 1.0,
+        }
+
+    response_mask = response_mask.bool()
+    if reward_mask is None:
+        reward_mask = response_mask
+    else:
+        reward_mask = reward_mask.bool() & response_mask
+    student_logprobs = student_topk_logprobs[..., :available_topk].float()
+    teacher_logprobs = teacher_on_student_topk_logprobs[..., :available_topk].float()
+    valid_topk = reward_mask.unsqueeze(-1) & torch.isfinite(student_logprobs) & torch.isfinite(teacher_logprobs)
+    if log_prob_min_clamp is not None:
+        clamp_value = float(log_prob_min_clamp)
+        student_logprobs = student_logprobs.clamp_min(clamp_value)
+        teacher_logprobs = teacher_logprobs.clamp_min(clamp_value)
+
+    if reward_weight_mode == "student_p":
+        weight_logits = student_logprobs
+    elif reward_weight_mode == "teacher_p":
+        weight_logits = teacher_logprobs
+    elif reward_weight_mode == "none":
+        weight_logits = torch.zeros_like(student_logprobs)
+    else:
+        raise ValueError(
+            f"reward_weight_mode must be one of 'student_p', 'teacher_p', or 'none', got {reward_weight_mode!r}."
+        )
+
+    weight_logits = torch.where(valid_topk, weight_logits, torch.full_like(weight_logits, float("-inf")))
+    has_valid = valid_topk.any(dim=-1)
+    normalized_weight_logits = weight_logits - torch.logsumexp(weight_logits, dim=-1, keepdim=True)
+    weights = torch.where(
+        valid_topk & has_valid.unsqueeze(-1),
+        normalized_weight_logits.exp(),
+        torch.zeros_like(normalized_weight_logits),
+    )
+    weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+
+    topk_advantages = teacher_logprobs - student_logprobs
+    topk_rewards = torch.where(valid_topk, topk_advantages, torch.zeros_like(topk_advantages)) * weights
+    topk_rewards = torch.where(reward_mask.unsqueeze(-1), topk_rewards, torch.zeros_like(topk_rewards))
+    scalar_token_rewards = topk_rewards.sum(dim=-1)
+
+    active_token_count = int(reward_mask.sum().item())
+    coverage_denominator = max(active_token_count * available_topk, 1)
+    metrics = {
+        "distillation/token_reward_direct/available_topk": float(available_topk),
+        "distillation/token_reward_direct/teacher_on_student_topk_coverage": float(valid_topk.sum().item())
+        / coverage_denominator,
+        "distillation/token_reward_direct/nonempty_token_fraction": _masked_mean(has_valid.float(), reward_mask),
+        "distillation/token_reward_direct/reward_mean": _masked_mean(scalar_token_rewards, reward_mask),
+        "distillation/token_reward_direct/reward_abs_mean": _masked_mean(scalar_token_rewards.abs(), reward_mask),
+        "distillation/token_reward_direct/rethinking_style": 1.0,
+    }
+    if response_mask.any():
+        metrics["distillation/token_reward_direct/active_token_fraction"] = float(reward_mask.sum().item()) / float(
+            response_mask.sum().item()
+        )
+    else:
+        metrics["distillation/token_reward_direct/active_token_fraction"] = 0.0
+    return topk_rewards, metrics

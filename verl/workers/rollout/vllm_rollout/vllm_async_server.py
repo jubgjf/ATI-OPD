@@ -396,8 +396,19 @@ class vLLMHttpServer:
 
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
+        from verl.workers.config.distillation import (
+            RETHINKING_TARGET_PROMPT_LOGPROBS_CONFIG_KEY,
+        )
+
+        custom_config = self.config.custom or {}
         await engine_client.collective_rpc(
-            method="monkey_patch_model", kwargs={"vocab_size": len(self.model_config.tokenizer)}
+            method="monkey_patch_model",
+            kwargs={
+                "vocab_size": len(self.model_config.tokenizer),
+                "enable_target_prompt_logprobs": bool(
+                    custom_config.get(RETHINKING_TARGET_PROMPT_LOGPROBS_CONFIG_KEY, False)
+                ),
+            },
         )
 
         build_app_sig = inspect.signature(build_app)
@@ -454,6 +465,7 @@ class vLLMHttpServer:
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
+        target_prompt_token_ids: Optional[list[list[int]]] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         prompt_ids = normalize_token_ids(prompt_ids)
@@ -489,8 +501,47 @@ class vLLMHttpServer:
         )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        if target_prompt_token_ids is not None:
+            from verl.workers.rollout.vllm_rollout.target_prompt_logprobs import (
+                VERL_TARGET_PROMPT_TOKEN_IDS_KEY,
+            )
+
+            if len(target_prompt_token_ids) != len(prompt_ids):
+                raise ValueError(
+                    "target_prompt_token_ids must contain one row per prompt token, "
+                    f"got target_rows={len(target_prompt_token_ids)}, prompt_len={len(prompt_ids)}."
+                )
+            target_widths = {len(row) for row in target_prompt_token_ids}
+            if len(target_widths) != 1 or not target_widths or next(iter(target_widths)) <= 0:
+                raise ValueError(
+                    "target_prompt_token_ids must be a non-empty rectangular [prompt_len, topk] list, "
+                    f"got row widths={sorted(target_widths)}."
+                )
+            target_width = next(iter(target_widths))
+            if sampling_params.get("prompt_logprobs") != target_width:
+                raise ValueError(
+                    "Target prompt scoring requires prompt_logprobs to equal the target width, "
+                    f"got prompt_logprobs={sampling_params.get('prompt_logprobs')!r}, target_width={target_width}."
+                )
+            if "extra_args" not in inspect.signature(SamplingParams).parameters:
+                raise RuntimeError(
+                    "only_stu_rethinking_style requires a vLLM version whose SamplingParams supports extra_args "
+                    "(vLLM >= 0.9). Upgrade the teacher inference backend or use the legacy only_stu strategy."
+                )
+            extra_args = dict(sampling_params.get("extra_args") or {})
+            if VERL_TARGET_PROMPT_TOKEN_IDS_KEY in extra_args:
+                raise ValueError(
+                    f"sampling_params.extra_args already contains reserved key {VERL_TARGET_PROMPT_TOKEN_IDS_KEY!r}."
+                )
+            extra_args[VERL_TARGET_PROMPT_TOKEN_IDS_KEY] = target_prompt_token_ids
+            sampling_params["extra_args"] = extra_args
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        if target_prompt_token_ids is not None and len(target_prompt_token_ids) != len(prompt_ids):
+            raise NotImplementedError(
+                "only_stu_rethinking_style target scoring does not support a multimodal prompt transformation "
+                "that changes token count inside the vLLM server."
+            )
         multi_modal_data = {}
         if image_data is not None:
             multi_modal_data["image"] = image_data

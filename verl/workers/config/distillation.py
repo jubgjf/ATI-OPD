@@ -24,6 +24,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from .rollout import RolloutConfig
 
 __all__ = [
+    "RETHINKING_TARGET_PROMPT_LOGPROBS_CONFIG_KEY",
     "DistillationLossHorizonConfig",
     "DistillationLossConfig",
     "DistillationInterventionConfig",
@@ -34,6 +35,8 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+RETHINKING_TARGET_PROMPT_LOGPROBS_CONFIG_KEY = "_verl_enable_target_prompt_logprobs"
 
 
 @dataclass
@@ -79,7 +82,10 @@ class DistillationLossConfig(BaseConfig):
     topk (int, optional):
         Number of top tokens to consider for top-k distillation losses.
     top_k_strategy (str):
-        Top-k support strategy for token-reward OPD. Currently only "only_stu" is supported by the trainer path.
+        Top-k support strategy for token-reward OPD. ``only_stu`` preserves the
+        repository's historical teacher/student Top-K intersection
+        approximation. ``only_stu_rethinking_style`` scores every student
+        Top-K id under the teacher's full distribution, matching THUNLP/OPD.
     reward_weight_mode (str):
         Probability weighting used when reducing top-k token rewards to a scalar reward.
     use_task_rewards (bool):
@@ -143,8 +149,12 @@ class DistillationLossConfig(BaseConfig):
         self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
         if self.topk is not None and self.topk <= 0:
             raise ValueError("distillation_loss.topk must be positive when set.")
-        if self.top_k_strategy != "only_stu":
-            raise ValueError(f"Only top_k_strategy='only_stu' is currently supported, got {self.top_k_strategy!r}.")
+        supported_top_k_strategies = {"only_stu", "only_stu_rethinking_style"}
+        if self.top_k_strategy not in supported_top_k_strategies:
+            raise ValueError(
+                f"distillation_loss.top_k_strategy must be one of {sorted(supported_top_k_strategies)}, "
+                f"got {self.top_k_strategy!r}."
+            )
         if self.reward_weight_mode not in {"student_p", "teacher_p", "none"}:
             raise ValueError(
                 "distillation_loss.reward_weight_mode must be one of 'student_p', 'teacher_p', or 'none', "

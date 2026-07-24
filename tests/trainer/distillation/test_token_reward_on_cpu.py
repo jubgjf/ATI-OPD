@@ -17,7 +17,10 @@ import math
 import pytest
 import torch
 
-from verl.trainer.distillation.token_reward import compute_only_student_topk_token_reward
+from verl.trainer.distillation.token_reward import (
+    compute_only_student_topk_token_reward,
+    compute_rethinking_only_student_topk_token_reward,
+)
 
 
 def test_only_student_topk_token_reward_matches_teacher_support_on_cpu():
@@ -70,3 +73,41 @@ def test_only_student_topk_token_reward_masks_missing_teacher_ids_on_cpu():
     assert torch.count_nonzero(token_rewards).item() == 0
     assert metrics["distillation/token_reward_direct/teacher_on_student_topk_coverage"] == 0.0
     assert metrics["distillation/token_reward_direct/nonempty_token_fraction"] == 0.0
+
+
+def test_rethinking_only_student_topk_uses_every_student_candidate_on_cpu():
+    student_logprobs = torch.log(torch.tensor([[[0.6, 0.3, 0.1]]]))
+    # These are exact teacher probabilities of the three student candidates;
+    # they need not be members of the teacher's own Top-K.
+    teacher_on_student_logprobs = torch.log(torch.tensor([[[0.05, 0.4, 0.2]]]))
+    response_mask = torch.ones(1, 1, dtype=torch.bool)
+
+    token_rewards, metrics = compute_rethinking_only_student_topk_token_reward(
+        student_topk_logprobs=student_logprobs,
+        teacher_on_student_topk_logprobs=teacher_on_student_logprobs,
+        response_mask=response_mask,
+        reward_weight_mode="student_p",
+    )
+
+    expected = (teacher_on_student_logprobs - student_logprobs) * torch.tensor([[[0.6, 0.3, 0.1]]])
+    torch.testing.assert_close(token_rewards, expected)
+    assert torch.count_nonzero(token_rewards).item() == 3
+    assert metrics["distillation/token_reward_direct/teacher_on_student_topk_coverage"] == 1.0
+    assert metrics["distillation/token_reward_direct/rethinking_style"] == 1.0
+
+
+@pytest.mark.parametrize("reward_weight_mode", ["student_p", "teacher_p", "none"])
+def test_rethinking_only_student_topk_supports_all_existing_weight_modes_on_cpu(reward_weight_mode):
+    student_logprobs = torch.log(torch.tensor([[[0.7, 0.2]]]))
+    teacher_logprobs = torch.log(torch.tensor([[[0.1, 0.6]]]))
+    response_mask = torch.ones(1, 1, dtype=torch.bool)
+
+    rewards, _ = compute_rethinking_only_student_topk_token_reward(
+        student_topk_logprobs=student_logprobs,
+        teacher_on_student_topk_logprobs=teacher_logprobs,
+        response_mask=response_mask,
+        reward_weight_mode=reward_weight_mode,
+    )
+
+    assert rewards.shape == (1, 1, 2)
+    assert torch.isfinite(rewards).all()

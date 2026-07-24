@@ -74,6 +74,29 @@ def test_apply_generation_max_tokens_rejects_non_positive_value_on_cpu():
         _apply_generation_max_tokens({}, {"generation_max_tokens": 0})
 
 
+def test_rethinking_only_stu_defers_student_support_scoring_to_exact_teacher_pass_on_cpu():
+    worker = object.__new__(AgentLoopWorker)
+    worker.config = SimpleNamespace(algorithm=SimpleNamespace(adv_estimator="token_reward_direct"))
+    worker.distillation_config = SimpleNamespace(
+        distillation_loss=SimpleNamespace(
+            topk=16,
+            top_k_strategy="only_stu_rethinking_style",
+            loss_settings=SimpleNamespace(use_topk=False),
+        ),
+        diagnostics=SimpleNamespace(
+            collect_topk_overlap=False,
+            collect_rethinking_opd_metrics=False,
+        ),
+    )
+
+    assert AgentLoopWorker._teacher_prompt_logprobs(worker) == 0
+
+    # The legacy strategy still requests teacher Top-K during rollout, which
+    # protects the exact behavior of existing only_stu experiments.
+    worker.distillation_config.distillation_loss.top_k_strategy = "only_stu"
+    assert AgentLoopWorker._teacher_prompt_logprobs(worker) == 16
+
+
 class _FakeServerManager:
     async def generate(
         self,
@@ -2555,6 +2578,96 @@ async def test_teacher_manager_parses_topk_and_sampled_prompt_logprobs_on_cpu():
     )
     assert result.nonfinite_count == 1
     assert result.nonfinite_sequence_positions == [1]
+
+
+@pytest.mark.asyncio
+async def test_teacher_manager_scores_exact_per_position_target_ids_on_cpu():
+    target_ids = [[7, 8], [11, 12], [21, 22], [0, 0]]
+
+    class _TargetTeacherClient:
+        async def generate(
+            self,
+            request_id: str,
+            *,
+            prompt_ids: list[int],
+            sampling_params: dict[str, Any],
+            image_data: Optional[list[Any]] = None,
+            video_data: Optional[list[Any]] = None,
+            audio_data: Optional[list[Any]] = None,
+            mm_processor_kwargs: Optional[dict[str, Any]] = None,
+            target_prompt_token_ids: Optional[list[list[int]]] = None,
+        ) -> TokenOutput:
+            del request_id, image_data, video_data, audio_data, mm_processor_kwargs
+            assert prompt_ids == [101, 102, 1, 2]
+            assert sampling_params["prompt_logprobs"] == 2
+            assert target_prompt_token_ids == target_ids
+            return TokenOutput(
+                token_ids=[1],
+                extra_fields={
+                    "prompt_ids": [[7, 8], [11, 12], [21, 22], [0, 0]],
+                    "prompt_logprobs": [[-1.0, -2.0], [-3.0, -4.0], [-5.0, -6.0], [0.0, 0.0]],
+                    "sampled_prompt_ids": [[102], [1], [2], [0]],
+                    "sampled_prompt_logprobs": [[-0.1], [-0.2], [-0.3], [0.0]],
+                },
+            )
+
+    manager = object.__new__(AsyncTeacherLLMServerManager)
+    manager.distillation_loss_config = SimpleNamespace(
+        topk=2,
+        log_prob_min_clamp=-10.0,
+        loss_settings=SimpleNamespace(use_topk=True),
+    )
+    manager.teacher_key = "data_source"
+    manager.teacher_model_configs = {
+        "teacher": SimpleNamespace(inference=SimpleNamespace(name="vllm", temperature=1.0)),
+    }
+    manager.teacher_client = {"teacher": _TargetTeacherClient()}
+
+    result = await manager.compute_teacher_logprobs_for_target_ids_single(
+        sequence_ids=[101, 102, 1, 2],
+        target_ids=target_ids,
+        routing_key="teacher",
+        request_id="target-teacher-score",
+    )
+
+    torch.testing.assert_close(result.ids, torch.tensor(target_ids, dtype=torch.int32))
+    torch.testing.assert_close(
+        result.logprobs,
+        torch.tensor([[-1.0, -2.0], [-3.0, -4.0], [-5.0, -6.0], [0.0, 0.0]]),
+    )
+
+
+@pytest.mark.asyncio
+async def test_teacher_manager_rejects_teacher_topk_fallback_for_target_scoring_on_cpu():
+    class _WrongSupportTeacherClient:
+        async def generate(self, **kwargs) -> TokenOutput:
+            del kwargs
+            return TokenOutput(
+                token_ids=[1],
+                extra_fields={
+                    "prompt_ids": [[90, 91], [92, 93], [94, 95]],
+                    "prompt_logprobs": [[-1.0, -2.0], [-3.0, -4.0], [0.0, 0.0]],
+                },
+            )
+
+    manager = object.__new__(AsyncTeacherLLMServerManager)
+    manager.distillation_loss_config = SimpleNamespace(
+        topk=2,
+        log_prob_min_clamp=-10.0,
+        loss_settings=SimpleNamespace(use_topk=True),
+    )
+    manager.teacher_key = "data_source"
+    manager.teacher_model_configs = {
+        "teacher": SimpleNamespace(inference=SimpleNamespace(name="vllm", temperature=1.0)),
+    }
+    manager.teacher_client = {"teacher": _WrongSupportTeacherClient()}
+
+    with pytest.raises(RuntimeError, match="did not return the requested per-position target ids"):
+        await manager.compute_teacher_logprobs_for_target_ids_single(
+            sequence_ids=[101, 102, 1],
+            target_ids=[[7, 8], [11, 12], [0, 0]],
+            routing_key="teacher",
+        )
 
 
 @pytest.mark.asyncio

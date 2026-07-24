@@ -56,6 +56,21 @@ class TeacherModelManager:
         self.distillation_config = distillation_config
         self.teacher_model_config = teacher_model_config
         self.resource_pool = resource_pool
+        uses_rethinking_style = self.distillation_config.distillation_loss.top_k_strategy == "only_stu_rethinking_style"
+        if uses_rethinking_style and str(self.teacher_model_config.inference.name).lower() != "vllm":
+            raise NotImplementedError(
+                "only_stu_rethinking_style requires a vLLM teacher backend for exact per-position target "
+                f"prompt scoring, got {self.teacher_model_config.inference.name!r} for "
+                f"teacher {self.teacher_model_config.key!r}."
+            )
+        if uses_rethinking_style:
+            from verl.workers.config.distillation import (
+                RETHINKING_TARGET_PROMPT_LOGPROBS_CONFIG_KEY,
+            )
+
+            custom_config = dict(self.teacher_model_config.inference.custom or {})
+            custom_config[RETHINKING_TARGET_PROMPT_LOGPROBS_CONFIG_KEY] = True
+            object.__setattr__(self.teacher_model_config.inference, "custom", custom_config)
         self._initialize_llm_servers()
         self._initialize_load_balancer_handle()
 

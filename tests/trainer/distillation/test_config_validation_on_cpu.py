@@ -16,7 +16,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from verl.trainer.distillation.config_validation import validate_distillation_intervention_training_config
-from verl.workers.config import DistillationInterventionConfig
+from verl.workers.config import DistillationInterventionConfig, DistillationLossConfig
 
 
 def test_teacher_segment_loss_config_defaults_to_legacy_opd_on_cpu():
@@ -39,6 +39,16 @@ def test_teacher_segment_loss_config_defaults_to_legacy_opd_on_cpu():
     assert config.teacher_nll_calibration_min_samples == 16
     assert config.teacher_nll_initial_threshold is None
     assert config.teacher_nll_healthy_probe_probability == 0.1
+
+
+def test_distillation_loss_config_preserves_legacy_only_stu_default_and_accepts_rethinking_style_on_cpu():
+    assert DistillationLossConfig().top_k_strategy == "only_stu"
+    assert (
+        DistillationLossConfig(top_k_strategy="only_stu_rethinking_style").top_k_strategy == "only_stu_rethinking_style"
+    )
+
+    with pytest.raises(ValueError, match="top_k_strategy"):
+        DistillationLossConfig(top_k_strategy="unknown")
 
 
 def test_teacher_segment_loss_config_validates_mode_and_coefficient_on_cpu():
@@ -172,3 +182,80 @@ def test_distillation_intervention_allows_default_decoupled_rollout_correction_o
     )
 
     validate_distillation_intervention_training_config(config)
+
+
+@pytest.mark.parametrize(
+    "intervention",
+    [
+        {"enabled": False, "gap_metric": "k3"},
+        {"enabled": True, "gap_metric": "k3"},
+        {"enabled": True, "gap_metric": "teacher_rejection"},
+        {
+            "enabled": True,
+            "gap_metric": "teacher_rejection",
+            "teacher_rejection_persistence_enabled": True,
+            "teacher_rejection_persistence_window_tokens": 32,
+            "teacher_rejection_persistence_min_valid_tokens": 16,
+        },
+        {"enabled": True, "gap_metric": "topk_distribution_kl"},
+        {
+            "enabled": True,
+            "gap_metric": "teacher_rejection",
+            "train_on_teacher_segments": True,
+            "teacher_segment_loss_mode": "sft",
+        },
+    ],
+)
+def test_rethinking_only_stu_is_compatible_with_vanilla_and_dmpd_intervention_settings_on_cpu(intervention):
+    # Instantiate the intervention dataclass as well as the cross-feature
+    # validator, so persistence and rejection-specific invariants are covered.
+    DistillationInterventionConfig(**intervention)
+    config = OmegaConf.create(
+        {
+            "distillation": {
+                "enabled": True,
+                "use_actor_loss": False,
+                "distillation_loss": {"top_k_strategy": "only_stu_rethinking_style"},
+                "intervention": intervention,
+            },
+            "algorithm": {
+                "adv_estimator": "token_reward_direct",
+                "rollout_correction": {"bypass_mode": False},
+            },
+        }
+    )
+
+    validate_distillation_intervention_training_config(config)
+
+
+@pytest.mark.parametrize(
+    ("use_actor_loss", "adv_estimator", "bypass_mode", "error"),
+    [
+        (True, "token_reward_direct", False, "use_actor_loss=false"),
+        (False, "gae", False, "token_reward_direct"),
+        (False, "token_reward_direct", True, "bypass_mode=false"),
+    ],
+)
+def test_rethinking_only_stu_rejects_silent_fallback_training_paths_on_cpu(
+    use_actor_loss,
+    adv_estimator,
+    bypass_mode,
+    error,
+):
+    config = OmegaConf.create(
+        {
+            "distillation": {
+                "enabled": True,
+                "use_actor_loss": use_actor_loss,
+                "distillation_loss": {"top_k_strategy": "only_stu_rethinking_style"},
+                "intervention": {"enabled": False},
+            },
+            "algorithm": {
+                "adv_estimator": adv_estimator,
+                "rollout_correction": {"bypass_mode": bypass_mode},
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match=error):
+        validate_distillation_intervention_training_config(config)

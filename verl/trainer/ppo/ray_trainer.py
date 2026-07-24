@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import asyncio
 import copy
 import json
 import os
@@ -56,7 +57,14 @@ from verl.trainer.distillation.diagnostics import (
     resolve_special_token_ids,
 )
 from verl.trainer.distillation.losses import is_distillation_enabled, is_teacher_segment_sft_enabled
-from verl.trainer.distillation.token_reward import compute_only_student_topk_token_reward
+from verl.trainer.distillation.teacher_target_scoring import (
+    assemble_teacher_target_logprobs,
+    build_teacher_target_scoring_requests,
+)
+from verl.trainer.distillation.token_reward import (
+    compute_only_student_topk_token_reward,
+    compute_rethinking_only_student_topk_token_reward,
+)
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -83,6 +91,7 @@ from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
+from verl.utils.ray_utils import auto_await
 from verl.utils.reward_score import math_dapo
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -91,6 +100,27 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+@auto_await
+async def _execute_teacher_target_scoring_requests(
+    teacher_scorer,
+    requests,
+    *,
+    request_id_prefix: str,
+):
+    tasks = [
+        teacher_scorer.compute_teacher_logprobs_for_target_ids_single(
+            sequence_ids=request.sequence_ids,
+            target_ids=request.target_ids,
+            multi_modal_data=request.multi_modal_data,
+            mm_processor_kwargs=request.mm_processor_kwargs,
+            routing_key=request.routing_key,
+            request_id=f"{request_id_prefix}-{sample_index}-{uuid.uuid4().hex}",
+        )
+        for sample_index, request in enumerate(requests)
+    ]
+    return await asyncio.gather(*tasks)
 
 
 def _with_reward_data_source(
@@ -2016,10 +2046,11 @@ class RayPPOTrainer:
                 "signal is applied through token rewards instead of the actor-side distillation loss."
             )
         loss_config = self.distillation_config.distillation_loss
-        if loss_config.top_k_strategy != "only_stu":
+        supported_strategies = {"only_stu", "only_stu_rethinking_style"}
+        if loss_config.top_k_strategy not in supported_strategies:
             raise NotImplementedError(
-                "ADV_ESTIMATOR=token_reward_direct currently supports only "
-                f"distillation.distillation_loss.top_k_strategy='only_stu', got {loss_config.top_k_strategy!r}."
+                "ADV_ESTIMATOR=token_reward_direct supports top-k strategies "
+                f"{sorted(supported_strategies)}, got {loss_config.top_k_strategy!r}."
             )
         if loss_config.topk is None or int(loss_config.topk) <= 0:
             raise ValueError("ADV_ESTIMATOR=token_reward_direct requires distillation.distillation_loss.topk > 0.")
@@ -2058,6 +2089,46 @@ class RayPPOTrainer:
             context="teacher_logprobs",
         )
 
+    def _compute_rethinking_teacher_on_student_topk(self, batch: DataProto) -> torch.Tensor:
+        from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
+
+        target_scorer = getattr(self, "_rethinking_teacher_target_scorer", None)
+        if target_scorer is None:
+            if self.teacher_model_manager is None:
+                raise RuntimeError(
+                    "only_stu_rethinking_style requires an initialized distillation teacher model manager."
+                )
+            target_scorer = AsyncTeacherLLMServerManager(
+                config=self.config,
+                teacher_client=self.teacher_model_manager.get_client(),
+            )
+            self._rethinking_teacher_target_scorer = target_scorer
+
+        teacher_key = self.distillation_config.teacher_key
+        routing_values = batch.non_tensor_batch.get(teacher_key)
+        routing_keys = None if routing_values is None else list(routing_values)
+        raw_multi_modal_data = batch.non_tensor_batch.get("multi_modal_data")
+        raw_mm_processor_kwargs = batch.non_tensor_batch.get("mm_processor_kwargs")
+        requests = build_teacher_target_scoring_requests(
+            input_ids=batch.batch["input_ids"],
+            attention_mask=batch.batch["attention_mask"],
+            student_topk_ids=batch.batch["student_topk_ids"],
+            prompt_width=batch.batch["prompts"].shape[1],
+            routing_keys=routing_keys,
+            multi_modal_data=None if raw_multi_modal_data is None else list(raw_multi_modal_data),
+            mm_processor_kwargs=None if raw_mm_processor_kwargs is None else list(raw_mm_processor_kwargs),
+        )
+        scoring_results = _execute_teacher_target_scoring_requests(
+            target_scorer,
+            requests,
+            request_id_prefix=f"only-stu-rethinking-step-{getattr(self, 'global_steps', -1)}",
+        )
+        return assemble_teacher_target_logprobs(
+            requests=requests,
+            scoring_results=scoring_results,
+            student_topk_ids=batch.batch["student_topk_ids"],
+        )
+
     def _compute_token_reward_direct_scores(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, float]]:
         topk = self._token_reward_direct_topk()
         missing_keys = {
@@ -2069,25 +2140,38 @@ class RayPPOTrainer:
                 f"but batch is missing {sorted(missing_keys)}. Make sure rollout_correction.bypass_mode=False."
             )
 
-        teacher_topk_ids, teacher_topk_logprobs = self._extract_teacher_response_topk_for_diagnostics(batch)
-        if teacher_topk_ids is None or teacher_topk_logprobs is None:
-            raise RuntimeError(
-                "ADV_ESTIMATOR=token_reward_direct requires teacher top-k prompt logprobs. "
-                "Check distillation.distillation_loss.topk and teacher inference logprob settings."
-            )
-
         loss_config = self.distillation_config.distillation_loss
-        token_rewards, reward_metrics = compute_only_student_topk_token_reward(
-            student_topk_ids=batch.batch["student_topk_ids"],
-            student_topk_logprobs=batch.batch["student_topk_logprobs"],
-            teacher_topk_ids=teacher_topk_ids,
-            teacher_topk_logprobs=teacher_topk_logprobs,
-            response_mask=batch.batch["response_mask"],
-            reward_mask=batch.batch.get("distillation_loss_mask", batch.batch["response_mask"]),
-            topk=topk,
-            reward_weight_mode=loss_config.reward_weight_mode,
-            log_prob_min_clamp=loss_config.log_prob_min_clamp,
-        )
+        if loss_config.top_k_strategy == "only_stu":
+            teacher_topk_ids, teacher_topk_logprobs = self._extract_teacher_response_topk_for_diagnostics(batch)
+            if teacher_topk_ids is None or teacher_topk_logprobs is None:
+                raise RuntimeError(
+                    "ADV_ESTIMATOR=token_reward_direct with legacy only_stu requires teacher top-k prompt "
+                    "logprobs. Check distillation.distillation_loss.topk and teacher inference settings."
+                )
+            token_rewards, reward_metrics = compute_only_student_topk_token_reward(
+                student_topk_ids=batch.batch["student_topk_ids"],
+                student_topk_logprobs=batch.batch["student_topk_logprobs"],
+                teacher_topk_ids=teacher_topk_ids,
+                teacher_topk_logprobs=teacher_topk_logprobs,
+                response_mask=batch.batch["response_mask"],
+                reward_mask=batch.batch.get("distillation_loss_mask", batch.batch["response_mask"]),
+                topk=topk,
+                reward_weight_mode=loss_config.reward_weight_mode,
+                log_prob_min_clamp=loss_config.log_prob_min_clamp,
+            )
+        elif loss_config.top_k_strategy == "only_stu_rethinking_style":
+            teacher_on_student_topk_logprobs = self._compute_rethinking_teacher_on_student_topk(batch)
+            token_rewards, reward_metrics = compute_rethinking_only_student_topk_token_reward(
+                student_topk_logprobs=batch.batch["student_topk_logprobs"],
+                teacher_on_student_topk_logprobs=teacher_on_student_topk_logprobs,
+                response_mask=batch.batch["response_mask"],
+                reward_mask=batch.batch.get("distillation_loss_mask", batch.batch["response_mask"]),
+                topk=topk,
+                reward_weight_mode=loss_config.reward_weight_mode,
+                log_prob_min_clamp=loss_config.log_prob_min_clamp,
+            )
+        else:
+            raise AssertionError(f"Unexpected top_k_strategy after validation: {loss_config.top_k_strategy!r}.")
         return token_rewards, reward_metrics
 
     @staticmethod

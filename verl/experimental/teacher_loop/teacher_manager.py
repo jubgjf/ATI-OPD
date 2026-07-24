@@ -384,6 +384,151 @@ class AsyncTeacherLLMServerManager:
             replacement_value=replacement_value,
         )
 
+    async def compute_teacher_logprobs_for_target_ids_single(
+        self,
+        sequence_ids: list[int],
+        target_ids: list[list[int]],
+        multi_modal_data: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        routing_key: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> TeacherLogprobScoringResult:
+        """Score a different fixed token-id set at every sequence position.
+
+        This is the exact teacher-on-student support required by THUNLP/OPD's
+        ``only_stu`` implementation.  ``target_ids[row]`` describes the
+        candidates for output prompt-logprob row ``row``; the final row is a
+        contract-preserving dummy because no prompt token follows the final
+        hidden state.
+        """
+        if not sequence_ids:
+            raise ValueError("compute_teacher_logprobs_for_target_ids_single received an empty sequence.")
+        if len(target_ids) != len(sequence_ids):
+            raise ValueError(
+                "Target teacher scoring requires one target row per sequence token, "
+                f"got target_rows={len(target_ids)}, sequence_len={len(sequence_ids)}."
+            )
+        target_widths = {len(row) for row in target_ids}
+        if len(target_widths) != 1 or not target_widths or next(iter(target_widths)) <= 0:
+            raise ValueError(
+                "Target teacher scoring requires a non-empty rectangular [sequence_len, topk] list, "
+                f"got row widths={sorted(target_widths)}."
+            )
+        target_width = next(iter(target_widths))
+
+        multi_modal_data = multi_modal_data or {}
+        teacher_key = self._resolve_teacher_key(routing_key)
+        teacher_model_config = self.teacher_model_configs[teacher_key]
+        backend = str(teacher_model_config.inference.name).lower()
+        if backend != "vllm":
+            raise NotImplementedError(
+                "only_stu_rethinking_style exact per-position teacher target scoring currently requires "
+                f"a vLLM teacher backend, got {backend!r} for teacher {teacher_key!r}."
+            )
+
+        client = self.teacher_client[teacher_key]
+        resolved_request_id = request_id or uuid4().hex
+        sampling_params = _get_teacher_sampling_params(
+            teacher_model_config,
+            self.distillation_loss_config,
+            prompt_logprobs=target_width,
+        )
+        teacher_output = await client.generate(
+            request_id=resolved_request_id,
+            prompt_ids=sequence_ids,
+            sampling_params=sampling_params,
+            image_data=multi_modal_data.get("images"),
+            video_data=multi_modal_data.get("videos"),
+            audio_data=multi_modal_data.get("audios"),
+            mm_processor_kwargs=mm_processor_kwargs,
+            target_prompt_token_ids=target_ids,
+        )
+        extra_fields = teacher_output.extra_fields or {}
+        missing_keys = {"prompt_ids", "prompt_logprobs"} - set(extra_fields)
+        if missing_keys:
+            raise RuntimeError(
+                "Target teacher scoring did not return the required prompt fields "
+                f"{sorted(missing_keys)} for teacher={teacher_key!r}, request_id={resolved_request_id!r}."
+            )
+        try:
+            teacher_ids = torch.tensor(extra_fields["prompt_ids"], dtype=torch.int32)
+            teacher_logprobs = torch.tensor(extra_fields["prompt_logprobs"])
+            sampled_teacher_ids = (
+                torch.tensor(extra_fields["sampled_prompt_ids"], dtype=torch.int32)
+                if "sampled_prompt_ids" in extra_fields
+                else None
+            )
+            sampled_teacher_logprobs = (
+                torch.tensor(extra_fields["sampled_prompt_logprobs"])
+                if "sampled_prompt_logprobs" in extra_fields
+                else None
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Target teacher scoring returned non-rectangular or non-numeric prompt fields for "
+                f"teacher={teacher_key!r}, request_id={resolved_request_id!r}."
+            ) from exc
+
+        expected_shape = (len(sequence_ids), target_width)
+        if teacher_ids.shape != expected_shape or teacher_logprobs.shape != expected_shape:
+            raise RuntimeError(
+                "Target teacher scoring returned an invalid shape for "
+                f"teacher={teacher_key!r}, request_id={resolved_request_id!r}: expected={expected_shape}, "
+                f"teacher_ids.shape={tuple(teacher_ids.shape)}, "
+                f"teacher_logprobs.shape={tuple(teacher_logprobs.shape)}."
+            )
+        expected_ids = torch.tensor(target_ids[:-1], dtype=torch.int32)
+        if expected_ids.numel() and not torch.equal(teacher_ids[:-1].cpu(), expected_ids):
+            mismatch = torch.nonzero(teacher_ids[:-1].cpu() != expected_ids, as_tuple=False)[0]
+            row, column = int(mismatch[0]), int(mismatch[1])
+            raise RuntimeError(
+                "The vLLM teacher did not return the requested per-position target ids. "
+                "This would silently fall back to teacher Top-K and is therefore rejected: "
+                f"teacher={teacher_key!r}, request_id={resolved_request_id!r}, row={row}, column={column}, "
+                f"expected_id={int(expected_ids[row, column])}, returned_id={int(teacher_ids[row, column])}."
+            )
+        if (sampled_teacher_ids is None) != (sampled_teacher_logprobs is None):
+            raise RuntimeError(
+                "Target teacher scoring must return both sampled_prompt_ids and sampled_prompt_logprobs, "
+                f"but got extra_fields keys: {sorted(extra_fields.keys())}."
+            )
+        if sampled_teacher_ids is not None and (
+            sampled_teacher_ids.shape != (len(sequence_ids), 1)
+            or sampled_teacher_logprobs.shape != (len(sequence_ids), 1)
+        ):
+            raise RuntimeError(
+                "Target teacher sampled prompt fields must have shape [sequence_len, 1], "
+                f"got sampled_ids={tuple(sampled_teacher_ids.shape)}, "
+                f"sampled_logprobs={tuple(sampled_teacher_logprobs.shape)}."
+            )
+
+        replacement_value = _finite_logprob_replacement(self.distillation_loss_config)
+        teacher_logprobs, nonfinite_sequence_positions = _sanitize_nonfinite_teacher_logprobs(
+            teacher_logprobs,
+            replacement=replacement_value,
+        )
+        if sampled_teacher_logprobs is not None:
+            sampled_teacher_logprobs, sampled_nonfinite_positions = _sanitize_nonfinite_teacher_logprobs(
+                sampled_teacher_logprobs,
+                replacement=replacement_value,
+            )
+            nonfinite_sequence_positions = sorted(set(nonfinite_sequence_positions).union(sampled_nonfinite_positions))
+        if teacher_logprobs.max().item() > 1e-6:
+            raise RuntimeError(
+                "Target teacher scoring returned positive log probabilities for "
+                f"teacher={teacher_key!r}, request_id={resolved_request_id!r}, "
+                f"max_logprob={teacher_logprobs.max().item():.6f}."
+            )
+        return TeacherLogprobScoringResult(
+            ids=teacher_ids,
+            logprobs=teacher_logprobs,
+            sampled_ids=sampled_teacher_ids,
+            sampled_logprobs=sampled_teacher_logprobs,
+            nonfinite_count=len(nonfinite_sequence_positions),
+            nonfinite_sequence_positions=nonfinite_sequence_positions,
+            replacement_value=replacement_value,
+        )
+
     async def generate_teacher_segment_single(
         self,
         prefix_ids: list[int],
