@@ -12,31 +12,141 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Idempotently publish standalone OPD benchmark results to Weights & Biases."""
+"""Idempotently publish standalone OPD benchmark results to Weights & Biases.
+
+This file is intentionally standalone: outside Python's standard library, only
+``wandb`` is imported, and that import happens only when a real sync starts.
+Execute this file by path instead of importing the ``verl`` package.
+"""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import math
+import os
 import re
 import sys
 from pathlib import Path
 from typing import Any, Iterable
 
-from verl.utils.evaluation.opd_benchmark import (
-    COMPLETION_FILENAME,
+SCHEMA_VERSION = 2
+METADATA_FILENAME = "metadata.json"
+ROLLOUTS_FILENAME = "rollouts.jsonl.gz"
+SUMMARY_FILENAME = "summary.json"
+PER_PROBLEM_FILENAME = "per_problem.csv"
+LENGTH_BINS_FILENAME = "length_bins.csv"
+COMPLETION_FILENAME = "COMPLETED.json"
+BENCHMARKS_DIRNAME = "benchmarks"
+WORK_DIRNAME = ".work"
+REQUIRED_RESULT_FILES = (
+    METADATA_FILENAME,
+    ROLLOUTS_FILENAME,
     SUMMARY_FILENAME,
-    WORK_DIRNAME,
-    canonical_json,
-    discover_units,
-    finite_float,
-    write_json_atomic,
+    PER_PROBLEM_FILENAME,
+    LENGTH_BINS_FILENAME,
 )
-
 SYNC_FILENAME = "wandb-sync.json"
 SYNC_UNIT_KEY = "sync/unit_key"
 SYNC_FINGERPRINT_KEY = "sync/result_fingerprint"
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return str(value)
+
+
+def canonical_json(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=_json_default)
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=_json_default)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+
+
+def finite_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def normalize_benchmark_path(raw_path: str) -> str:
+    stripped = str(raw_path).strip()
+    path = Path(stripped)
+    if not stripped or path.is_absolute() or path == Path(".") or ".." in path.parts:
+        raise ValueError(f"Benchmark must be a non-empty path relative to the dataset root, got {raw_path!r}")
+    return path.as_posix()
+
+
+def _validate_completed_unit(output_dir: Path) -> tuple[bool, str]:
+    marker_path = output_dir / COMPLETION_FILENAME
+    metadata_path = output_dir / METADATA_FILENAME
+    if not marker_path.is_file() or not metadata_path.is_file():
+        return False, "completion marker or metadata is missing"
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, f"completion metadata is unreadable: {exc}"
+    if marker.get("schema_version") != SCHEMA_VERSION or metadata.get("schema_version") != SCHEMA_VERSION:
+        return False, "schema version differs"
+    if not metadata.get("generation_complete"):
+        return False, "generation_complete is false"
+    if marker.get("generation_fingerprint") != metadata.get("generation_fingerprint"):
+        return False, "completion marker and metadata fingerprints differ"
+
+    file_entries = marker.get("files") or {}
+    for name in REQUIRED_RESULT_FILES:
+        path = output_dir / name
+        entry = file_entries.get(name)
+        if not path.is_file() or not isinstance(entry, dict):
+            return False, f"required result file is missing: {name}"
+        if path.stat().st_size != entry.get("size"):
+            return False, f"result file size changed: {name}"
+    return True, "complete"
+
+
+def discover_units(result_root: str | Path) -> dict[tuple[str, int], Path]:
+    root = Path(result_root).expanduser().resolve()
+    units: dict[tuple[str, int], Path] = {}
+    benchmarks_root = root / BENCHMARKS_DIRNAME
+    if not benchmarks_root.is_dir():
+        return units
+    for directory in sorted(benchmarks_root.iterdir()):
+        benchmark_metadata_path = directory / "benchmark.json"
+        if not directory.is_dir() or not benchmark_metadata_path.is_file():
+            continue
+        try:
+            benchmark_metadata = json.loads(benchmark_metadata_path.read_text(encoding="utf-8"))
+            normalized = normalize_benchmark_path(str(benchmark_metadata["path"]))
+        except Exception:
+            continue
+        for step_dir in sorted(directory.glob("global_step_*")):
+            match = re.fullmatch(r"global_step_(\d+)", step_dir.name)
+            if not match:
+                continue
+            valid, _ = _validate_completed_unit(step_dir)
+            if valid:
+                units[(normalized, int(match.group(1)))] = step_dir
+    return dict(sorted(units.items()))
 
 
 def stable_run_id(entity: str, project: str, experiment: str) -> str:

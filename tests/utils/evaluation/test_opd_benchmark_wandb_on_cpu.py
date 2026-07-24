@@ -12,19 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
+import ast
+import importlib.util
+import json
+import subprocess
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from verl.utils.evaluation.opd_benchmark_wandb import (
-    _is_not_found_error,
-    artifact_fingerprint,
-    artifact_name,
-    resolve_run_id,
-    stable_run_id,
-    unit_metric_payload,
-    unit_sync_key,
-)
+SCRIPT_PATH = Path(__file__).resolve().parents[3] / "run" / "upload_opd_benchmark_wandb.py"
+
+
+def _load_standalone_uploader() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("standalone_opd_benchmark_wandb", SCRIPT_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load standalone uploader from {SCRIPT_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+uploader = _load_standalone_uploader()
+_is_not_found_error = uploader._is_not_found_error
+artifact_fingerprint = uploader.artifact_fingerprint
+artifact_name = uploader.artifact_name
+resolve_run_id = uploader.resolve_run_id
+stable_run_id = uploader.stable_run_id
+unit_metric_payload = uploader.unit_metric_payload
+unit_sync_key = uploader.unit_sync_key
 
 
 def test_wandb_identity_is_stable_and_scoped_on_cpu():
@@ -126,3 +143,61 @@ def test_run_id_resolution_adopts_one_legacy_name_and_rejects_ambiguity_on_cpu()
             "experiment",
             adopt_existing_name=True,
         )
+
+
+def test_standalone_uploader_imports_only_stdlib_and_wandb_on_cpu():
+    tree = ast.parse(SCRIPT_PATH.read_text(encoding="utf-8"))
+    imported_roots = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_roots.update(alias.name.partition(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported_roots.add(node.module.partition(".")[0])
+
+    assert imported_roots <= set(sys.stdlib_module_names) | {"wandb"}
+
+
+def test_standalone_uploader_help_does_not_import_verl_on_cpu():
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "Idempotently publish standalone OPD benchmark results" in result.stdout
+
+
+def test_standalone_uploader_discovers_completed_units_on_cpu(tmp_path):
+    result_root = tmp_path / "experiment"
+    benchmark_root = result_root / "benchmarks" / "aime24--abc"
+    unit_dir = benchmark_root / "global_step_100"
+    unit_dir.mkdir(parents=True)
+    (benchmark_root / "benchmark.json").write_text(
+        json.dumps({"path": "math-ai/aime24"}),
+        encoding="utf-8",
+    )
+
+    required_files = {}
+    for name in uploader.REQUIRED_RESULT_FILES:
+        path = unit_dir / name
+        if name == uploader.METADATA_FILENAME:
+            payload = {
+                "schema_version": uploader.SCHEMA_VERSION,
+                "generation_complete": True,
+                "generation_fingerprint": "generation-hash",
+            }
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        else:
+            path.write_text("{}\n", encoding="utf-8")
+        required_files[name] = {"size": path.stat().st_size, "sha256": "not-checked"}
+
+    marker = {
+        "schema_version": uploader.SCHEMA_VERSION,
+        "generation_fingerprint": "generation-hash",
+        "result_fingerprint": "result-hash",
+        "files": required_files,
+    }
+    (unit_dir / uploader.COMPLETION_FILENAME).write_text(json.dumps(marker), encoding="utf-8")
+
+    assert uploader.discover_units(result_root) == {("math-ai/aime24", 100): unit_dir}
