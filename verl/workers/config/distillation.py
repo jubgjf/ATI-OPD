@@ -212,6 +212,9 @@ class DistillationInterventionConfig(BaseConfig):
     outcome_correctness_key: str = "acc"
     outcome_correctness_threshold: float = 0.5
     teacher_candidate_count: int = 4
+    # Healthy best-of-K teacher NLLs are aggregated globally across rollout
+    # workers at batch boundaries, then one rolling-quantile threshold is
+    # broadcast for the next batch.
     teacher_nll_calibration_quantile: float = 0.75
     teacher_nll_calibration_window: int = 256
     teacher_nll_calibration_min_samples: int = 16

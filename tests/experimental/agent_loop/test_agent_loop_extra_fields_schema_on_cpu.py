@@ -24,6 +24,7 @@ import torch
 from omegaconf import OmegaConf
 
 from verl.experimental.agent_loop.agent_loop import (
+    AgentLoopManager,
     AgentLoopMetrics,
     AgentLoopOutput,
     AgentLoopWorker,
@@ -31,9 +32,11 @@ from verl.experimental.agent_loop.agent_loop import (
     _apply_generation_max_tokens,
     _compute_distribution_intervention_gap,
     _compute_intervention_gap,
+    _GlobalTeacherNLLCalibration,
     _InternalAgentLoopOutput,
     _is_moe_like_hf_config,
     _select_intervention_segment,
+    _TeacherNLLCalibrationSnapshot,
 )
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
 from verl.experimental.teacher_loop.teacher_manager import (
@@ -785,7 +788,6 @@ class _DirectInterventionWorker:
     _teacher_routing_key = AgentLoopWorker._teacher_routing_key
     _score_sequence_for_intervention = AgentLoopWorker._score_sequence_for_intervention
     _score_student_sequence_for_intervention = AgentLoopWorker._score_student_sequence_for_intervention
-    _ensure_teacher_nll_calibration_state = AgentLoopWorker._ensure_teacher_nll_calibration_state
     _current_teacher_nll_threshold = AgentLoopWorker._current_teacher_nll_threshold
     _generate_and_select_teacher_candidate = AgentLoopWorker._generate_and_select_teacher_candidate
     _generate_student_suffix = AgentLoopWorker._generate_student_suffix
@@ -874,7 +876,13 @@ class _DirectInterventionWorker:
         )
         self._teacher_intervention_logged_samples = 0
         self._teacher_intervention_logged_step = None
-        self._teacher_nll_healthy_history = None
+        self._teacher_nll_calibration_snapshot = _TeacherNLLCalibrationSnapshot(
+            threshold=teacher_nll_initial_threshold,
+            source="unavailable" if teacher_nll_initial_threshold is None else "initial",
+            count=0,
+            version=0,
+        )
+        self._teacher_nll_pending_updates = []
 
 
 def _outcome_gated_intervention_output(*, request_id: str, raw_correct: bool) -> AgentLoopOutput:
@@ -895,6 +903,93 @@ def _outcome_gated_intervention_output(*, request_id: str, raw_correct: bool) ->
             },
         },
     )
+
+
+class _FakeRemoteMethod:
+    def __init__(self, function):
+        self.function = function
+
+    def remote(self, *args):
+        async def invoke():
+            return self.function(*args)
+
+        return invoke()
+
+
+class _FakeCalibrationWorkerHandle:
+    def __init__(self, updates: list[float]):
+        self.updates = list(updates)
+        self.snapshot: Optional[_TeacherNLLCalibrationSnapshot] = None
+        self.drain_teacher_nll_calibration_updates = _FakeRemoteMethod(self._drain)
+        self.set_teacher_nll_calibration_state = _FakeRemoteMethod(self._set)
+
+    def _drain(self) -> list[float]:
+        updates = self.updates
+        self.updates = []
+        return updates
+
+    def _set(self, snapshot: _TeacherNLLCalibrationSnapshot) -> None:
+        self.snapshot = snapshot
+
+
+def test_agent_loop_manager_builds_global_teacher_nll_calibration_from_plain_config_on_cpu():
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {"agent": {"num_workers": 2}},
+                "model": {},
+            },
+            "distillation": {
+                "enabled": True,
+                "intervention": {
+                    "enabled": True,
+                    "outcome_aware_candidate_selection_enabled": True,
+                    "teacher_nll_calibration_min_samples": 4,
+                },
+            },
+        }
+    )
+
+    manager = AgentLoopManager(config, llm_client=None)
+
+    assert manager._global_teacher_nll_calibration is not None
+    assert manager._global_teacher_nll_calibration.min_samples == 4
+    assert manager._global_teacher_nll_calibration.snapshot().source == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_manager_globally_aggregates_and_broadcasts_teacher_nll_on_cpu():
+    config = DistillationInterventionConfig(
+        enabled=True,
+        outcome_aware_candidate_selection_enabled=True,
+        teacher_nll_calibration_quantile=0.75,
+        teacher_nll_calibration_window=8,
+        teacher_nll_calibration_min_samples=4,
+    )
+    manager = object.__new__(AgentLoopManager)
+    manager._global_teacher_nll_calibration = _GlobalTeacherNLLCalibration(config)
+    workers = [
+        _FakeCalibrationWorkerHandle([0.1, 0.3]),
+        _FakeCalibrationWorkerHandle([0.2, 0.4]),
+    ]
+    manager.agent_loop_workers = workers
+
+    await AgentLoopManager._refresh_global_teacher_nll_calibration(manager)
+
+    expected_threshold = float(np.quantile(np.asarray([0.1, 0.3, 0.2, 0.4]), 0.75))
+    assert manager._global_teacher_nll_calibration.history == pytest.approx([0.1, 0.3, 0.2, 0.4])
+    assert all(worker.snapshot is not None for worker in workers)
+    assert all(worker.snapshot.threshold == pytest.approx(expected_threshold) for worker in workers)
+    assert all(worker.snapshot.source == "rolling_healthy_quantile" for worker in workers)
+    assert all(worker.snapshot.count == 4 for worker in workers)
+    assert all(worker.snapshot.version == 1 for worker in workers)
+    assert all(worker.updates == [] for worker in workers)
+
+    workers[0].updates = [0.5]
+    await AgentLoopManager._refresh_global_teacher_nll_calibration(manager)
+
+    assert all(worker.snapshot.count == 5 for worker in workers)
+    assert all(worker.snapshot.version == 2 for worker in workers)
 
 
 class _SequenceAwareRewardMethod:
@@ -926,7 +1021,15 @@ async def test_outcome_aware_postprocess_scores_raw_then_repaired_answer_on_cpu(
         teacher_manager=teacher_manager,
         response_length=6,
         outcome_aware_candidate_selection_enabled=True,
-        teacher_nll_initial_threshold=0.5,
+    )
+    AgentLoopWorker.set_teacher_nll_calibration_state(
+        worker,
+        _TeacherNLLCalibrationSnapshot(
+            threshold=0.5,
+            source="rolling_healthy_quantile",
+            count=16,
+            version=3,
+        ),
     )
     worker.llm_client = _CandidateSelectionStudentClient(student_nll_by_token={30: 0.4, 31: 0.1, 32: 0.2, 33: 0.05})
     reward_handle = _SequenceAwareRewardHandle()
@@ -969,7 +1072,15 @@ async def test_outcome_aware_candidate_selection_filters_then_uses_rank_sum_on_c
         teacher_manager=teacher_manager,
         response_length=6,
         outcome_aware_candidate_selection_enabled=True,
-        teacher_nll_initial_threshold=0.5,
+    )
+    AgentLoopWorker.set_teacher_nll_calibration_state(
+        worker,
+        _TeacherNLLCalibrationSnapshot(
+            threshold=0.5,
+            source="rolling_healthy_quantile",
+            count=16,
+            version=3,
+        ),
     )
     worker.llm_client = _CandidateSelectionStudentClient(student_nll_by_token={30: 0.4, 31: 0.1, 32: 0.2, 33: 0.05})
     output = _outcome_gated_intervention_output(request_id="candidate-rank", raw_correct=False)
@@ -993,6 +1104,9 @@ async def test_outcome_aware_candidate_selection_filters_then_uses_rank_sum_on_c
     assert intervention["candidate_count_teacher_nll_valid"] == 4
     assert intervention["candidate_count_threshold_eligible"] == 3
     assert intervention["candidate_count_rankable"] == 3
+    assert intervention["teacher_nll_calibration_scope"] == "global"
+    assert intervention["teacher_nll_calibration_count_before"] == 16
+    assert intervention["teacher_nll_calibration_version"] == 3
     assert intervention["selected_candidate_index"] == 1
     assert intervention["selected_teacher_rank"] == 2
     assert intervention["selected_student_rank"] == 1
@@ -1140,7 +1254,10 @@ async def test_outcome_correct_sample_is_never_rewritten_and_can_shadow_calibrat
     assert skipped["reason"] == "outcome_correct"
     assert skipped["healthy_calibration_probe"] is True
     assert skipped["healthy_calibration_updated"] is True
-    assert list(worker._teacher_nll_healthy_history) == pytest.approx([0.2])
+    assert skipped["teacher_nll_calibration_scope"] == "global"
+    assert skipped["teacher_nll_global_update_pending"] is True
+    assert AgentLoopWorker.drain_teacher_nll_calibration_updates(worker) == pytest.approx([0.2])
+    assert AgentLoopWorker.drain_teacher_nll_calibration_updates(worker) == []
     assert not any(":student-candidate-score:" in call["request_id"] for call in worker.llm_client.calls)
 
 

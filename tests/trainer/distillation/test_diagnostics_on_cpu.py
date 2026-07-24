@@ -906,6 +906,8 @@ def test_compute_intervention_metrics_aggregates_outcome_and_candidate_selection
                 "teacher_nll_threshold": 0.5,
                 "teacher_nll_threshold_source": "rolling_healthy_quantile",
                 "teacher_nll_calibration_count_before": 32,
+                "teacher_nll_calibration_scope": "global",
+                "teacher_nll_calibration_version": 5,
                 "selected_teacher_nll": 0.2,
                 "selected_student_nll": 0.3,
                 "teacher_candidates": [
@@ -931,6 +933,8 @@ def test_compute_intervention_metrics_aggregates_outcome_and_candidate_selection
                 "teacher_nll_threshold": 0.4,
                 "teacher_nll_threshold_source": "rolling_healthy_quantile",
                 "teacher_nll_calibration_count_before": 31,
+                "teacher_nll_calibration_scope": "global",
+                "teacher_nll_calibration_version": 4,
                 "teacher_candidates": [],
             }
         ],
@@ -972,6 +976,8 @@ def test_compute_intervention_metrics_aggregates_outcome_and_candidate_selection
     assert metrics["opd_intervention/candidates/requested_count"] == 8
     assert metrics["opd_intervention/candidates/threshold_eligible_count"] == 2
     assert metrics["opd_intervention/candidates/teacher_nll_threshold_mean"] == pytest.approx(0.45)
+    assert metrics["opd_intervention/candidates/calibration_version_max"] == 5
+    assert metrics["opd_intervention/candidates/global_calibration_fraction"] == 1.0
     assert metrics["opd_intervention/candidates/invalid_count"] == 1
 
 

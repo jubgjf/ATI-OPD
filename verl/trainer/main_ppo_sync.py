@@ -472,6 +472,8 @@ class AgentLoopManagerTQ(AgentLoopManager):
         Args:
             prompts (TensorDict): Input batch from train or validation dataset.
         """
+        self._refresh_global_teacher_nll_calibration_blocking()
+
         # mark prompts as pending in replay buffer
         global_steps = prompts["global_steps"]
         partition_id = "train" if "validate" not in prompts else "val"

@@ -135,6 +135,65 @@ class _TeacherCandidateSelectionResult:
     skip_reason: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class _TeacherNLLCalibrationSnapshot:
+    """Read-only global teacher-NLL calibration state broadcast to rollout workers."""
+
+    threshold: Optional[float]
+    source: str
+    count: int
+    version: int
+
+
+class _GlobalTeacherNLLCalibration:
+    """Manager-owned rolling calibration history shared by all agent-loop workers."""
+
+    def __init__(self, config: DistillationInterventionConfig):
+        self.quantile = float(config.teacher_nll_calibration_quantile)
+        self.min_samples = int(config.teacher_nll_calibration_min_samples)
+        self.initial_threshold = (
+            None if config.teacher_nll_initial_threshold is None else float(config.teacher_nll_initial_threshold)
+        )
+        self.history: deque[float] = deque(maxlen=int(config.teacher_nll_calibration_window))
+        self.version = 0
+
+    def snapshot(self) -> _TeacherNLLCalibrationSnapshot:
+        """Return the threshold state derived from the current global history."""
+        count = len(self.history)
+        if count >= self.min_samples:
+            threshold = float(np.quantile(np.asarray(self.history, dtype=np.float64), self.quantile))
+            source = "rolling_healthy_quantile"
+        elif self.initial_threshold is not None:
+            threshold = self.initial_threshold
+            source = "initial"
+        else:
+            threshold = None
+            source = "unavailable"
+        return _TeacherNLLCalibrationSnapshot(
+            threshold=threshold,
+            source=source,
+            count=count,
+            version=self.version,
+        )
+
+    def add_updates(self, worker_updates: list[list[float]]) -> _TeacherNLLCalibrationSnapshot:
+        """Merge one batch of per-worker healthy NLL updates and return the new snapshot."""
+        updates: list[float] = []
+        for worker_index, values in enumerate(worker_updates):
+            for value_index, value in enumerate(values):
+                value = float(value)
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError(
+                        "Global teacher-NLL calibration updates must be finite and non-negative, "
+                        f"but worker {worker_index} update {value_index} was {value!r}."
+                    )
+                updates.append(value)
+        if updates:
+            self.history.extend(updates)
+            self.version += 1
+        return self.snapshot()
+
+
 def _as_single_float(value: Any, *, context: str) -> float:
     """Normalize a reward-manager scalar without silently reducing a batch."""
     if isinstance(value, torch.Tensor):
@@ -1478,7 +1537,13 @@ class AgentLoopWorker:
         self._teacher_intervention_logged_step = None
         self._teacher_intervention_thinking_start_pattern: list[int] = []
         self._teacher_intervention_thinking_end_pattern: list[int] = []
-        self._teacher_nll_healthy_history: deque[float] = deque()
+        self._teacher_nll_calibration_snapshot = _TeacherNLLCalibrationSnapshot(
+            threshold=None,
+            source="unavailable",
+            count=0,
+            version=0,
+        )
+        self._teacher_nll_pending_updates: list[float] = []
         if self.distillation_enabled:
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 
@@ -1493,8 +1558,12 @@ class AgentLoopWorker:
             self._validate_teacher_intervention_compatibility()
             self._init_teacher_intervention_token_patterns()
             if self.teacher_intervention_config.outcome_aware_candidate_selection_enabled:
-                self._teacher_nll_healthy_history = deque(
-                    maxlen=self.teacher_intervention_config.teacher_nll_calibration_window
+                initial_threshold = self.teacher_intervention_config.teacher_nll_initial_threshold
+                self._teacher_nll_calibration_snapshot = _TeacherNLLCalibrationSnapshot(
+                    threshold=None if initial_threshold is None else float(initial_threshold),
+                    source="unavailable" if initial_threshold is None else "initial",
+                    count=0,
+                    version=0,
                 )
 
         # Load tools once per worker; each trajectory just reuses self.tools.
@@ -2267,31 +2336,61 @@ class AgentLoopWorker:
             context="Student intervention",
         )
 
-    def _ensure_teacher_nll_calibration_state(self) -> deque[float]:
+    def _teacher_nll_calibration_state(self) -> _TeacherNLLCalibrationSnapshot:
+        snapshot = getattr(self, "_teacher_nll_calibration_snapshot", None)
+        if isinstance(snapshot, _TeacherNLLCalibrationSnapshot):
+            return snapshot
+
         config: DistillationInterventionConfig = self.teacher_intervention_config
-        window = int(config.teacher_nll_calibration_window)
-        history = getattr(self, "_teacher_nll_healthy_history", None)
-        if not isinstance(history, deque) or history.maxlen != window:
-            existing = list(history or [])[-window:]
-            history = deque(existing, maxlen=window)
-            self._teacher_nll_healthy_history = history
-        return history
+        initial_threshold = config.teacher_nll_initial_threshold
+        snapshot = _TeacherNLLCalibrationSnapshot(
+            threshold=None if initial_threshold is None else float(initial_threshold),
+            source="unavailable" if initial_threshold is None else "initial",
+            count=0,
+            version=0,
+        )
+        self._teacher_nll_calibration_snapshot = snapshot
+        return snapshot
+
+    def set_teacher_nll_calibration_state(self, snapshot: _TeacherNLLCalibrationSnapshot) -> None:
+        """Install one manager-computed calibration snapshot for the next rollout batch."""
+        if not isinstance(snapshot, _TeacherNLLCalibrationSnapshot):
+            raise TypeError(
+                "Teacher-NLL calibration broadcasts must use _TeacherNLLCalibrationSnapshot, "
+                f"got {type(snapshot).__name__}."
+            )
+        if snapshot.threshold is not None and (not math.isfinite(snapshot.threshold) or snapshot.threshold < 0):
+            raise ValueError(
+                "Teacher-NLL calibration threshold must be finite and non-negative when set, "
+                f"got {snapshot.threshold!r}."
+            )
+        if snapshot.count < 0 or snapshot.version < 0:
+            raise ValueError(
+                "Teacher-NLL calibration count and version must be non-negative, "
+                f"got count={snapshot.count}, version={snapshot.version}."
+            )
+        self._teacher_nll_calibration_snapshot = snapshot
+
+    def drain_teacher_nll_calibration_updates(self) -> list[float]:
+        """Return and clear healthy-NLL updates accumulated during the previous rollout batch."""
+        updates = list(getattr(self, "_teacher_nll_pending_updates", []))
+        self._teacher_nll_pending_updates = []
+        return updates
+
+    def _queue_teacher_nll_calibration_update(self, value: float) -> int:
+        value = float(value)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"Healthy teacher-NLL calibration update must be finite and non-negative, got {value!r}.")
+        pending = getattr(self, "_teacher_nll_pending_updates", None)
+        if not isinstance(pending, list):
+            pending = []
+            self._teacher_nll_pending_updates = pending
+        pending.append(value)
+        return len(pending)
 
     def _current_teacher_nll_threshold(self) -> tuple[Optional[float], str, int]:
-        config: DistillationInterventionConfig = self.teacher_intervention_config
-        history = AgentLoopWorker._ensure_teacher_nll_calibration_state(self)
-        count = len(history)
-        if count >= int(config.teacher_nll_calibration_min_samples):
-            threshold = float(
-                np.quantile(
-                    np.asarray(history, dtype=np.float64),
-                    config.teacher_nll_calibration_quantile,
-                )
-            )
-            return threshold, "rolling_healthy_quantile", count
-        if config.teacher_nll_initial_threshold is not None:
-            return float(config.teacher_nll_initial_threshold), "initial", count
-        return None, "unavailable", count
+        snapshot = AgentLoopWorker._teacher_nll_calibration_state(self)
+        return snapshot.threshold, snapshot.source, snapshot.count
 
     @staticmethod
     def _candidate_mean_nll(
@@ -2339,7 +2438,10 @@ class AgentLoopWorker:
         """Generate K candidates, NLL-filter them, then select by teacher/student rank sum."""
         config: DistillationInterventionConfig = self.teacher_intervention_config
         candidate_count = int(config.teacher_candidate_count)
-        threshold, threshold_source, calibration_count_before = AgentLoopWorker._current_teacher_nll_threshold(self)
+        calibration_snapshot = AgentLoopWorker._teacher_nll_calibration_state(self)
+        threshold = calibration_snapshot.threshold
+        threshold_source = calibration_snapshot.source
+        calibration_count_before = calibration_snapshot.count
         generation_results = await asyncio.gather(
             *[
                 self.teacher_server_manager.generate_teacher_segment_single(
@@ -2443,24 +2545,27 @@ class AgentLoopWorker:
             "teacher_nll_threshold_source": threshold_source,
             "teacher_nll_calibration_quantile": float(config.teacher_nll_calibration_quantile),
             "teacher_nll_calibration_count_before": calibration_count_before,
+            "teacher_nll_calibration_scope": "global",
+            "teacher_nll_calibration_version": calibration_snapshot.version,
             "candidate_generation_failures": generation_failures,
         }
 
         if calibration_only:
             if teacher_scored_candidates:
                 healthy_min_nll = min(candidate.teacher_nll for candidate in teacher_scored_candidates)
-                history = AgentLoopWorker._ensure_teacher_nll_calibration_state(self)
-                history.append(float(healthy_min_nll))
-                threshold_after, threshold_source_after, calibration_count_after = (
-                    AgentLoopWorker._current_teacher_nll_threshold(self)
+                pending_count = AgentLoopWorker._queue_teacher_nll_calibration_update(
+                    self,
+                    healthy_min_nll,
                 )
                 metadata.update(
                     {
                         "healthy_calibration_updated": True,
                         "healthy_calibration_min_teacher_nll": float(healthy_min_nll),
-                        "teacher_nll_calibration_count_after": calibration_count_after,
-                        "teacher_nll_threshold_after": threshold_after,
-                        "teacher_nll_threshold_source_after": threshold_source_after,
+                        "teacher_nll_calibration_count_after": calibration_count_before,
+                        "teacher_nll_calibration_pending_count_after": pending_count,
+                        "teacher_nll_global_update_pending": True,
+                        "teacher_nll_threshold_after": threshold,
+                        "teacher_nll_threshold_source_after": threshold_source,
                     }
                 )
             else:
@@ -2468,6 +2573,10 @@ class AgentLoopWorker:
                     {
                         "healthy_calibration_updated": False,
                         "teacher_nll_calibration_count_after": calibration_count_before,
+                        "teacher_nll_calibration_pending_count_after": len(
+                            getattr(self, "_teacher_nll_pending_updates", [])
+                        ),
+                        "teacher_nll_global_update_pending": False,
                     }
                 )
             metadata["teacher_candidates"] = [
@@ -3425,6 +3534,16 @@ class AgentLoopManager:
         self.llm_client = llm_client
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
+        self._global_teacher_nll_calibration: Optional[_GlobalTeacherNLLCalibration] = None
+
+        distillation_config = getattr(config, "distillation", None)
+        if is_distillation_enabled(distillation_config):
+            intervention_config: DistillationInterventionConfig = omega_conf_to_dataclass(
+                distillation_config.intervention,
+                dataclass_type=DistillationInterventionConfig,
+            )
+            if intervention_config.outcome_aware_candidate_selection_enabled:
+                self._global_teacher_nll_calibration = _GlobalTeacherNLLCalibration(intervention_config)
 
         if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
@@ -3436,6 +3555,36 @@ class AgentLoopManager:
         instance = cls(*args, **kwargs)
         await instance._init_agent_loop_workers()
         return instance
+
+    def _apply_global_teacher_nll_calibration_updates(
+        self,
+        worker_updates: list[list[float]],
+    ) -> Optional[_TeacherNLLCalibrationSnapshot]:
+        if self._global_teacher_nll_calibration is None:
+            return None
+        return self._global_teacher_nll_calibration.add_updates(worker_updates)
+
+    async def _refresh_global_teacher_nll_calibration(self) -> None:
+        """Aggregate the previous batch's updates and broadcast one snapshot before the next batch."""
+        if self._global_teacher_nll_calibration is None:
+            return
+        worker_updates = await asyncio.gather(
+            *[worker.drain_teacher_nll_calibration_updates.remote() for worker in self.agent_loop_workers]
+        )
+        snapshot = self._apply_global_teacher_nll_calibration_updates(worker_updates)
+        await asyncio.gather(
+            *[worker.set_teacher_nll_calibration_state.remote(snapshot) for worker in self.agent_loop_workers]
+        )
+
+    def _refresh_global_teacher_nll_calibration_blocking(self) -> None:
+        """Blocking equivalent used by the TransferQueue rollout manager."""
+        if self._global_teacher_nll_calibration is None:
+            return
+        worker_updates = ray.get(
+            [worker.drain_teacher_nll_calibration_updates.remote() for worker in self.agent_loop_workers]
+        )
+        snapshot = self._apply_global_teacher_nll_calibration_updates(worker_updates)
+        ray.get([worker.set_teacher_nll_calibration_state.remote(snapshot) for worker in self.agent_loop_workers])
 
     async def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
@@ -3469,6 +3618,7 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
+        await self._refresh_global_teacher_nll_calibration()
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = await asyncio.gather(
             *[

@@ -127,7 +127,8 @@ intervention:
   outcome_correctness_threshold: 0.5
   teacher_candidate_count: 4
   # Each healthy prefix contributes the minimum teacher NLL among its K
-  # candidates, matching the best-of-K decision variable used for repair.
+  # candidates. Updates are aggregated globally across rollout workers after
+  # each batch, and one rolling threshold is broadcast for the next batch.
   teacher_nll_calibration_quantile: 0.75
   teacher_nll_calibration_window: 256
   teacher_nll_calibration_min_samples: 16

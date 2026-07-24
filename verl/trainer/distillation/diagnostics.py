@@ -2672,6 +2672,19 @@ def compute_intervention_metrics(
         if calibration_counts:
             metrics["opd_intervention/candidates/calibration_count_mean"] = float(np.mean(calibration_counts))
             metrics["opd_intervention/candidates/calibration_count_max"] = float(np.max(calibration_counts))
+        calibration_versions = [
+            float(item["teacher_nll_calibration_version"])
+            for item in candidate_records
+            if item.get("teacher_nll_calibration_version") is not None
+        ]
+        if calibration_versions:
+            metrics["opd_intervention/candidates/calibration_version_max"] = float(np.max(calibration_versions))
+        global_calibration_records = sum(
+            item.get("teacher_nll_calibration_scope") == "global" for item in candidate_records
+        )
+        metrics["opd_intervention/candidates/global_calibration_fraction"] = global_calibration_records / len(
+            candidate_records
+        )
         selected_teacher_nlls = [
             float(item["selected_teacher_nll"])
             for item in candidate_records
