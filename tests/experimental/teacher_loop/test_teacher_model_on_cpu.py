@@ -27,21 +27,35 @@ def _disable_teacher_server_initialization(monkeypatch):
 
 def test_rethinking_style_enables_target_patch_only_on_its_teacher_on_cpu(monkeypatch):
     _disable_teacher_server_initialization(monkeypatch)
-    inference = SimpleNamespace(name="vllm", custom=None)
+    inference = SimpleNamespace(
+        name="vllm",
+        custom=None,
+        enable_prefix_caching=True,
+        engine_kwargs={"vllm": {"enable_prefix_caching": True, "max_num_seqs": 8}},
+    )
     teacher_config = SimpleNamespace(key="teacher", inference=inference)
     distillation_config = SimpleNamespace(distillation_loss=SimpleNamespace(top_k_strategy="only_stu_rethinking_style"))
 
     TeacherModelManager(distillation_config, teacher_config, resource_pool=object())
 
     assert inference.custom == {RETHINKING_TARGET_PROMPT_LOGPROBS_CONFIG_KEY: True}
+    assert inference.enable_prefix_caching is False
+    assert inference.engine_kwargs == {"vllm": {"enable_prefix_caching": False, "max_num_seqs": 8}}
 
 
 def test_legacy_only_stu_does_not_enable_or_mutate_target_patch_config_on_cpu(monkeypatch):
     _disable_teacher_server_initialization(monkeypatch)
-    inference = SimpleNamespace(name="vllm", custom=None)
+    inference = SimpleNamespace(
+        name="vllm",
+        custom=None,
+        enable_prefix_caching=True,
+        engine_kwargs={"vllm": {"enable_prefix_caching": True}},
+    )
     teacher_config = SimpleNamespace(key="teacher", inference=inference)
     distillation_config = SimpleNamespace(distillation_loss=SimpleNamespace(top_k_strategy="only_stu"))
 
     TeacherModelManager(distillation_config, teacher_config, resource_pool=object())
 
     assert inference.custom is None
+    assert inference.enable_prefix_caching is True
+    assert inference.engine_kwargs == {"vllm": {"enable_prefix_caching": True}}

@@ -68,6 +68,18 @@ class TeacherModelManager:
                 RETHINKING_TARGET_PROMPT_LOGPROBS_CONFIG_KEY,
             )
 
+            # Exact prompt logprobs require logits for every prompt position.
+            # A prefix-cache hit advances request.num_computed_tokens without
+            # recomputing the cached prefix logits, leaving those output rows
+            # unavailable. This is a correctness constraint, not merely a
+            # performance preference.
+            object.__setattr__(self.teacher_model_config.inference, "enable_prefix_caching", False)
+            engine_kwargs = dict(self.teacher_model_config.inference.engine_kwargs or {})
+            vllm_engine_kwargs = dict(engine_kwargs.get("vllm", {}) or {})
+            vllm_engine_kwargs["enable_prefix_caching"] = False
+            engine_kwargs["vllm"] = vllm_engine_kwargs
+            object.__setattr__(self.teacher_model_config.inference, "engine_kwargs", engine_kwargs)
+
             custom_config = dict(self.teacher_model_config.inference.custom or {})
             custom_config[RETHINKING_TARGET_PROMPT_LOGPROBS_CONFIG_KEY] = True
             object.__setattr__(self.teacher_model_config.inference, "custom", custom_config)

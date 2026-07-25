@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 
@@ -180,6 +181,18 @@ def test_vllm_target_prompt_patch_accumulates_chunked_prefill_on_cpu():
     torch.testing.assert_close(output.logprobs[:, 1:], expected_logprobs)
     torch.testing.assert_close(output.selected_token_ranks, torch.tensor([3, 3, 3], dtype=torch.int32))
     assert runner._verl_target_prompt_token_ids_tensors == {}
+
+
+def test_vllm_target_prompt_patch_rejects_prefix_cache_hits_on_cpu():
+    runner, _ = _target_runner()
+    runner.requests["target"].num_computed_tokens = 1
+    patch_vllm_model_runner_target_prompt_logprobs(
+        runner,
+        logprobs_tensors_cls=_FakeLogprobsTensors,
+    )
+
+    with pytest.raises(RuntimeError, match="cannot reuse prefix-cached KV states"):
+        runner._get_prompt_logprobs_dict(torch.randn(3, 5), {"target": 3})
 
 
 def test_vllm_target_prompt_patch_delegates_legacy_requests_without_changes_on_cpu():

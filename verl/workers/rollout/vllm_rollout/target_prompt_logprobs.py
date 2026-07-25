@@ -259,6 +259,13 @@ def patch_vllm_model_runner_target_prompt_logprobs(
             target_width = target_tensor.shape[-1]
             logprobs_tensors = in_progress.get(request_id)
             if not logprobs_tensors:
+                if request.num_computed_tokens > 0:
+                    raise RuntimeError(
+                        "Exact target prompt scoring cannot reuse prefix-cached KV states because cached positions "
+                        "do not provide the logits needed for prompt logprobs. Disable enable_prefix_caching on the "
+                        "only_stu_rethinking_style teacher. "
+                        f"request={request_id!r}, cached_prefix_tokens={request.num_computed_tokens}."
+                    )
                 logprobs_tensors = logprobs_tensors_cls.empty_cpu(prompt_len - 1, target_width + 1)
                 in_progress[request_id] = logprobs_tensors
 
