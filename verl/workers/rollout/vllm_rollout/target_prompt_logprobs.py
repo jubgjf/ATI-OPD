@@ -47,13 +47,17 @@ def _build_target_logprob_rows(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build vLLM ``LogprobsTensors`` rows for exact target token ids.
 
-    vLLM allocates ``K + 1`` output columns for ``prompt_logprobs=K``: K
-    requested entries plus one slot for the actual prompt token.  We place the
-    K per-position targets in ranks ``1..K`` so the existing verl output
-    extractor preserves their order.  The final slot contains the actual
-    prompt token when it is not already a target; otherwise it contains an
-    arbitrary non-target token to keep token ids unique in vLLM's dict-shaped
-    output.
+    vLLM allocates ``K + 1`` output columns for ``prompt_logprobs=K``.  Its
+    serialization contract requires the actual prompt token in column zero
+    and assigns ranks ``1..K`` to the following K columns.  The separate
+    ``selected_token_ranks`` tensor is one-dimensional: it contains only the
+    full-vocabulary rank of the actual prompt token.
+
+    We put the K per-position student targets in columns ``1..K`` and use
+    ``K + 1`` as a sentinel selected-token rank.  If the actual prompt token
+    is also a student target, vLLM's dict conversion overwrites the duplicate
+    column-zero entry with its synthetic rank in ``1..K``.  Otherwise the
+    sentinel keeps the extra actual-token entry outside the K target ranks.
     """
     if normalized_logprobs.ndim != 2:
         raise ValueError(
@@ -76,34 +80,18 @@ def _build_target_logprob_rows(
     # ``gather`` below enforces the token-id range. Do not call ``min().item()``
     # or ``max().item()`` here: this function runs once per request per
     # chunk, and each scalar read would serialize the entire NPU stream.
-    vocab_size = normalized_logprobs.shape[-1]
     target_logprobs = normalized_logprobs.gather(dim=-1, index=target_token_ids)
     target_width = target_token_ids.shape[-1]
-    if target_width >= vocab_size:
-        raise ValueError(
-            "Target prompt-logprob width must be smaller than the vocabulary so the sampled-token slot "
-            f"can remain unique, got target_width={target_width}, vocab_size={vocab_size}."
-        )
-    sampled_is_target = (target_token_ids == sampled_token_ids.unsqueeze(-1)).any(dim=-1)
-
-    # A set containing K token ids must omit at least one id from [0, K].
-    # Find that id in one vectorized NPU/GPU operation. Avoiding a Python retry
-    # loop is important on Ascend because every tensor truth-value check forces
-    # a device synchronization.
-    filler_candidates = torch.arange(target_width + 1, device=target_token_ids.device)
-    candidate_is_target = (target_token_ids.unsqueeze(-1) == filler_candidates).any(dim=-2)
-    missing_candidate_ids = (~candidate_is_target).to(torch.int64).argmax(dim=-1)
-    filler_ids = torch.where(sampled_is_target, missing_candidate_ids, sampled_token_ids)
-
-    filler_logprobs = normalized_logprobs.gather(dim=-1, index=filler_ids.unsqueeze(-1))
-    output_ids = torch.cat((target_token_ids, filler_ids.unsqueeze(-1)), dim=-1)
-    output_logprobs = torch.cat((target_logprobs, filler_logprobs), dim=-1)
-    output_ranks = (
-        torch.arange(1, target_token_ids.shape[-1] + 2, device=target_token_ids.device)
-        .unsqueeze(0)
-        .expand_as(output_ids)
+    sampled_logprobs = normalized_logprobs.gather(dim=-1, index=sampled_token_ids.unsqueeze(-1))
+    output_ids = torch.cat((sampled_token_ids.unsqueeze(-1), target_token_ids), dim=-1)
+    output_logprobs = torch.cat((sampled_logprobs, target_logprobs), dim=-1)
+    selected_token_ranks = torch.full(
+        (target_token_ids.shape[0],),
+        target_width + 1,
+        dtype=torch.long,
+        device=target_token_ids.device,
     )
-    return output_ids, output_logprobs, output_ranks
+    return output_ids, output_logprobs, selected_token_ranks
 
 
 def _num_scheduled_tokens_by_request(scheduling_state: Any) -> dict[str, int]:

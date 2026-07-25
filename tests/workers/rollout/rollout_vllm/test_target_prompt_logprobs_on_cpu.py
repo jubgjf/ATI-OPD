@@ -32,15 +32,17 @@ def _load_target_prompt_logprobs_module():
 
 _TARGET_MODULE = _load_target_prompt_logprobs_module()
 VERL_TARGET_PROMPT_TOKEN_IDS_KEY = _TARGET_MODULE.VERL_TARGET_PROMPT_TOKEN_IDS_KEY
+_build_target_logprob_rows = _TARGET_MODULE._build_target_logprob_rows
 patch_vllm_model_runner_target_prompt_logprobs = _TARGET_MODULE.patch_vllm_model_runner_target_prompt_logprobs
 _sync_model_runner_device = _TARGET_MODULE._sync_model_runner_device
 
 
 class _FakeLogprobsTensors:
     def __init__(self, rows, width):
-        self.logprob_token_ids = torch.zeros(rows, width, dtype=torch.long)
+        # Match vLLM 0.11's real LogprobsTensors contract exactly.
+        self.logprob_token_ids = torch.zeros(rows, width, dtype=torch.int32)
         self.logprobs = torch.zeros(rows, width)
-        self.selected_token_ranks = torch.zeros(rows, width, dtype=torch.long)
+        self.selected_token_ranks = torch.zeros(rows, dtype=torch.int32)
 
     @classmethod
     def empty_cpu(cls, rows, width):
@@ -105,12 +107,51 @@ def test_vllm_target_prompt_patch_gathers_exact_per_position_ids_on_cpu():
     output = outputs["target"]
     expected_ids = torch.tensor(target_rows[:3])
     expected_logprobs = torch.log_softmax(logits, dim=-1).gather(dim=-1, index=expected_ids)
-    torch.testing.assert_close(output.logprob_token_ids[:, :2], expected_ids)
-    torch.testing.assert_close(output.logprobs[:, :2], expected_logprobs)
-    torch.testing.assert_close(output.selected_token_ranks[:, :2], torch.tensor([[1, 2], [1, 2], [1, 2]]))
-    # vLLM converts each row to a dict, so the extra sampled-token slot must
-    # never duplicate one of the two target ids.
-    assert (output.logprob_token_ids[:, :2] != output.logprob_token_ids[:, 2:]).all()
+    torch.testing.assert_close(output.logprob_token_ids[:, 0], torch.tensor([1, 2, 3], dtype=torch.int32))
+    torch.testing.assert_close(output.logprob_token_ids[:, 1:], expected_ids.to(torch.int32))
+    torch.testing.assert_close(output.logprobs[:, 1:], expected_logprobs)
+    torch.testing.assert_close(output.selected_token_ranks, torch.tensor([3, 3, 3], dtype=torch.int32))
+
+
+def test_vllm_target_prompt_rows_survive_v011_dict_serialization_on_cpu():
+    normalized_logprobs = torch.log_softmax(
+        torch.tensor(
+            [
+                [0.2, 2.0, -0.5, 0.1, 1.1],
+                [1.0, -0.5, 0.3, 0.1, 2.0],
+            ]
+        ),
+        dim=-1,
+    )
+    target_token_ids = torch.tensor([[1, 4], [0, 4]])
+    sampled_token_ids = torch.tensor([1, 2])
+
+    output_ids, output_logprobs, selected_ranks = _build_target_logprob_rows(
+        normalized_logprobs=normalized_logprobs,
+        target_token_ids=target_token_ids,
+        sampled_token_ids=sampled_token_ids,
+    )
+
+    # Mirror vLLM 0.11 LogprobsProcessor._make_logprob_dict: column zero
+    # receives selected_ranks[pos], while columns 1..K receive ranks 1..K.
+    for position in range(len(sampled_token_ids)):
+        serialized = {}
+        ranks = [int(selected_ranks[position]), *range(1, output_ids.shape[1])]
+        for token_id, logprob, rank in zip(
+            output_ids[position].tolist(),
+            output_logprobs[position].tolist(),
+            ranks,
+            strict=True,
+        ):
+            serialized[token_id] = SimpleNamespace(logprob=logprob, rank=rank)
+
+        recovered_target_ids = [None] * target_token_ids.shape[1]
+        for token_id, token_logprob in serialized.items():
+            if 1 <= token_logprob.rank <= len(recovered_target_ids):
+                recovered_target_ids[token_logprob.rank - 1] = token_id
+
+        assert recovered_target_ids == target_token_ids[position].tolist()
+        assert sampled_token_ids[position].item() in serialized
 
 
 def test_vllm_target_prompt_patch_accumulates_chunked_prefill_on_cpu():
@@ -135,8 +176,9 @@ def test_vllm_target_prompt_patch_accumulates_chunked_prefill_on_cpu():
     all_logits = torch.cat((first_logits, second_logits[:1]), dim=0)
     expected_ids = torch.tensor(target_rows[:3])
     expected_logprobs = torch.log_softmax(all_logits, dim=-1).gather(dim=-1, index=expected_ids)
-    torch.testing.assert_close(output.logprob_token_ids[:, :2], expected_ids)
-    torch.testing.assert_close(output.logprobs[:, :2], expected_logprobs)
+    torch.testing.assert_close(output.logprob_token_ids[:, 1:], expected_ids.to(torch.int32))
+    torch.testing.assert_close(output.logprobs[:, 1:], expected_logprobs)
+    torch.testing.assert_close(output.selected_token_ranks, torch.tensor([3, 3, 3], dtype=torch.int32))
     assert runner._verl_target_prompt_token_ids_tensors == {}
 
 
@@ -207,7 +249,10 @@ def test_vllm_target_prompt_patch_supports_vllm_ascend_v011_runner_contract_on_c
 
     outputs = runner._get_prompt_logprobs_dict(logits, scheduler_output)
 
-    torch.testing.assert_close(outputs["target"].logprob_token_ids[:, :2], torch.tensor(target_rows[:3]))
+    torch.testing.assert_close(
+        outputs["target"].logprob_token_ids[:, 1:],
+        torch.tensor(target_rows[:3], dtype=torch.int32),
+    )
     assert sync_calls == ["sync"]
 
 
@@ -243,4 +288,7 @@ def test_vllm_target_prompt_patch_supports_inherited_vllm_ascend_v013_contract_o
 
     outputs = runner._get_prompt_logprobs_dict(logits, {"target": 4})
 
-    torch.testing.assert_close(outputs["target"].logprob_token_ids[:, :2], torch.tensor(target_rows[:3]))
+    torch.testing.assert_close(
+        outputs["target"].logprob_token_ids[:, 1:],
+        torch.tensor(target_rows[:3], dtype=torch.int32),
+    )
