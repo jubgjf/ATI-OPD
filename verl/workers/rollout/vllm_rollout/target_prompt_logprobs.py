@@ -83,12 +83,16 @@ def _build_target_logprob_rows(
     target_logprobs = normalized_logprobs.gather(dim=-1, index=target_token_ids)
     target_width = target_token_ids.shape[-1]
     sampled_logprobs = normalized_logprobs.gather(dim=-1, index=sampled_token_ids.unsqueeze(-1))
-    output_ids = torch.cat((sampled_token_ids.unsqueeze(-1), target_token_ids), dim=-1)
+    # ``LogprobsTensors.empty_cpu`` stores token ids as int32.  Match that
+    # dtype on device before the non-blocking D2H copy below.  In particular,
+    # older torch-npu releases can expose an uninitialized CPU-side cast
+    # result for a mixed-dtype ``int64 NPU -> int32 CPU`` asynchronous copy.
+    output_ids = torch.cat((sampled_token_ids.unsqueeze(-1), target_token_ids), dim=-1).to(torch.int32)
     output_logprobs = torch.cat((sampled_logprobs, target_logprobs), dim=-1)
     selected_token_ranks = torch.full(
         (target_token_ids.shape[0],),
         target_width + 1,
-        dtype=torch.long,
+        dtype=torch.int32,
         device=target_token_ids.device,
     )
     return output_ids, output_logprobs, selected_token_ranks
@@ -149,10 +153,47 @@ def _sync_model_runner_device(model_runner: Any) -> None:
         synchronize()
 
 
+def _validate_completed_token_ids(
+    completed_outputs: dict[str, Any],
+    *,
+    vocab_size: int | None,
+) -> None:
+    """Reject incomplete or corrupt prompt-logprob token-id buffers."""
+    if vocab_size is None:
+        return
+
+    for request_id, output in completed_outputs.items():
+        token_ids = output.logprob_token_ids
+        if token_ids.dtype != torch.int32:
+            raise RuntimeError(
+                "Target prompt-logprob token ids must use vLLM's int32 output contract, "
+                f"got dtype={token_ids.dtype} for request={request_id!r}."
+            )
+        if token_ids.numel() == 0:
+            continue
+
+        min_token_id, max_token_id = torch.aminmax(token_ids)
+        min_token_id = int(min_token_id.item())
+        max_token_id = int(max_token_id.item())
+        if min_token_id >= 0 and max_token_id < vocab_size:
+            continue
+
+        invalid = (token_ids < 0) | (token_ids >= vocab_size)
+        row, column = torch.nonzero(invalid, as_tuple=False)[0].tolist()
+        invalid_token_id = int(token_ids[row, column].item())
+        raise RuntimeError(
+            "Target prompt-logprob output contains an invalid token id after the device-to-host transfer. "
+            "This indicates an incomplete output row or a corrupt asynchronous transfer: "
+            f"request={request_id!r}, row={row}, column={column}, token_id={invalid_token_id}, "
+            f"valid_range=[0, {vocab_size})."
+        )
+
+
 def patch_vllm_model_runner_target_prompt_logprobs(
     model_runner: Any,
     *,
     logprobs_tensors_cls: type | None = None,
+    vocab_size: int | None = None,
 ) -> None:
     """Install exact target prompt-logprob support on one vLLM V1 runner.
 
@@ -163,6 +204,8 @@ def patch_vllm_model_runner_target_prompt_logprobs(
     """
     if getattr(model_runner, _PATCHED_ATTRIBUTE, False):
         return
+    if vocab_size is not None and vocab_size <= 0:
+        raise ValueError(f"vocab_size must be positive when provided, got {vocab_size}.")
     original_method = getattr(model_runner, "_get_prompt_logprobs_dict", None)
     if original_method is None:
         raise RuntimeError(
@@ -267,6 +310,10 @@ def patch_vllm_model_runner_target_prompt_logprobs(
                         f"request={request_id!r}, cached_prefix_tokens={request.num_computed_tokens}."
                     )
                 logprobs_tensors = logprobs_tensors_cls.empty_cpu(prompt_len - 1, target_width + 1)
+                # vLLM allocates this buffer with ``torch.empty``.  A sentinel
+                # makes any scheduler/copy hole deterministic and lets the
+                # completion check reject it before tokenizer decoding.
+                logprobs_tensors.logprob_token_ids.fill_(-1)
                 in_progress[request_id] = logprobs_tensors
 
             start_index = request.num_computed_tokens
@@ -295,6 +342,16 @@ def patch_vllm_model_runner_target_prompt_logprobs(
             )
 
             chunk = slice(start_index, start_index + num_logits)
+            if token_ids.dtype != logprobs_tensors.logprob_token_ids.dtype:
+                raise RuntimeError(
+                    "Target prompt-logprob token ids must have the same dtype on device and CPU before "
+                    f"non-blocking copy, got device={token_ids.dtype}, cpu={logprobs_tensors.logprob_token_ids.dtype}."
+                )
+            if ranks.dtype != logprobs_tensors.selected_token_ranks.dtype:
+                raise RuntimeError(
+                    "Target prompt-logprob ranks must have the same dtype on device and CPU before non-blocking copy, "
+                    f"got device={ranks.dtype}, cpu={logprobs_tensors.selected_token_ranks.dtype}."
+                )
             logprobs_tensors.logprob_token_ids[chunk].copy_(token_ids, non_blocking=True)
             logprobs_tensors.logprobs[chunk].copy_(logprobs, non_blocking=True)
             logprobs_tensors.selected_token_ranks[chunk].copy_(ranks, non_blocking=True)
@@ -305,6 +362,7 @@ def patch_vllm_model_runner_target_prompt_logprobs(
             target_tensor_cache.pop(request_id, None)
         if completed_outputs:
             _sync_model_runner_device(self)
+            _validate_completed_token_ids(completed_outputs, vocab_size=vocab_size)
         return completed_outputs
 
     model_runner._get_prompt_logprobs_dict = MethodType(_get_prompt_logprobs_dict_with_targets, model_runner)

@@ -220,7 +220,7 @@ class vLLMColocateWorkerExtension:
                 patch_vllm_model_runner_target_prompt_logprobs,
             )
 
-            patch_vllm_model_runner_target_prompt_logprobs(self.model_runner)
+            patch_vllm_model_runner_target_prompt_logprobs(self.model_runner, vocab_size=vocab_size)
         # patch weight loader to support MoE model
         patch_vllm_moe_model_weight_loader(self.model_runner.model)
 

@@ -36,14 +36,15 @@ VERL_TARGET_PROMPT_TOKEN_IDS_KEY = _TARGET_MODULE.VERL_TARGET_PROMPT_TOKEN_IDS_K
 _build_target_logprob_rows = _TARGET_MODULE._build_target_logprob_rows
 patch_vllm_model_runner_target_prompt_logprobs = _TARGET_MODULE.patch_vllm_model_runner_target_prompt_logprobs
 _sync_model_runner_device = _TARGET_MODULE._sync_model_runner_device
+_validate_completed_token_ids = _TARGET_MODULE._validate_completed_token_ids
 
 
 class _FakeLogprobsTensors:
     def __init__(self, rows, width):
         # Match vLLM 0.11's real LogprobsTensors contract exactly.
-        self.logprob_token_ids = torch.zeros(rows, width, dtype=torch.int32)
-        self.logprobs = torch.zeros(rows, width)
-        self.selected_token_ranks = torch.zeros(rows, dtype=torch.int32)
+        self.logprob_token_ids = torch.empty(rows, width, dtype=torch.int32)
+        self.logprobs = torch.empty(rows, width)
+        self.selected_token_ranks = torch.empty(rows, dtype=torch.int32)
 
     @classmethod
     def empty_cpu(cls, rows, width):
@@ -94,6 +95,7 @@ def test_vllm_target_prompt_patch_gathers_exact_per_position_ids_on_cpu():
     patch_vllm_model_runner_target_prompt_logprobs(
         runner,
         logprobs_tensors_cls=_FakeLogprobsTensors,
+        vocab_size=5,
     )
     logits = torch.tensor(
         [
@@ -133,6 +135,9 @@ def test_vllm_target_prompt_rows_survive_v011_dict_serialization_on_cpu():
         sampled_token_ids=sampled_token_ids,
     )
 
+    assert output_ids.dtype == torch.int32
+    assert selected_ranks.dtype == torch.int32
+
     # Mirror vLLM 0.11 LogprobsProcessor._make_logprob_dict: column zero
     # receives selected_ranks[pos], while columns 1..K receive ranks 1..K.
     for position in range(len(sampled_token_ids)):
@@ -160,6 +165,7 @@ def test_vllm_target_prompt_patch_accumulates_chunked_prefill_on_cpu():
     patch_vllm_model_runner_target_prompt_logprobs(
         runner,
         logprobs_tensors_cls=_FakeLogprobsTensors,
+        vocab_size=5,
     )
     first_logits = torch.tensor(
         [
@@ -189,6 +195,7 @@ def test_vllm_target_prompt_patch_rejects_prefix_cache_hits_on_cpu():
     patch_vllm_model_runner_target_prompt_logprobs(
         runner,
         logprobs_tensors_cls=_FakeLogprobsTensors,
+        vocab_size=5,
     )
 
     with pytest.raises(RuntimeError, match="cannot reuse prefix-cached KV states"):
@@ -219,6 +226,7 @@ def test_vllm_target_prompt_patch_delegates_legacy_requests_without_changes_on_c
     patch_vllm_model_runner_target_prompt_logprobs(
         runner,
         logprobs_tensors_cls=_FakeLogprobsTensors,
+        vocab_size=5,
     )
     hidden_states = torch.randn(2, 3)
     scheduling_state = {"legacy": 2}
@@ -250,6 +258,7 @@ def test_vllm_target_prompt_patch_supports_vllm_ascend_v011_runner_contract_on_c
     patch_vllm_model_runner_target_prompt_logprobs(
         runner,
         logprobs_tensors_cls=_FakeLogprobsTensors,
+        vocab_size=5,
     )
     logits = torch.tensor(
         [
@@ -280,6 +289,14 @@ def test_vllm_target_prompt_patch_dispatches_sync_to_torch_npu_on_cpu(monkeypatc
     assert sync_calls == ["npu"]
 
 
+def test_vllm_target_prompt_patch_rejects_corrupt_completed_token_ids_on_cpu():
+    output = _FakeLogprobsTensors(rows=2, width=3)
+    output.logprob_token_ids.copy_(torch.tensor([[0, 1, 2], [3, -1, 4]], dtype=torch.int32))
+
+    with pytest.raises(RuntimeError, match=r"row=1, column=1, token_id=-1, valid_range=\[0, 5\)"):
+        _validate_completed_token_ids({"target": output}, vocab_size=5)
+
+
 def test_vllm_target_prompt_patch_supports_inherited_vllm_ascend_v013_contract_on_cpu():
     """Exercise the GPUModelRunner-compatible contract used since Ascend 0.13."""
     runner, target_rows = _target_runner()
@@ -290,6 +307,7 @@ def test_vllm_target_prompt_patch_supports_inherited_vllm_ascend_v013_contract_o
     patch_vllm_model_runner_target_prompt_logprobs(
         runner,
         logprobs_tensors_cls=_FakeLogprobsTensors,
+        vocab_size=5,
     )
     logits = torch.tensor(
         [
