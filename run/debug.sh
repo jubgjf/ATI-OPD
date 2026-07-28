@@ -10,6 +10,7 @@
 #   DEBUG_MODE=vanilla TOTAL_TRAINING_STEPS=1 bash run/debug.sh
 #   DEBUG_MODE=popd TEACHER_GPUS=1 TEACHER_TP=1 bash run/debug.sh
 #   DEBUG_MODE=outcome-nll-rank TEACHER_GPUS=1 TEACHER_TP=1 bash run/debug.sh
+#   TRAIN_DATASET=deepmath_103k DEBUG_MODE=dmpd bash run/debug.sh
 #
 # The job disables W&B and checkpoint saves by default.
 
@@ -44,9 +45,25 @@ if [[ ! -d "$DEFAULT_TEACHER_MODEL" && -d "$MODEL_ROOT/JustRL-DeepSeek-1.5B" ]];
 fi
 STUDENT_MODEL=${STUDENT_MODEL:-"$DEFAULT_STUDENT_MODEL"}
 TEACHER_MODEL=${TEACHER_MODEL:-"$DEFAULT_TEACHER_MODEL"}
-TRAIN_FILE=${TRAIN_FILE:-"$DATASET_ROOT/DAPO-Math-17k-Processed-verl--qwen3/train.parquet"}
-VAL_FILE=${VAL_FILE:-"$DATASET_ROOT/DAPO-Math-17k-Processed-verl--qwen3/test.parquet"}
 CHAT_TEMPLATE_MODEL=${CHAT_TEMPLATE_MODEL:-$TEACHER_MODEL}
+
+TRAIN_DATASET=${TRAIN_DATASET:-dapo_math_17k}
+case "$TRAIN_DATASET" in
+    dapo_math_17k)
+        DEFAULT_TRAIN_FILE="$DATASET_ROOT/DAPO-Math-17k-Processed-verl--qwen3/train.parquet"
+        DEFAULT_VAL_FILE="$DATASET_ROOT/DAPO-Math-17k-Processed-verl--qwen3/test.parquet"
+        ;;
+    deepmath_103k)
+        DEFAULT_TRAIN_FILE=${DEEPMATH_103K_TRAIN:-"$DATASET_ROOT/zwhe99/DeepMath-103K-Processed-verl/train.parquet"}
+        DEFAULT_VAL_FILE=${DEEPMATH_103K_VALID:-"$DATASET_ROOT/zwhe99/DeepMath-103K-Processed-verl/test.parquet"}
+        ;;
+    *)
+        echo "Unsupported TRAIN_DATASET=$TRAIN_DATASET. Use dapo_math_17k or deepmath_103k." >&2
+        exit 2
+        ;;
+esac
+TRAIN_FILE=${TRAIN_FILE:-"$DEFAULT_TRAIN_FILE"}
+VAL_FILE=${VAL_FILE:-"$DEFAULT_VAL_FILE"}
 
 STUDENT_GPUS=${STUDENT_GPUS:-4}
 TEACHER_GPUS=${TEACHER_GPUS:-4}
@@ -498,6 +515,7 @@ cat <<EOF
   mode:         ${MODE_NAME}
   student:      ${STUDENT_MODEL}
   teacher:      ${TEACHER_MODEL}
+  dataset:      ${TRAIN_DATASET}
   data train:   ${TRAIN_FILE}
   data val:     ${VAL_FILE}
   gpu split:    student ${STUDENT_GPUS}g tp=${STUDENT_TP}, teacher ${TEACHER_GPUS}g tp=${TEACHER_TP}

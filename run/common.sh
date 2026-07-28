@@ -114,10 +114,23 @@ run_npu_opd_job() {
     TEACHER_MODEL=${TEACHER_MODEL:-$DATASET_DIR/models/hbx/JustRL-DeepSeek-1.5B}
     CHAT_TEMPLATE_MODEL=${CHAT_TEMPLATE_MODEL:-$TEACHER_MODEL}
 
-    dapo_math_train=${DAPO_MATH_TRAIN:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl--qwen3/train.parquet}
-    dapo_math_valid=${DAPO_MATH_VALID:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl--qwen3/test.parquet}
-    train_files=${TRAIN_FILES:-"['$dapo_math_train']"}
-    valid_files=${VALID_FILES:-"['$dapo_math_valid']"}
+    TRAIN_DATASET=${TRAIN_DATASET:-dapo_math_17k}
+    case "$TRAIN_DATASET" in
+        dapo_math_17k)
+            default_train_file=${DAPO_MATH_TRAIN:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl--qwen3/train.parquet}
+            default_valid_file=${DAPO_MATH_VALID:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl--qwen3/test.parquet}
+            ;;
+        deepmath_103k)
+            default_train_file=${DEEPMATH_103K_TRAIN:-$DATASET_DIR/datasets/zwhe99/DeepMath-103K-Processed-verl/train.parquet}
+            default_valid_file=${DEEPMATH_103K_VALID:-$DATASET_DIR/datasets/zwhe99/DeepMath-103K-Processed-verl/test.parquet}
+            ;;
+        *)
+            echo "Unsupported TRAIN_DATASET=$TRAIN_DATASET. Use dapo_math_17k or deepmath_103k." >&2
+            return 2
+            ;;
+    esac
+    train_files=${TRAIN_FILES:-"['$default_train_file']"}
+    valid_files=${VALID_FILES:-"['$default_valid_file']"}
 
     NNODES=${NNODES:-$VC_WORKER_NUM}
     STUDENT_NNODES=${STUDENT_NNODES:-$((VC_WORKER_NUM - 1))}
