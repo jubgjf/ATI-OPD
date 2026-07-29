@@ -7,7 +7,6 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DEFAULT_EXPERIMENT_NAME=${EXPERIMENT_NAME:-dmpd--k3_0.15--only_stu_rethinking_style}
 
 TOP_K_STRATEGY=${TOP_K_STRATEGY:-only_stu_rethinking_style}
-DISTILLATION_LOG_PROB_MIN_CLAMP=${DISTILLATION_LOG_PROB_MIN_CLAMP:-null}
 
 teacher_intervention_segment_length=${TEACHER_INTERVENTION_SEGMENT_LENGTH:-128}
 teacher_intervention_teacher_length=${TEACHER_INTERVENTION_TEACHER_LENGTH:-128}
