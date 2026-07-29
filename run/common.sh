@@ -183,7 +183,7 @@ run_npu_opd_job() {
     data_seed=${DATA_SEED:--42}
 
     distillation_loss_mode=${DISTILLATION_LOSS_MODE:-k1}
-    top_k_strategy=${TOP_K_STRATEGY:-only_stu}
+    top_k_strategy=${TOP_K_STRATEGY:-only_stu_rethinking_style}
     reward_weight_mode=${REWARD_WEIGHT_MODE:-student_p}
     use_task_rewards=${USE_TASK_REWARDS:-False}
     use_policy_gradient=${USE_POLICY_GRADIENT:-True}
