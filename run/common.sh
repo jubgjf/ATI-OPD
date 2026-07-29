@@ -121,8 +121,8 @@ run_npu_opd_job() {
             default_valid_file=${DAPO_MATH_VALID:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl--qwen3/test.parquet}
             ;;
         deepmath_103k)
-            default_train_file=${DEEPMATH_103K_TRAIN:-$DATASET_DIR/datasets/zwhe99/DeepMath-103K-Processed-verl/train.parquet}
-            default_valid_file=${DEEPMATH_103K_VALID:-$DATASET_DIR/datasets/zwhe99/DeepMath-103K-Processed-verl/test.parquet}
+            default_train_file=${DEEPMATH_103K_TRAIN:-$DATASET_DIR/datasets/zwhe99/DeepMath-103K-verl--qwen3/train.parquet}
+            default_valid_file=${DEEPMATH_103K_VALID:-$DATASET_DIR/datasets/zwhe99/DeepMath-103K-verl--qwen3/test.parquet}
             ;;
         *)
             echo "Unsupported TRAIN_DATASET=$TRAIN_DATASET. Use dapo_math_17k or deepmath_103k." >&2
