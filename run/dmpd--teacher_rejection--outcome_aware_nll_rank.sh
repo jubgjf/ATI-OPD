@@ -4,7 +4,7 @@ set -x
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-DEFAULT_EXPERIMENT_NAME=${EXPERIMENT_NAME:-dmpd--teacher_rejection_0.3--outcome_aware_nll_rank}
+DEFAULT_EXPERIMENT_NAME=${EXPERIMENT_NAME:-dmpd--teacher_rejection--outcome_aware_nll_rank}
 
 teacher_intervention_segment_length=${TEACHER_INTERVENTION_SEGMENT_LENGTH:-128}
 teacher_intervention_teacher_length=${TEACHER_INTERVENTION_TEACHER_LENGTH:-128}
