@@ -22,6 +22,7 @@ from omegaconf import OmegaConf
 from verl import DataProto
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
+    _build_generation_archive_records,
     _build_validation_sample_records,
     _compute_reward_format_metrics,
     _compute_validation_format_metrics,
@@ -94,6 +95,55 @@ def test_teacher_validation_sample_records_include_format_fields_on_cpu():
             "has_boxed_pattern": True,
             "has_accepted_answer_format": True,
         }
+    ]
+
+
+def test_generation_archive_records_preserve_complete_evaluation_fields_on_cpu():
+    records = _build_generation_archive_records(
+        evaluation_scope="test",
+        global_step=8,
+        inputs=["question-1", "question-2"],
+        outputs=["answer-1", "answer-2"],
+        gts=["one", "two"],
+        scores=[1.0, 0.0],
+        reward_extra_infos_dict={"acc": [1.0, 0.0], "pred": ["one", "wrong"], "ignored": [1.0]},
+        response_lengths=[11, 22],
+        finish_reasons=["stop", "length"],
+        data_sources=["aime", "amc"],
+        sample_uids=np.array(["uid-1", "uid-2"], dtype=object),
+    )
+
+    assert records == [
+        {
+            "evaluation_scope": "test",
+            "global_step": 8,
+            "sample_index": 0,
+            "input": "question-1",
+            "output": "answer-1",
+            "ground_truth": "one",
+            "score": 1.0,
+            "response_token_count": 11,
+            "finish_reason": "stop",
+            "data_source": "aime",
+            "uid": "uid-1",
+            "acc": 1.0,
+            "pred": "one",
+        },
+        {
+            "evaluation_scope": "test",
+            "global_step": 8,
+            "sample_index": 1,
+            "input": "question-2",
+            "output": "answer-2",
+            "ground_truth": "two",
+            "score": 0.0,
+            "response_token_count": 22,
+            "finish_reason": "length",
+            "data_source": "amc",
+            "uid": "uid-2",
+            "acc": 0.0,
+            "pred": "wrong",
+        },
     ]
 
 

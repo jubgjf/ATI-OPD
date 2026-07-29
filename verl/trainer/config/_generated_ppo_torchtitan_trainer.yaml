@@ -909,6 +909,16 @@ trainer:
   logger:
   - console
   - wandb
+  metric_logging:
+    mode: full
+    resume_policy: strict
+    live_key_warning_threshold: 250
+    archive:
+      enabled: false
+      local_dir: null
+      shard_interval_steps: 20
+      upload_to_wandb: auto
+      finish_timeout_seconds: 60
   log_val_generations: 0
   log_test_generations: 0
   teacher_val_before_train: true

@@ -240,6 +240,25 @@ run_npu_opd_job() {
     default_local_dir=${DEFAULT_LOCAL_DIR:-$WORKSPACE/outputs/${experiment_name}}
     total_epochs=${TOTAL_EPOCHS:-1}
     save_freq=${SAVE_FREQ:-20}
+    metric_logging_mode=${METRIC_LOGGING_MODE:-balanced}
+    metric_logging_resume_policy=${METRIC_LOGGING_RESUME_POLICY:-strict}
+    metric_logging_live_key_warning_threshold=${METRIC_LOGGING_LIVE_KEY_WARNING_THRESHOLD:-250}
+    metric_logging_archive_enabled=${METRIC_LOGGING_ARCHIVE_ENABLED:-True}
+    metric_logging_archive_local_dir=${METRIC_LOGGING_ARCHIVE_LOCAL_DIR:-null}
+    metric_logging_archive_upload_to_wandb=${METRIC_LOGGING_ARCHIVE_UPLOAD_TO_WANDB:-auto}
+    metric_logging_archive_finish_timeout_seconds=${METRIC_LOGGING_ARCHIVE_FINISH_TIMEOUT_SECONDS:-60}
+    metric_logging_archive_shard_interval_steps=${METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS:-}
+    if [[ -z "$metric_logging_archive_shard_interval_steps" ]]; then
+        if [[ "$save_freq" =~ ^[1-9][0-9]*$ ]]; then
+            metric_logging_archive_shard_interval_steps=$save_freq
+        else
+            metric_logging_archive_shard_interval_steps=20
+        fi
+    fi
+    if [[ ! "$metric_logging_archive_shard_interval_steps" =~ ^[1-9][0-9]*$ ]]; then
+        echo "METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS must be a positive integer, got: $metric_logging_archive_shard_interval_steps" >&2
+        exit 1
+    fi
     test_freq=${TEST_FREQ:-10}
     test_benchmarks_freq=${TEST_BENCHMARKS_FREQ:-20}
     test_benchmarks_max_response_length=${TEST_BENCHMARKS_MAX_RESPONSE_LENGTH:-$max_response_length}
@@ -250,13 +269,22 @@ run_npu_opd_job() {
     export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
     export WANDB_DIR=${WORKSPACE}
     case "$resume_required" in
-        True) export WANDB_RESUME=must ;;
-        False) ;;
+        True)
+            if [[ "$WANDB_MODE" == "offline" || "$WANDB_MODE" == "disabled" ]]; then
+                unset WANDB_RESUME
+            else
+                export WANDB_RESUME=must
+            fi
+            ;;
+        False) unset WANDB_RESUME ;;
         *)
             echo "RESUME_REQUIRED must be True or False, got: $resume_required" >&2
             exit 1
             ;;
     esac
+
+    echo "Metric logging: mode=$metric_logging_mode, archive=$metric_logging_archive_enabled, shard_interval=$metric_logging_archive_shard_interval_steps, upload=$metric_logging_archive_upload_to_wandb"
+    echo "W&B resume: mode=$WANDB_MODE, required=$resume_required, run_id=${WANDB_RUN_ID:-unset}, resume=${WANDB_RESUME:-unset}"
 
     export NODE_RANK=${NODE_RANK:-$VC_TASK_INDEX}
     export MASTER_ADDR=${MASTER_ADDR:-"${MA_VJ_NAME}-${MA_TASK_NAME}-0.${MA_VJ_NAME}"}
@@ -443,6 +471,14 @@ _submit_npu_verl_job() {
         "reward.reward_manager.name=${reward_manager_name}"
         "trainer.balance_batch=True"
         "trainer.logger=${trainer_logger}"
+        "trainer.metric_logging.mode=${metric_logging_mode}"
+        "trainer.metric_logging.resume_policy=${metric_logging_resume_policy}"
+        "trainer.metric_logging.live_key_warning_threshold=${metric_logging_live_key_warning_threshold}"
+        "trainer.metric_logging.archive.enabled=${metric_logging_archive_enabled}"
+        "trainer.metric_logging.archive.local_dir=${metric_logging_archive_local_dir}"
+        "trainer.metric_logging.archive.shard_interval_steps=${metric_logging_archive_shard_interval_steps}"
+        "trainer.metric_logging.archive.upload_to_wandb=${metric_logging_archive_upload_to_wandb}"
+        "trainer.metric_logging.archive.finish_timeout_seconds=${metric_logging_archive_finish_timeout_seconds}"
         "trainer.project_name=${project_name}"
         "trainer.experiment_name=${experiment_name}"
         "trainer.n_gpus_per_node=${STUDENT_NGPUS_PER_NODE}"
@@ -511,7 +547,7 @@ _submit_npu_verl_job() {
     hydra_args+=("${METHOD_HYDRA_OVERRIDES[@]}")
 
     local runtime_env_json
-    if [[ "$resume_required" == "True" ]]; then
+    if [[ -n "${WANDB_RUN_ID:-}" && -n "${WANDB_RESUME:-}" ]]; then
         runtime_env_json='{
             "working_dir": "./",
             "excludes": ["/.git/"],
@@ -520,8 +556,22 @@ _submit_npu_verl_job() {
                 "CUDA_DEVICE_MAX_CONNECTIONS": "1",
                 "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
                 "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
+                "WANDB_MODE": "'"$WANDB_MODE"'",
                 "WANDB_RUN_ID": "'"$WANDB_RUN_ID"'",
                 "WANDB_RESUME": "'"$WANDB_RESUME"'"
+            }
+        }'
+    elif [[ -n "${WANDB_RUN_ID:-}" ]]; then
+        runtime_env_json='{
+            "working_dir": "./",
+            "excludes": ["/.git/"],
+            "env_vars": {
+                "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
+                "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+                "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
+                "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
+                "WANDB_MODE": "'"$WANDB_MODE"'",
+                "WANDB_RUN_ID": "'"$WANDB_RUN_ID"'"
             }
         }'
     else
@@ -532,7 +582,8 @@ _submit_npu_verl_job() {
                 "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
                 "CUDA_DEVICE_MAX_CONNECTIONS": "1",
                 "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
-                "HCCL_NPU_SOCKET_PORT_RANGE": "auto"
+                "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
+                "WANDB_MODE": "'"$WANDB_MODE"'"
             }
         }'
     fi

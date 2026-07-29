@@ -569,6 +569,22 @@ def test_compute_entropy_heatmap_row_and_tracker_on_cpu():
         fig.clear()
 
 
+def test_opd_heatmap_caps_wide_long_sequence_figures_and_ticks_on_cpu():
+    tracker = OpdDiagnosticsTracker(history_steps=80, bin_size=128)
+    for step in range(80):
+        tracker.add_entropy_row(step, np.arange(184, dtype=np.float32))
+
+    fig = tracker.render_entropy_heatmap()
+    if fig is None:
+        pytest.skip("matplotlib is not installed")
+
+    width, height = fig.get_size_inches()
+    assert width <= 24
+    assert height <= 18
+    assert len(fig.axes[0].get_xticks()) <= 16
+    fig.clear()
+
+
 def test_opd_diagnostics_filters_sentinel_outliers_on_cpu():
     student_logprobs = torch.tensor([[-1.0, -1.0, -1.0, -1.0]])
     teacher_logprobs = torch.tensor([[-1.2, -1.0e38, -2.0, -3.0]])

@@ -130,10 +130,42 @@ trainer:
   # Logging backends to use: "console", "wandb", etc.
   logger: ["console", "wandb"]
 
-  # Number of generations to log during validation
+  # Controls whether metrics are logged in full or split between live backends and a detailed archive
+  metric_logging:
+
+    # Metric routing mode: "full" preserves the legacy behavior; "balanced" archives high-cardinality metrics
+    mode: full
+
+    # Resume validation policy for checkpoint, archive, and tracking identities
+    resume_policy: strict
+
+    # Warn when the number of live scalar keys in one event exceeds this threshold
+    live_key_warning_threshold: 250
+
+    # Detailed metric ledger and W&B Artifact settings
+    archive:
+
+      # Whether to write the complete metric ledger to immutable Parquet shards
+      enabled: false
+
+      # Archive directory; null resolves to ${trainer.default_local_dir}/diagnostics
+      local_dir: null
+
+      # Number of training steps per Parquet shard
+      shard_interval_steps: 20
+
+      # W&B Artifact upload policy: "auto" follows the active W&B mode; "disabled" keeps files local
+      upload_to_wandb: auto
+
+      # Maximum time to wait for pending archive uploads during trainer shutdown
+      finish_timeout_seconds: 60
+
+  # Number of validation generations shown in each W&B Table preview. When positive
+  # in balanced mode, the complete current evaluation is stored as a compressed diagnostics attachment.
   log_val_generations: 0
 
-  # Number of generations to log during benchmark testing
+  # Number of benchmark generations shown in each W&B Table preview. When positive
+  # in balanced mode, the complete current evaluation is stored as a compressed diagnostics attachment.
   log_test_generations: 0
 
   # Run a small teacher validation pass at step 0 when val_before_train and distillation are enabled

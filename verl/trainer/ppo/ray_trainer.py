@@ -22,6 +22,7 @@ import asyncio
 import copy
 import json
 import os
+import shlex
 import time
 import uuid
 from collections import defaultdict
@@ -184,6 +185,163 @@ class _PendingOpdDiagnostics:
     submitted_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingGenerationArchive:
+    global_step: int
+    metric_key: str
+    records: tuple[dict[str, Any], ...]
+
+
+_OPD_HEATMAP_METRIC_KEYS = frozenset(
+    {
+        "opd/entropy_heatmap",
+        "opd/gap_abs_heatmap",
+        "opd/gap_abs_high_heatmap",
+        "opd/teacher_logprob_nonfinite_heatmap",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedCheckpointContext:
+    path: str | None
+    step: int
+
+    @property
+    def is_resume(self) -> bool:
+        """Return whether a concrete checkpoint directory was selected."""
+        return self.path is not None
+
+
+def _normalize_wandb_mode(mode: str | None) -> str:
+    normalized = str(mode or "online").strip().lower()
+    return "offline" if normalized == "dryrun" else normalized
+
+
+def _query_wandb_remote_run_step(*, project: str, run_id: str, entity: str | None) -> int:
+    """Return the last remote W&B history step, raising when identity cannot be verified."""
+    import wandb
+
+    api = wandb.Api()
+    resolved_entity = entity or api.default_entity
+    if not resolved_entity:
+        raise RuntimeError("Unable to resolve the W&B entity for strict online resume.")
+    remote_run = api.run(f"{resolved_entity}/{project}/{run_id}")
+    remote_run_id = str(getattr(remote_run, "id", ""))
+    if remote_run_id != run_id:
+        raise RuntimeError(f"W&B remote run ID mismatch: requested={run_id!r}, remote={remote_run_id!r}.")
+    last_step = getattr(remote_run, "lastHistoryStep", None)
+    if last_step is None:
+        return -1
+    return int(last_step)
+
+
+def _manifest_wandb_sync_file(session: dict[str, Any]) -> str | None:
+    sync_file_value = session.get("wandb_sync_file")
+    sync_file = os.path.abspath(sync_file_value) if sync_file_value else None
+    if sync_file is None and session.get("wandb_sync_dir"):
+        sync_dir = os.path.abspath(session["wandb_sync_dir"])
+        if os.path.isdir(sync_dir):
+            candidates = sorted(
+                os.path.join(sync_dir, name)
+                for name in os.listdir(sync_dir)
+                if name.endswith((".wandb", ".wandb.synced"))
+            )
+            sync_file = candidates[-1] if candidates else None
+    return sync_file
+
+
+def _manifest_wandb_sync_available(session: dict[str, Any]) -> bool:
+    sync_file = _manifest_wandb_sync_file(session)
+    return bool(sync_file and (os.path.exists(sync_file) or os.path.exists(f"{sync_file}.synced")))
+
+
+def _manifest_offline_session_has_payload(manifest: dict[str, Any], session: dict[str, Any]) -> bool:
+    has_history = bool(session.get("wandb_committed_ranges"))
+    recovered_by = session.get("wandb_history_recovered_by_session")
+    if has_history and recovered_by:
+        recovered_session = manifest.get("sessions", {}).get(recovered_by, {})
+        if _manifest_wandb_sync_available(recovered_session):
+            has_history = False
+    session_id = session.get("session_id")
+    has_staged_artifact = any(
+        shard.get("state") == "STAGED_OFFLINE"
+        and shard.get("wandb_delivery_session_id", shard.get("session_id")) == session_id
+        for shard in manifest.get("shards", ())
+    )
+    return has_history or has_staged_artifact
+
+
+def _unsynced_offline_sessions(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    result = []
+    sessions = sorted(
+        manifest.get("sessions", {}).values(),
+        key=lambda item: (
+            int(item.get("session_order", 0)),
+            str(item.get("started_at", "")),
+            str(item.get("session_id", "")),
+        ),
+    )
+    for session in sessions:
+        if session.get("wandb_mode") != "offline":
+            continue
+        if not _manifest_offline_session_has_payload(manifest, session):
+            continue
+        sync_file = _manifest_wandb_sync_file(session)
+        synced = bool(
+            sync_file
+            and ((sync_file.endswith(".synced") and os.path.exists(sync_file)) or os.path.exists(f"{sync_file}.synced"))
+        )
+        if not synced:
+            item = dict(session)
+            item["resolved_sync_file"] = sync_file
+            result.append(item)
+    return result
+
+
+def _offline_sync_commands(
+    manifest: dict[str, Any],
+    *,
+    entity: str | None,
+    project: str,
+) -> tuple[str, ...]:
+    unsynced = {item["session_id"]: item for item in _unsynced_offline_sessions(manifest)}
+    sessions = sorted(
+        manifest.get("sessions", {}).values(),
+        key=lambda item: (
+            int(item.get("session_order", 0)),
+            str(item.get("started_at", "")),
+            str(item.get("session_id", "")),
+        ),
+    )
+    commands = []
+    prior_remote_segment = any(item.get("wandb_mode") == "online" for item in sessions)
+    for session in sessions:
+        if session.get("wandb_mode") != "offline":
+            continue
+        if not _manifest_offline_session_has_payload(manifest, session):
+            continue
+        pending = unsynced.get(session["session_id"])
+        if pending is not None and pending.get("resolved_sync_file"):
+            parts = ["wandb", "sync"]
+            if prior_remote_segment:
+                parts.append("--append")
+            if entity:
+                parts.extend(["--entity", entity])
+            parts.extend(
+                [
+                    "--project",
+                    project,
+                    "--id",
+                    str(manifest["logical_run_id"]),
+                    str(pending["resolved_sync_file"]),
+                ]
+            )
+            commands.append(" ".join(shlex.quote(part) for part in parts))
+        prior_remote_segment = True
+    return tuple(commands)
+
+
 def _has_boxed_pattern(text: Any) -> bool:
     return math_dapo.has_boxed_answer(text)
 
@@ -310,6 +468,61 @@ def _build_validation_sample_records(
             record["response_token_count"] = response_lengths[idx] if idx < len(response_lengths) else None
         if finish_reasons is not None:
             record["finish_reason"] = finish_reasons[idx] if idx < len(finish_reasons) else None
+        records.append(record)
+    return records
+
+
+def _build_generation_archive_records(
+    *,
+    evaluation_scope: str,
+    global_step: int,
+    inputs: list[str],
+    outputs: list[str],
+    gts: list[Any],
+    scores: list[float],
+    reward_extra_infos_dict: dict[str, list],
+    response_lengths: list[int] | None = None,
+    finish_reasons: list[Any] | None = None,
+    data_sources: list[Any] | None = None,
+    sample_uids: list[Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Build complete per-sample text records for the diagnostics Artifact."""
+
+    sample_count = len(inputs)
+    required_lengths = {
+        "outputs": len(outputs),
+        "ground_truths": len(gts),
+        "scores": len(scores),
+    }
+    mismatched = {name: length for name, length in required_lengths.items() if length != sample_count}
+    if mismatched:
+        raise ValueError(
+            "Generation archive fields must have identical sample counts: "
+            f"inputs={sample_count}, mismatched={mismatched}."
+        )
+
+    records = []
+    for sample_index in range(sample_count):
+        record = {
+            "evaluation_scope": evaluation_scope,
+            "global_step": int(global_step),
+            "sample_index": sample_index,
+            "input": inputs[sample_index],
+            "output": outputs[sample_index],
+            "ground_truth": gts[sample_index],
+            "score": scores[sample_index],
+        }
+        if response_lengths is not None and sample_index < len(response_lengths):
+            record["response_token_count"] = response_lengths[sample_index]
+        if finish_reasons is not None and sample_index < len(finish_reasons):
+            record["finish_reason"] = finish_reasons[sample_index]
+        if data_sources is not None and sample_index < len(data_sources):
+            record["data_source"] = data_sources[sample_index]
+        if sample_uids is not None and sample_index < len(sample_uids):
+            record["uid"] = sample_uids[sample_index]
+        for key, values in reward_extra_infos_dict.items():
+            if key not in record and len(values) == sample_count:
+                record[key] = values[sample_index]
         records.append(record)
     return records
 
@@ -687,6 +900,19 @@ class RayPPOTrainer:
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        from verl.trainer.ppo.metric_archive import MetricLoggingSettings
+
+        self._metric_logging_settings = MetricLoggingSettings.from_mapping(
+            self.config.trainer.get("metric_logging", None)
+        )
+        if self._metric_logging_settings.mode == "balanced":
+            checkpoint_config = self.config.actor_rollout_ref.actor.checkpoint
+            if bool(checkpoint_config.get("async_save", False)):
+                raise ValueError(
+                    "Balanced metric logging currently requires "
+                    "actor_rollout_ref.actor.checkpoint.async_save=false so checkpoint payload, "
+                    "metric shard, commit marker, and tracker can be committed in order."
+                )
         validate_distillation_intervention_training_config(self.config)
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
@@ -708,14 +934,17 @@ class RayPPOTrainer:
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.distillation_config: DistillationConfig | None = None
+        cumulative_generation_tables = self._metric_logging_settings.mode != "balanced"
         self.validation_generations_logger = ValidationGenerationsLogger(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
+            cumulative_wandb_table=cumulative_generation_tables,
         )
         self.test_benchmark_generations_logger = ValidationGenerationsLogger(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             table_name="test/generations",
+            cumulative_wandb_table=cumulative_generation_tables,
         )
         self.teacher_validation_generations_logger = ValidationGenerationsLogger(
             project_name=self.config.trainer.project_name,
@@ -755,6 +984,15 @@ class RayPPOTrainer:
         )
 
         self.checkpoint_manager = None
+        self._resolved_checkpoint_context: _ResolvedCheckpointContext | None = None
+        self._logical_run_id: str | None = None
+        self._metric_archive_writer = None
+        self._metric_router = None
+        self._metric_archive_session_id: str | None = None
+        self._metric_resume_step: int | None = None
+        self._metric_artifact_uploader = None
+        self._offline_live_metric_buffer: list[tuple[int, dict[str, Any]]] = []
+        self._pending_generation_archives: list[_PendingGenerationArchive] = []
 
     def _create_dataloader(
         self,
@@ -975,6 +1213,34 @@ class RayPPOTrainer:
             defer_wandb=defer_wandb,
         )
 
+    def _queue_generation_archive(
+        self,
+        *,
+        evaluation_scope: str,
+        records: list[dict[str, Any]],
+    ) -> None:
+        """Queue complete val/test records for the metric event at this step."""
+
+        if evaluation_scope not in {"val", "test"}:
+            return
+        if (
+            self._metric_logging_settings.mode != "balanced"
+            or getattr(self, "_metric_archive_writer", None) is None
+            or not records
+        ):
+            return
+        pending = getattr(self, "_pending_generation_archives", None)
+        if pending is None:
+            pending = []
+            self._pending_generation_archives = pending
+        pending.append(
+            _PendingGenerationArchive(
+                global_step=int(self.global_steps),
+                metric_key=f"{evaluation_scope}/generations_full",
+                records=tuple(dict(record) for record in records),
+            )
+        )
+
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
@@ -1015,6 +1281,7 @@ class RayPPOTrainer:
         repeat_times: int | None = None,
         do_sample: bool | None = None,
         generation_max_tokens: int | None = None,
+        suppress_tracking: bool = False,
     ):
         if evaluation_mode not in {"val", "test"}:
             raise ValueError(f"evaluation_mode must be 'val' or 'test', got {evaluation_mode!r}.")
@@ -1176,15 +1443,41 @@ class RayPPOTrainer:
             if include_format_metrics
             else None
         )
-        validation_media = self._maybe_log_val_generations(
-            inputs=sample_inputs,
-            outputs=sample_outputs,
-            scores=sample_scores,
-            generations_to_log=log_generations,
-            generation_logger=validation_generations_logger,
-            sample_records=sample_records,
-            defer_wandb=not merged,
-        )
+        validation_media = {}
+        if not suppress_tracking:
+            generations_to_log = int(
+                self.config.trainer.log_val_generations if log_generations is None else log_generations
+            )
+            if generations_to_log < 0:
+                raise ValueError(f"generations_to_log must be non-negative, got {generations_to_log}.")
+            if generations_to_log > 0:
+                flattened_data_sources = np.concatenate(data_source_lst, axis=0).tolist() if data_source_lst else None
+                generation_archive_records = _build_generation_archive_records(
+                    evaluation_scope=metric_prefix,
+                    global_step=self.global_steps,
+                    inputs=sample_inputs,
+                    outputs=sample_outputs,
+                    gts=sample_gts,
+                    scores=sample_scores,
+                    reward_extra_infos_dict=reward_extra_infos_dict,
+                    response_lengths=sample_response_lengths or None,
+                    finish_reasons=sample_finish_reasons or None,
+                    data_sources=flattened_data_sources,
+                    sample_uids=sample_uids,
+                )
+                self._queue_generation_archive(
+                    evaluation_scope=metric_prefix,
+                    records=generation_archive_records,
+                )
+            validation_media = self._maybe_log_val_generations(
+                inputs=sample_inputs,
+                outputs=sample_outputs,
+                scores=sample_scores,
+                generations_to_log=generations_to_log,
+                generation_logger=validation_generations_logger,
+                sample_records=sample_records,
+                defer_wandb=not merged,
+            )
 
         # dump generations
         if validation_data_dir:
@@ -1264,7 +1557,7 @@ class RayPPOTrainer:
 
         return metric_dict
 
-    def _validate_test_benchmarks(self) -> dict[str, Any]:
+    def _validate_test_benchmarks(self, *, suppress_tracking: bool = False) -> dict[str, Any]:
         """Run the configured benchmark datasets through the student validation path."""
         if self.test_benchmark_dataloader is None:
             raise RuntimeError(
@@ -1294,6 +1587,7 @@ class RayPPOTrainer:
             dump_filename_prefix="test_benchmarks",
             include_format_metrics=True,
             generation_max_tokens=generation_max_tokens,
+            suppress_tracking=suppress_tracking,
         )
         assert metrics, f"{metrics=}"
         return metrics
@@ -1321,7 +1615,7 @@ class RayPPOTrainer:
         )
         return self.teacher_validation_manager
 
-    def _validate_teacher_before_train(self):
+    def _validate_teacher_before_train(self, *, suppress_tracking: bool = False):
         if not self.config.trainer.get("teacher_val_before_train", False):
             return {}
         if not self.use_teacher_policy or self.distillation_config is None:
@@ -1353,6 +1647,7 @@ class RayPPOTrainer:
             dump_filename_prefix="teacher_val",
             include_format_metrics=True,
             generation_max_tokens=teacher_generation_max_tokens,
+            suppress_tracking=suppress_tracking,
         )
         assert teacher_metrics, f"{teacher_metrics=}"
         return teacher_metrics
@@ -1581,7 +1876,12 @@ class RayPPOTrainer:
         # sleep all replicas to load checkpoint
         self.checkpoint_manager.sleep_replicas()
 
-    def _save_checkpoint(self):
+    def _checkpoint_async_save_enabled(self) -> bool:
+        checkpoint_config = self.config.actor_rollout_ref.actor.checkpoint
+        return bool(checkpoint_config.get("async_save", False))
+
+    def _save_checkpoint_payload(self) -> str:
+        """Save checkpoint payloads without advancing the committed-checkpoint tracker."""
         from verl.utils.fs import local_mkdir_safe
 
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -1610,6 +1910,22 @@ class RayPPOTrainer:
         max_critic_ckpt_to_keep = (
             self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
         )
+        if self._metric_logging_mode() == "balanced":
+            # The root tracker is intentionally committed after the metric
+            # marker. Preserve its currently selected payload throughout that
+            # window, even when the requested retention count is one.
+            if (
+                isinstance(max_actor_ckpt_to_keep, int)
+                and not isinstance(max_actor_ckpt_to_keep, bool)
+                and max_actor_ckpt_to_keep > 0
+            ):
+                max_actor_ckpt_to_keep += 1
+            if (
+                isinstance(max_critic_ckpt_to_keep, int)
+                and not isinstance(max_critic_ckpt_to_keep, bool)
+                and max_critic_ckpt_to_keep > 0
+            ):
+                max_critic_ckpt_to_keep += 1
 
         self.actor_rollout_wg.save_checkpoint(
             actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
@@ -1633,55 +1949,141 @@ class RayPPOTrainer:
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
+        return local_global_step_folder
 
-        # latest checkpointed iteration tracker (for atomic usage)
-        if (
-            hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
-            and self.config.actor_rollout_ref.actor.checkpoint.async_save
-        ) or (
-            "async_save" in self.config.actor_rollout_ref.actor.checkpoint
-            and self.config.actor_rollout_ref.actor.checkpoint["async_save"]
-        ):
+    def _commit_checkpoint_tracker(self, checkpoint_step: int) -> None:
+        """Atomically make a fully written checkpoint visible to resume discovery."""
+        if self._checkpoint_async_save_enabled():
             print("skip write latest_checkpointed_iteration.txt when async_save is True")
             return
-        local_latest_checkpointed_iteration = os.path.join(
-            self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
+
+        checkpoint_root = os.path.abspath(self.config.trainer.default_local_dir)
+        os.makedirs(checkpoint_root, exist_ok=True)
+        local_latest_checkpointed_iteration = os.path.join(checkpoint_root, "latest_checkpointed_iteration.txt")
+        temporary_tracker = f"{local_latest_checkpointed_iteration}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        with open(temporary_tracker, "w", encoding="utf-8") as tracker_file:
+            tracker_file.write(str(int(checkpoint_step)))
+            tracker_file.flush()
+            os.fsync(tracker_file.fileno())
+        os.replace(temporary_tracker, local_latest_checkpointed_iteration)
+        directory_fd = os.open(checkpoint_root, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _save_checkpoint(self) -> str:
+        """Backward-compatible checkpoint save with an immediate tracker commit."""
+        local_global_step_folder = self._save_checkpoint_payload()
+        self._commit_checkpoint_tracker(self.global_steps)
+        return local_global_step_folder
+
+    def _metric_logging_mode(self) -> str:
+        metric_logging = self.config.trainer.get("metric_logging", None)
+        return "full" if metric_logging is None else str(metric_logging.get("mode", "full")).lower()
+
+    def _resolve_resume_context(self) -> _ResolvedCheckpointContext:
+        """Resolve the checkpoint once, before W&B initialization and worker loading."""
+        if self._resolved_checkpoint_context is not None:
+            return self._resolved_checkpoint_context
+
+        resume_mode = str(self.config.trainer.resume_mode)
+        if resume_mode not in {"disable", "auto", "resume_path"}:
+            raise ValueError(
+                f"trainer.resume_mode must be one of 'disable', 'auto', or 'resume_path', got {resume_mode!r}."
+            )
+
+        checkpoint_root = os.path.abspath(self.config.trainer.default_local_dir)
+        tracker_path = os.path.join(checkpoint_root, "latest_checkpointed_iteration.txt")
+        metric_logging = self.config.trainer.get("metric_logging", {})
+        archive_config = metric_logging.get("archive", {}) if metric_logging is not None else {}
+        archive_dir = archive_config.get("local_dir", None)
+        if archive_dir is None:
+            archive_dir = os.path.join(checkpoint_root, "diagnostics")
+        else:
+            archive_dir = os.path.abspath(os.path.expanduser(str(archive_dir)))
+        manifest_path = os.path.join(archive_dir, "manifest.json")
+        strict_balanced = (
+            self._metric_logging_mode() == "balanced"
+            and str(metric_logging.get("resume_policy", "strict")).lower() == "strict"
         )
-        with open(local_latest_checkpointed_iteration, "w") as f:
-            f.write(str(self.global_steps))
 
-    def _load_checkpoint(self):
-        if self.config.trainer.resume_mode == "disable":
-            return 0
+        if resume_mode == "disable":
+            if strict_balanced:
+                checkpoint_entries = []
+                if os.path.isdir(checkpoint_root):
+                    checkpoint_entries = [
+                        entry.name
+                        for entry in os.scandir(checkpoint_root)
+                        if entry.is_dir() and entry.name.startswith("global_step_")
+                    ]
+                if os.path.exists(tracker_path) or os.path.exists(manifest_path) or checkpoint_entries:
+                    raise RuntimeError(
+                        "trainer.resume_mode=disable cannot reuse an output directory containing checkpoint "
+                        "or metric archive state in balanced/strict mode. Choose a new trainer.default_local_dir "
+                        f"or enable resume. checkpoint_root={checkpoint_root!r}, manifest={manifest_path!r}."
+                    )
+            self._resolved_checkpoint_context = _ResolvedCheckpointContext(path=None, step=0)
+            return self._resolved_checkpoint_context
 
-        # load from hdfs
         if self.config.trainer.default_hdfs_dir is not None:
             raise NotImplementedError("load from hdfs is not implemented yet")
-        else:
-            checkpoint_folder = self.config.trainer.default_local_dir  # TODO: check path
-            if not os.path.isabs(checkpoint_folder):
-                working_dir = os.getcwd()
-                checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
-            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
 
-        # find global_step_folder
-        if self.config.trainer.resume_mode == "auto":
+        if resume_mode == "auto":
+            global_step_folder = find_latest_ckpt_path(checkpoint_root)
             if global_step_folder is None:
+                if strict_balanced and os.path.exists(tracker_path):
+                    raise RuntimeError(
+                        "The checkpoint tracker exists but does not resolve to a checkpoint directory: "
+                        f"tracker={tracker_path!r}."
+                    )
                 print("Training from scratch")
-                return 0
+                self._resolved_checkpoint_context = _ResolvedCheckpointContext(path=None, step=0)
+                return self._resolved_checkpoint_context
         else:
-            if self.config.trainer.resume_mode == "resume_path":
-                assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
-                assert "global_step_" in self.config.trainer.resume_from_path, (
-                    "resume ckpt must specify the global_steps"
+            resume_from_path = self.config.trainer.resume_from_path
+            if not isinstance(resume_from_path, str):
+                raise TypeError("trainer.resume_from_path must be a string when resume_mode='resume_path'.")
+            global_step_folder = os.path.abspath(os.path.expanduser(resume_from_path))
+            if not os.path.isdir(global_step_folder):
+                raise FileNotFoundError(f"Resume checkpoint directory does not exist: {global_step_folder}")
+
+        checkpoint_name = os.path.basename(os.path.normpath(global_step_folder))
+        if not checkpoint_name.startswith("global_step_"):
+            raise ValueError(f"Resume checkpoint must be named global_step_<integer>, got {global_step_folder!r}.")
+        try:
+            checkpoint_step = int(checkpoint_name.removeprefix("global_step_"))
+        except ValueError as exc:
+            raise ValueError(
+                f"Resume checkpoint must be named global_step_<integer>, got {global_step_folder!r}."
+            ) from exc
+
+        if strict_balanced and os.path.exists(tracker_path):
+            with open(tracker_path, encoding="utf-8") as tracker_file:
+                tracker_step = int(tracker_file.read().strip())
+            if tracker_step != checkpoint_step:
+                raise RuntimeError(
+                    "Checkpoint identity mismatch in balanced/strict resume: "
+                    f"resolved_checkpoint_step={checkpoint_step}, tracker_step={tracker_step}, "
+                    f"checkpoint={global_step_folder!r}, tracker={tracker_path!r}."
                 )
-                global_step_folder = self.config.trainer.resume_from_path
-                if not os.path.isabs(global_step_folder):
-                    working_dir = os.getcwd()
-                    global_step_folder = os.path.join(working_dir, global_step_folder)
+
+        self._resolved_checkpoint_context = _ResolvedCheckpointContext(
+            path=os.path.abspath(global_step_folder),
+            step=checkpoint_step,
+        )
+        return self._resolved_checkpoint_context
+
+    def _load_checkpoint(self):
+        resume_context = self._resolve_resume_context()
+        if not resume_context.is_resume:
+            return 0
+
+        global_step_folder = resume_context.path
+        assert global_step_folder is not None
         print(f"Load from checkpoint folder: {global_step_folder}")
         # set global step
-        self.global_steps = int(global_step_folder.split("global_step_")[-1])
+        self.global_steps = resume_context.step
 
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
@@ -2599,6 +3001,196 @@ class RayPPOTrainer:
         critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
         return critic_output
 
+    def _uses_wandb_backend(self) -> bool:
+        logger_config = self.config.trainer.logger
+        backends = [logger_config] if isinstance(logger_config, str) else list(logger_config)
+        return "wandb" in backends or "tracking" in backends
+
+    def _initialize_metric_logging(self) -> None:
+        if self._metric_logging_settings.mode != "balanced" or self._metric_archive_writer is not None:
+            return
+
+        from verl.trainer.ppo.metric_archive import (
+            METRIC_COMMIT_FILENAME,
+            MetricArchiveWriter,
+            MetricRouter,
+            inspect_metric_archive,
+        )
+
+        resume_context = self._resolve_resume_context()
+        archive_config = self._metric_logging_settings.archive
+        archive_root = archive_config.local_dir
+        if archive_root is None:
+            archive_root = os.path.join(
+                os.path.abspath(self.config.trainer.default_local_dir),
+                "diagnostics",
+            )
+        archive_root = os.path.abspath(os.path.expanduser(str(archive_root)))
+        existing_manifest = inspect_metric_archive(archive_root)
+        requested_wandb_mode = (
+            _normalize_wandb_mode(os.environ.get("WANDB_MODE")) if self._uses_wandb_backend() else "disabled"
+        )
+        if existing_manifest is not None and requested_wandb_mode == "online":
+            unsynced_sessions = _unsynced_offline_sessions(existing_manifest)
+            if unsynced_sessions:
+                commands = _offline_sync_commands(
+                    existing_manifest,
+                    entity=os.environ.get("WANDB_ENTITY"),
+                    project=str(self.config.trainer.project_name),
+                )
+                raise RuntimeError(
+                    "Cannot resume online while prior offline W&B sessions remain unsynced. "
+                    f"sessions={[item['session_id'] for item in unsynced_sessions]}, "
+                    f"sync_commands={commands}."
+                )
+        if (
+            existing_manifest is not None
+            and resume_context.is_resume
+            and not os.path.isfile(os.path.join(resume_context.path, METRIC_COMMIT_FILENAME))
+        ):
+            legacy_before_step = existing_manifest.get("legacy_before_step")
+            is_declared_legacy_checkpoint = legacy_before_step is not None and resume_context.step <= int(
+                legacy_before_step
+            )
+            if not is_declared_legacy_checkpoint:
+                raise RuntimeError(
+                    "The selected checkpoint belongs to a metric-archive run but has no metrics commit marker: "
+                    f"checkpoint={resume_context.path!r}. "
+                    "The tracker must point to the last fully committed checkpoint."
+                )
+
+        environment_run_id = os.environ.get("WANDB_RUN_ID")
+        manifest_run_id = (
+            str(existing_manifest["logical_run_id"])
+            if existing_manifest is not None and existing_manifest.get("logical_run_id")
+            else None
+        )
+        logical_run_id = environment_run_id or manifest_run_id or uuid.uuid4().hex
+        session_id = uuid.uuid4().hex
+        archive_resume_step = (
+            resume_context.step if resume_context.is_resume else (0 if existing_manifest is not None else None)
+        )
+        writer = MetricArchiveWriter(
+            archive_root,
+            logical_run_id=logical_run_id,
+            project=str(self.config.trainer.project_name),
+            experiment=str(self.config.trainer.experiment_name),
+            session_id=session_id,
+            resume_checkpoint_step=archive_resume_step,
+            checkpoint_dir=resume_context.path,
+            strict_identity=True,
+        )
+        try:
+            writer.validate_wandb_transition(requested_wandb_mode)
+        except BaseException:
+            writer.close(interrupted=True)
+            raise
+
+        configured_topk = None
+        distillation = self.config.get("distillation", None)
+        if distillation is not None:
+            diagnostics = distillation.get("diagnostics", None)
+            loss_config = distillation.get("distillation_loss", None)
+            if diagnostics is not None:
+                configured_topk = diagnostics.get("topk", None)
+            if configured_topk is None and loss_config is not None:
+                configured_topk = loss_config.get("topk", None)
+        self._logical_run_id = writer.logical_run_id
+        self._metric_archive_session_id = session_id
+        self._metric_resume_step = archive_resume_step
+        self._metric_archive_writer = writer
+        self._metric_router = MetricRouter(
+            mode="balanced",
+            configured_topk=int(configured_topk) if configured_topk is not None else None,
+            live_key_warning_threshold=self._metric_logging_settings.live_key_warning_threshold,
+        )
+
+    def _build_wandb_resume_spec(self):
+        if self._metric_logging_mode() != "balanced" or not self._uses_wandb_backend():
+            return None
+
+        from verl.utils.tracking import WandbResumeSpec
+
+        resume_context = self._resolve_resume_context()
+        resume_step = getattr(self, "_metric_resume_step", None)
+        is_resume = resume_context.is_resume or resume_step is not None
+        run_id = self._logical_run_id or os.environ.get("WANDB_RUN_ID")
+        if not run_id:
+            run_id = uuid.uuid4().hex
+        self._logical_run_id = str(run_id)
+
+        wandb_mode = _normalize_wandb_mode(os.environ.get("WANDB_MODE"))
+        if not is_resume:
+            return WandbResumeSpec(run_id=self._logical_run_id, resume="never")
+        if wandb_mode in {"offline", "disabled"}:
+            return WandbResumeSpec(run_id=self._logical_run_id, resume="must")
+
+        try:
+            remote_step = _query_wandb_remote_run_step(
+                project=str(self.config.trainer.project_name),
+                run_id=self._logical_run_id,
+                entity=os.environ.get("WANDB_ENTITY"),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Strict online W&B resume could not verify the existing remote run. "
+                f"project={self.config.trainer.project_name!r}, run_id={self._logical_run_id!r}, "
+                f"checkpoint_step={resume_step if resume_step is not None else resume_context.step}."
+            ) from exc
+
+        checkpoint_step = resume_step if resume_step is not None else resume_context.step
+        if remote_step <= checkpoint_step:
+            return WandbResumeSpec(run_id=self._logical_run_id, resume="must")
+        return WandbResumeSpec(
+            run_id=self._logical_run_id,
+            resume_from=f"{self._logical_run_id}?_step={checkpoint_step}",
+        )
+
+    def _recover_missing_offline_wandb_history(self, logger) -> None:
+        if self._metric_archive_writer is None:
+            return
+        run_info = logger.wandb_run_info
+        resume_context = self._resolve_resume_context()
+        resume_step = getattr(self, "_metric_resume_step", None)
+        if run_info is None or not run_info.is_offline or (not resume_context.is_resume and resume_step is None):
+            return
+        events = self._metric_archive_writer.unrecorded_offline_committed_live_events(
+            checkpoint_step=resume_step if resume_step is not None else resume_context.step
+        )
+        if not events:
+            return
+
+        import wandb
+
+        ordered_events = sorted(events, key=lambda item: (item.global_step, item.session_id, item.event_seq))
+        current_step = None
+        current_event_ids: list[str] = []
+        recovered_source_session_ids: set[str] = set()
+        for event in ordered_events:
+            if current_step is not None and event.global_step != current_step:
+                self._metric_archive_writer.record_wandb_committed_range(
+                    step_start=current_step,
+                    step_end=current_step,
+                    recovered_event_ids=tuple(current_event_ids),
+                )
+                current_event_ids = []
+            metrics = dict(event.metrics)
+            for event_file in event.event_files:
+                if event_file.metric_key in _OPD_HEATMAP_METRIC_KEYS and os.path.isfile(event_file.path):
+                    metrics[event_file.metric_key] = wandb.Image(event_file.path)
+            logger.log(data=metrics, step=event.global_step, backend=["wandb"])
+            current_step = event.global_step
+            current_event_ids.append(event.event_id)
+            recovered_source_session_ids.add(event.session_id)
+        assert current_step is not None
+        self._metric_archive_writer.record_wandb_committed_range(
+            step_start=current_step,
+            step_end=current_step,
+            recovered_event_ids=tuple(current_event_ids),
+        )
+        self._metric_archive_writer.mark_wandb_history_recovered(tuple(sorted(recovered_source_session_ids)))
+        print(f"Recovered {len(ordered_events)} committed metric event(s) missing from prior offline W&B segments.")
+
     def init_logger(self):
         """Initialize and return the trainer logger."""
         from omegaconf import OmegaConf
@@ -2608,14 +3200,206 @@ class RayPPOTrainer:
         if getattr(self, "logger", None) is not None:
             return self.logger
 
-        logger = Tracking(
-            project_name=self.config.trainer.project_name,
-            experiment_name=self.config.trainer.experiment_name,
-            default_backend=self.config.trainer.logger,
-            config=OmegaConf.to_container(self.config, resolve=True),
-        )
+        self._resolve_resume_context()
+        logger = None
+        try:
+            self._initialize_metric_logging()
+            wandb_resume = self._build_wandb_resume_spec()
+            logger = Tracking(
+                project_name=self.config.trainer.project_name,
+                experiment_name=self.config.trainer.experiment_name,
+                default_backend=self.config.trainer.logger,
+                config=OmegaConf.to_container(self.config, resolve=True),
+                wandb_resume=wandb_resume,
+            )
+            if self._metric_archive_writer is not None:
+                run_info = logger.wandb_run_info
+                self._metric_archive_writer.register_wandb_session(
+                    mode=run_info.mode if run_info is not None else "disabled",
+                    run_id=run_info.run_id if run_info is not None else None,
+                    sync_dir=run_info.sync_dir if run_info is not None else None,
+                    sync_file=run_info.sync_file if run_info is not None else None,
+                )
+                self._recover_missing_offline_wandb_history(logger)
+                if (
+                    self._metric_logging_settings.archive.upload_to_wandb == "auto"
+                    and run_info is not None
+                    and run_info.mode != "disabled"
+                ):
+                    from verl.trainer.ppo.metric_artifact import MetricArtifactUploader
+
+                    self._metric_artifact_uploader = MetricArtifactUploader(
+                        writer=self._metric_archive_writer,
+                        tracking=logger,
+                        project=str(self.config.trainer.project_name),
+                        entity=os.environ.get("WANDB_ENTITY"),
+                        finish_timeout_seconds=self._metric_logging_settings.archive.finish_timeout_seconds,
+                    )
+                    self._metric_artifact_uploader.submit_pending()
+        except BaseException:
+            if getattr(self, "_metric_artifact_uploader", None) is not None:
+                self._metric_artifact_uploader.finish()
+                self._metric_artifact_uploader = None
+            if getattr(self, "_metric_archive_writer", None) is not None:
+                self._metric_archive_writer.close(interrupted=True)
+                self._metric_archive_writer = None
+                self._metric_router = None
+            if logger is not None:
+                logger.finish(exit_code=1)
+            raise
         self.logger = logger
         return logger
+
+    def _archive_metric_event_files(self, metrics: dict[str, Any], *, global_step: int) -> None:
+        if self._metric_archive_writer is None:
+            return
+        for metric_key in _OPD_HEATMAP_METRIC_KEYS & metrics.keys():
+            media_path = getattr(metrics[metric_key], "_path", None)
+            if media_path and os.path.isfile(media_path):
+                self._metric_archive_writer.add_event_file(
+                    media_path,
+                    global_step=global_step,
+                    metric_key=metric_key,
+                )
+
+    def _archive_pending_generation_records(self, *, global_step: int) -> None:
+        """Attach complete val/test outputs to the active metric shard."""
+
+        pending = list(getattr(self, "_pending_generation_archives", ()))
+        if not pending:
+            return
+        stale = [item for item in pending if item.global_step < global_step]
+        if stale:
+            descriptions = [f"{item.metric_key}@{item.global_step}" for item in stale]
+            raise RuntimeError(
+                "Generation archive records were not attached to their metric event before the trainer advanced: "
+                f"current_step={global_step}, pending={descriptions}."
+            )
+        ready = [item for item in pending if item.global_step == global_step]
+        for item in ready:
+            self._metric_archive_writer.add_event_records(
+                item.records,
+                global_step=global_step,
+                metric_key=item.metric_key,
+            )
+        self._pending_generation_archives = [item for item in pending if item.global_step > global_step]
+
+    def _log_balanced_live_metrics(self, logger, live_metrics: dict[str, Any], *, step: int) -> None:
+        run_info = logger.wandb_run_info
+        if run_info is None or run_info.is_online:
+            logger.log(data=live_metrics, step=step)
+            return
+
+        non_wandb_backends = [backend for backend in logger.logger if backend != "wandb"]
+        if non_wandb_backends:
+            logger.log(data=live_metrics, step=step, backend=non_wandb_backends)
+        if run_info.is_offline:
+            self._offline_live_metric_buffer.append((int(step), dict(live_metrics)))
+
+    def _flush_offline_wandb_history(self, logger, *, checkpoint_step: int) -> None:
+        run_info = logger.wandb_run_info
+        if run_info is None or not run_info.is_offline:
+            return
+        committed = []
+        remaining = []
+        for step, metrics in self._offline_live_metric_buffer:
+            if step <= checkpoint_step:
+                committed.append((step, metrics))
+            else:
+                remaining.append((step, metrics))
+        current_step = None
+        for step, metrics in committed:
+            if current_step is not None and step != current_step and self._metric_archive_writer is not None:
+                self._metric_archive_writer.record_wandb_committed_range(
+                    step_start=current_step,
+                    step_end=current_step,
+                )
+            logger.log(data=metrics, step=step, backend=["wandb"])
+            current_step = step
+        if current_step is not None and self._metric_archive_writer is not None:
+            self._metric_archive_writer.record_wandb_committed_range(
+                step_start=current_step,
+                step_end=current_step,
+            )
+        self._offline_live_metric_buffer = remaining
+
+    def _record_metric_event(
+        self,
+        logger,
+        metrics: dict[str, Any],
+        *,
+        event_kind: str,
+        checkpoint_payload_path: str | None = None,
+    ) -> None:
+        if self._metric_logging_settings.mode == "full":
+            logger.log(data=metrics, step=self.global_steps)
+            return
+
+        if self._metric_archive_writer is None or self._metric_router is None:
+            raise RuntimeError("Balanced metric logging was not initialized before the first metric event.")
+        if self._metric_artifact_uploader is not None:
+            self._metric_artifact_uploader.drain_completed()
+
+        routed_input = dict(metrics)
+        routed_input.update(self._metric_archive_writer.health_metrics())
+        if checkpoint_payload_path is not None:
+            routed_input["metric_archive/last_committed_step"] = float(self.global_steps)
+        route = self._metric_router.route(routed_input)
+        self._metric_archive_writer.append_event(
+            route,
+            global_step=self.global_steps,
+            event_kind=event_kind,
+            checkpoint_step=self.global_steps if checkpoint_payload_path is not None else None,
+        )
+        self._archive_metric_event_files(route.live_metrics, global_step=self.global_steps)
+        self._archive_pending_generation_records(global_step=self.global_steps)
+
+        if checkpoint_payload_path is not None:
+            self._metric_archive_writer.commit_checkpoint(
+                checkpoint_payload_path,
+                checkpoint_step=self.global_steps,
+            )
+            self._commit_checkpoint_tracker(self.global_steps)
+            self._log_balanced_live_metrics(logger, route.live_metrics, step=self.global_steps)
+            self._flush_offline_wandb_history(logger, checkpoint_step=self.global_steps)
+            if self._metric_artifact_uploader is not None:
+                self._metric_artifact_uploader.submit_pending()
+        elif (
+            self.global_steps > 0
+            and self.global_steps % self._metric_logging_settings.archive.shard_interval_steps == 0
+        ):
+            self._metric_archive_writer.close_shard()
+            self._log_balanced_live_metrics(logger, route.live_metrics, step=self.global_steps)
+        else:
+            self._log_balanced_live_metrics(logger, route.live_metrics, step=self.global_steps)
+
+    def _finalize_metric_logging(self, logger, *, interrupted: bool) -> None:
+        writer = self._metric_archive_writer
+        if writer is None:
+            return
+        try:
+            if not interrupted:
+                writer.close_shard()
+                if self._metric_artifact_uploader is not None:
+                    self._metric_artifact_uploader.submit_pending()
+            if self._metric_artifact_uploader is not None:
+                self._metric_artifact_uploader.finish()
+            if self._offline_live_metric_buffer:
+                first_step = self._offline_live_metric_buffer[0][0]
+                last_step = self._offline_live_metric_buffer[-1][0]
+                print(
+                    f"Leaving uncommitted offline W&B history out of the sync segment: steps={first_step}-{last_step}."
+                )
+            sync_commands = writer.standard_wandb_sync_commands(
+                entity=os.environ.get("WANDB_ENTITY"),
+                project=str(self.config.trainer.project_name),
+            )
+            if sync_commands:
+                print("Offline W&B segments can be synchronized in manifest order with:")
+                for command in sync_commands:
+                    print(f"  {command}")
+        finally:
+            writer.close(interrupted=interrupted)
 
     def fit(self):
         """Run training with deterministic logger and diagnostics cleanup."""
@@ -2628,7 +3412,10 @@ class RayPPOTrainer:
             raise
         finally:
             self._shutdown_opd_diagnostics_executor()
-            logger.finish(exit_code=exit_code)
+            try:
+                self._finalize_metric_logging(logger, interrupted=exit_code != 0)
+            finally:
+                logger.finish(exit_code=exit_code)
 
     def _fit_impl(self, logger):
         """
@@ -2644,31 +3431,53 @@ class RayPPOTrainer:
         self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
+        resumed_initial_evaluation = self.global_steps > 0 or getattr(self, "_metric_resume_step", None) is not None
 
         # Perform validation and optional benchmark testing before training.
         initial_metrics = {}
         if self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate(include_format_metrics=True)
+            val_metrics = self._validate(
+                include_format_metrics=True,
+                suppress_tracking=resumed_initial_evaluation,
+            )
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             initial_metrics.update(val_metrics)
-            teacher_val_metrics = self._validate_teacher_before_train()
+            teacher_val_metrics = self._validate_teacher_before_train(
+                suppress_tracking=resumed_initial_evaluation,
+            )
             if teacher_val_metrics:
                 pprint(f"Initial teacher validation metrics: {teacher_val_metrics}")
                 initial_metrics.update(teacher_val_metrics)
 
         if self.config.trainer.get("test_before_train", False):
-            test_benchmark_metrics = self._validate_test_benchmarks()
+            test_benchmark_metrics = self._validate_test_benchmarks(
+                suppress_tracking=resumed_initial_evaluation,
+            )
             pprint(f"Initial test benchmark metrics: {test_benchmark_metrics}")
             initial_metrics.update(test_benchmark_metrics)
 
-        if initial_metrics:
-            logger.log(data=initial_metrics, step=self.global_steps)
+        if initial_metrics and not resumed_initial_evaluation:
+            self._record_metric_event(
+                logger,
+                initial_metrics,
+                event_kind="initial_validation",
+            )
+        elif initial_metrics:
+            print(
+                f"Resume validation at checkpoint step {self.global_steps} is intentionally excluded "
+                "from realtime history and the metric ledger."
+            )
         if self.config.trainer.get("val_only", False):
             if not initial_metrics:
                 raise ValueError(
                     "trainer.val_only=True requires trainer.val_before_train or trainer.test_before_train."
                 )
+            if not resumed_initial_evaluation and self._metric_logging_settings.mode == "balanced":
+                # A fresh explicit evaluation is a terminal event rather than
+                # an uncheckpointed training tail, so preserve its offline
+                # history even though no model checkpoint is created.
+                self._flush_offline_wandb_history(logger, checkpoint_step=self.global_steps)
             return
 
         if self.config.actor_rollout_ref.rollout.skip.get("enable", False):
@@ -2700,6 +3509,7 @@ class RayPPOTrainer:
                 timing_raw = {}
                 opd_entropy = None
                 opd_diagnostics_task = None
+                checkpoint_payload_path = None
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -3010,7 +3820,10 @@ class RayPPOTrainer:
                             if esi_close_to_expiration:
                                 print("Force saving checkpoint: ESI instance expiration approaching.")
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
-                                self._save_checkpoint()
+                                if self._metric_logging_settings.mode == "balanced":
+                                    checkpoint_payload_path = self._save_checkpoint_payload()
+                                else:
+                                    self._save_checkpoint()
 
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
@@ -3103,8 +3916,12 @@ class RayPPOTrainer:
                 metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
-                # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
+                self._record_metric_event(
+                    logger,
+                    metrics,
+                    event_kind="train",
+                    checkpoint_payload_path=checkpoint_payload_path,
+                )
 
                 progress_bar.update(1)
                 self.global_steps += 1

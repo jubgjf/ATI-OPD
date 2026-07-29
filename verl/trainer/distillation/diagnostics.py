@@ -2797,13 +2797,20 @@ class OpdDiagnosticsTracker:
         for idx, row in enumerate(self.rows):
             heatmap[idx, : row.shape[0]] = row
 
-        fig, ax = plt.subplots(figsize=(max(6.0, width * 0.8), max(3.0, len(self.rows) * 0.18)))
+        figure_width = min(24.0, max(6.0, width * 0.18))
+        figure_height = min(18.0, max(3.0, len(self.rows) * 0.18))
+        fig, ax = plt.subplots(figsize=(figure_width, figure_height))
         image = ax.imshow(heatmap, aspect="auto", interpolation="nearest", origin="lower")
         ax.set_title(title)
         ax.set_xlabel("Response token position bin")
         ax.set_ylabel("Training step")
-        ax.set_xticks(range(width))
-        ax.set_xticklabels([f"{i * self.bin_size}-{(i + 1) * self.bin_size}" for i in range(width)], rotation=45)
+        x_tick_count = min(16, width)
+        x_tick_positions = np.unique(np.linspace(0, width - 1, x_tick_count, dtype=int))
+        ax.set_xticks(x_tick_positions)
+        ax.set_xticklabels(
+            [f"{i * self.bin_size}-{(i + 1) * self.bin_size}" for i in x_tick_positions],
+            rotation=45,
+        )
         step_values = list(self.steps)
         if step_values:
             tick_count = min(8, len(step_values))

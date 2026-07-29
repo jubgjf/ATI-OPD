@@ -124,6 +124,25 @@ TEST_FREQ=${TEST_FREQ:--1}
 TEST_BENCHMARKS_FREQ=${TEST_BENCHMARKS_FREQ:--1}
 TEST_BENCHMARKS_MAX_RESPONSE_LENGTH=${TEST_BENCHMARKS_MAX_RESPONSE_LENGTH:-$MAX_RESPONSE_LENGTH}
 SAVE_FREQ=${SAVE_FREQ:--1}
+METRIC_LOGGING_MODE=${METRIC_LOGGING_MODE:-balanced}
+METRIC_LOGGING_RESUME_POLICY=${METRIC_LOGGING_RESUME_POLICY:-strict}
+METRIC_LOGGING_LIVE_KEY_WARNING_THRESHOLD=${METRIC_LOGGING_LIVE_KEY_WARNING_THRESHOLD:-250}
+METRIC_LOGGING_ARCHIVE_ENABLED=${METRIC_LOGGING_ARCHIVE_ENABLED:-True}
+METRIC_LOGGING_ARCHIVE_LOCAL_DIR=${METRIC_LOGGING_ARCHIVE_LOCAL_DIR:-null}
+METRIC_LOGGING_ARCHIVE_UPLOAD_TO_WANDB=${METRIC_LOGGING_ARCHIVE_UPLOAD_TO_WANDB:-auto}
+METRIC_LOGGING_ARCHIVE_FINISH_TIMEOUT_SECONDS=${METRIC_LOGGING_ARCHIVE_FINISH_TIMEOUT_SECONDS:-60}
+METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS=${METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS:-}
+if [[ -z "$METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS" ]]; then
+    if [[ "$SAVE_FREQ" =~ ^[1-9][0-9]*$ ]]; then
+        METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS=$SAVE_FREQ
+    else
+        METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS=20
+    fi
+fi
+if [[ ! "$METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS must be a positive integer, got: $METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS" >&2
+    exit 1
+fi
 ACTOR_LR=${ACTOR_LR:-1e-6}
 PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-$(( (MAX_MODEL_LEN + 127) / 128 * 128 ))}
 
@@ -210,6 +229,23 @@ WANDB_DISABLED=${WANDB_DISABLED:-true}
 WANDB_DIR=${WANDB_DIR:-}
 WANDB_ENTITY=${WANDB_ENTITY:-}
 WANDB_CONFIG_MODE=${WANDB_CONFIG_MODE:-full}
+WANDB_RUN_ID=${WANDB_RUN_ID:-}
+RESUME_REQUIRED=${RESUME_REQUIRED:-False}
+case "$RESUME_REQUIRED" in
+    True)
+        if [[ "$WANDB_MODE" == "offline" || "$WANDB_MODE" == "disabled" || -z "$WANDB_RUN_ID" ]]; then
+            unset WANDB_RESUME
+        else
+            WANDB_RESUME=must
+            export WANDB_RESUME
+        fi
+        ;;
+    False) unset WANDB_RESUME ;;
+    *)
+        echo "RESUME_REQUIRED must be True or False, got: $RESUME_REQUIRED" >&2
+        exit 1
+        ;;
+esac
 
 EXPERIMENT_TIMESTAMP=${EXPERIMENT_TIMESTAMP:-$(date +"%Y%m%d-%H%M%S")}
 EXPERIMENT_BASE_NAME=${EXPERIMENT_NAME:-"debug-${DEBUG_MODE}"}
@@ -367,6 +403,14 @@ COMMON_OVERRIDES=(
     "critic.enable=False"
     "trainer.balance_batch=True"
     "trainer.logger=${TRAINER_LOGGER}"
+    "trainer.metric_logging.mode=${METRIC_LOGGING_MODE}"
+    "trainer.metric_logging.resume_policy=${METRIC_LOGGING_RESUME_POLICY}"
+    "trainer.metric_logging.live_key_warning_threshold=${METRIC_LOGGING_LIVE_KEY_WARNING_THRESHOLD}"
+    "trainer.metric_logging.archive.enabled=${METRIC_LOGGING_ARCHIVE_ENABLED}"
+    "trainer.metric_logging.archive.local_dir=${METRIC_LOGGING_ARCHIVE_LOCAL_DIR}"
+    "trainer.metric_logging.archive.shard_interval_steps=${METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS}"
+    "trainer.metric_logging.archive.upload_to_wandb=${METRIC_LOGGING_ARCHIVE_UPLOAD_TO_WANDB}"
+    "trainer.metric_logging.archive.finish_timeout_seconds=${METRIC_LOGGING_ARCHIVE_FINISH_TIMEOUT_SECONDS}"
     "trainer.project_name=${PROJECT_NAME}"
     "trainer.experiment_name=${EXPERIMENT_FULL_NAME}"
     "trainer.n_gpus_per_node=${STUDENT_GPUS}"
@@ -463,6 +507,7 @@ fi
 
 REMOTE_CMD='set -euo pipefail
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+unset WANDB_RUN_ID WANDB_RESUME
 export WANDB_MODE='"$WANDB_MODE"'
 export WANDB_DISABLED='"$WANDB_DISABLED"'
 export WANDB_CONFIG_MODE='"$WANDB_CONFIG_MODE"'
@@ -491,6 +536,14 @@ mkdir -p $(printf "%q" "$WANDB_DIR")
 fi
 if [[ -n "$WANDB_ENTITY" ]]; then
     REMOTE_CMD+="export WANDB_ENTITY=$(printf "%q" "$WANDB_ENTITY")
+"
+fi
+if [[ -n "$WANDB_RUN_ID" ]]; then
+    REMOTE_CMD+="export WANDB_RUN_ID=$(printf "%q" "$WANDB_RUN_ID")
+"
+fi
+if [[ -n "${WANDB_RESUME:-}" ]]; then
+    REMOTE_CMD+="export WANDB_RESUME=$(printf "%q" "$WANDB_RESUME")
 "
 fi
 
@@ -524,8 +577,9 @@ cat <<EOF
   chat template:${CHAT_TEMPLATE_MODEL:-disabled}
   attention:    ${ATTN_IMPLEMENTATION}, vllm backend ${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}
   diagnostics:  log every ${OPD_DIAGNOSTICS_LOG_INTERVAL}, topk every ${OPD_DIAGNOSTICS_TOPK_LOG_INTERVAL}, repetition=${OPD_DIAGNOSTICS_COLLECT_REPETITION}, async=${OPD_DIAGNOSTICS_ASYNC_METRICS}
-  wandb/ckpt:   WANDB_MODE=${WANDB_MODE}, WANDB_DIR=${WANDB_DIR:-default}, save_freq=${SAVE_FREQ}
-  val logging:  test_freq=${TEST_FREQ}, samples=${VAL_MAX_SAMPLES}, table_rows=${LOG_VAL_GENERATIONS}
+  metric logs:  mode=${METRIC_LOGGING_MODE}, archive=${METRIC_LOGGING_ARCHIVE_ENABLED}, shard_interval=${METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS}, upload=${METRIC_LOGGING_ARCHIVE_UPLOAD_TO_WANDB}
+  wandb/ckpt:   WANDB_MODE=${WANDB_MODE}, WANDB_DIR=${WANDB_DIR:-default}, run_id=${WANDB_RUN_ID:-unset}, resume=${WANDB_RESUME:-unset}, save_freq=${SAVE_FREQ}
+  val logging:  test_freq=${TEST_FREQ}, samples=${VAL_MAX_SAMPLES}, table_preview_rows=${LOG_VAL_GENERATIONS}
   benchmarks:   before_train=${TEST_BEFORE_TRAIN}, freq=${TEST_BENCHMARKS_FREQ}, n=${TEST_N}, names=${TEST_BENCHMARKS}
 EOF
 

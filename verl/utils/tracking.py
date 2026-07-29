@@ -19,10 +19,11 @@ import dataclasses
 import json
 import logging
 import os
+from contextlib import contextmanager, nullcontext
 from enum import Enum
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import orjson
 
@@ -30,6 +31,104 @@ logger = logging.getLogger(__name__)
 
 MLFLOW_MAX_ATTEMPTS = 3
 MLFLOW_SLEEP_SECONDS = 5
+
+_WANDB_OFFLINE_MODES = {"offline", "dryrun"}
+_WANDB_NON_NETWORKED_MODES = _WANDB_OFFLINE_MODES | {"disabled"}
+
+
+@dataclasses.dataclass(frozen=True)
+class WandbResumeSpec:
+    """Explicit W&B run identity and online resume behavior.
+
+    W&B cannot resume an offline process. In offline/disabled mode, ``run_id`` is
+    still reused to preserve the logical run identity, while the resume directive
+    is suppressed. Each process therefore creates a separate local W&B segment.
+    """
+
+    run_id: str
+    resume: bool | Literal["allow", "never", "must", "auto"] | None = None
+    resume_from: str | None = None
+
+    def __post_init__(self):
+        if not self.run_id:
+            raise ValueError("WandbResumeSpec.run_id must be non-empty.")
+        if self.resume is not None and self.resume_from is not None:
+            raise ValueError("W&B resume and resume_from are mutually exclusive.")
+        if self.resume_from is not None:
+            resume_run_id = self.resume_from.split("?", maxsplit=1)[0]
+            if resume_run_id != self.run_id:
+                raise ValueError(
+                    "WandbResumeSpec.resume_from must reference the same run_id: "
+                    f"run_id={self.run_id!r}, resume_from={self.resume_from!r}."
+                )
+
+    def init_kwargs(self, mode: str) -> dict[str, Any]:
+        """Return conflict-free keyword arguments for ``wandb.init``."""
+        kwargs: dict[str, Any] = {"id": self.run_id}
+        if _normalize_wandb_mode(mode) in _WANDB_NON_NETWORKED_MODES:
+            # An explicit value is required to override a process-level
+            # WANDB_RESUME=must inherited by Ray workers.
+            kwargs["resume"] = "never"
+        elif self.resume_from is not None:
+            kwargs["resume_from"] = self.resume_from
+        elif self.resume is not None:
+            kwargs["resume"] = self.resume
+        return kwargs
+
+
+@dataclasses.dataclass(frozen=True)
+class WandbRunInfo:
+    """Stable W&B session information needed by checkpoint/archive code."""
+
+    mode: str
+    run_id: str | None
+    sync_dir: Path | None
+    sync_file: Path | None
+
+    @property
+    def is_online(self) -> bool:
+        return self.mode not in _WANDB_NON_NETWORKED_MODES
+
+    @property
+    def is_offline(self) -> bool:
+        return self.mode in _WANDB_OFFLINE_MODES
+
+
+@dataclasses.dataclass(frozen=True)
+class WandbArtifactSubmission:
+    """Result of staging an artifact in the current W&B session."""
+
+    artifact_name: str
+    artifact_type: str
+    aliases: tuple[str, ...]
+    run_info: WandbRunInfo
+    wait_handle: Any | None = dataclasses.field(default=None, repr=False)
+
+    @property
+    def requires_wait(self) -> bool:
+        """Whether the caller may wait for a remote upload to finish."""
+        return self.wait_handle is not None
+
+
+def _normalize_wandb_mode(mode: str | None) -> str:
+    normalized = str(getattr(mode, "value", mode) or "online").lower()
+    return "offline" if normalized == "dryrun" else normalized
+
+
+def _path_or_none(value: Any) -> Path | None:
+    if value is None or value == "":
+        return None
+    return Path(value).expanduser().resolve()
+
+
+@contextmanager
+def _without_environment_variable(name: str):
+    previous = os.environ.pop(name, None)
+    try:
+        yield
+    finally:
+        if previous is not None:
+            os.environ[name] = previous
 
 
 def _is_wandb_media_value(value: Any) -> bool:
@@ -227,7 +326,15 @@ class Tracking:
         "file",
     ]
 
-    def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None):
+    def __init__(
+        self,
+        project_name,
+        experiment_name,
+        default_backend: str | list[str] = "console",
+        config=None,
+        *,
+        wandb_resume: WandbResumeSpec | None = None,
+    ):
         if isinstance(default_backend, str):
             default_backend = [default_backend]
         for backend in default_backend:
@@ -241,6 +348,8 @@ class Tracking:
         self.logger = {}
         self._finished = False
         self._last_step: int | None = None
+        self._last_steps_by_backend: dict[str, int] = {}
+        self._wandb_run = None
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import os
@@ -249,13 +358,32 @@ class Tracking:
 
             settings = _build_wandb_settings(wandb, config)
             entity = os.environ.get("WANDB_ENTITY", None)
-            wandb.init(
-                project=project_name,
-                name=experiment_name,
-                entity=entity,
-                config=_prepare_wandb_config(config),
-                settings=settings,
+            init_kwargs: dict[str, Any] = {}
+            if wandb_resume is not None:
+                wandb_mode = _normalize_wandb_mode(os.environ.get("WANDB_MODE"))
+                init_kwargs.update(wandb_resume.init_kwargs(wandb_mode))
+                if wandb_mode in _WANDB_NON_NETWORKED_MODES and (
+                    wandb_resume.resume is not None or wandb_resume.resume_from is not None
+                ):
+                    logger.warning(
+                        "W&B does not resume local %s runs; reusing run_id=%s in a new local session.",
+                        wandb_mode,
+                        wandb_resume.run_id,
+                    )
+            # Make an explicit resume spec authoritative. In particular,
+            # WANDB_RESUME=must must not collide with resume_from during rewind.
+            resume_env_context = (
+                _without_environment_variable("WANDB_RESUME") if wandb_resume is not None else nullcontext()
             )
+            with resume_env_context:
+                self._wandb_run = wandb.init(
+                    project=project_name,
+                    name=experiment_name,
+                    entity=entity,
+                    config=_prepare_wandb_config(config),
+                    settings=settings,
+                    **init_kwargs,
+                )
             self.logger["wandb"] = wandb
 
         if "trackio" in default_backend:
@@ -356,13 +484,94 @@ class Tracking:
         if "file" in default_backend:
             self.logger["file"] = FileLogger(project_name, experiment_name)
 
+    @property
+    def wandb_run_info(self) -> WandbRunInfo | None:
+        """Return the current W&B run identity and local sync paths."""
+        wandb_module = self.logger.get("wandb")
+        if wandb_module is None:
+            return None
+        run = getattr(self, "_wandb_run", None) or getattr(wandb_module, "run", None)
+        if run is None:
+            return None
+
+        settings = getattr(run, "settings", None)
+        raw_mode = getattr(settings, "mode", None) or os.environ.get("WANDB_MODE")
+        mode = _normalize_wandb_mode(raw_mode)
+        if getattr(run, "offline", False):
+            mode = "offline"
+
+        run_id = getattr(run, "id", None) or getattr(settings, "run_id", None)
+        return WandbRunInfo(
+            mode=mode,
+            run_id=run_id,
+            sync_dir=_path_or_none(getattr(settings, "sync_dir", None)),
+            sync_file=_path_or_none(getattr(settings, "sync_file", None)),
+        )
+
+    def log_wandb_artifact(
+        self,
+        local_path: str | os.PathLike,
+        *,
+        artifact_name: str,
+        artifact_type: str,
+        metadata: dict[str, Any] | None = None,
+        aliases: tuple[str, ...] | list[str] = (),
+        artifact_file_name: str | None = None,
+        additional_files: dict[str, str | os.PathLike] | None = None,
+    ) -> WandbArtifactSubmission:
+        """Stage one immutable local file as a W&B artifact.
+
+        Online submissions return the SDK handle through ``wait_handle`` so the
+        caller can decide when to wait. Offline submissions are recorded in the
+        local W&B sync file and deliberately return no wait handle.
+        """
+        if self._finished:
+            raise RuntimeError("Cannot log a W&B artifact after Tracking.finish().")
+        if not artifact_name:
+            raise ValueError("artifact_name must be non-empty.")
+        if not artifact_type:
+            raise ValueError("artifact_type must be non-empty.")
+
+        source_path = Path(local_path).expanduser().resolve()
+        if not source_path.is_file():
+            raise FileNotFoundError(f"W&B artifact source must be an existing file: {source_path}")
+
+        wandb_module = self.logger.get("wandb")
+        run_info = self.wandb_run_info
+        run = (
+            getattr(self, "_wandb_run", None) or getattr(wandb_module, "run", None)
+            if wandb_module is not None
+            else None
+        )
+        if wandb_module is None or run is None or run_info is None:
+            raise RuntimeError("The wandb backend must be initialized before logging an artifact.")
+        if run_info.mode == "disabled":
+            raise RuntimeError("Cannot stage a W&B artifact while WANDB_MODE=disabled.")
+
+        normalized_aliases = tuple(dict.fromkeys(aliases))
+        artifact = wandb_module.Artifact(
+            name=artifact_name,
+            type=artifact_type,
+            metadata=dict(metadata or {}),
+        )
+        artifact.add_file(str(source_path), name=artifact_file_name or source_path.name)
+        for artifact_path, local_file in (additional_files or {}).items():
+            additional_path = Path(local_file).expanduser().resolve()
+            if not additional_path.is_file():
+                raise FileNotFoundError(f"W&B artifact source must be an existing file: {additional_path}")
+            artifact.add_file(str(additional_path), name=str(artifact_path))
+        submitted_handle = run.log_artifact(artifact, aliases=list(normalized_aliases))
+
+        return WandbArtifactSubmission(
+            artifact_name=artifact_name,
+            artifact_type=artifact_type,
+            aliases=normalized_aliases,
+            run_info=run_info,
+            wait_handle=submitted_handle if run_info.is_online else None,
+        )
+
     def log(self, data, step, backend=None):
         normalized_step = _as_integral_step(step, name="Tracking.log(step)")
-        if self._last_step is not None and normalized_step < self._last_step:
-            raise ValueError(
-                "Tracking steps must be monotonically non-decreasing: "
-                f"last_step={self._last_step}, requested_step={normalized_step}."
-            )
         if isinstance(data, dict) and (source_step := data.get("opd/diagnostics_async/source_step")) is not None:
             normalized_source_step = _as_integral_step(source_step, name="opd/diagnostics_async/source_step")
             if normalized_source_step != normalized_step:
@@ -371,13 +580,31 @@ class Tracking:
                     f"{normalized_source_step} does not match Tracking.log(step={normalized_step})."
                 )
 
-        for default_backend, logger_instance in self.logger.items():
-            if backend is None or default_backend in backend:
-                backend_data = _filter_wandb_media_for_backend(data, default_backend)
-                if isinstance(backend_data, dict) and not backend_data:
-                    continue
-                logger_instance.log(data=backend_data, step=step)
-        self._last_step = normalized_step
+        selected_backends = [
+            (default_backend, logger_instance)
+            for default_backend, logger_instance in self.logger.items()
+            if backend is None or default_backend in backend
+        ]
+        last_steps = getattr(self, "_last_steps_by_backend", None)
+        if last_steps is None:
+            last_steps = {}
+            self._last_steps_by_backend = last_steps
+        for default_backend, _logger_instance in selected_backends:
+            backend_last_step = last_steps.get(default_backend)
+            if backend_last_step is not None and normalized_step < backend_last_step:
+                raise ValueError(
+                    "Tracking steps must be monotonically non-decreasing per backend: "
+                    f"backend={default_backend!r}, last_step={backend_last_step}, "
+                    f"requested_step={normalized_step}."
+                )
+
+        for default_backend, logger_instance in selected_backends:
+            backend_data = _filter_wandb_media_for_backend(data, default_backend)
+            if isinstance(backend_data, dict) and not backend_data:
+                continue
+            logger_instance.log(data=backend_data, step=step)
+            last_steps[default_backend] = normalized_step
+        self._last_step = normalized_step if self._last_step is None else max(self._last_step, normalized_step)
 
     def finish(self, exit_code=0):
         if getattr(self, "_finished", False):
@@ -584,6 +811,7 @@ class ValidationGenerationsLogger:
     project_name: str = None
     experiment_name: str = None
     table_name: str = "val/generations"
+    cumulative_wandb_table: bool = True
 
     def log(self, loggers, samples, step, *, defer_wandb: bool = False) -> dict[str, Any]:
         deferred_media: dict[str, Any] = {}
@@ -620,28 +848,28 @@ class ValidationGenerationsLogger:
         fields = self._sample_fields(samples)
         if self._samples_are_records(samples):
             columns = ["step", "sample_index", *fields]
-            if not hasattr(self, "validation_table"):
-                self.validation_table = wandb.Table(columns=columns)
-
-            new_table = wandb.Table(columns=columns, data=self.validation_table.data)
+            previous_data = (
+                self.validation_table.data
+                if self.cumulative_wandb_table and hasattr(self, "validation_table")
+                else None
+            )
+            new_table = wandb.Table(columns=columns, data=previous_data)
             for sample_index, sample in enumerate(samples):
                 new_table.add_data(step, sample_index, *self._sample_to_values(sample, fields))
 
             if wandb.run is not None and not defer:
                 wandb.log({self.table_name: new_table}, step=step)
-            self.validation_table = new_table
+            if self.cumulative_wandb_table:
+                self.validation_table = new_table
             return {self.table_name: new_table} if wandb.run is not None and defer else {}
 
         # Create column names for all samples
         columns = ["step"] + sum([[f"{field}_{i + 1}" for field in fields] for i in range(len(samples))], [])
 
-        if not hasattr(self, "validation_table"):
-            # Initialize the table on first call
-            self.validation_table = wandb.Table(columns=columns)
-
-        # Create a new table with same columns and existing data
-        # Workaround for https://github.com/wandb/wandb/issues/2981#issuecomment-1997445737
-        new_table = wandb.Table(columns=columns, data=self.validation_table.data)
+        previous_data = (
+            self.validation_table.data if self.cumulative_wandb_table and hasattr(self, "validation_table") else None
+        )
+        new_table = wandb.Table(columns=columns, data=previous_data)
 
         # Add new row with all data
         row_data = []
@@ -654,7 +882,8 @@ class ValidationGenerationsLogger:
         # Update reference and log
         if wandb.run is not None and not defer:
             wandb.log({self.table_name: new_table}, step=step)
-        self.validation_table = new_table
+        if self.cumulative_wandb_table:
+            self.validation_table = new_table
         return {self.table_name: new_table} if wandb.run is not None and defer else {}
 
     def log_generations_to_swanlab(self, samples, step):
