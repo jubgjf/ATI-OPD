@@ -34,6 +34,7 @@ def test_teacher_segment_loss_config_defaults_to_legacy_opd_on_cpu():
     assert config.outcome_aware_candidate_selection_enabled is False
     assert config.outcome_correctness_key == "acc"
     assert config.teacher_candidate_count == 4
+    assert config.teacher_candidate_max_concurrency_per_worker == 4
     assert config.teacher_nll_calibration_quantile == 0.75
     assert config.teacher_nll_calibration_window == 256
     assert config.teacher_nll_calibration_min_samples == 16
@@ -109,6 +110,7 @@ def test_outcome_aware_candidate_selection_config_validates_on_cpu():
         outcome_aware_candidate_selection_enabled=True,
         gap_metric="teacher_rejection",
         teacher_candidate_count=4,
+        teacher_candidate_max_concurrency_per_worker=2,
         teacher_nll_calibration_quantile=0.8,
         teacher_nll_calibration_window=64,
         teacher_nll_calibration_min_samples=8,
@@ -123,6 +125,8 @@ def test_outcome_aware_candidate_selection_config_validates_on_cpu():
         DistillationInterventionConfig(outcome_correctness_key="")
     with pytest.raises(ValueError, match="teacher_candidate_count"):
         DistillationInterventionConfig(teacher_candidate_count=0)
+    with pytest.raises(ValueError, match="teacher_candidate_max_concurrency_per_worker"):
+        DistillationInterventionConfig(teacher_candidate_max_concurrency_per_worker=0)
     for quantile in (0.0, 1.0, float("nan")):
         with pytest.raises(ValueError, match="teacher_nll_calibration_quantile"):
             DistillationInterventionConfig(teacher_nll_calibration_quantile=quantile)

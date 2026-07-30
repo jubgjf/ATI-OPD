@@ -1544,6 +1544,7 @@ class AgentLoopWorker:
             version=0,
         )
         self._teacher_nll_pending_updates: list[float] = []
+        self._teacher_candidate_rpc_semaphore: Optional[asyncio.Semaphore] = None
         if self.distillation_enabled:
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 
@@ -2396,6 +2397,15 @@ class AgentLoopWorker:
         snapshot = AgentLoopWorker._teacher_nll_calibration_state(self)
         return snapshot.threshold, snapshot.source, snapshot.count
 
+    def _teacher_candidate_rpc_limiter(self) -> asyncio.Semaphore:
+        """Return the worker-wide limiter shared by all candidate RPC stages."""
+        limiter = getattr(self, "_teacher_candidate_rpc_semaphore", None)
+        if limiter is None:
+            config: DistillationInterventionConfig = self.teacher_intervention_config
+            limiter = asyncio.Semaphore(int(config.teacher_candidate_max_concurrency_per_worker))
+            self._teacher_candidate_rpc_semaphore = limiter
+        return limiter
+
     @staticmethod
     def _candidate_mean_nll(
         result: TeacherLogprobScoringResult,
@@ -2446,9 +2456,11 @@ class AgentLoopWorker:
         threshold = calibration_snapshot.threshold
         threshold_source = calibration_snapshot.source
         calibration_count_before = calibration_snapshot.count
-        generation_results = await asyncio.gather(
-            *[
-                self.teacher_server_manager.generate_teacher_segment_single(
+        candidate_rpc_limiter = AgentLoopWorker._teacher_candidate_rpc_limiter(self)
+
+        async def generate_candidate(candidate_index: int) -> TeacherGenerationResult:
+            async with candidate_rpc_limiter:
+                return await self.teacher_server_manager.generate_teacher_segment_single(
                     prefix_ids=prefix_ids,
                     max_tokens=max_tokens,
                     multi_modal_data=output.multi_modal_data,
@@ -2456,8 +2468,9 @@ class AgentLoopWorker:
                     routing_key=routing_key,
                     request_id=f"{base_request_id}:teacher-candidate:{attempt}:{candidate_index}",
                 )
-                for candidate_index in range(candidate_count)
-            ],
+
+        generation_results = await asyncio.gather(
+            *(generate_candidate(candidate_index) for candidate_index in range(candidate_count)),
             return_exceptions=True,
         )
 
@@ -2505,13 +2518,14 @@ class AgentLoopWorker:
             if candidate.invalid_reason is not None:
                 return
             try:
-                teacher_result = await self._score_sequence_for_intervention(
-                    request_id=f"{base_request_id}:teacher-candidate-score:{attempt}:{candidate.index}",
-                    prompt_ids=prefix_ids,
-                    response_ids=candidate.token_ids,
-                    output=output,
-                    routing_key=routing_key,
-                )
+                async with candidate_rpc_limiter:
+                    teacher_result = await self._score_sequence_for_intervention(
+                        request_id=f"{base_request_id}:teacher-candidate-score:{attempt}:{candidate.index}",
+                        prompt_ids=prefix_ids,
+                        response_ids=candidate.token_ids,
+                        output=output,
+                        routing_key=routing_key,
+                    )
                 candidate.teacher_nll = AgentLoopWorker._candidate_mean_nll(
                     teacher_result,
                     prefix_len=len(prefix_ids),
@@ -2539,6 +2553,7 @@ class AgentLoopWorker:
         metadata: dict[str, Any] = {
             "candidate_selection_enabled": True,
             "candidate_count_requested": candidate_count,
+            "candidate_rpc_max_concurrency_per_worker": int(config.teacher_candidate_max_concurrency_per_worker),
             "candidate_count_generated": candidate_count - len(generation_failures),
             "candidate_count_teacher_nll_valid": len(teacher_scored_candidates),
             "candidate_unique_count": unique_candidate_count,
@@ -2649,12 +2664,13 @@ class AgentLoopWorker:
 
         async def score_student_nll(candidate: _TeacherRepairCandidate) -> None:
             try:
-                student_result = await self._score_student_sequence_for_intervention(
-                    request_id=f"{base_request_id}:student-candidate-score:{attempt}:{candidate.index}",
-                    prompt_ids=prefix_ids,
-                    response_ids=candidate.token_ids,
-                    output=output,
-                )
+                async with candidate_rpc_limiter:
+                    student_result = await self._score_student_sequence_for_intervention(
+                        request_id=f"{base_request_id}:student-candidate-score:{attempt}:{candidate.index}",
+                        prompt_ids=prefix_ids,
+                        response_ids=candidate.token_ids,
+                        output=output,
+                    )
                 candidate.student_nll = AgentLoopWorker._candidate_mean_nll(
                     student_result,
                     prefix_len=len(prefix_ids),

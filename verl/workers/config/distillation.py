@@ -222,6 +222,10 @@ class DistillationInterventionConfig(BaseConfig):
     outcome_correctness_key: str = "acc"
     outcome_correctness_threshold: float = 0.5
     teacher_candidate_count: int = 4
+    # Bound candidate generation/scoring RPCs shared by all concurrent samples
+    # inside one AgentLoopWorker. This prevents best-of-K selection from
+    # multiplying rollout concurrency into an inference-server request storm.
+    teacher_candidate_max_concurrency_per_worker: int = 4
     # Healthy best-of-K teacher NLLs are aggregated globally across rollout
     # workers at batch boundaries, then one rolling-quantile threshold is
     # broadcast for the next batch.
@@ -321,6 +325,8 @@ class DistillationInterventionConfig(BaseConfig):
             )
         if self.teacher_candidate_count <= 0:
             raise ValueError("teacher_candidate_count must be positive.")
+        if self.teacher_candidate_max_concurrency_per_worker <= 0:
+            raise ValueError("teacher_candidate_max_concurrency_per_worker must be positive.")
         if (
             not math.isfinite(self.teacher_nll_calibration_quantile)
             or not 0 < self.teacher_nll_calibration_quantile < 1

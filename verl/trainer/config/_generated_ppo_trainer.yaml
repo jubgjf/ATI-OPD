@@ -852,6 +852,7 @@ distillation:
     outcome_correctness_key: acc
     outcome_correctness_threshold: 0.5
     teacher_candidate_count: 4
+    teacher_candidate_max_concurrency_per_worker: 4
     teacher_nll_calibration_quantile: 0.75
     teacher_nll_calibration_window: 256
     teacher_nll_calibration_min_samples: 16

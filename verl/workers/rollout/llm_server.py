@@ -38,6 +38,28 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+MAX_TERMINAL_SERVER_FAILOVER_RETRIES = 1
+
+
+def _is_terminal_server_failure(exc: BaseException) -> bool:
+    """Whether an inference replica is permanently unusable for later requests."""
+    actor_died_error = getattr(ray.exceptions, "ActorDiedError", None)
+    if actor_died_error is not None and isinstance(exc, actor_died_error):
+        return True
+
+    # RayTaskError preserves the remote exception in ``cause``. Avoid importing
+    # vLLM here because this client is also used by non-vLLM backends.
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__name__ == "EngineDeadError":
+            return True
+        nested = getattr(current, "cause", None)
+        if not isinstance(nested, BaseException):
+            nested = current.__cause__
+        current = nested if isinstance(nested, BaseException) else None
+    return False
 
 
 @ray.remote
@@ -198,25 +220,48 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
-        server_id, server = await self._acquire_server(request_id)
-        try:
-            multimodal_kwargs = {}
-            if audio_data is not None:
-                multimodal_kwargs["audio_data"] = audio_data
-            if mm_processor_kwargs:
-                multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
-            output: TokenOutput = await server.generate.remote(
-                request_id=uuid4().hex,  # use new request_id for each turn
-                prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
-                image_data=image_data,
-                video_data=video_data,
-                **multimodal_kwargs,
-                **kwargs,
-            )
-            return output
-        finally:
-            self._release_server(server_id)
+        multimodal_kwargs = {}
+        if audio_data is not None:
+            multimodal_kwargs["audio_data"] = audio_data
+        if mm_processor_kwargs:
+            multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+
+        for failover_attempt in range(MAX_TERMINAL_SERVER_FAILOVER_RETRIES + 1):
+            server_id, server = await self._acquire_server(request_id)
+            try:
+                output: TokenOutput = await server.generate.remote(
+                    request_id=uuid4().hex,  # use new request_id for each turn
+                    prompt_ids=prompt_ids,
+                    sampling_params=sampling_params,
+                    image_data=image_data,
+                    video_data=video_data,
+                    **multimodal_kwargs,
+                    **kwargs,
+                )
+                return output
+            except Exception as exc:
+                if not _is_terminal_server_failure(exc):
+                    raise
+
+                # EngineDeadError leaves the Ray server actor alive, so simply
+                # retrying without eviction would route later requests back to
+                # the same permanently dead EngineCore.
+                await self._load_balancer.remove_servers.remote(server_ids=[server_id])
+                remaining_server_ids = await self._load_balancer.get_all_servers.remote()
+                logger.warning(
+                    "Evicted terminally failed LLM server %s after %s; remaining replicas=%d, request_attempt=%d/%d.",
+                    server_id,
+                    type(getattr(exc, "cause", exc)).__name__,
+                    len(remaining_server_ids),
+                    failover_attempt + 1,
+                    MAX_TERMINAL_SERVER_FAILOVER_RETRIES + 1,
+                )
+                if failover_attempt >= MAX_TERMINAL_SERVER_FAILOVER_RETRIES or not remaining_server_ids:
+                    raise
+            finally:
+                self._release_server(server_id)
+
+        raise AssertionError("LLM server failover loop exited unexpectedly.")
 
 
 class LLMServerManager:

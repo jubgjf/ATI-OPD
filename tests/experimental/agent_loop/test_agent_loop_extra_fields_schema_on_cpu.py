@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import warnings
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -649,6 +650,40 @@ class _CandidateSelectionTeacherManager:
         )
 
 
+class _ConcurrencyTrackingCandidateTeacherManager(_CandidateSelectionTeacherManager):
+    def __init__(self, candidates: list[list[int]]):
+        super().__init__(candidates)
+        self.active_candidate_rpcs = 0
+        self.max_active_candidate_rpcs = 0
+
+    def _rpc_started(self) -> None:
+        self.active_candidate_rpcs += 1
+        self.max_active_candidate_rpcs = max(
+            self.max_active_candidate_rpcs,
+            self.active_candidate_rpcs,
+        )
+
+    async def generate_teacher_segment_single(self, *args: Any, **kwargs: Any) -> TeacherGenerationResult:
+        self._rpc_started()
+        try:
+            await asyncio.sleep(0.01)
+            return await super().generate_teacher_segment_single(*args, **kwargs)
+        finally:
+            self.active_candidate_rpcs -= 1
+
+    async def compute_teacher_logprobs_single(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> TeacherLogprobScoringResult:
+        self._rpc_started()
+        try:
+            await asyncio.sleep(0.01)
+            return await super().compute_teacher_logprobs_single(*args, **kwargs)
+        finally:
+            self.active_candidate_rpcs -= 1
+
+
 class _DistributionGapStudentClient(_FakeRepairStudentClient):
     async def generate(
         self,
@@ -812,6 +847,7 @@ class _DirectInterventionWorker:
     _score_sequence_for_intervention = AgentLoopWorker._score_sequence_for_intervention
     _score_student_sequence_for_intervention = AgentLoopWorker._score_student_sequence_for_intervention
     _current_teacher_nll_threshold = AgentLoopWorker._current_teacher_nll_threshold
+    _teacher_candidate_rpc_limiter = AgentLoopWorker._teacher_candidate_rpc_limiter
     _generate_and_select_teacher_candidate = AgentLoopWorker._generate_and_select_teacher_candidate
     _generate_student_suffix = AgentLoopWorker._generate_student_suffix
     _maybe_repair_with_teacher = AgentLoopWorker._maybe_repair_with_teacher
@@ -845,6 +881,7 @@ class _DirectInterventionWorker:
         diagnostics_topk: Optional[int] = None,
         outcome_aware_candidate_selection_enabled: bool = False,
         teacher_candidate_count: int = 4,
+        teacher_candidate_max_concurrency_per_worker: int = 4,
         teacher_nll_calibration_quantile: float = 0.75,
         teacher_nll_calibration_window: int = 16,
         teacher_nll_calibration_min_samples: int = 2,
@@ -877,6 +914,7 @@ class _DirectInterventionWorker:
             thinking_end_text=thinking_end_text,
             outcome_aware_candidate_selection_enabled=outcome_aware_candidate_selection_enabled,
             teacher_candidate_count=teacher_candidate_count,
+            teacher_candidate_max_concurrency_per_worker=teacher_candidate_max_concurrency_per_worker,
             teacher_nll_calibration_quantile=teacher_nll_calibration_quantile,
             teacher_nll_calibration_window=teacher_nll_calibration_window,
             teacher_nll_calibration_min_samples=teacher_nll_calibration_min_samples,
@@ -906,6 +944,7 @@ class _DirectInterventionWorker:
             version=0,
         )
         self._teacher_nll_pending_updates = []
+        self._teacher_candidate_rpc_semaphore = None
 
 
 def _outcome_gated_intervention_output(*, request_id: str, raw_correct: bool) -> AgentLoopOutput:
@@ -1136,6 +1175,41 @@ async def test_outcome_aware_candidate_selection_filters_then_uses_rank_sum_on_c
     assert intervention["selected_rank_sum"] == 3
     assert output.reward_score is None
     assert output.extra_fields["teacher_intervention_outcome"]["reward_recompute_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_outcome_aware_candidate_rpcs_are_bounded_across_concurrent_samples_on_cpu():
+    teacher_manager = _ConcurrencyTrackingCandidateTeacherManager([[30], [31], [32], [33]])
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        outcome_aware_candidate_selection_enabled=True,
+        teacher_candidate_count=4,
+        teacher_candidate_max_concurrency_per_worker=2,
+    )
+    outputs = [
+        _outcome_gated_intervention_output(request_id=f"bounded-candidates-{index}", raw_correct=True)
+        for index in range(2)
+    ]
+
+    results = await asyncio.gather(
+        *[
+            AgentLoopWorker._generate_and_select_teacher_candidate(
+                worker,
+                prefix_ids=[101, 102],
+                max_tokens=1,
+                output=output,
+                routing_key=None,
+                base_request_id=f"bounded-candidates-{index}",
+                attempt=0,
+                calibration_only=True,
+            )
+            for index, output in enumerate(outputs)
+        ]
+    )
+
+    assert teacher_manager.max_active_candidate_rpcs == 2
+    assert all(result.metadata["candidate_rpc_max_concurrency_per_worker"] == 2 for result in results)
+    assert all(result.metadata["candidate_count_teacher_nll_valid"] == 4 for result in results)
 
 
 @pytest.mark.asyncio

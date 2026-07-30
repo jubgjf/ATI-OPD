@@ -128,6 +128,9 @@ intervention:
   outcome_correctness_key: acc
   outcome_correctness_threshold: 0.5
   teacher_candidate_count: 4
+  # Shared cap across concurrent samples in each AgentLoopWorker. It applies
+  # to candidate generation and teacher/student candidate NLL scoring RPCs.
+  teacher_candidate_max_concurrency_per_worker: 4
   # Each healthy prefix contributes the minimum teacher NLL among its K
   # candidates. Updates are aggregated globally across rollout workers after
   # each batch, and one rolling threshold is broadcast for the next batch.

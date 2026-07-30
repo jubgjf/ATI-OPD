@@ -211,6 +211,7 @@ TEACHER_INTERVENTION_PERSISTENCE_MIN_TOKENS=${TEACHER_INTERVENTION_PERSISTENCE_M
 OUTCOME_CORRECTNESS_KEY=${OUTCOME_CORRECTNESS_KEY:-acc}
 OUTCOME_CORRECTNESS_THRESHOLD=${OUTCOME_CORRECTNESS_THRESHOLD:-0.5}
 TEACHER_CANDIDATE_COUNT=${TEACHER_CANDIDATE_COUNT:-4}
+TEACHER_CANDIDATE_MAX_CONCURRENCY_PER_WORKER=${TEACHER_CANDIDATE_MAX_CONCURRENCY_PER_WORKER:-32}
 TEACHER_NLL_CALIBRATION_QUANTILE=${TEACHER_NLL_CALIBRATION_QUANTILE:-0.75}
 TEACHER_NLL_CALIBRATION_WINDOW=${TEACHER_NLL_CALIBRATION_WINDOW:-256}
 TEACHER_NLL_CALIBRATION_MIN_SAMPLES=${TEACHER_NLL_CALIBRATION_MIN_SAMPLES:-16}
@@ -322,6 +323,7 @@ case "$DEBUG_MODE" in
             "distillation.intervention.outcome_correctness_key=${OUTCOME_CORRECTNESS_KEY}"
             "distillation.intervention.outcome_correctness_threshold=${OUTCOME_CORRECTNESS_THRESHOLD}"
             "distillation.intervention.teacher_candidate_count=${TEACHER_CANDIDATE_COUNT}"
+            "distillation.intervention.teacher_candidate_max_concurrency_per_worker=${TEACHER_CANDIDATE_MAX_CONCURRENCY_PER_WORKER}"
             "distillation.intervention.teacher_nll_calibration_quantile=${TEACHER_NLL_CALIBRATION_QUANTILE}"
             "distillation.intervention.teacher_nll_calibration_window=${TEACHER_NLL_CALIBRATION_WINDOW}"
             "distillation.intervention.teacher_nll_calibration_min_samples=${TEACHER_NLL_CALIBRATION_MIN_SAMPLES}"

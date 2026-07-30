@@ -2636,6 +2636,15 @@ def compute_intervention_metrics(
         )
     if candidate_records:
         metrics["opd_intervention/candidates/set_count"] = float(len(candidate_records))
+        rpc_concurrency_limits = [
+            float(item["candidate_rpc_max_concurrency_per_worker"])
+            for item in candidate_records
+            if item.get("candidate_rpc_max_concurrency_per_worker") is not None
+        ]
+        if rpc_concurrency_limits:
+            metrics["opd_intervention/candidates/rpc_max_concurrency_per_worker"] = float(
+                np.mean(rpc_concurrency_limits)
+            )
         for field, metric_name in (
             ("candidate_count_requested", "requested"),
             ("candidate_count_generated", "generated"),

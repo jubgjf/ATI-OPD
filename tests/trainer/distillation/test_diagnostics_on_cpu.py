@@ -913,6 +913,7 @@ def test_compute_intervention_metrics_aggregates_outcome_and_candidate_selection
                 "student_suffix_tokens": 4,
                 "candidate_selection_enabled": True,
                 "candidate_count_requested": 4,
+                "candidate_rpc_max_concurrency_per_worker": 2,
                 "candidate_count_generated": 4,
                 "candidate_count_teacher_nll_valid": 4,
                 "candidate_count_threshold_eligible": 2,
@@ -941,6 +942,7 @@ def test_compute_intervention_metrics_aggregates_outcome_and_candidate_selection
                 "reason": "teacher_candidates_above_nll_threshold",
                 "candidate_selection_enabled": True,
                 "candidate_count_requested": 4,
+                "candidate_rpc_max_concurrency_per_worker": 2,
                 "candidate_count_generated": 4,
                 "candidate_count_teacher_nll_valid": 4,
                 "candidate_count_threshold_eligible": 0,
@@ -989,6 +991,7 @@ def test_compute_intervention_metrics_aggregates_outcome_and_candidate_selection
     assert metrics["opd_intervention/outcome/repair_effective_fraction"] == 1.0
     assert metrics["opd_intervention/outcome/repair_coverage_of_raw_wrong"] == 0.5
     assert metrics["opd_intervention/candidates/set_count"] == 2
+    assert metrics["opd_intervention/candidates/rpc_max_concurrency_per_worker"] == 2
     assert metrics["opd_intervention/candidates/requested_count"] == 8
     assert metrics["opd_intervention/candidates/threshold_eligible_count"] == 2
     assert metrics["opd_intervention/candidates/teacher_nll_threshold_mean"] == pytest.approx(0.45)
