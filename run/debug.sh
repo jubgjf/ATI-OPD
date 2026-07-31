@@ -228,6 +228,7 @@ PROJECT_NAME=${PROJECT_NAME:-DMPD-debug}
 WANDB_MODE=${WANDB_MODE:-disabled}
 WANDB_DISABLED=${WANDB_DISABLED:-true}
 WANDB_DIR=${WANDB_DIR:-}
+WANDB_DATA_DIR=${WANDB_DATA_DIR:-}
 WANDB_ENTITY=${WANDB_ENTITY:-}
 WANDB_CONFIG_MODE=${WANDB_CONFIG_MODE:-full}
 WANDB_RUN_ID=${WANDB_RUN_ID:-}
@@ -252,6 +253,9 @@ EXPERIMENT_TIMESTAMP=${EXPERIMENT_TIMESTAMP:-$(date +"%Y%m%d-%H%M%S")}
 EXPERIMENT_BASE_NAME=${EXPERIMENT_NAME:-"debug-${DEBUG_MODE}"}
 EXPERIMENT_FULL_NAME=${EXPERIMENT_FULL_NAME:-"${EXPERIMENT_BASE_NAME}-${EXPERIMENT_TIMESTAMP}"}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-"/tmp/verl_debug/${EXPERIMENT_FULL_NAME}"}
+if [[ -z "$WANDB_DATA_DIR" && -n "$WANDB_DIR" ]]; then
+    WANDB_DATA_DIR="${WANDB_DIR%/}/wandb-data/${EXPERIMENT_FULL_NAME}"
+fi
 
 case "$DEBUG_MODE" in
     vanilla | opd)
@@ -536,6 +540,11 @@ if [[ -n "$WANDB_DIR" ]]; then
 mkdir -p $(printf "%q" "$WANDB_DIR")
 "
 fi
+if [[ -n "$WANDB_DATA_DIR" ]]; then
+    REMOTE_CMD+="export WANDB_DATA_DIR=$(printf "%q" "$WANDB_DATA_DIR")
+mkdir -p $(printf "%q" "$WANDB_DATA_DIR")
+"
+fi
 if [[ -n "$WANDB_ENTITY" ]]; then
     REMOTE_CMD+="export WANDB_ENTITY=$(printf "%q" "$WANDB_ENTITY")
 "
@@ -580,7 +589,7 @@ cat <<EOF
   attention:    ${ATTN_IMPLEMENTATION}, vllm backend ${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}
   diagnostics:  log every ${OPD_DIAGNOSTICS_LOG_INTERVAL}, topk every ${OPD_DIAGNOSTICS_TOPK_LOG_INTERVAL}, repetition=${OPD_DIAGNOSTICS_COLLECT_REPETITION}, async=${OPD_DIAGNOSTICS_ASYNC_METRICS}
   metric logs:  mode=${METRIC_LOGGING_MODE}, archive=${METRIC_LOGGING_ARCHIVE_ENABLED}, shard_interval=${METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS}, upload=${METRIC_LOGGING_ARCHIVE_UPLOAD_TO_WANDB}
-  wandb/ckpt:   WANDB_MODE=${WANDB_MODE}, WANDB_DIR=${WANDB_DIR:-default}, run_id=${WANDB_RUN_ID:-unset}, resume=${WANDB_RESUME:-unset}, save_freq=${SAVE_FREQ}
+  wandb/ckpt:   WANDB_MODE=${WANDB_MODE}, WANDB_DIR=${WANDB_DIR:-default}, WANDB_DATA_DIR=${WANDB_DATA_DIR:-default}, run_id=${WANDB_RUN_ID:-unset}, resume=${WANDB_RESUME:-unset}, save_freq=${SAVE_FREQ}
   val logging:  test_freq=${TEST_FREQ}, samples=${VAL_MAX_SAMPLES}, table_preview_rows=${LOG_VAL_GENERATIONS}
   benchmarks:   before_train=${TEST_BEFORE_TRAIN}, freq=${TEST_BENCHMARKS_FREQ}, n=${TEST_N}, names=${TEST_BENCHMARKS}
 EOF

@@ -27,6 +27,7 @@ def test_get_ppo_ray_runtime_env_skips_wandb_vars_already_set_by_job(monkeypatch
                 "runtime_env": {
                     "working_dir": "gcs://_ray_pkg_test.zip",
                     "env_vars": {
+                        "WANDB_DATA_DIR": "/shared/wandb-data",
                         "WANDB_RESUME": "must",
                         "WANDB_RUN_ID": "resume-run-id",
                     },
@@ -37,12 +38,14 @@ def test_get_ppo_ray_runtime_env_skips_wandb_vars_already_set_by_job(monkeypatch
     monkeypatch.setenv("WANDB_RESUME", "must")
     monkeypatch.setenv("WANDB_RUN_ID", "resume-run-id")
     monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_DATA_DIR", "/shared/wandb-data")
 
     runtime_env = get_ppo_ray_runtime_env()
 
     assert "working_dir" not in runtime_env
     assert "WANDB_RESUME" not in runtime_env["env_vars"]
     assert "WANDB_RUN_ID" not in runtime_env["env_vars"]
+    assert "WANDB_DATA_DIR" not in runtime_env["env_vars"]
     assert runtime_env["env_vars"]["WANDB_MODE"] == "offline"
 
 
@@ -50,9 +53,11 @@ def test_get_ppo_ray_runtime_env_passes_through_wandb_vars_without_job_runtime_e
     monkeypatch.delenv(RAY_JOB_CONFIG_JSON_ENV_VAR, raising=False)
     monkeypatch.setenv("WANDB_RESUME", "must")
     monkeypatch.setenv("WANDB_RUN_ID", "resume-run-id")
+    monkeypatch.setenv("WANDB_DATA_DIR", "/shared/wandb-data")
 
     runtime_env = get_ppo_ray_runtime_env()
 
     assert runtime_env["working_dir"] is None
     assert runtime_env["env_vars"]["WANDB_RESUME"] == "must"
     assert runtime_env["env_vars"]["WANDB_RUN_ID"] == "resume-run-id"
+    assert runtime_env["env_vars"]["WANDB_DATA_DIR"] == "/shared/wandb-data"

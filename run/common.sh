@@ -57,6 +57,77 @@ _check_resume_required() {
     echo "Resume preflight passed: $latest_ckpt"
 }
 
+_configure_wandb_storage() {
+    local training_dataset_dir=${1%/}
+    local training_workspace=${2%/}
+    local run_name=$3
+    local wandb_mode=$4
+    local portable_workspace=
+
+    if [[ "$wandb_mode" == "offline" || "$wandb_mode" == "dryrun" ]]; then
+        # Offline .wandb files retain absolute Artifact staging paths. Spell those paths as the
+        # jump host sees them, and expose the same spelling inside the NPU container via a symlink.
+        local portable_dataset_dir=${WANDB_PORTABLE_DATASET_DIR:-/home/ma-user/work/dataset/jnguan}
+        portable_dataset_dir=${portable_dataset_dir%/}
+        if [[ -z "${WANDB_DIR:-}" || -z "${WANDB_DATA_DIR:-}" ]]; then
+            if [[ "$portable_dataset_dir" != "$training_dataset_dir" ]]; then
+                if [[ -e "$portable_dataset_dir" || -L "$portable_dataset_dir" ]]; then
+                    if [[ ! "$portable_dataset_dir" -ef "$training_dataset_dir" ]]; then
+                        echo "WANDB_PORTABLE_DATASET_DIR exists but does not resolve to the NPU dataset mount:" >&2
+                        echo "  portable=$portable_dataset_dir" >&2
+                        echo "  npu=$training_dataset_dir" >&2
+                        return 1
+                    fi
+                else
+                    mkdir -p "$(dirname "$portable_dataset_dir")"
+                    if ! ln -s "$training_dataset_dir" "$portable_dataset_dir"; then
+                        if [[ ! "$portable_dataset_dir" -ef "$training_dataset_dir" ]]; then
+                            echo "Failed to create a portable W&B path for the NPU dataset mount:" >&2
+                            echo "  portable=$portable_dataset_dir" >&2
+                            echo "  npu=$training_dataset_dir" >&2
+                            return 1
+                        fi
+                    fi
+                fi
+            fi
+            case "$training_workspace" in
+                "$training_dataset_dir"/*)
+                    portable_workspace="$portable_dataset_dir/${training_workspace#"$training_dataset_dir"/}"
+                    ;;
+                *)
+                    echo "Training workspace must be below the dataset mount for portable offline W&B storage:" >&2
+                    echo "  workspace=$training_workspace" >&2
+                    echo "  dataset_mount=$training_dataset_dir" >&2
+                    return 1
+                    ;;
+            esac
+        fi
+        WANDB_DIR=${WANDB_DIR:-$portable_workspace/wandb_logs}
+        WANDB_DATA_DIR=${WANDB_DATA_DIR:-$portable_workspace/wandb_logs/wandb-data/$run_name}
+    else
+        WANDB_DIR=${WANDB_DIR:-$training_workspace/wandb_logs}
+        WANDB_DATA_DIR=${WANDB_DATA_DIR:-$training_workspace/wandb_logs/wandb-data/$run_name}
+    fi
+
+    case "$WANDB_DIR" in
+        /*) ;;
+        *)
+            echo "WANDB_DIR must be an absolute path, got: $WANDB_DIR" >&2
+            return 1
+            ;;
+    esac
+    case "$WANDB_DATA_DIR" in
+        /*) ;;
+        *)
+            echo "WANDB_DATA_DIR must be an absolute path, got: $WANDB_DATA_DIR" >&2
+            return 1
+            ;;
+    esac
+
+    mkdir -p "$WANDB_DIR" "$WANDB_DATA_DIR"
+    export WANDB_DIR WANDB_DATA_DIR
+}
+
 run_npu_opd_job() {
     HOME=/home/ma-user
     DATASET_DIR=/opt/huawei/dataset/jnguan
@@ -267,7 +338,7 @@ run_npu_opd_job() {
 
     export WANDB_MODE=${WANDB_MODE:-online}
     export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
-    export WANDB_DIR=${WORKSPACE}
+    _configure_wandb_storage "$DATASET_DIR" "$WORKSPACE" "$experiment_name" "$WANDB_MODE" || exit 1
     case "$resume_required" in
         True)
             if [[ "$WANDB_MODE" == "offline" || "$WANDB_MODE" == "disabled" ]]; then
@@ -285,6 +356,7 @@ run_npu_opd_job() {
 
     echo "Metric logging: mode=$metric_logging_mode, archive=$metric_logging_archive_enabled, shard_interval=$metric_logging_archive_shard_interval_steps, upload=$metric_logging_archive_upload_to_wandb"
     echo "W&B resume: mode=$WANDB_MODE, required=$resume_required, run_id=${WANDB_RUN_ID:-unset}, resume=${WANDB_RESUME:-unset}"
+    echo "W&B storage: run_root=$WANDB_DIR, upload_staging_root=$WANDB_DATA_DIR"
 
     export NODE_RANK=${NODE_RANK:-$VC_TASK_INDEX}
     export MASTER_ADDR=${MASTER_ADDR:-"${MA_VJ_NAME}-${MA_TASK_NAME}-0.${MA_VJ_NAME}"}
@@ -557,6 +629,8 @@ _submit_npu_verl_job() {
                 "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
                 "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
                 "WANDB_MODE": "'"$WANDB_MODE"'",
+                "WANDB_DIR": "'"$WANDB_DIR"'",
+                "WANDB_DATA_DIR": "'"$WANDB_DATA_DIR"'",
                 "WANDB_RUN_ID": "'"$WANDB_RUN_ID"'",
                 "WANDB_RESUME": "'"$WANDB_RESUME"'"
             }
@@ -571,6 +645,8 @@ _submit_npu_verl_job() {
                 "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
                 "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
                 "WANDB_MODE": "'"$WANDB_MODE"'",
+                "WANDB_DIR": "'"$WANDB_DIR"'",
+                "WANDB_DATA_DIR": "'"$WANDB_DATA_DIR"'",
                 "WANDB_RUN_ID": "'"$WANDB_RUN_ID"'"
             }
         }'
@@ -583,7 +659,9 @@ _submit_npu_verl_job() {
                 "CUDA_DEVICE_MAX_CONNECTIONS": "1",
                 "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
                 "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
-                "WANDB_MODE": "'"$WANDB_MODE"'"
+                "WANDB_MODE": "'"$WANDB_MODE"'",
+                "WANDB_DIR": "'"$WANDB_DIR"'",
+                "WANDB_DATA_DIR": "'"$WANDB_DATA_DIR"'"
             }
         }'
     fi
