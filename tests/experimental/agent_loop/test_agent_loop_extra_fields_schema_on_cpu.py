@@ -887,6 +887,9 @@ class _DirectInterventionWorker:
         teacher_nll_calibration_min_samples: int = 2,
         teacher_nll_initial_threshold: Optional[float] = None,
         teacher_nll_healthy_probe_probability: float = 0.0,
+        repair_for_evaluation: bool = False,
+        collect_intervention_outcome_transitions: bool = False,
+        outcome_case_samples_per_transition: int = 8,
     ):
         self.tokenizer = _FakeTokenizer()
         self.rollout_config = OmegaConf.create({"prompt_length": 4, "response_length": response_length})
@@ -920,6 +923,7 @@ class _DirectInterventionWorker:
             teacher_nll_calibration_min_samples=teacher_nll_calibration_min_samples,
             teacher_nll_initial_threshold=teacher_nll_initial_threshold,
             teacher_nll_healthy_probe_probability=teacher_nll_healthy_probe_probability,
+            repair_for_evaluation=repair_for_evaluation,
             log_examples_per_worker=log_examples_per_worker,
         )
         self.teacher_server_manager = teacher_manager
@@ -931,6 +935,11 @@ class _DirectInterventionWorker:
                 log_prob_min_clamp=-10.0,
             ),
             diagnostics=SimpleNamespace(
+                enabled=collect_intervention_outcome_transitions,
+                collect_intervention_metrics=True,
+                collect_intervention_outcome_transitions=collect_intervention_outcome_transitions,
+                outcome_case_samples_per_transition=outcome_case_samples_per_transition,
+                log_interval=1,
                 collect_topk_overlap=diagnostics_topk is not None,
                 topk=diagnostics_topk or 64,
             ),
@@ -1054,6 +1063,31 @@ async def test_agent_loop_manager_globally_aggregates_and_broadcasts_teacher_nll
     assert all(worker.snapshot.version == 2 for worker in workers)
 
 
+def test_agent_loop_manager_caps_full_text_outcome_cases_per_transition_by_stable_rank_on_cpu():
+    manager = object.__new__(AgentLoopManager)
+    manager.config = OmegaConf.create({"distillation": {"diagnostics": {"outcome_case_samples_per_transition": 1}}})
+    output = DataProto.from_single_dict(
+        {
+            "dummy": torch.arange(5).unsqueeze(-1),
+            "teacher_intervention_outcome_case": np.array(
+                [
+                    {"transition": "pre_wrong_post_correct", "case_rank": 0.8},
+                    {"transition": "pre_wrong_post_correct", "case_rank": 0.2},
+                    {"transition": "pre_wrong_post_correct", "case_rank": 0.5},
+                    {"transition": "pre_correct_post_wrong", "case_rank": 0.7},
+                    {"transition": "pre_correct_post_wrong", "case_rank": 0.1},
+                ],
+                dtype=object,
+            ),
+        }
+    )
+
+    AgentLoopManager._cap_intervention_outcome_cases(manager, output)
+
+    cases = output.non_tensor_batch["teacher_intervention_outcome_case"].tolist()
+    assert [index for index, case in enumerate(cases) if case is not None] == [1, 4]
+
+
 class _SequenceAwareRewardMethod:
     def __init__(self):
         self.responses: list[list[int]] = []
@@ -1121,7 +1155,287 @@ async def test_outcome_aware_postprocess_scores_raw_then_repaired_answer_on_cpu(
     assert outcome["final_correct"] is True
     assert outcome["repair_effective"] is True
     assert outcome["repair_ineffective"] is False
+    assert "transition_observation_event" not in outcome
+    assert "raw_reward_extra_info" not in outcome
+    assert "transition" not in outcome
+    assert "_teacher_segment_ids" not in internal.extra_fields["teacher_interventions"][0]
     assert internal.extra_fields["teacher_interventions"][0]["sample_outcome_summary"] is True
+
+
+@pytest.mark.asyncio
+async def test_intervention_outcome_diagnostics_scores_raw_and_final_without_outcome_gate_on_cpu():
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[31, 31], finish_reason="length"),
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        collect_intervention_outcome_transitions=True,
+    )
+    # Collection covers every training sample; log_interval only controls
+    # when the aggregate diagnostics are emitted.
+    worker.distillation_config.diagnostics.log_interval = 100
+    reward_handle = _SequenceAwareRewardHandle()
+    worker.reward_loop_worker_handles = [reward_handle]
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "diagnostic-raw-final"},
+    )
+
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        data_source="openai/gsm8k",
+        uid="uid-diagnostic",
+        global_steps=4,
+    )
+
+    assert reward_handle.compute_score.responses == [[1, 2, 3, 4, 5, 6], [31, 31, 40, 41]]
+    assert internal.reward_score == 1.0
+    outcome = internal.extra_fields["teacher_intervention_outcome"]
+    assert outcome["raw_reward_score"] == 0.0
+    assert outcome["final_reward_score"] == 1.0
+    assert outcome["transition"] == "pre_wrong_post_correct"
+    assert outcome["intervention_count"] == 1
+    assert outcome["repair_executed"] is True
+    training_batch = AgentLoopWorker._postprocess(worker, [internal], validate=False)
+    assert training_batch.batch["rm_scores"].sum().item() == 1.0
+    assert "raw_reward_score" not in training_batch.batch
+    assert training_batch.non_tensor_batch["teacher_intervention_outcome"][0]["raw_reward_score"] == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_answer_token", "teacher_answer_token", "expected_transition"),
+    [
+        (31, 31, "pre_correct_post_correct"),
+        (31, 30, "pre_correct_post_wrong"),
+        (1, 31, "pre_wrong_post_correct"),
+        (1, 30, "pre_wrong_post_wrong"),
+    ],
+)
+async def test_intervention_outcome_diagnostics_classifies_all_four_transitions_on_cpu(
+    raw_answer_token,
+    teacher_answer_token,
+    expected_transition,
+):
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[teacher_answer_token, teacher_answer_token], finish_reason="length"),
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        collect_intervention_outcome_transitions=True,
+    )
+    reward_handle = _SequenceAwareRewardHandle()
+    worker.reward_loop_worker_handles = [reward_handle]
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[raw_answer_token, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": f"transition-{expected_transition}"},
+    )
+
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        data_source="openai/gsm8k",
+        global_steps=3,
+    )
+
+    assert len(reward_handle.compute_score.responses) == 2
+    assert internal.extra_fields["teacher_intervention_outcome"]["transition"] == expected_transition
+
+
+@pytest.mark.asyncio
+async def test_intervention_outcome_diagnostics_reuses_raw_reward_when_no_repair_on_cpu():
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[31, 31], finish_reason="length"),
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        gap_threshold=10.0,
+        collect_intervention_outcome_transitions=True,
+    )
+    reward_handle = _SequenceAwareRewardHandle()
+    worker.reward_loop_worker_handles = [reward_handle]
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[31, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "diagnostic-no-repair"},
+    )
+
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        data_source="openai/gsm8k",
+        global_steps=4,
+    )
+
+    assert reward_handle.compute_score.responses == [[31, 2, 3, 4, 5, 6]]
+    assert internal.reward_score == 1.0
+    outcome = internal.extra_fields["teacher_intervention_outcome"]
+    assert outcome["transition"] == "not_repaired"
+    assert outcome["repair_executed"] is False
+    assert outcome["raw_reward_score"] == outcome["final_reward_score"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_repair_evaluation_forks_one_raw_response_and_discards_detection_logprobs_on_cpu():
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[31, 31], finish_reason="length"),
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        repair_for_evaluation=True,
+    )
+    reward_handle = _SequenceAwareRewardHandle()
+    worker.reward_loop_worker_handles = [reward_handle]
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "paired-evaluation"},
+    )
+
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        output,
+        validate=True,
+        repair_for_evaluation=True,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        data_source="openai/gsm8k",
+        uid="paired-uid",
+        global_steps=0,
+    )
+
+    assert reward_handle.compute_score.responses == [[1, 2, 3, 4, 5, 6], [31, 31, 40, 41]]
+    assert internal.response_logprobs is None
+    assert internal.teacher_segment_mask is None
+    assert internal.teacher_ids is None
+    assert internal.teacher_logprobs is None
+    assert internal.teacher_sampled_ids is None
+    assert internal.teacher_sampled_logprobs is None
+    assert "teacher_logprob_nonfinite_positions" not in internal.extra_fields
+    outcome = internal.extra_fields["teacher_intervention_outcome"]
+    assert outcome["evaluation_pair"] is True
+    assert outcome["raw_response"] == "<decoded>"
+    assert outcome["transition"] == "pre_wrong_post_correct"
+
+
+@pytest.mark.asyncio
+async def test_validation_without_repair_flag_preserves_legacy_no_teacher_path_on_cpu():
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[31, 31], finish_reason="length"),
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        repair_for_evaluation=True,
+    )
+    reward_handle = _SequenceAwareRewardHandle()
+    worker.reward_loop_worker_handles = [reward_handle]
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "legacy-validation"},
+    )
+
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        output,
+        validate=True,
+        repair_for_evaluation=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        data_source="openai/gsm8k",
+    )
+
+    assert reward_handle.compute_score.responses == [[1, 2, 3, 4, 5, 6]]
+    assert teacher_manager.scored_sequences == []
+    assert teacher_manager.generated_prefixes == []
+    assert "teacher_intervention_outcome" not in internal.extra_fields
+    assert "teacher_intervention_count" not in internal.extra_fields
+
+
+@pytest.mark.asyncio
+async def test_outcome_aware_repair_evaluation_reads_but_does_not_update_calibration_on_cpu():
+    teacher_manager = _CandidateSelectionTeacherManager(
+        [[30, 30], [31, 31], [32, 32], [33, 33]],
+        teacher_nll_by_token={30: 0.1, 31: 0.2, 32: 0.3, 33: 0.8},
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        outcome_aware_candidate_selection_enabled=True,
+        repair_for_evaluation=True,
+    )
+    AgentLoopWorker.set_teacher_nll_calibration_state(
+        worker,
+        _TeacherNLLCalibrationSnapshot(
+            threshold=0.5,
+            source="rolling_healthy_quantile",
+            count=16,
+            version=3,
+        ),
+    )
+    worker.llm_client = _CandidateSelectionStudentClient(student_nll_by_token={30: 0.4, 31: 0.1, 32: 0.2, 33: 0.05})
+    reward_handle = _SequenceAwareRewardHandle()
+    worker.reward_loop_worker_handles = [reward_handle]
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "oracle-evaluation"},
+    )
+
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        output,
+        validate=True,
+        repair_for_evaluation=True,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        data_source="openai/gsm8k",
+        global_steps=0,
+    )
+
+    assert worker._teacher_nll_pending_updates == []
+    outcome = internal.extra_fields["teacher_intervention_outcome"]
+    assert outcome["oracle_gate_used"] is True
+    assert outcome["transition"] == "pre_wrong_post_correct"
+    intervention = internal.extra_fields["teacher_interventions"][0]
+    assert intervention["teacher_nll_calibration_read_only"] is True
+    assert intervention["teacher_nll_calibration_count_before"] == 16
+    assert intervention["teacher_nll_calibration_version"] == 3
 
 
 @pytest.mark.asyncio
@@ -1440,6 +1754,11 @@ async def test_agent_loop_postprocess_repairs_high_gap_segment_on_cpu():
     assert internal.extra_fields["teacher_intervention_count"] == 1
     assert internal.extra_fields["teacher_logprob_nonfinite_count"] == 1
     assert internal.extra_fields["teacher_logprob_nonfinite_positions"] == [4]
+    training_batch = AgentLoopWorker._postprocess(worker, [internal], validate=False)
+    serialized_intervention = training_batch.non_tensor_batch["teacher_interventions"][0][0]
+    assert "_original_student_segment_ids" not in serialized_intervention
+    assert "_teacher_segment_ids" not in serialized_intervention
+    assert "teacher_intervention_outcome_case" not in training_batch.non_tensor_batch
 
 
 @pytest.mark.asyncio
@@ -2427,6 +2746,55 @@ async def test_teacher_intervention_sft_preserves_provenance_across_multiple_rep
     assert first_intervention["local_effect_pair_available"] is True
     assert second_intervention["local_effect_pair_available"] is False
     assert second_intervention["local_effect_unavailable_reason"] == "no_no_current_intervention_tokens"
+
+
+@pytest.mark.asyncio
+async def test_multiple_repairs_produce_one_sample_transition_and_one_final_reward_recompute_on_cpu():
+    class _SequentialGapTeacherManager(_FixedGapTeacherManager):
+        async def compute_teacher_logprobs_single(self, *args, **kwargs):
+            gap_starts = [2, 4, 99]
+            self.high_gap_start = gap_starts[min(len(self.scored_sequences), len(gap_starts) - 1)]
+            return await super().compute_teacher_logprobs_single(*args, **kwargs)
+
+    teacher_manager = _SequentialGapTeacherManager(
+        TeacherGenerationResult(token_ids=[31], stop_reason="completed", finish_reason="length"),
+        high_gap_width=1,
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=8,
+        student_segment_length=1,
+        teacher_segment_length=1,
+        max_interventions_per_sample=2,
+        collect_intervention_outcome_transitions=True,
+    )
+    reward_handle = _SequenceAwareRewardHandle()
+    worker.reward_loop_worker_handles = [reward_handle]
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "multiple-repair-outcome"},
+    )
+
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        data_source="openai/gsm8k",
+        global_steps=2,
+    )
+
+    assert len(reward_handle.compute_score.responses) == 2
+    assert internal.extra_fields["teacher_intervention_count"] == 2
+    outcome = internal.extra_fields["teacher_intervention_outcome"]
+    assert outcome["intervention_count"] == 2
+    assert outcome["transition"] == "pre_wrong_post_correct"
+    assert sum(bool(item.get("sample_outcome_summary")) for item in internal.extra_fields["teacher_interventions"]) == 1
 
 
 @pytest.mark.asyncio

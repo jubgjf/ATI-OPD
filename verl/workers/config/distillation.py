@@ -216,6 +216,10 @@ class DistillationInterventionConfig(BaseConfig):
     teacher_temperature: float = 0.6
     teacher_top_p: float = 0.95
     teacher_top_k: int = 20
+    # Opt-in paired student/repair evaluation. The raw student rollout remains
+    # the canonical validation result; the repaired branch is reported under a
+    # separate metric namespace.
+    repair_for_evaluation: bool = False
     # Opt-in outcome-aware candidate selection. Keeping this disabled preserves
     # the legacy one-teacher-segment intervention path exactly.
     outcome_aware_candidate_selection_enabled: bool = False
@@ -313,6 +317,8 @@ class DistillationInterventionConfig(BaseConfig):
             raise ValueError(f"teacher_top_p must be in (0, 1], got {self.teacher_top_p!r}.")
         if self.teacher_top_k < -1:
             raise ValueError(f"teacher_top_k must be -1 or non-negative, got {self.teacher_top_k!r}.")
+        if self.repair_for_evaluation and not self.enabled:
+            raise ValueError("repair_for_evaluation=true requires distillation.intervention.enabled=true.")
         if self.outcome_aware_candidate_selection_enabled and not self.enabled:
             raise ValueError(
                 "outcome_aware_candidate_selection_enabled=true requires distillation.intervention.enabled=true."
@@ -373,6 +379,8 @@ class DistillationDiagnosticsConfig(BaseConfig):
     log_wandb_heatmap: bool = True
     high_gap_threshold: float = 1.0
     collect_intervention_metrics: bool = True
+    collect_intervention_outcome_transitions: bool = False
+    outcome_case_samples_per_transition: int = 8
     collect_topk_overlap: bool = False
     collect_rethinking_opd_metrics: bool = False
     collect_repetition_metrics: bool = True
@@ -410,6 +418,8 @@ class DistillationDiagnosticsConfig(BaseConfig):
             raise ValueError(
                 f"diagnostics.high_gap_threshold must be finite and non-negative, got {self.high_gap_threshold!r}."
             )
+        if self.outcome_case_samples_per_transition < 0:
+            raise ValueError("diagnostics.outcome_case_samples_per_transition must be non-negative.")
         if self.topk is not None and self.topk <= 0:
             raise ValueError("diagnostics.topk must be positive.")
         if self.repetition_tail_chars <= 0:

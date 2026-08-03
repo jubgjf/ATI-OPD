@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import asyncio
 import copy
+import hashlib
 import json
 import os
 import shlex
@@ -186,7 +187,7 @@ class _PendingOpdDiagnostics:
 
 
 @dataclass(frozen=True, slots=True)
-class _PendingGenerationArchive:
+class _PendingEventRecordsArchive:
     global_step: int
     metric_key: str
     records: tuple[dict[str, Any], ...]
@@ -525,6 +526,209 @@ def _build_generation_archive_records(
                 record[key] = values[sample_index]
         records.append(record)
     return records
+
+
+def _as_sample_values(values: Any, *, sample_count: int, field_name: str) -> list[Any]:
+    if isinstance(values, np.ndarray):
+        result = values.tolist()
+    elif isinstance(values, torch.Tensor):
+        result = values.detach().cpu().tolist()
+    elif isinstance(values, list | tuple):
+        result = list(values)
+    else:
+        result = [values]
+    if not isinstance(result, list):
+        result = [result]
+    if len(result) != sample_count:
+        raise ValueError(
+            f"Evaluation reward field {field_name!r} must contain one value per sample: "
+            f"expected={sample_count}, got={len(result)}."
+        )
+    return result
+
+
+def _extend_reward_extra_infos(
+    destination: dict[str, list],
+    *,
+    scores: list[float],
+    per_sample_infos: list[dict[str, Any]],
+) -> None:
+    """Append a batch of aligned reward records while preserving missing keys."""
+    if len(scores) != len(per_sample_infos):
+        raise ValueError(
+            "Evaluation reward scores and per-sample extra info must align: "
+            f"scores={len(scores)}, extra_infos={len(per_sample_infos)}."
+        )
+    prior_count = len(destination.get("reward", []))
+    new_keys = {key for info in per_sample_infos for key in info} - {"reward"}
+    for key in new_keys:
+        destination.setdefault(key, [None] * prior_count)
+    destination.setdefault("reward", []).extend(scores)
+    known_keys = set(destination) - {"reward"}
+    for info in per_sample_infos:
+        for key in known_keys:
+            destination[key].append(info.get(key))
+
+
+def _reward_info_dict_to_samples(reward_extra_info: dict[str, Any], *, sample_count: int) -> list[dict[str, Any]]:
+    result = [{} for _ in range(sample_count)]
+    for key, values in reward_extra_info.items():
+        normalized = _as_sample_values(values, sample_count=sample_count, field_name=key)
+        for index, value in enumerate(normalized):
+            result[index][key] = value
+    return result
+
+
+def _build_repair_evaluation_archive_records(
+    *,
+    evaluation_scope: str,
+    global_step: int,
+    inputs: list[str],
+    ground_truths: list[Any],
+    raw_outputs: list[str],
+    final_outputs: list[str],
+    raw_scores: list[float],
+    final_scores: list[float],
+    sample_uids: list[Any],
+    data_sources: list[Any],
+    outcomes: list[dict[str, Any]],
+    interventions: list[Any],
+    skipped_interventions: list[Any],
+    cases: list[Any],
+) -> list[dict[str, Any]]:
+    """Build compact paired records, adding full text only to selected cases."""
+    sample_count = len(inputs)
+    fields = {
+        "ground_truths": ground_truths,
+        "raw_outputs": raw_outputs,
+        "final_outputs": final_outputs,
+        "raw_scores": raw_scores,
+        "final_scores": final_scores,
+        "sample_uids": sample_uids,
+        "data_sources": data_sources,
+        "outcomes": outcomes,
+        "interventions": interventions,
+        "skipped_interventions": skipped_interventions,
+        "cases": cases,
+    }
+    mismatched = {name: len(values) for name, values in fields.items() if len(values) != sample_count}
+    if mismatched:
+        raise ValueError(
+            "Repair evaluation archive fields must have identical sample counts: "
+            f"inputs={sample_count}, mismatched={mismatched}."
+        )
+
+    records = []
+    for index in range(sample_count):
+        outcome = copy.deepcopy(outcomes[index])
+        outcome.pop("raw_response", None)
+        outcome.pop("_raw_response_ids", None)
+        record = {
+            "evaluation_scope": evaluation_scope,
+            "global_step": int(global_step),
+            "sample_index": index,
+            "uid": sample_uids[index],
+            "data_source": data_sources[index],
+            "raw_score": raw_scores[index],
+            "final_score": final_scores[index],
+            "raw_output_sha256": hashlib.sha256(raw_outputs[index].encode("utf-8")).hexdigest(),
+            "final_output_sha256": hashlib.sha256(final_outputs[index].encode("utf-8")).hexdigest(),
+            "outcome": outcome,
+            "interventions": interventions[index],
+            "skipped_interventions": skipped_interventions[index],
+            "oracle": bool(outcome.get("oracle_gate_used", False)),
+            "case_included": isinstance(cases[index], dict),
+        }
+        if isinstance(cases[index], dict):
+            record.update(
+                {
+                    "input": inputs[index],
+                    "ground_truth": ground_truths[index],
+                    "raw_output": raw_outputs[index],
+                    "final_output": final_outputs[index],
+                    "repair_segments": cases[index].get("repair_segments", []),
+                }
+            )
+        records.append(record)
+    return records
+
+
+def _build_training_intervention_outcome_archive_records(
+    *,
+    global_step: int,
+    outcomes: list[Any],
+    interventions: list[Any],
+    skipped_interventions: list[Any],
+    cases: list[Any],
+    sample_uids: list[Any],
+    data_sources: list[Any],
+    raw_prompts: list[Any],
+    reward_models: list[Any],
+) -> list[dict[str, Any]]:
+    """Build all-sample compact train records with bounded full-text cases."""
+    sample_count = len(outcomes)
+    fields = {
+        "interventions": interventions,
+        "skipped_interventions": skipped_interventions,
+        "cases": cases,
+        "sample_uids": sample_uids,
+        "data_sources": data_sources,
+        "raw_prompts": raw_prompts,
+        "reward_models": reward_models,
+    }
+    mismatched = {name: len(values) for name, values in fields.items() if len(values) != sample_count}
+    if mismatched:
+        raise ValueError(
+            "Training intervention archive fields must have identical sample counts: "
+            f"outcomes={sample_count}, mismatched={mismatched}."
+        )
+
+    records = []
+    for index, raw_outcome in enumerate(outcomes):
+        if not isinstance(raw_outcome, dict) or not raw_outcome.get("enabled"):
+            continue
+        outcome = copy.deepcopy(raw_outcome)
+        outcome.pop("raw_response", None)
+        outcome.pop("_raw_response_ids", None)
+        record = {
+            "global_step": int(global_step),
+            "sample_index": index,
+            "uid": sample_uids[index],
+            "data_source": data_sources[index],
+            "outcome": outcome,
+            "interventions": interventions[index],
+            "skipped_interventions": skipped_interventions[index],
+            "case_included": isinstance(cases[index], dict),
+        }
+        if isinstance(cases[index], dict):
+            reward_model = reward_models[index]
+            ground_truth = reward_model.get("ground_truth") if isinstance(reward_model, dict) else None
+            record.update(
+                {
+                    "raw_prompt": raw_prompts[index],
+                    "ground_truth": ground_truth,
+                    **dict(cases[index]),
+                }
+            )
+        records.append(record)
+    return records
+
+
+def _cap_ranked_outcome_cases(cases: list[Any], *, case_limit: int) -> list[Any]:
+    """Apply one deterministic per-transition case cap across a complete event."""
+    if case_limit < 0:
+        raise ValueError(f"case_limit must be non-negative, got {case_limit}.")
+    candidates: dict[str, list[tuple[float, int]]] = defaultdict(list)
+    for index, case in enumerate(cases):
+        if not isinstance(case, dict):
+            continue
+        transition = case.get("transition")
+        case_rank = case.get("case_rank")
+        if transition is None or case_rank is None:
+            continue
+        candidates[str(transition)].append((float(case_rank), index))
+    selected = {index for transition_cases in candidates.values() for _, index in sorted(transition_cases)[:case_limit]}
+    return [case if index in selected else None for index, case in enumerate(cases)]
 
 
 def _aggregate_generation_timing(timings: list[dict[str, Any]]) -> dict[str, float]:
@@ -992,7 +1196,8 @@ class RayPPOTrainer:
         self._metric_resume_step: int | None = None
         self._metric_artifact_uploader = None
         self._offline_live_metric_buffer: list[tuple[int, dict[str, Any]]] = []
-        self._pending_generation_archives: list[_PendingGenerationArchive] = []
+        self._pending_event_record_archives: list[_PendingEventRecordsArchive] = []
+        self._event_record_archive_warning_emitted = False
 
     def _create_dataloader(
         self,
@@ -1223,22 +1428,105 @@ class RayPPOTrainer:
 
         if evaluation_scope not in {"val", "test"}:
             return
+        # Preserve the historical generation-logging behavior outside balanced
+        # mode; the explicit warning below is reserved for newly requested
+        # intervention/paired-evaluation diagnostics.
         if (
-            self._metric_logging_settings.mode != "balanced"
+            not records
+            or self._metric_logging_settings.mode != "balanced"
             or getattr(self, "_metric_archive_writer", None) is None
-            or not records
         ):
             return
-        pending = getattr(self, "_pending_generation_archives", None)
+        self._queue_event_records_archive(
+            metric_key=f"{evaluation_scope}/generations_full",
+            records=records,
+        )
+
+    def _queue_event_records_archive(
+        self,
+        *,
+        metric_key: str,
+        records: list[dict[str, Any]],
+    ) -> None:
+        """Queue arbitrary detailed records for the current metric event."""
+        if not records:
+            return
+        if self._metric_logging_settings.mode != "balanced" or getattr(self, "_metric_archive_writer", None) is None:
+            if not getattr(self, "_event_record_archive_warning_emitted", False):
+                print(
+                    "WARNING: detailed intervention/evaluation event records require "
+                    "trainer.metric_logging.mode=balanced with metric archival enabled. Aggregated metrics "
+                    "will still be logged, but JSONL/Artifact records are unavailable for this run."
+                )
+                self._event_record_archive_warning_emitted = True
+            return
+        pending = getattr(self, "_pending_event_record_archives", None)
         if pending is None:
             pending = []
-            self._pending_generation_archives = pending
+            self._pending_event_record_archives = pending
         pending.append(
-            _PendingGenerationArchive(
+            _PendingEventRecordsArchive(
                 global_step=int(self.global_steps),
-                metric_key=f"{evaluation_scope}/generations_full",
-                records=tuple(dict(record) for record in records),
+                metric_key=metric_key,
+                records=tuple(copy.deepcopy(record) for record in records),
             )
+        )
+
+    def _queue_training_intervention_outcome_archive(
+        self,
+        *,
+        batch: DataProto,
+        global_steps: int,
+    ) -> None:
+        """Queue compact train outcomes and the bounded full-text case subset."""
+        diagnostics_config = self._distillation_diagnostics_config()
+        if not (
+            diagnostics_config is not None
+            and getattr(diagnostics_config, "collect_intervention_metrics", False)
+            and getattr(diagnostics_config, "collect_intervention_outcome_transitions", False)
+        ):
+            return
+
+        outcome_values = batch.non_tensor_batch.get("teacher_intervention_outcome")
+        if outcome_values is None:
+            raise RuntimeError(
+                "Intervention outcome diagnostics are enabled, but rollout output did not include "
+                "teacher_intervention_outcome. Check that the async DMPD agent-loop path is active."
+            )
+
+        sample_count = len(batch)
+
+        def values_or_default(key: str, default: Any) -> list[Any]:
+            values = batch.non_tensor_batch.get(key)
+            if values is None:
+                return [copy.deepcopy(default) for _ in range(sample_count)]
+            result = self._non_tensor_to_list(values)
+            if len(result) != sample_count:
+                raise RuntimeError(
+                    f"Training intervention archive field {key!r} has {len(result)} values for "
+                    f"batch_size={sample_count}."
+                )
+            return result
+
+        outcomes = self._non_tensor_to_list(outcome_values)
+        if len(outcomes) != sample_count or not all(isinstance(item, dict) for item in outcomes):
+            raise RuntimeError(
+                "Intervention outcome diagnostics require one complete outcome dictionary per training sample."
+            )
+        records = _build_training_intervention_outcome_archive_records(
+            global_step=global_steps,
+            outcomes=outcomes,
+            interventions=values_or_default("teacher_interventions", []),
+            skipped_interventions=values_or_default("teacher_intervention_skipped", []),
+            cases=values_or_default("teacher_intervention_outcome_case", None),
+            sample_uids=values_or_default("uid", None),
+            data_sources=values_or_default("data_source", "unknown"),
+            raw_prompts=values_or_default("raw_prompt", None),
+            reward_models=values_or_default("reward_model", None),
+        )
+        self._queue_event_records_archive(
+            metric_key="opd_intervention/outcome_pairs",
+            records=records,
         )
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
@@ -1282,11 +1570,36 @@ class RayPPOTrainer:
         do_sample: bool | None = None,
         generation_max_tokens: int | None = None,
         suppress_tracking: bool = False,
+        repair_for_evaluation: bool | None = None,
     ):
         if evaluation_mode not in {"val", "test"}:
             raise ValueError(f"evaluation_mode must be 'val' or 'test', got {evaluation_mode!r}.")
         dataloader = self.val_dataloader if dataloader is None else dataloader
-        generation_manager = generation_manager or self.async_rollout_manager
+        default_generation_manager = getattr(self, "async_rollout_manager", None)
+        uses_student_generation_manager = generation_manager is None or generation_manager is default_generation_manager
+        generation_manager = generation_manager or default_generation_manager
+        if generation_manager is None:
+            raise RuntimeError("Validation requires a generation manager.")
+        intervention_config = getattr(getattr(self, "distillation_config", None), "intervention", None)
+        configured_repair_evaluation = bool(
+            intervention_config is not None
+            and getattr(intervention_config, "enabled", False)
+            and getattr(intervention_config, "repair_for_evaluation", False)
+        )
+        repair_for_evaluation = (
+            uses_student_generation_manager and configured_repair_evaluation
+            if repair_for_evaluation is None
+            else bool(repair_for_evaluation)
+        )
+        if repair_for_evaluation and not (uses_student_generation_manager and configured_repair_evaluation):
+            raise ValueError(
+                "Paired repair evaluation requires the student generation manager and "
+                "distillation.intervention.repair_for_evaluation=true."
+            )
+        repair_metric_prefix = None
+        if repair_for_evaluation:
+            oracle_gate = bool(getattr(intervention_config, "outcome_aware_candidate_selection_enabled", False))
+            repair_metric_prefix = f"{metric_prefix}-oracle-repair" if oracle_gate else f"{metric_prefix}-repair"
         sampling_config = (
             self.config.actor_rollout_ref.rollout.test_kwargs
             if evaluation_mode == "test"
@@ -1314,6 +1627,15 @@ class RayPPOTrainer:
         sample_uids = []
         sample_response_lengths = []
         sample_finish_reasons = []
+        repair_outputs: list[str] = []
+        repair_scores: list[float] = []
+        repair_reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        repair_response_lengths: list[int] = []
+        repair_finish_reasons: list[Any] = []
+        repair_outcomes: list[dict[str, Any]] = []
+        repair_interventions: list[Any] = []
+        repair_skipped_interventions: list[Any] = []
+        repair_cases: list[Any] = []
         processed_samples = 0
 
         for test_data in dataloader:
@@ -1358,6 +1680,8 @@ class RayPPOTrainer:
                 "evaluation_mode": evaluation_mode,
                 "global_steps": self.global_steps,
             }
+            if repair_for_evaluation:
+                test_gen_batch.meta_info["repair_for_evaluation"] = True
             if generation_max_tokens is not None:
                 test_gen_batch.meta_info["generation_max_tokens"] = generation_max_tokens
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
@@ -1382,23 +1706,8 @@ class RayPPOTrainer:
 
             print("validation generation end")
 
-            # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            prior_output_count = len(sample_outputs)
-            output_count = len(output_texts)
-            sample_outputs.extend(output_texts)
-            if "response_mask" in test_output_gen_batch.batch:
-                sample_response_lengths.extend(
-                    [int(length) for length in test_output_gen_batch.batch["response_mask"].sum(dim=-1).cpu().tolist()]
-                )
-            if "finish_reason" in test_output_gen_batch.non_tensor_batch:
-                if len(sample_finish_reasons) < prior_output_count:
-                    sample_finish_reasons.extend([None] * (prior_output_count - len(sample_finish_reasons)))
-                sample_finish_reasons.extend(test_output_gen_batch.non_tensor_batch["finish_reason"].tolist())
-            elif sample_finish_reasons:
-                sample_finish_reasons.extend([None] * output_count)
-
+            final_output_ids = test_output_gen_batch.batch["responses"]
+            final_output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in final_output_ids]
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
@@ -1409,26 +1718,106 @@ class RayPPOTrainer:
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
 
-            # evaluate using reward_function
+            # The tensor batch is the repaired branch when paired evaluation is
+            # enabled, and the ordinary student branch otherwise.
             reward_tensor, reward_extra_info = extract_reward(test_batch)
+            final_scores = reward_tensor.sum(-1).cpu().tolist()
+            final_reward_infos = _reward_info_dict_to_samples(
+                reward_extra_info,
+                sample_count=len(final_scores),
+            )
 
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
+            if repair_for_evaluation:
+                outcome_values = test_output_gen_batch.non_tensor_batch.get("teacher_intervention_outcome")
+                if outcome_values is None:
+                    raise RuntimeError(
+                        "Paired repair evaluation did not receive teacher_intervention_outcome metadata from "
+                        "the agent-loop worker."
+                    )
+                batch_outcomes = outcome_values.tolist()
+                if len(batch_outcomes) != len(final_scores) or not all(
+                    isinstance(item, dict) and item.get("evaluation_pair") for item in batch_outcomes
+                ):
+                    raise RuntimeError(
+                        "Paired repair evaluation requires one complete raw/final outcome record per sample."
+                    )
+                batch_raw_outputs = [str(item["raw_response"]) for item in batch_outcomes]
+                batch_raw_scores = [float(item["raw_reward_score"]) for item in batch_outcomes]
+                batch_raw_infos = [dict(item.get("raw_reward_extra_info", {})) for item in batch_outcomes]
+                sample_outputs.extend(batch_raw_outputs)
+                sample_scores.extend(batch_raw_scores)
+                sample_response_lengths.extend(int(item["raw_response_length"]) for item in batch_outcomes)
+                sample_finish_reasons.extend(item.get("raw_finish_reason") for item in batch_outcomes)
+                _extend_reward_extra_infos(
+                    reward_extra_infos_dict,
+                    scores=batch_raw_scores,
+                    per_sample_infos=batch_raw_infos,
+                )
 
-            reward_extra_infos_dict["reward"].extend(scores)
-            for key, values in reward_extra_info.items():
-                if key not in reward_extra_infos_dict:
-                    reward_extra_infos_dict[key] = []
-                if isinstance(values, np.ndarray):
-                    reward_extra_infos_dict[key].extend(values.tolist())
-                else:
-                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
+                repair_outputs.extend(final_output_texts)
+                repair_scores.extend(final_scores)
+                repair_response_lengths.extend(int(item["final_response_length"]) for item in batch_outcomes)
+                repair_finish_reasons.extend(item.get("final_finish_reason") for item in batch_outcomes)
+                _extend_reward_extra_infos(
+                    repair_reward_extra_infos_dict,
+                    scores=final_scores,
+                    per_sample_infos=final_reward_infos,
+                )
+                repair_outcomes.extend(batch_outcomes)
+                repair_interventions.extend(
+                    test_output_gen_batch.non_tensor_batch.get(
+                        "teacher_interventions",
+                        np.asarray([[] for _ in batch_outcomes], dtype=object),
+                    ).tolist()
+                )
+                repair_skipped_interventions.extend(
+                    test_output_gen_batch.non_tensor_batch.get(
+                        "teacher_intervention_skipped",
+                        np.asarray([[] for _ in batch_outcomes], dtype=object),
+                    ).tolist()
+                )
+                repair_cases.extend(
+                    test_output_gen_batch.non_tensor_batch.get(
+                        "teacher_intervention_outcome_case",
+                        np.asarray([None for _ in batch_outcomes], dtype=object),
+                    ).tolist()
+                )
+            else:
+                prior_output_count = len(sample_outputs)
+                output_count = len(final_output_texts)
+                sample_outputs.extend(final_output_texts)
+                sample_scores.extend(final_scores)
+                if "response_mask" in test_output_gen_batch.batch:
+                    sample_response_lengths.extend(
+                        [
+                            int(length)
+                            for length in test_output_gen_batch.batch["response_mask"].sum(dim=-1).cpu().tolist()
+                        ]
+                    )
+                if "finish_reason" in test_output_gen_batch.non_tensor_batch:
+                    if len(sample_finish_reasons) < prior_output_count:
+                        sample_finish_reasons.extend([None] * (prior_output_count - len(sample_finish_reasons)))
+                    sample_finish_reasons.extend(test_output_gen_batch.non_tensor_batch["finish_reason"].tolist())
+                elif sample_finish_reasons:
+                    sample_finish_reasons.extend([None] * output_count)
+                _extend_reward_extra_infos(
+                    reward_extra_infos_dict,
+                    scores=final_scores,
+                    per_sample_infos=final_reward_infos,
+                )
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+
+        if repair_for_evaluation:
+            diagnostics_config = getattr(getattr(self, "distillation_config", None), "diagnostics", None)
+            repair_cases = _cap_ranked_outcome_cases(
+                repair_cases,
+                case_limit=int(getattr(diagnostics_config, "outcome_case_samples_per_transition", 0) or 0),
+            )
 
         sample_records = (
             _build_validation_sample_records(
@@ -1469,6 +1858,29 @@ class RayPPOTrainer:
                     evaluation_scope=metric_prefix,
                     records=generation_archive_records,
                 )
+            if repair_for_evaluation:
+                assert repair_metric_prefix is not None
+                flattened_data_sources = np.concatenate(data_source_lst, axis=0).tolist()
+                repair_archive_records = _build_repair_evaluation_archive_records(
+                    evaluation_scope=repair_metric_prefix,
+                    global_step=self.global_steps,
+                    inputs=sample_inputs,
+                    ground_truths=sample_gts,
+                    raw_outputs=sample_outputs,
+                    final_outputs=repair_outputs,
+                    raw_scores=sample_scores,
+                    final_scores=repair_scores,
+                    sample_uids=sample_uids,
+                    data_sources=flattened_data_sources,
+                    outcomes=repair_outcomes,
+                    interventions=repair_interventions,
+                    skipped_interventions=repair_skipped_interventions,
+                    cases=repair_cases,
+                )
+                self._queue_event_records_archive(
+                    metric_key=f"{repair_metric_prefix}/paired_outcomes",
+                    records=repair_archive_records,
+                )
             validation_media = self._maybe_log_val_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
@@ -1493,6 +1905,19 @@ class RayPPOTrainer:
 
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+        if repair_for_evaluation:
+            for key_info, lst in repair_reward_extra_infos_dict.items():
+                assert len(lst) == len(repair_scores), f"{key_info}: {len(lst)=}, {len(repair_scores)=}"
+            if not (
+                len(sample_scores)
+                == len(repair_scores)
+                == len(repair_outputs)
+                == len(repair_outcomes)
+                == len(repair_interventions)
+                == len(repair_skipped_interventions)
+                == len(repair_cases)
+            ):
+                raise RuntimeError("Paired repair evaluation accumulators became misaligned.")
 
         if merged:
             print("_merge_validation_results validate result will be merged")
@@ -1525,11 +1950,59 @@ class RayPPOTrainer:
                     prefix=f"{metric_prefix}-aux",
                 )
             )
+        if repair_for_evaluation:
+            assert repair_metric_prefix is not None
+            metrics.update(
+                self._val_metrics_update(
+                    data_sources,
+                    sample_uids,
+                    repair_reward_extra_infos_dict,
+                    sample_turns,
+                    metric_prefix=repair_metric_prefix,
+                    core_mean_only=True,
+                )
+            )
+            metrics.update(
+                self._repair_evaluation_pair_metrics(
+                    data_sources=data_sources,
+                    raw_reward_extra_infos=reward_extra_infos_dict,
+                    final_reward_extra_infos=repair_reward_extra_infos_dict,
+                    outcomes=repair_outcomes,
+                    metric_prefix=repair_metric_prefix,
+                    repeat_times=repeat_times,
+                )
+            )
+            if include_format_metrics:
+                for metric_name, value in _compute_validation_format_metrics(
+                    repair_outputs,
+                    repair_reward_extra_infos_dict,
+                ).items():
+                    metrics[f"{repair_metric_prefix}-aux/{metric_name}"] = value
+                validation_max_response_length = int(
+                    generation_max_tokens
+                    if generation_max_tokens is not None
+                    else self.config.actor_rollout_ref.rollout.response_length
+                )
+                metrics.update(
+                    compute_text_repetition_and_truncation_metrics(
+                        outputs=repair_outputs,
+                        response_lengths=repair_response_lengths,
+                        max_response_length=validation_max_response_length,
+                        finish_reasons=repair_finish_reasons,
+                        prefix=f"{repair_metric_prefix}-aux",
+                    )
+                )
         metrics.update(validation_media)
         return metrics
 
     def _val_metrics_update(
-        self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns, metric_prefix="val"
+        self,
+        data_sources,
+        sample_uids,
+        reward_extra_infos_dict,
+        sample_turns,
+        metric_prefix="val",
+        core_mean_only: bool = False,
     ):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
@@ -1540,7 +2013,10 @@ class RayPPOTrainer:
                 for metric_name, metric_val in metric2val.items():
                     if (
                         (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                        and any(
+                            metric_name.startswith(pfx)
+                            for pfx in (["mean"] if core_mean_only else ["mean", "maj", "best"])
+                        )
                         and (f"@{n_max}" in metric_name)
                     ):
                         metric_sec = f"{metric_prefix}-core"
@@ -1556,6 +2032,55 @@ class RayPPOTrainer:
             metric_dict[f"{metric_prefix}-aux/num_turns/mean"] = sample_turns.mean()
 
         return metric_dict
+
+    def _repair_evaluation_pair_metrics(
+        self,
+        *,
+        data_sources: np.ndarray,
+        raw_reward_extra_infos: dict[str, list],
+        final_reward_extra_infos: dict[str, list],
+        outcomes: list[dict[str, Any]],
+        metric_prefix: str,
+        repeat_times: int,
+    ) -> dict[str, float]:
+        """Compute paired deltas plus detailed repair transition summaries."""
+        core_var = "acc" if "acc" in raw_reward_extra_infos and "acc" in final_reward_extra_infos else "reward"
+        raw_values = np.asarray(raw_reward_extra_infos[core_var], dtype=np.float64)
+        final_values = np.asarray(final_reward_extra_infos[core_var], dtype=np.float64)
+        if raw_values.shape != final_values.shape or raw_values.shape[0] != len(outcomes):
+            raise RuntimeError(
+                "Paired repair evaluation values must align sample-for-sample: "
+                f"raw={raw_values.shape}, final={final_values.shape}, outcomes={len(outcomes)}."
+            )
+
+        metrics: dict[str, float] = {}
+        for data_source in dict.fromkeys(data_sources.tolist()):
+            indices = np.flatnonzero(data_sources == data_source)
+            source_outcomes = [outcomes[int(index)] for index in indices]
+            paired_delta = float((final_values[indices] - raw_values[indices]).mean())
+            metrics[f"{metric_prefix}-core/{data_source}/{core_var}/paired_delta@{repeat_times}"] = paired_delta
+
+            repaired = [item for item in source_outcomes if bool(item.get("repair_executed", False))]
+            repaired_count = len(repaired)
+            base = f"{metric_prefix}-aux/{data_source}/outcome"
+            metrics[f"{base}/sample_count"] = float(len(source_outcomes))
+            metrics[f"{base}/repair_executed_count"] = float(repaired_count)
+            metrics[f"{base}/repair_executed_fraction"] = repaired_count / max(len(source_outcomes), 1)
+            for transition in (
+                "pre_correct_post_correct",
+                "pre_correct_post_wrong",
+                "pre_wrong_post_correct",
+                "pre_wrong_post_wrong",
+            ):
+                count = sum(item.get("transition") == transition for item in repaired)
+                metrics[f"{base}/{transition}_count"] = float(count)
+                metrics[f"{base}/{transition}_fraction_among_repaired"] = (
+                    count / repaired_count if repaired_count else 0.0
+                )
+            rescued = sum(item.get("transition") == "pre_wrong_post_correct" for item in repaired)
+            harmed = sum(item.get("transition") == "pre_correct_post_wrong" for item in repaired)
+            metrics[f"{base}/net_accuracy_delta_all_samples"] = (rescued - harmed) / max(len(source_outcomes), 1)
+        return metrics
 
     def _validate_test_benchmarks(self, *, suppress_tracking: bool = False) -> dict[str, Any]:
         """Run the configured benchmark datasets through the student validation path."""
@@ -1648,6 +2173,7 @@ class RayPPOTrainer:
             include_format_metrics=True,
             generation_max_tokens=teacher_generation_max_tokens,
             suppress_tracking=suppress_tracking,
+            repair_for_evaluation=False,
         )
         assert teacher_metrics, f"{teacher_metrics=}"
         return teacher_metrics
@@ -3262,17 +3788,17 @@ class RayPPOTrainer:
                     metric_key=metric_key,
                 )
 
-    def _archive_pending_generation_records(self, *, global_step: int) -> None:
-        """Attach complete val/test outputs to the active metric shard."""
+    def _archive_pending_event_records(self, *, global_step: int) -> None:
+        """Attach queued detailed records to the active metric shard."""
 
-        pending = list(getattr(self, "_pending_generation_archives", ()))
+        pending = list(getattr(self, "_pending_event_record_archives", ()))
         if not pending:
             return
         stale = [item for item in pending if item.global_step < global_step]
         if stale:
             descriptions = [f"{item.metric_key}@{item.global_step}" for item in stale]
             raise RuntimeError(
-                "Generation archive records were not attached to their metric event before the trainer advanced: "
+                "Detailed archive records were not attached to their metric event before the trainer advanced: "
                 f"current_step={global_step}, pending={descriptions}."
             )
         ready = [item for item in pending if item.global_step == global_step]
@@ -3282,7 +3808,7 @@ class RayPPOTrainer:
                 global_step=global_step,
                 metric_key=item.metric_key,
             )
-        self._pending_generation_archives = [item for item in pending if item.global_step > global_step]
+        self._pending_event_record_archives = [item for item in pending if item.global_step > global_step]
 
     def _log_balanced_live_metrics(self, logger, live_metrics: dict[str, Any], *, step: int) -> None:
         run_info = logger.wandb_run_info
@@ -3352,7 +3878,7 @@ class RayPPOTrainer:
             checkpoint_step=self.global_steps if checkpoint_payload_path is not None else None,
         )
         self._archive_metric_event_files(route.live_metrics, global_step=self.global_steps)
-        self._archive_pending_generation_records(global_step=self.global_steps)
+        self._archive_pending_event_records(global_step=self.global_steps)
 
         if checkpoint_payload_path is not None:
             self._metric_archive_writer.commit_checkpoint(
@@ -3374,7 +3900,7 @@ class RayPPOTrainer:
             self._log_balanced_live_metrics(logger, route.live_metrics, step=self.global_steps)
 
     def _finalize_metric_logging(self, logger, *, interrupted: bool) -> None:
-        writer = self._metric_archive_writer
+        writer = getattr(self, "_metric_archive_writer", None)
         if writer is None:
             return
         try:
@@ -3739,6 +4265,10 @@ class RayPPOTrainer:
                                 batch=batch, entropy=opd_entropy, global_steps=self.global_steps
                             )
                             metrics.update(diagnostics_metrics)
+                            self._queue_training_intervention_outcome_archive(
+                                batch=batch,
+                                global_steps=self.global_steps,
+                            )
                         for diagnostics_key in ("student_topk_ids", "student_topk_logprobs"):
                             if diagnostics_key in batch.batch and not self._uses_token_reward_direct():
                                 batch.batch.pop(diagnostics_key)

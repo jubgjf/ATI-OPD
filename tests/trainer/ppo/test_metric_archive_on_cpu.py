@@ -29,6 +29,7 @@ from verl.trainer.ppo.metric_archive import (
     MetricLoggingSettings,
     MetricRouter,
     ShardState,
+    _parse_metric_dimensions,
     inspect_metric_archive,
 )
 
@@ -183,6 +184,46 @@ def test_balanced_router_warns_but_never_truncates_live_metrics(caplog):
 
     assert all(key in route.live_metrics for key in metrics)
     assert "exceeds warning threshold" in caplog.text
+
+
+def test_balanced_routing_keeps_only_fixed_outcome_and_paired_repair_surface_live_on_cpu():
+    outcome_prefix = "opd_intervention/outcome"
+    metrics = {
+        f"{outcome_prefix}/pre_correct_post_correct_fraction_among_repaired": 0.1,
+        f"{outcome_prefix}/pre_correct_post_wrong_fraction_among_repaired": 0.2,
+        f"{outcome_prefix}/pre_wrong_post_correct_fraction_among_repaired": 0.3,
+        f"{outcome_prefix}/pre_wrong_post_wrong_fraction_among_repaired": 0.4,
+        f"{outcome_prefix}/net_accuracy_delta_all_samples": 0.1,
+        f"{outcome_prefix}/sample_count": 32,
+        f"{outcome_prefix}/pre_wrong_post_correct_count": 3,
+        "test-repair-core/aime24/acc/mean@16": 0.5,
+        "test-repair-core/aime24/acc/paired_delta@16": 0.125,
+        "test-repair-core/aime24/acc/maj@16": 0.6,
+        "test-repair-aux/aime24/outcome/repair_executed_count": 8,
+        "val-oracle-repair-core/math/reward/mean@4": 0.75,
+        "val-oracle-repair-core/math/reward/paired_delta@4": 0.25,
+        "val-oracle-repair-aux/math/outcome/pre_wrong_post_correct_count": 2,
+    }
+
+    route = MetricRouter("balanced").route(metrics)
+
+    expected_live = {
+        f"{outcome_prefix}/pre_correct_post_correct_fraction_among_repaired",
+        f"{outcome_prefix}/pre_correct_post_wrong_fraction_among_repaired",
+        f"{outcome_prefix}/pre_wrong_post_correct_fraction_among_repaired",
+        f"{outcome_prefix}/pre_wrong_post_wrong_fraction_among_repaired",
+        f"{outcome_prefix}/net_accuracy_delta_all_samples",
+        "test-repair-core/aime24/acc/mean@16",
+        "test-repair-core/aime24/acc/paired_delta@16",
+        "val-oracle-repair-core/math/reward/mean@4",
+        "val-oracle-repair-core/math/reward/paired_delta@4",
+    }
+    assert expected_live <= set(route.live_metrics)
+    assert set(route.detailed_metrics) == set(metrics) - expected_live
+    assert _parse_metric_dimensions("test-repair-core/aime24/acc/mean@16")["eval_scope"] == "test-repair"
+    assert (
+        _parse_metric_dimensions("val-oracle-repair-aux/math/outcome/sample_count")["eval_scope"] == "val-oracle-repair"
+    )
 
 
 def test_23k_128_token_bins_and_bootstrap_metrics_collapse_to_small_live_surface():

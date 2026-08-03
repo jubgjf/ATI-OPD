@@ -120,6 +120,9 @@ intervention:
   teacher_temperature: 0.6
   teacher_top_p: 0.95
   teacher_top_k: 20
+  # Evaluate a paired repair branch from the exact same raw student rollout.
+  # The no-repair branch remains the canonical val/test result.
+  repair_for_evaluation: false
   # Opt-in outcome-aware candidate selection. If enabled, only incorrect
   # on-policy responses may be repaired. The teacher samples several short
   # candidates; a rolling NLL threshold calibrated on correct on-policy
@@ -164,6 +167,12 @@ diagnostics:
   log_wandb_heatmap: true
   high_gap_threshold: 1.0
   collect_intervention_metrics: true
+  # Score the raw response and the final response after all repairs, then
+  # report the four sample-level correctness transitions.
+  collect_intervention_outcome_transitions: false
+  # Maximum number of full-text cases retained for each transition per event.
+  # Compact numeric records are retained for every sample.
+  outcome_case_samples_per_transition: 8
   collect_topk_overlap: false
   collect_rethinking_opd_metrics: false
   collect_repetition_metrics: true

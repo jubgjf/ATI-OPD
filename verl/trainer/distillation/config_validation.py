@@ -35,6 +35,50 @@ def validate_distillation_intervention_training_config(config: Any) -> None:
     if not is_distillation_enabled(distillation_config):
         return
     intervention_enabled = bool(_get_nested(distillation_config, "intervention", "enabled", default=False))
+    repair_for_evaluation = bool(
+        _get_nested(distillation_config, "intervention", "repair_for_evaluation", default=False)
+    )
+    diagnostics_enabled = bool(_get_nested(distillation_config, "diagnostics", "enabled", default=False))
+    collect_intervention_metrics = bool(
+        _get_nested(distillation_config, "diagnostics", "collect_intervention_metrics", default=True)
+    )
+    collect_outcome_transitions = bool(
+        _get_nested(
+            distillation_config,
+            "diagnostics",
+            "collect_intervention_outcome_transitions",
+            default=False,
+        )
+    )
+    outcome_case_samples_per_transition = int(
+        _get_nested(
+            distillation_config,
+            "diagnostics",
+            "outcome_case_samples_per_transition",
+            default=8,
+        )
+    )
+    if outcome_case_samples_per_transition < 0:
+        raise ValueError("distillation.diagnostics.outcome_case_samples_per_transition must be non-negative.")
+    if repair_for_evaluation and not intervention_enabled:
+        raise ValueError(
+            "distillation.intervention.repair_for_evaluation=true requires distillation.intervention.enabled=true."
+        )
+    if collect_outcome_transitions and not intervention_enabled:
+        raise ValueError(
+            "distillation.diagnostics.collect_intervention_outcome_transitions=true requires "
+            "distillation.intervention.enabled=true."
+        )
+    if collect_outcome_transitions and not diagnostics_enabled:
+        raise ValueError(
+            "distillation.diagnostics.collect_intervention_outcome_transitions=true requires "
+            "distillation.diagnostics.enabled=true."
+        )
+    if collect_outcome_transitions and not collect_intervention_metrics:
+        raise ValueError(
+            "distillation.diagnostics.collect_intervention_outcome_transitions=true requires "
+            "distillation.diagnostics.collect_intervention_metrics=true."
+        )
     train_on_teacher_segments = bool(
         _get_nested(distillation_config, "intervention", "train_on_teacher_segments", default=False)
     )

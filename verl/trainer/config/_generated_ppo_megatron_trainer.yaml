@@ -895,6 +895,7 @@ distillation:
     teacher_temperature: 0.6
     teacher_top_p: 0.95
     teacher_top_k: 20
+    repair_for_evaluation: false
     outcome_aware_candidate_selection_enabled: false
     outcome_correctness_key: acc
     outcome_correctness_threshold: 0.5
@@ -919,6 +920,8 @@ distillation:
     log_wandb_heatmap: true
     high_gap_threshold: 1.0
     collect_intervention_metrics: true
+    collect_intervention_outcome_transitions: false
+    outcome_case_samples_per_transition: 8
     collect_topk_overlap: false
     collect_rethinking_opd_metrics: false
     collect_repetition_metrics: true

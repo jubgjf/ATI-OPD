@@ -393,7 +393,8 @@ def test_balanced_checkpoint_event_commits_ledger_before_tracker_and_replays_com
     trainer._metric_router = MetricRouter("balanced")
     trainer._metric_artifact_uploader = None
     trainer._offline_live_metric_buffer = []
-    trainer._pending_generation_archives = []
+    trainer._pending_event_record_archives = []
+    trainer._event_record_archive_warning_emitted = False
     trainer._queue_generation_archive(
         evaluation_scope="val",
         records=[{"input": "val question", "output": "complete val answer", "score": 1.0}],
@@ -401,6 +402,10 @@ def test_balanced_checkpoint_event_commits_ledger_before_tracker_and_replays_com
     trainer._queue_generation_archive(
         evaluation_scope="test",
         records=[{"input": "test question", "output": "complete test answer", "score": 0.0}],
+    )
+    trainer._queue_event_records_archive(
+        metric_key="opd_intervention/outcome_pairs",
+        records=[{"uid": "uid-1", "transition": "pre_wrong_post_correct"}],
     )
 
     class _Logger:
@@ -438,17 +443,35 @@ def test_balanced_checkpoint_event_commits_ledger_before_tracker_and_replays_com
     assert deliveries["bucket/bin/0000_0128/token_count"] == "archive"
     shard = trainer._metric_archive_writer.pending_upload_shards()[0]
     event_files = {item.metric_key: item for item in shard.event_files}
-    assert set(event_files) == {"val/generations_full", "test/generations_full"}
+    assert set(event_files) == {
+        "val/generations_full",
+        "test/generations_full",
+        "opd_intervention/outcome_pairs",
+    }
     with gzip.open(event_files["val/generations_full"].path, "rt", encoding="utf-8") as stream:
         assert [json.loads(line) for line in stream] == [
             {"input": "val question", "output": "complete val answer", "score": 1.0}
         ]
-    assert trainer._pending_generation_archives == []
+    assert trainer._pending_event_record_archives == []
     assert [backend for _data, _step, backend in logger.calls] == [["console"], ["wandb"]]
     assert all("bucket/bin/0000_0128/token_count" not in data for data, _step, _backend in logger.calls)
     session = trainer._metric_archive_writer.manifest["sessions"][trainer._metric_archive_writer.session_id]
     assert session["wandb_committed_ranges"] == [{"step_start": 2, "step_end": 2}]
     trainer._metric_archive_writer.close()
+
+
+def test_full_metric_mode_warns_once_when_detailed_event_archive_is_unavailable_on_cpu(capsys):
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.global_steps = 3
+    trainer._metric_logging_settings = MetricLoggingSettings.from_mapping({"mode": "full"})
+    trainer._metric_archive_writer = None
+    trainer._event_record_archive_warning_emitted = False
+
+    trainer._queue_event_records_archive(metric_key="opd_intervention/outcome_pairs", records=[{"uid": "one"}])
+    trainer._queue_event_records_archive(metric_key="test-repair/paired_outcomes", records=[{"uid": "two"}])
+
+    assert capsys.readouterr().out.count("JSONL/Artifact records are unavailable") == 1
+    assert trainer._event_record_archive_warning_emitted is True
 
 
 def test_offline_history_recovery_replays_heatmaps_but_not_generation_attachments_on_cpu(

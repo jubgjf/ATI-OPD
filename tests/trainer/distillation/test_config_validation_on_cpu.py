@@ -16,7 +16,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from verl.trainer.distillation.config_validation import validate_distillation_intervention_training_config
-from verl.workers.config import DistillationInterventionConfig, DistillationLossConfig
+from verl.workers.config import DistillationDiagnosticsConfig, DistillationInterventionConfig, DistillationLossConfig
 
 
 def test_teacher_segment_loss_config_defaults_to_legacy_opd_on_cpu():
@@ -40,6 +40,67 @@ def test_teacher_segment_loss_config_defaults_to_legacy_opd_on_cpu():
     assert config.teacher_nll_calibration_min_samples == 16
     assert config.teacher_nll_initial_threshold is None
     assert config.teacher_nll_healthy_probe_probability == 0.1
+    assert config.repair_for_evaluation is False
+
+
+def test_intervention_outcome_observation_config_defaults_and_validation_on_cpu():
+    diagnostics = DistillationDiagnosticsConfig()
+
+    assert diagnostics.collect_intervention_outcome_transitions is False
+    assert diagnostics.outcome_case_samples_per_transition == 8
+
+    with pytest.raises(ValueError, match="outcome_case_samples_per_transition"):
+        DistillationDiagnosticsConfig(outcome_case_samples_per_transition=-1)
+
+    with pytest.raises(ValueError, match="repair_for_evaluation=true"):
+        DistillationInterventionConfig(repair_for_evaluation=True)
+
+    enabled = DistillationInterventionConfig(enabled=True, repair_for_evaluation=True)
+    assert enabled.repair_for_evaluation is True
+
+    config = OmegaConf.create(
+        {
+            "distillation": {
+                "enabled": True,
+                "intervention": {"enabled": True},
+                "diagnostics": {"outcome_case_samples_per_transition": -1},
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="outcome_case_samples_per_transition"):
+        validate_distillation_intervention_training_config(config)
+
+
+@pytest.mark.parametrize(
+    ("intervention_enabled", "diagnostics_enabled", "collect_intervention_metrics", "error"),
+    [
+        (False, True, True, "intervention.enabled=true"),
+        (True, False, True, "diagnostics.enabled=true"),
+        (True, True, False, "collect_intervention_metrics=true"),
+    ],
+)
+def test_outcome_transition_cross_config_requires_intervention_diagnostics_and_metrics_on_cpu(
+    intervention_enabled,
+    diagnostics_enabled,
+    collect_intervention_metrics,
+    error,
+):
+    config = OmegaConf.create(
+        {
+            "distillation": {
+                "enabled": True,
+                "intervention": {"enabled": intervention_enabled},
+                "diagnostics": {
+                    "enabled": diagnostics_enabled,
+                    "collect_intervention_metrics": collect_intervention_metrics,
+                    "collect_intervention_outcome_transitions": True,
+                },
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match=error):
+        validate_distillation_intervention_training_config(config)
 
 
 def test_distillation_loss_config_preserves_legacy_only_stu_default_and_accepts_rethinking_style_on_cpu():

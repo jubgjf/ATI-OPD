@@ -990,6 +990,7 @@ def test_compute_intervention_metrics_aggregates_outcome_and_candidate_selection
     assert metrics["opd_intervention/outcome/repair_effective_count"] == 1
     assert metrics["opd_intervention/outcome/repair_effective_fraction"] == 1.0
     assert metrics["opd_intervention/outcome/repair_coverage_of_raw_wrong"] == 0.5
+    assert "opd_intervention/outcome/net_accuracy_delta_all_samples" not in metrics
     assert metrics["opd_intervention/candidates/set_count"] == 2
     assert metrics["opd_intervention/candidates/rpc_max_concurrency_per_worker"] == 2
     assert metrics["opd_intervention/candidates/requested_count"] == 8
@@ -998,6 +999,107 @@ def test_compute_intervention_metrics_aggregates_outcome_and_candidate_selection
     assert metrics["opd_intervention/candidates/calibration_version_max"] == 5
     assert metrics["opd_intervention/candidates/global_calibration_fraction"] == 1.0
     assert metrics["opd_intervention/candidates/invalid_count"] == 1
+
+
+def test_compute_intervention_metrics_reports_complete_correctness_transition_table_on_cpu():
+    transitions = [
+        (True, True),
+        (True, False),
+        (False, True),
+        (False, True),
+        (False, False),
+    ]
+    outcomes = [
+        {
+            "enabled": True,
+            "transition_observation_event": True,
+            "raw_correct": raw_correct,
+            "final_correct": final_correct,
+            "trigger_detected": True,
+            "repair_executed": True,
+            "transition": (
+                f"pre_{'correct' if raw_correct else 'wrong'}_post_{'correct' if final_correct else 'wrong'}"
+            ),
+        }
+        for raw_correct, final_correct in transitions
+    ]
+    outcomes.append(
+        {
+            "enabled": True,
+            "transition_observation_event": True,
+            "raw_correct": True,
+            "final_correct": True,
+            "trigger_detected": False,
+            "repair_executed": False,
+            "transition": "not_repaired",
+        }
+    )
+
+    metrics = compute_intervention_metrics(
+        intervention_counts=[1, 1, 1, 1, 1, 0],
+        interventions=[[], [], [], [], [], []],
+        intervention_skipped=[[], [], [], [], [], []],
+        intervention_outcomes=outcomes,
+        response_mask=torch.ones((6, 4), dtype=torch.bool),
+    )
+
+    prefix = "opd_intervention/outcome"
+    assert metrics[f"{prefix}/pre_correct_post_correct_count"] == 1
+    assert metrics[f"{prefix}/pre_correct_post_wrong_count"] == 1
+    assert metrics[f"{prefix}/pre_wrong_post_correct_count"] == 2
+    assert metrics[f"{prefix}/pre_wrong_post_wrong_count"] == 1
+    fractions = [
+        metrics[f"{prefix}/{transition}_fraction_among_repaired"]
+        for transition in (
+            "pre_correct_post_correct",
+            "pre_correct_post_wrong",
+            "pre_wrong_post_correct",
+            "pre_wrong_post_wrong",
+        )
+    ]
+    assert fractions == pytest.approx([0.2, 0.2, 0.4, 0.2])
+    assert sum(fractions) == pytest.approx(1.0)
+    assert metrics[f"{prefix}/net_accuracy_delta_all_samples"] == pytest.approx(1 / 6)
+
+
+def test_compute_intervention_metrics_emits_zero_transition_fractions_without_repairs_on_cpu():
+    metrics = compute_intervention_metrics(
+        intervention_counts=[0, 0],
+        interventions=[[], []],
+        intervention_skipped=[[], []],
+        intervention_outcomes=[
+            {
+                "enabled": True,
+                "transition_observation_event": True,
+                "raw_correct": True,
+                "repair_executed": False,
+                "repair_effective": False,
+                "repair_ineffective": False,
+                "transition": "not_repaired",
+            },
+            {
+                "enabled": True,
+                "transition_observation_event": True,
+                "raw_correct": False,
+                "final_correct": False,
+                "repair_executed": False,
+                "transition": "not_repaired",
+            },
+        ],
+        response_mask=torch.ones((2, 4), dtype=torch.bool),
+    )
+
+    prefix = "opd_intervention/outcome"
+    assert metrics[f"{prefix}/repair_executed_count"] == 0
+    assert metrics[f"{prefix}/final_correct_fraction"] == 0.5
+    assert metrics[f"{prefix}/net_accuracy_delta_all_samples"] == 0
+    for transition in (
+        "pre_correct_post_correct",
+        "pre_correct_post_wrong",
+        "pre_wrong_post_correct",
+        "pre_wrong_post_wrong",
+    ):
+        assert metrics[f"{prefix}/{transition}_fraction_among_repaired"] == 0
 
 
 def test_compute_intervention_metrics_aggregates_paired_local_effect_on_cpu():

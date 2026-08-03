@@ -2590,13 +2590,47 @@ def compute_intervention_metrics(
 
     outcomes = [item for item in (intervention_outcomes or []) if isinstance(item, dict) and item.get("enabled")]
     if outcomes:
+
+        def resolve_final_correct(item: dict[str, Any]) -> bool:
+            if "final_correct" in item:
+                return bool(item["final_correct"])
+            if item.get("repair_effective"):
+                return True
+            if item.get("repair_ineffective"):
+                return False
+            return bool(item.get("raw_correct", False))
+
+        def resolve_transition(item: dict[str, Any]) -> str:
+            transition = item.get("transition")
+            if transition:
+                return str(transition)
+            raw_is_correct = bool(item.get("raw_correct", False))
+            final_is_correct = resolve_final_correct(item)
+            if raw_is_correct:
+                return "pre_correct_post_correct" if final_is_correct else "pre_correct_post_wrong"
+            return "pre_wrong_post_correct" if final_is_correct else "pre_wrong_post_wrong"
+
         outcome_count = len(outcomes)
         raw_correct = sum(bool(item.get("raw_correct", False)) for item in outcomes)
         trigger_detected = sum(bool(item.get("trigger_detected", False)) for item in outcomes)
-        repair_executed = sum(bool(item.get("repair_executed", False)) for item in outcomes)
-        repair_effective = sum(bool(item.get("repair_effective", False)) for item in outcomes)
-        repair_ineffective = sum(bool(item.get("repair_ineffective", False)) for item in outcomes)
+        repaired_outcomes = [item for item in outcomes if bool(item.get("repair_executed", False))]
+        repair_executed = len(repaired_outcomes)
+        transition_counts = {
+            transition: sum(resolve_transition(item) == transition for item in repaired_outcomes)
+            for transition in (
+                "pre_correct_post_correct",
+                "pre_correct_post_wrong",
+                "pre_wrong_post_correct",
+                "pre_wrong_post_wrong",
+            )
+        }
+        pre_wrong_post_correct = transition_counts["pre_wrong_post_correct"]
+        pre_wrong_post_wrong = transition_counts["pre_wrong_post_wrong"]
+        repair_effective = pre_wrong_post_correct
+        repair_ineffective = pre_wrong_post_wrong
         raw_wrong = outcome_count - raw_correct
+        repaired_raw_wrong = pre_wrong_post_correct + pre_wrong_post_wrong
+        has_transition_observation = any(bool(item.get("transition_observation_event", False)) for item in outcomes)
         metrics.update(
             {
                 "opd_intervention/outcome/sample_count": float(outcome_count),
@@ -2615,13 +2649,56 @@ def compute_intervention_metrics(
                     repair_ineffective / repair_executed if repair_executed else 0.0
                 ),
                 "opd_intervention/outcome/repair_coverage_of_raw_wrong": (
-                    repair_executed / raw_wrong if raw_wrong else 0.0
+                    (repaired_raw_wrong if has_transition_observation else repair_executed) / raw_wrong
+                    if raw_wrong
+                    else 0.0
                 ),
                 "opd_intervention/outcome/correct_yield_from_raw_wrong": (
                     repair_effective / raw_wrong if raw_wrong else 0.0
                 ),
             }
         )
+
+        observed_outcomes = [item for item in outcomes if bool(item.get("transition_observation_event", False))]
+        if observed_outcomes:
+            observed_count = len(observed_outcomes)
+            observed_repaired = [item for item in observed_outcomes if bool(item.get("repair_executed", False))]
+            observed_repaired_count = len(observed_repaired)
+            observed_transition_counts = {
+                transition: sum(resolve_transition(item) == transition for item in observed_repaired)
+                for transition in (
+                    "pre_correct_post_correct",
+                    "pre_correct_post_wrong",
+                    "pre_wrong_post_correct",
+                    "pre_wrong_post_wrong",
+                )
+            }
+            metrics.update(
+                {
+                    "opd_intervention/outcome/final_correct_count": float(
+                        sum(resolve_final_correct(item) for item in observed_outcomes)
+                    ),
+                    "opd_intervention/outcome/final_correct_fraction": sum(
+                        resolve_final_correct(item) for item in observed_outcomes
+                    )
+                    / observed_count,
+                    **{
+                        f"opd_intervention/outcome/{transition}_count": float(count)
+                        for transition, count in observed_transition_counts.items()
+                    },
+                    **{
+                        f"opd_intervention/outcome/{transition}_fraction_among_repaired": (
+                            count / observed_repaired_count if observed_repaired_count else 0.0
+                        )
+                        for transition, count in observed_transition_counts.items()
+                    },
+                    "opd_intervention/outcome/net_accuracy_delta_all_samples": (
+                        observed_transition_counts["pre_wrong_post_correct"]
+                        - observed_transition_counts["pre_correct_post_wrong"]
+                    )
+                    / observed_count,
+                }
+            )
 
     candidate_records: list[dict[str, Any]] = []
     for sample_items in list(interventions) + list(intervention_skipped or []):

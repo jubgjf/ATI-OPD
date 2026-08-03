@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -23,6 +24,7 @@ from verl import DataProto
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     _build_generation_archive_records,
+    _build_training_intervention_outcome_archive_records,
     _build_validation_sample_records,
     _compute_reward_format_metrics,
     _compute_validation_format_metrics,
@@ -147,6 +149,97 @@ def test_generation_archive_records_preserve_complete_evaluation_fields_on_cpu()
     ]
 
 
+def test_training_outcome_archive_keeps_all_compact_rows_and_only_selected_case_text_on_cpu():
+    records = _build_training_intervention_outcome_archive_records(
+        global_step=7,
+        outcomes=[
+            {
+                "enabled": True,
+                "raw_correct": False,
+                "final_correct": True,
+                "transition": "pre_wrong_post_correct",
+                "raw_reward_score": 0.0,
+                "final_reward_score": 1.0,
+                "_raw_response_ids": [1, 2],
+            },
+            {
+                "enabled": True,
+                "raw_correct": True,
+                "final_correct": True,
+                "transition": "not_repaired",
+                "raw_reward_score": 1.0,
+                "final_reward_score": 1.0,
+            },
+        ],
+        interventions=[[{"start": 4, "teacher_tokens": 2}], []],
+        skipped_interventions=[[], [{"reason": "below_threshold"}]],
+        cases=[
+            {
+                "transition": "pre_wrong_post_correct",
+                "raw_response": "wrong reasoning",
+                "final_response": "fixed reasoning",
+                "repair_segments": [{"teacher_segment": "fix"}],
+            },
+            None,
+        ],
+        sample_uids=["uid-1", "uid-2"],
+        data_sources=["math", "math"],
+        raw_prompts=[[{"role": "user", "content": "question 1"}], [{"role": "user", "content": "question 2"}]],
+        reward_models=[{"ground_truth": "one"}, {"ground_truth": "two"}],
+    )
+
+    assert len(records) == 2
+    assert records[0]["case_included"] is True
+    assert records[0]["raw_response"] == "wrong reasoning"
+    assert records[0]["final_response"] == "fixed reasoning"
+    assert records[0]["ground_truth"] == "one"
+    assert "_raw_response_ids" not in records[0]["outcome"]
+    assert records[1]["case_included"] is False
+    assert records[1]["skipped_interventions"] == [{"reason": "below_threshold"}]
+    assert "raw_response" not in records[1]
+    assert "raw_prompt" not in records[1]
+
+
+def test_training_outcome_archive_queue_is_independent_of_diagnostics_event_interval_on_cpu():
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.global_steps = 3
+    trainer.distillation_config = SimpleNamespace(
+        diagnostics=SimpleNamespace(
+            enabled=True,
+            collect_intervention_metrics=True,
+            collect_intervention_outcome_transitions=True,
+            log_interval=2,
+        )
+    )
+    trainer._metric_logging_settings = SimpleNamespace(mode="balanced")
+    trainer._metric_archive_writer = object()
+    trainer._pending_event_record_archives = []
+    trainer._event_record_archive_warning_emitted = False
+    batch = DataProto.from_single_dict(
+        {
+            "dummy": torch.ones((2, 1)),
+            "teacher_intervention_outcome": np.array(
+                [
+                    {"enabled": True, "transition": "pre_wrong_post_correct"},
+                    {"enabled": True, "transition": "not_repaired"},
+                ],
+                dtype=object,
+            ),
+            "teacher_interventions": np.array([[{"start": 1}], []], dtype=object),
+            "teacher_intervention_outcome_case": np.array([None, None], dtype=object),
+            "uid": np.array(["uid-1", "uid-2"], dtype=object),
+            "data_source": np.array(["math", "math"], dtype=object),
+        }
+    )
+
+    trainer._queue_training_intervention_outcome_archive(batch=batch, global_steps=3)
+    assert len(trainer._pending_event_record_archives) == 1
+    pending = trainer._pending_event_record_archives[0]
+    assert pending.global_step == 3
+    assert pending.metric_key == "opd_intervention/outcome_pairs"
+    assert len(pending.records) == 2
+
+
 def test_teacher_validation_metric_prefix_does_not_overwrite_student_on_cpu():
     trainer = object.__new__(RayPPOTrainer)
     metrics = trainer._val_metrics_update(
@@ -201,6 +294,7 @@ def test_teacher_validation_before_train_uses_val_kwargs_on_cpu():
     assert "repeat_times" not in captured
     assert "do_sample" not in captured
     assert captured["generation_max_tokens"] == 128
+    assert captured["repair_for_evaluation"] is False
 
 
 def test_validation_generation_logger_supports_teacher_record_shape_on_cpu():

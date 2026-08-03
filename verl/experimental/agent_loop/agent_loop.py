@@ -28,6 +28,7 @@ and is designed to be fully replaceable by other agent frameworks such as:
 """
 
 import asyncio
+import copy
 import hashlib
 import logging
 import math
@@ -226,14 +227,14 @@ def _extract_outcome_correctness(
     reward_extra_info = output.extra_fields.get("reward_extra_info")
     if not isinstance(reward_extra_info, dict):
         raise RuntimeError(
-            "Outcome-aware teacher intervention requires reward_extra_info from the reward manager, "
+            "Teacher-intervention outcome observation requires reward_extra_info from the reward manager, "
             "but it was unavailable. Configure an async reward loop that returns the correctness field "
             f"{intervention_config.outcome_correctness_key!r}."
         )
     correctness_key = str(intervention_config.outcome_correctness_key)
     if correctness_key not in reward_extra_info:
         raise RuntimeError(
-            "Outcome-aware teacher intervention could not find its correctness signal: "
+            "Teacher-intervention outcome observation could not find its correctness signal: "
             f"reward_extra_info has keys={sorted(reward_extra_info)}, expected {correctness_key!r}."
         )
     correctness_value = _as_single_float(
@@ -241,6 +242,17 @@ def _extract_outcome_correctness(
         context=f"reward_extra_info[{correctness_key!r}]",
     )
     return correctness_value > float(intervention_config.outcome_correctness_threshold), correctness_value
+
+
+def _outcome_transition(raw_correct: bool, final_correct: bool) -> str:
+    """Return the canonical sample-level pre/post correctness transition."""
+    if raw_correct:
+        return "pre_correct_post_correct" if final_correct else "pre_correct_post_wrong"
+    return "pre_wrong_post_correct" if final_correct else "pre_wrong_post_wrong"
+
+
+def _token_ids_sha256(token_ids: list[int]) -> str:
+    return hashlib.sha256(np.asarray(token_ids, dtype=np.int64).tobytes()).hexdigest()
 
 
 def _stable_fraction(key: str) -> float:
@@ -1713,6 +1725,101 @@ class AgentLoopWorker:
             self._teacher_intervention_logged_step = global_steps
             self._teacher_intervention_logged_samples = 0
 
+    def _collect_training_intervention_outcomes(
+        self,
+        *,
+        validate: bool,
+    ) -> bool:
+        """Return whether sample-level training outcome observation is enabled."""
+        if validate:
+            return False
+        distillation_config = getattr(self, "distillation_config", None)
+        diagnostics_config = getattr(distillation_config, "diagnostics", None)
+        if not (
+            diagnostics_config is not None
+            and getattr(diagnostics_config, "enabled", False)
+            and getattr(diagnostics_config, "collect_intervention_metrics", False)
+            and getattr(diagnostics_config, "collect_intervention_outcome_transitions", False)
+        ):
+            return False
+        return True
+
+    def _outcome_case_limit(self) -> int:
+        diagnostics_config = getattr(getattr(self, "distillation_config", None), "diagnostics", None)
+        if diagnostics_config is None:
+            return 0
+        return int(getattr(diagnostics_config, "outcome_case_samples_per_transition", 0) or 0)
+
+    def _prepare_local_intervention_outcome_cases(self, inputs: list["_InternalAgentLoopOutput"]) -> None:
+        """Keep only the local top-K full-text cases per transition.
+
+        The manager performs the same stable-rank reduction after concatenating
+        worker outputs, which yields a global cap without transmitting every
+        long raw response between processes.
+        """
+        case_limit = AgentLoopWorker._outcome_case_limit(self)
+        candidates: dict[str, list[tuple[float, int]]] = {}
+        for index, input_item in enumerate(inputs):
+            outcome = input_item.extra_fields.get("teacher_intervention_outcome")
+            if not (
+                isinstance(outcome, dict)
+                and outcome.get("transition_observation_event")
+                and outcome.get("repair_executed")
+            ):
+                continue
+            transition = outcome.get("transition")
+            rank = outcome.get("case_rank")
+            if transition is None or rank is None:
+                continue
+            candidates.setdefault(str(transition), []).append((float(rank), index))
+
+        selected = {
+            index
+            for transition_candidates in candidates.values()
+            for _, index in sorted(transition_candidates)[:case_limit]
+        }
+        for index, input_item in enumerate(inputs):
+            outcome = input_item.extra_fields.get("teacher_intervention_outcome")
+            raw_response_ids = outcome.pop("_raw_response_ids", None) if isinstance(outcome, dict) else None
+            interventions = input_item.extra_fields.get("teacher_interventions") or []
+            decoded_segments = []
+            for intervention in interventions:
+                if not isinstance(intervention, dict):
+                    continue
+                original_ids = intervention.pop("_original_student_segment_ids", None)
+                teacher_ids = intervention.pop("_teacher_segment_ids", None)
+                if index in selected:
+                    decoded_segments.append(
+                        {
+                            "attempt": intervention.get("attempt"),
+                            "start": intervention.get("start"),
+                            "end": intervention.get("end"),
+                            "original_student_segment": self.tokenizer.decode(
+                                original_ids or [], skip_special_tokens=True
+                            ),
+                            "teacher_segment": self.tokenizer.decode(teacher_ids or [], skip_special_tokens=True),
+                        }
+                    )
+            if not (isinstance(outcome, dict) and outcome.get("transition_observation_event")):
+                input_item.extra_fields.pop("teacher_intervention_outcome_case", None)
+                continue
+            if index not in selected:
+                input_item.extra_fields["teacher_intervention_outcome_case"] = None
+                continue
+
+            final_length = int(outcome.get("final_response_length", 0) or 0)
+            final_response_ids = input_item.response_ids[0, :final_length].detach().cpu().tolist()
+            raw_response = outcome.get("raw_response")
+            if raw_response is None:
+                raw_response = self.tokenizer.decode(raw_response_ids or [], skip_special_tokens=True)
+            input_item.extra_fields["teacher_intervention_outcome_case"] = {
+                "case_rank": float(outcome["case_rank"]),
+                "transition": outcome["transition"],
+                "raw_response": raw_response,
+                "final_response": self.tokenizer.decode(final_response_ids, skip_special_tokens=True),
+                "repair_segments": decoded_segments,
+            }
+
     def _get_mm_processor_kwargs(self, audio_data: Optional[list[Any]] = None) -> dict[str, Any]:
         """Return multimodal processor kwargs with audio sampling-rate defaults."""
         mm_processor_kwargs = dict(self.mm_processor_kwargs or {})
@@ -1744,13 +1851,24 @@ class AgentLoopWorker:
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
         config = self.rollout_config
-        validate = batch.meta_info.get("validate", False)
+        validate = bool(batch.meta_info.get("validate", False))
+        repair_for_evaluation = bool(batch.meta_info.get("repair_for_evaluation", False))
+        intervention_config = getattr(self, "teacher_intervention_config", None)
+        configured_repair_for_evaluation = bool(
+            intervention_config is not None and getattr(intervention_config, "repair_for_evaluation", False)
+        )
+        if repair_for_evaluation and not (validate and configured_repair_for_evaluation):
+            raise ValueError(
+                "repair_for_evaluation may be requested only for validation/test when "
+                "distillation.intervention.repair_for_evaluation=true."
+            )
+        intervention_active = self.teacher_intervention_enabled and (not validate or repair_for_evaluation)
         sampling_params = dict(
             temperature=config.temperature,
             top_p=config.top_p,
             top_k=config.top_k,
             repetition_penalty=1.0,
-            logprobs=config.calculate_log_probs or (self.teacher_intervention_enabled and not validate),
+            logprobs=config.calculate_log_probs or intervention_active,
         )
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
@@ -1818,7 +1936,13 @@ class AgentLoopWorker:
                 apply_greedy_sampling_params(sample_sampling_params)
             tasks.append(
                 asyncio.create_task(
-                    self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                    self._run_agent_loop(
+                        sample_sampling_params,
+                        trajectory_info[i],
+                        trace=trace_this_sample,
+                        repair_for_evaluation=repair_for_evaluation,
+                        **kwargs,
+                    )
                 )
             )
         outputs = await asyncio.gather(*tasks)
@@ -1835,6 +1959,7 @@ class AgentLoopWorker:
         *,
         agent_name: str,
         trace: bool = True,
+        repair_for_evaluation: bool = False,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
         with rollout_trace_attr(
@@ -1865,6 +1990,7 @@ class AgentLoopWorker:
                 output,
                 trajectory["validate"],
                 sampling_params=sampling_params,
+                repair_for_evaluation=repair_for_evaluation,
                 **kwargs,
             )
 
@@ -1873,6 +1999,7 @@ class AgentLoopWorker:
         output,
         validate,
         sampling_params: Optional[dict[str, Any]] = None,
+        repair_for_evaluation: bool = False,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
@@ -1882,7 +2009,14 @@ class AgentLoopWorker:
                 self.teacher_intervention_config is not None
                 and self.teacher_intervention_config.outcome_aware_candidate_selection_enabled
             )
-            if outcome_aware_selection and not validate:
+            collect_training_outcomes = AgentLoopWorker._collect_training_intervention_outcomes(
+                self,
+                validate=bool(validate),
+            )
+            observe_outcome = bool(
+                collect_training_outcomes or (outcome_aware_selection and not validate) or repair_for_evaluation
+            )
+            if observe_outcome:
                 # The raw student answer must be judged before any token is
                 # rewritten. This call is a no-op if a custom AgentLoop already
                 # populated the reward.
@@ -1891,7 +2025,8 @@ class AgentLoopWorker:
                     output,
                     self.teacher_intervention_config,
                 )
-                output.extra_fields["teacher_intervention_outcome"] = {
+                transition_observation_event = bool(collect_training_outcomes or repair_for_evaluation)
+                outcome_metadata = {
                     "enabled": True,
                     "correctness_key": self.teacher_intervention_config.outcome_correctness_key,
                     "correctness_threshold": float(self.teacher_intervention_config.outcome_correctness_threshold),
@@ -1901,9 +2036,29 @@ class AgentLoopWorker:
                     "trigger_detected": False,
                     "repair_executed": False,
                 }
+                if transition_observation_event:
+                    outcome_metadata.update(
+                        {
+                            "raw_reward_extra_info": copy.deepcopy(output.extra_fields.get("reward_extra_info", {})),
+                            "raw_response_length": len(output.response_ids),
+                            "raw_output_token_sha256": _token_ids_sha256(output.response_ids),
+                            "raw_finish_reason": output.extra_fields.get("finish_reason"),
+                            "_raw_response_ids": list(output.response_ids),
+                            "oracle_gate_used": bool(outcome_aware_selection and repair_for_evaluation),
+                            "evaluation_pair": bool(repair_for_evaluation),
+                            "transition_observation_event": True,
+                        }
+                    )
+                output.extra_fields["teacher_intervention_outcome"] = outcome_metadata
+                if repair_for_evaluation:
+                    outcome_metadata["raw_response"] = self.tokenizer.decode(
+                        output.response_ids,
+                        skip_special_tokens=True,
+                    )
             await self._maybe_repair_with_teacher(
                 output,
                 validate=validate,
+                repair_for_evaluation=repair_for_evaluation,
                 sampling_params=sampling_params,
                 sample_kwargs=kwargs,
             )
@@ -1919,6 +2074,22 @@ class AgentLoopWorker:
                 # from the actor over the final sequence instead of receiving a
                 # mixed per-sample schema.
                 output.response_logprobs = None
+            elif repair_for_evaluation:
+                # Evaluation needed rollout logprobs only while detecting and
+                # executing repairs. Avoid returning dense student or teacher
+                # scoring tensors that the validation aggregator never consumes.
+                output.response_logprobs = None
+                output.teacher_segment_mask = None
+                for scoring_key in (
+                    "teacher_ids",
+                    "teacher_logprobs",
+                    "teacher_sampled_ids",
+                    "teacher_sampled_logprobs",
+                    "teacher_logprob_nonfinite_count",
+                    "teacher_logprob_nonfinite_positions",
+                    "teacher_logprob_nonfinite_replacement",
+                ):
+                    output.extra_fields.pop(scoring_key, None)
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -2037,30 +2208,60 @@ class AgentLoopWorker:
             ),
         )
         await self._compute_score([output], kwargs=kwargs)
-        if (
-            getattr(self, "teacher_intervention_enabled", False)
-            and self.teacher_intervention_config is not None
-            and self.teacher_intervention_config.outcome_aware_candidate_selection_enabled
-            and not validate
-        ):
+        outcome_metadata = output.extra_fields.get("teacher_intervention_outcome")
+        if isinstance(outcome_metadata, dict):
             final_correct, final_correctness_value = _extract_outcome_correctness(
                 output,
                 self.teacher_intervention_config,
             )
-            outcome_metadata = output.extra_fields["teacher_intervention_outcome"]
             intervention_count = int(output.extra_fields.get("teacher_intervention_count", 0) or 0)
             raw_correct = bool(outcome_metadata["raw_correct"])
+            repair_executed = intervention_count > 0
+            interventions = output.extra_fields.get("teacher_interventions") or []
             outcome_metadata.update(
                 {
                     "final_reward_score": output.reward_score,
                     "final_correctness_value": final_correctness_value,
                     "final_correct": final_correct,
-                    "repair_executed": intervention_count > 0,
-                    "repair_effective": intervention_count > 0 and not raw_correct and final_correct,
-                    "repair_ineffective": intervention_count > 0 and not raw_correct and not final_correct,
+                    "repair_executed": repair_executed,
+                    "repair_effective": repair_executed and not raw_correct and final_correct,
+                    "repair_ineffective": repair_executed and not raw_correct and not final_correct,
                 }
             )
-            interventions = output.extra_fields.get("teacher_interventions") or []
+            transition = None
+            if outcome_metadata.get("transition_observation_event"):
+                transition = _outcome_transition(raw_correct, final_correct) if repair_executed else "not_repaired"
+                final_output_token_sha256 = _token_ids_sha256(output.response_ids)
+                rank_key = ":".join(
+                    str(value)
+                    for value in (
+                        kwargs.get("data_source"),
+                        kwargs.get("index"),
+                        kwargs.get("global_steps"),
+                        transition,
+                        outcome_metadata.get("raw_output_token_sha256"),
+                        final_output_token_sha256,
+                    )
+                )
+                final_finish_reason = output.extra_fields.get("finish_reason")
+                if interventions:
+                    last_intervention = interventions[-1]
+                    final_finish_reason = (
+                        last_intervention.get("student_suffix_finish_reason")
+                        or last_intervention.get("teacher_finish_reason")
+                        or final_finish_reason
+                    )
+                outcome_metadata.update(
+                    {
+                        "final_reward_extra_info": copy.deepcopy(output.extra_fields.get("reward_extra_info", {})),
+                        "final_response_length": len(output.response_ids),
+                        "final_output_token_sha256": final_output_token_sha256,
+                        "final_finish_reason": final_finish_reason,
+                        "intervention_count": intervention_count,
+                        "transition": transition,
+                        "case_rank": _stable_fraction(rank_key),
+                    }
+                )
             if interventions:
                 # Outcome effectiveness is sample-level. Attach it only to the
                 # first intervention so aggregation does not double-count
@@ -2076,6 +2277,8 @@ class AgentLoopWorker:
                         "repair_ineffective": outcome_metadata["repair_ineffective"],
                     }
                 )
+                if transition is not None:
+                    interventions[0]["transition"] = transition
         await self._compute_teacher_logprobs(
             output,
             prompt_ids=output.prompt_ids,
@@ -2816,12 +3019,15 @@ class AgentLoopWorker:
         output: AgentLoopOutput,
         *,
         validate: bool,
+        repair_for_evaluation: bool = False,
         sampling_params: Optional[dict[str, Any]],
         sample_kwargs: Optional[dict[str, Any]],
     ) -> None:
         """Repair high-gap response segments with teacher generation before padding/training."""
-        if not self.teacher_intervention_enabled or validate:
+        if not self.teacher_intervention_enabled or (validate and not repair_for_evaluation):
             return
+        if repair_for_evaluation and not validate:
+            raise ValueError("repair_for_evaluation is valid only when validate=true.")
 
         AgentLoopWorker._maybe_reset_teacher_intervention_log_counter(self, sample_kwargs)
         AgentLoopWorker._ensure_teacher_intervention_token_patterns(self)
@@ -2965,7 +3171,7 @@ class AgentLoopWorker:
                 break
 
             start, end, score = bad_segment
-            if outcome_aware_selection:
+            if isinstance(outcome_metadata, dict):
                 outcome_metadata["trigger_detected"] = True
                 outcome_metadata["trigger_count"] = int(outcome_metadata.get("trigger_count", 0)) + 1
             persistence_metadata: dict[str, Any] = {}
@@ -3033,8 +3239,10 @@ class AgentLoopWorker:
                     configured_probe_probability = float(intervention_config.teacher_nll_healthy_probe_probability)
                     _, _, calibration_count = AgentLoopWorker._current_teacher_nll_threshold(self)
                     calibration_warmup = calibration_count < intervention_config.teacher_nll_calibration_min_samples
-                    probe_probability = 1.0 if calibration_warmup else configured_probe_probability
-                    should_probe = (
+                    probe_probability = (
+                        0.0 if validate else (1.0 if calibration_warmup else configured_probe_probability)
+                    )
+                    should_probe = not validate and (
                         _stable_fraction(f"{base_request_id}:healthy-teacher-nll-probe:{attempt}") < probe_probability
                     )
                     candidate_selection_metadata = {
@@ -3042,6 +3250,7 @@ class AgentLoopWorker:
                         "healthy_calibration_warmup": calibration_warmup,
                         "healthy_calibration_probe_probability": configured_probe_probability,
                         "healthy_calibration_effective_probe_probability": probe_probability,
+                        "teacher_nll_calibration_read_only": bool(validate),
                     }
                     if should_probe:
                         calibration_result = await self._generate_and_select_teacher_candidate(
@@ -3078,6 +3287,7 @@ class AgentLoopWorker:
                     calibration_only=False,
                 )
                 candidate_selection_metadata = selection_result.metadata
+                candidate_selection_metadata["teacher_nll_calibration_read_only"] = bool(validate)
                 if selection_result.candidate is None:
                     skip_reason = selection_result.skip_reason or "teacher_candidate_selection_failed"
                     _record_skipped_intervention(
@@ -3288,8 +3498,15 @@ class AgentLoopWorker:
                 **local_effect_metadata,
                 **candidate_selection_metadata,
             }
+            if isinstance(outcome_metadata, dict) and outcome_metadata.get("transition_observation_event"):
+                intervention_item.update(
+                    {
+                        "_original_student_segment_ids": list(original_student_segment_ids),
+                        "_teacher_segment_ids": list(teacher_segment_ids),
+                    }
+                )
             interventions.append(intervention_item)
-            if outcome_aware_selection:
+            if isinstance(outcome_metadata, dict):
                 outcome_metadata["repair_executed"] = True
             if candidate_terminal:
                 _mark_local_effect_unavailable(intervention_item, "terminal_response")
@@ -3300,7 +3517,7 @@ class AgentLoopWorker:
             pending_metadata, _ = pending_local_effect
             _mark_local_effect_unavailable(pending_metadata, "repaired_response_not_rescored")
 
-        if outcome_aware_selection and interventions:
+        if isinstance(outcome_metadata, dict) and interventions:
             # The reward currently belongs to the untouched on-policy answer.
             # Force _agent_loop_postprocess to score the repaired response.
             output.reward_score = None
@@ -3396,6 +3613,7 @@ class AgentLoopWorker:
         validate: bool = False,
     ) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
+        AgentLoopWorker._prepare_local_intervention_outcome_cases(self, inputs)
         # Convert lists back to tensors and stack them to create a batch.
         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
         response_ids = torch.cat([input.response_ids for input in inputs], dim=0)
@@ -3596,6 +3814,28 @@ class AgentLoopManager:
             *[worker.set_teacher_nll_calibration_state.remote(snapshot) for worker in self.agent_loop_workers]
         )
 
+    def _cap_intervention_outcome_cases(self, output: DataProto) -> None:
+        """Apply the configured global per-transition full-text case cap."""
+        key = "teacher_intervention_outcome_case"
+        if key not in output.non_tensor_batch:
+            return
+        diagnostics_config = getattr(getattr(self.config, "distillation", None), "diagnostics", None)
+        case_limit = int(getattr(diagnostics_config, "outcome_case_samples_per_transition", 0) or 0)
+        cases = output.non_tensor_batch[key]
+        candidates: dict[str, list[tuple[float, int]]] = {}
+        for index, case in enumerate(cases):
+            if not isinstance(case, dict):
+                continue
+            candidates.setdefault(str(case["transition"]), []).append((float(case["case_rank"]), index))
+        selected = {
+            index
+            for transition_candidates in candidates.values()
+            for _, index in sorted(transition_candidates)[:case_limit]
+        }
+        for index in range(len(cases)):
+            if index not in selected:
+                cases[index] = None
+
     def _refresh_global_teacher_nll_calibration_blocking(self) -> None:
         """Blocking equivalent used by the TransferQueue rollout manager."""
         if self._global_teacher_nll_calibration is None:
@@ -3647,6 +3887,7 @@ class AgentLoopManager:
             ]
         )
         output = DataProto.concat(outputs)
+        self._cap_intervention_outcome_cases(output)
 
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
