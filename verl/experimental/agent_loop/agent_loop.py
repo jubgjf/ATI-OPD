@@ -86,6 +86,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+MAX_NONFINITE_STUDENT_SUFFIX_LOGPROB_WARNINGS = 10
 INTERVENTION_TOPK_DISTRIBUTION_GAP_METRICS = {"topk_kl", "topk_distribution_kl", "topk_dist_kl"}
 INTERVENTION_FULL_DISTRIBUTION_GAP_METRICS = {"full_kl", "full_distribution_kl", "distribution_kl"}
 
@@ -98,6 +99,8 @@ class _StudentSuffixGenerationResult:
     finish_reason: Optional[str] = None
     terminal: bool = False
     eos_truncated: bool = False
+    nonfinite_logprob_offsets: tuple[int, ...] = ()
+    nonfinite_logprob_replacement: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -2990,14 +2993,48 @@ class AgentLoopWorker:
                 "Check that rollout sampling_params['logprobs'] is enabled and the rollout backend returns "
                 "one logprob per generated token."
             )
-        if suffix_logprobs and not torch.isfinite(torch.tensor(suffix_logprobs, dtype=torch.float32)).all():
-            raise RuntimeError(f"Student suffix generation returned NaN/Inf logprobs for request_id={request_id!r}.")
+        nonfinite_logprob_offsets: tuple[int, ...] = ()
+        nonfinite_logprob_replacement = None
+        if suffix_logprobs:
+            suffix_logprobs_tensor = torch.tensor(suffix_logprobs, dtype=torch.float32)
+            finite_mask = torch.isfinite(suffix_logprobs_tensor)
+            if not finite_mask.all():
+                nonfinite_logprob_offsets = tuple(
+                    int(offset) for offset in torch.nonzero(~finite_mask, as_tuple=False).flatten().tolist()
+                )
+                nonfinite_logprob_replacement = _logprob_floor_from_distillation_config(self.distillation_config)
+                suffix_logprobs_tensor = torch.nan_to_num(
+                    suffix_logprobs_tensor,
+                    nan=nonfinite_logprob_replacement,
+                    neginf=nonfinite_logprob_replacement,
+                    posinf=0.0,
+                )
+                if not torch.isfinite(suffix_logprobs_tensor).all():
+                    raise RuntimeError(
+                        "Student suffix logprob sanitization failed to produce finite values for "
+                        f"request_id={request_id!r}."
+                    )
+                suffix_logprobs = suffix_logprobs_tensor.tolist()
+                warning_count = getattr(self, "_student_suffix_nonfinite_logprob_warnings", 0)
+                if warning_count < MAX_NONFINITE_STUDENT_SUFFIX_LOGPROB_WARNINGS:
+                    logger.warning(
+                        "Student suffix generation returned NaN/Inf logprobs at %d token positions for "
+                        "request_id=%r, suffix_len=%d; replaced them with finite logprobs and excluded those "
+                        "positions from subsequent intervention-gap detection.",
+                        len(nonfinite_logprob_offsets),
+                        request_id,
+                        len(suffix_ids),
+                    )
+                    self._student_suffix_nonfinite_logprob_warnings = warning_count + 1
         finish_reason = (student_output.extra_fields or {}).get("finish_reason")
         suffix_ids, suffix_logprobs, eos_truncated = _truncate_generation_at_eos(
             suffix_ids,
             suffix_logprobs,
             eos_token_ids=_tokenizer_eos_token_ids(self.tokenizer),
         )
+        nonfinite_logprob_offsets = tuple(offset for offset in nonfinite_logprob_offsets if offset < len(suffix_ids))
+        if not nonfinite_logprob_offsets:
+            nonfinite_logprob_replacement = None
         return _StudentSuffixGenerationResult(
             token_ids=suffix_ids,
             logprobs=suffix_logprobs,
@@ -3012,6 +3049,8 @@ class AgentLoopWorker:
             )
             or _generation_was_aborted(stop_reason=student_output.stop_reason, finish_reason=finish_reason),
             eos_truncated=eos_truncated,
+            nonfinite_logprob_offsets=nonfinite_logprob_offsets,
+            nonfinite_logprob_replacement=nonfinite_logprob_replacement,
         )
 
     async def _maybe_repair_with_teacher(
@@ -3402,9 +3441,26 @@ class AgentLoopWorker:
             candidate_response_logprobs = (
                 prefix_response_logprobs + teacher_segment_logprobs + student_suffix_result.logprobs
             )
-            candidate_gap_mask = (
-                prefix_gap_mask + [0] * len(teacher_segment_ids) + [1] * len(student_suffix_result.token_ids)
-            )
+            suffix_gap_mask = [1] * len(student_suffix_result.token_ids)
+            for suffix_offset in student_suffix_result.nonfinite_logprob_offsets:
+                suffix_gap_mask[suffix_offset] = 0
+            candidate_gap_mask = prefix_gap_mask + [0] * len(teacher_segment_ids) + suffix_gap_mask
+            student_suffix_nonfinite_response_positions = [
+                len(prefix_response_ids) + len(teacher_segment_ids) + suffix_offset
+                for suffix_offset in student_suffix_result.nonfinite_logprob_offsets
+            ]
+            student_suffix_logprob_metadata = {}
+            if student_suffix_nonfinite_response_positions:
+                student_suffix_logprob_metadata = {
+                    "student_suffix_logprob_nonfinite_count": len(student_suffix_nonfinite_response_positions),
+                    "student_suffix_logprob_nonfinite_offsets": list(student_suffix_result.nonfinite_logprob_offsets),
+                    "student_suffix_logprob_nonfinite_response_positions": (
+                        student_suffix_nonfinite_response_positions
+                    ),
+                    "student_suffix_logprob_nonfinite_replacement": (
+                        student_suffix_result.nonfinite_logprob_replacement
+                    ),
+                }
             candidate_teacher_segment_mask = None
             if prefix_teacher_segment_mask is not None:
                 candidate_teacher_segment_mask = (
@@ -3439,6 +3495,7 @@ class AgentLoopWorker:
                     student_suffix_tokens=len(student_suffix_result.token_ids),
                 )
                 skipped_interventions[-1]["thinking_reason"] = thinking_state.reason
+                skipped_interventions[-1].update(student_suffix_logprob_metadata)
                 break
             candidate_terminal = teacher_terminal or student_suffix_result.terminal
             if (
@@ -3457,6 +3514,7 @@ class AgentLoopWorker:
                     teacher_tokens=len(teacher_segment_ids),
                     student_suffix_tokens=len(student_suffix_result.token_ids),
                 )
+                skipped_interventions[-1].update(student_suffix_logprob_metadata)
                 break
             candidate_trainable_tokens = sum(candidate_response_mask)
             if candidate_teacher_segment_mask is not None:
@@ -3473,6 +3531,7 @@ class AgentLoopWorker:
                     teacher_tokens=len(teacher_segment_ids),
                     student_suffix_tokens=len(student_suffix_result.token_ids),
                 )
+                skipped_interventions[-1].update(student_suffix_logprob_metadata)
                 break
 
             response_ids = candidate_response_ids
@@ -3497,6 +3556,7 @@ class AgentLoopWorker:
                 **rewrite_overlap_metrics,
                 **local_effect_metadata,
                 **candidate_selection_metadata,
+                **student_suffix_logprob_metadata,
             }
             if isinstance(outcome_metadata, dict) and outcome_metadata.get("transition_observation_event"):
                 intervention_item.update(

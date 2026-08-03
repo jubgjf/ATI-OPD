@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import warnings
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -521,6 +522,25 @@ class _FakeRepairStudentClient:
             {"request_id": request_id, "prompt_ids": list(prompt_ids), "sampling_params": sampling_params}
         )
         return TokenOutput(token_ids=[40, 41], log_probs=[-0.2, -0.2])
+
+
+class _NonfiniteRepairStudentClient(_FakeRepairStudentClient):
+    async def generate(
+        self,
+        request_id: str,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    ) -> TokenOutput:
+        del image_data, video_data, audio_data, mm_processor_kwargs
+        self.calls.append(
+            {"request_id": request_id, "prompt_ids": list(prompt_ids), "sampling_params": sampling_params}
+        )
+        return TokenOutput(token_ids=[40, 41], log_probs=[float("-inf"), float("nan")])
 
 
 class _CandidateSelectionStudentClient(_FakeRepairStudentClient):
@@ -1759,6 +1779,47 @@ async def test_agent_loop_postprocess_repairs_high_gap_segment_on_cpu():
     assert "_original_student_segment_ids" not in serialized_intervention
     assert "_teacher_segment_ids" not in serialized_intervention
     assert "teacher_intervention_outcome_case" not in training_batch.non_tensor_batch
+
+
+@pytest.mark.asyncio
+async def test_teacher_intervention_sanitizes_nonfinite_student_suffix_logprobs_on_cpu(caplog):
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[30, 31], finish_reason="length"),
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        max_interventions_per_sample=2,
+    )
+    worker.llm_client = _NonfiniteRepairStudentClient()
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "nonfinite-student-suffix"},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await AgentLoopWorker._maybe_repair_with_teacher(
+            worker,
+            output,
+            validate=False,
+            sampling_params={"temperature": 0.8, "logprobs": True},
+            sample_kwargs={"data_source": "openai/gsm8k"},
+        )
+
+    assert output.response_ids == [30, 31, 40, 41]
+    assert output.response_logprobs == pytest.approx([0.0, 0.0, -10.0, -10.0])
+    assert output.extra_fields["teacher_intervention_count"] == 1
+    intervention = output.extra_fields["teacher_interventions"][0]
+    assert intervention["student_suffix_logprob_nonfinite_count"] == 2
+    assert intervention["student_suffix_logprob_nonfinite_offsets"] == [0, 1]
+    assert intervention["student_suffix_logprob_nonfinite_response_positions"] == [2, 3]
+    assert intervention["student_suffix_logprob_nonfinite_replacement"] == -10.0
+    assert len(teacher_manager.scored_sequences) == 2
+    assert "excluded those positions from subsequent intervention-gap detection" in caplog.text
 
 
 @pytest.mark.asyncio
