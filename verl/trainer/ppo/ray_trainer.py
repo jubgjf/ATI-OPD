@@ -64,6 +64,7 @@ from verl.trainer.distillation.teacher_target_scoring import (
     build_teacher_target_scoring_requests,
 )
 from verl.trainer.distillation.token_reward import (
+    compute_only_student_teacher_topk_token_reward,
     compute_only_student_topk_token_reward,
     compute_rethinking_only_student_topk_token_reward,
 )
@@ -2974,7 +2975,7 @@ class RayPPOTrainer:
                 "signal is applied through token rewards instead of the actor-side distillation loss."
             )
         loss_config = self.distillation_config.distillation_loss
-        supported_strategies = {"only_stu", "only_stu_rethinking_style"}
+        supported_strategies = {"only_stu", "only_stu_rethinking_style", "only_stu_teacher_topk"}
         if loss_config.top_k_strategy not in supported_strategies:
             raise NotImplementedError(
                 "ADV_ESTIMATOR=token_reward_direct supports top-k strategies "
@@ -3086,6 +3087,31 @@ class RayPPOTrainer:
                 topk=topk,
                 reward_weight_mode=loss_config.reward_weight_mode,
                 log_prob_min_clamp=loss_config.log_prob_min_clamp,
+            )
+        elif loss_config.top_k_strategy == "only_stu_teacher_topk":
+            teacher_topk_ids, teacher_topk_logprobs = self._extract_teacher_response_topk_for_diagnostics(batch)
+            if teacher_topk_ids is None or teacher_topk_logprobs is None:
+                raise RuntimeError(
+                    "ADV_ESTIMATOR=token_reward_direct with only_stu_teacher_topk requires expanded teacher "
+                    "top-k prompt logprobs. Check distillation.distillation_loss.teacher_topk and teacher "
+                    "inference settings."
+                )
+            diagnostics_config = self._distillation_diagnostics_config()
+            position_bin_size = None
+            if diagnostics_config is not None and self.global_steps % diagnostics_config.topk_log_interval == 0:
+                position_bin_size = diagnostics_config.position_bin_size
+            token_rewards, reward_metrics = compute_only_student_teacher_topk_token_reward(
+                student_topk_ids=batch.batch["student_topk_ids"],
+                student_topk_logprobs=batch.batch["student_topk_logprobs"],
+                teacher_topk_ids=teacher_topk_ids,
+                teacher_topk_logprobs=teacher_topk_logprobs,
+                response_mask=batch.batch["response_mask"],
+                reward_mask=batch.batch.get("distillation_loss_mask", batch.batch["response_mask"]),
+                topk=topk,
+                teacher_topk=loss_config.teacher_topk,
+                reward_weight_mode=loss_config.reward_weight_mode,
+                log_prob_min_clamp=loss_config.log_prob_min_clamp,
+                position_bin_size=position_bin_size,
             )
         elif loss_config.top_k_strategy == "only_stu_rethinking_style":
             teacher_on_student_topk_logprobs = self._compute_rethinking_teacher_on_student_topk(batch)

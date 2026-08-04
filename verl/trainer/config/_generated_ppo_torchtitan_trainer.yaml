@@ -782,6 +782,7 @@ distillation:
     _target_: verl.workers.config.DistillationLossConfig
     loss_mode: k3
     topk: 32
+    teacher_topk: 128
     top_k_strategy: only_stu
     reward_weight_mode: student_p
     use_task_rewards: true

@@ -96,24 +96,24 @@ def validate_distillation_intervention_training_config(config: Any) -> None:
         "top_k_strategy",
         default="only_stu",
     )
-    if top_k_strategy == "only_stu_rethinking_style":
+    if top_k_strategy in {"only_stu_rethinking_style", "only_stu_teacher_topk"}:
         adv_estimator = _get_nested(config, "algorithm", "adv_estimator", default="")
         adv_estimator = getattr(adv_estimator, "value", adv_estimator)
         if str(adv_estimator) != "token_reward_direct":
             raise ValueError(
-                "distillation_loss.top_k_strategy='only_stu_rethinking_style' requires "
-                "algorithm.adv_estimator='token_reward_direct'. The exact teacher-on-student Top-K tensor is "
-                "consumed by the paper-style token-reward update, not the legacy actor-side OPD loss."
+                f"distillation_loss.top_k_strategy={top_k_strategy!r} requires "
+                "algorithm.adv_estimator='token_reward_direct'. This student-support strategy is consumed by "
+                "the paper-style token-reward update, not the legacy actor-side OPD loss."
             )
         if bool(_get_nested(distillation_config, "use_actor_loss", default=True)):
             raise ValueError(
-                "distillation_loss.top_k_strategy='only_stu_rethinking_style' requires "
-                "distillation.use_actor_loss=false so the exact Top-K teacher signal is not mixed with the "
+                f"distillation_loss.top_k_strategy={top_k_strategy!r} requires "
+                "distillation.use_actor_loss=false so the student-support teacher signal is not mixed with the "
                 "legacy actor-side distillation path."
             )
         if bypass_mode:
             raise ValueError(
-                "distillation_loss.top_k_strategy='only_stu_rethinking_style' requires "
+                f"distillation_loss.top_k_strategy={top_k_strategy!r} requires "
                 "algorithm.rollout_correction.bypass_mode=false because student Top-K ids must be recomputed "
-                "before exact teacher target scoring."
+                "before token rewards are constructed."
             )

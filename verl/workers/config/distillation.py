@@ -81,11 +81,16 @@ class DistillationLossConfig(BaseConfig):
         Distillation loss function to use.
     topk (int, optional):
         Number of top tokens to consider for top-k distillation losses.
+    teacher_topk (int):
+        Number of teacher candidates returned for ``only_stu_teacher_topk``.
+        This support width is independent of the student ``topk`` update width.
     top_k_strategy (str):
         Top-k support strategy for token-reward OPD. ``only_stu`` preserves the
         repository's historical teacher/student Top-K intersection
-        approximation. ``only_stu_rethinking_style`` scores every student
-        Top-K id under the teacher's full distribution, matching THUNLP/OPD.
+        approximation. ``only_stu_teacher_topk`` expands only the teacher
+        support used by that approximation. ``only_stu_rethinking_style``
+        scores every student Top-K id under the teacher's full distribution,
+        matching THUNLP/OPD.
     reward_weight_mode (str):
         Probability weighting used when reducing top-k token rewards to a scalar reward.
     use_task_rewards (bool):
@@ -118,6 +123,7 @@ class DistillationLossConfig(BaseConfig):
 
     loss_mode: str = "k3"
     topk: Optional[int] = 128
+    teacher_topk: int = 128
     top_k_strategy: str = "only_stu"
     reward_weight_mode: str = "student_p"
     use_task_rewards: bool = True
@@ -149,12 +155,22 @@ class DistillationLossConfig(BaseConfig):
         self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
         if self.topk is not None and self.topk <= 0:
             raise ValueError("distillation_loss.topk must be positive when set.")
-        supported_top_k_strategies = {"only_stu", "only_stu_rethinking_style"}
+        if self.teacher_topk <= 0:
+            raise ValueError("distillation_loss.teacher_topk must be positive.")
+        supported_top_k_strategies = {"only_stu", "only_stu_rethinking_style", "only_stu_teacher_topk"}
         if self.top_k_strategy not in supported_top_k_strategies:
             raise ValueError(
                 f"distillation_loss.top_k_strategy must be one of {sorted(supported_top_k_strategies)}, "
                 f"got {self.top_k_strategy!r}."
             )
+        if self.top_k_strategy == "only_stu_teacher_topk":
+            if self.topk is None:
+                raise ValueError("distillation_loss.topk must be set for only_stu_teacher_topk.")
+            if self.teacher_topk < self.topk:
+                raise ValueError(
+                    "distillation_loss.teacher_topk must be greater than or equal to topk for "
+                    f"only_stu_teacher_topk, got teacher_topk={self.teacher_topk} and topk={self.topk}."
+                )
         if self.reward_weight_mode not in {"student_p", "teacher_p", "none"}:
             raise ValueError(
                 "distillation_loss.reward_weight_mode must be one of 'student_p', 'teacher_p', or 'none', "
@@ -613,6 +629,8 @@ class DistillationConfig(BaseConfig):
         logprob_topk = self.distillation_loss.topk if self.distillation_loss.loss_settings.use_topk else None
         if not self.use_actor_loss:
             logprob_topk = max(int(logprob_topk or 0), int(self.distillation_loss.topk or 0))
+        if self.distillation_loss.top_k_strategy == "only_stu_teacher_topk":
+            logprob_topk = max(int(logprob_topk or 0), int(self.distillation_loss.teacher_topk))
         if self.diagnostics.collect_topk_overlap or self.diagnostics.collect_rethinking_opd_metrics:
             logprob_topk = max(int(logprob_topk or 0), int(self.diagnostics.topk))
         for teacher_model in self.teacher_models.values():

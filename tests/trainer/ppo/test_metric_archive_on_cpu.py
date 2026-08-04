@@ -119,6 +119,11 @@ def test_balanced_routing_archives_high_cardinality_families_losslessly():
         "response_end/ended_by_im_end_ratio": 0.5,
         "distillation/token_reward_direct/p99": 2.0,
         "distillation/token_reward_direct/mean": 0.25,
+        "distillation/token_reward_direct/teacher_on_student_topk_coverage": 0.98,
+        "distillation/only_stu_teacher_topk/overlap_ratio": 0.98,
+        "distillation/only_stu_teacher_topk/overlap_mass_student": 0.999,
+        "distillation/only_stu_teacher_topk/student_top1_hit_rate": 1.0,
+        "distillation/only_stu_teacher_topk/overlap_ratio_bin/0_512": 0.99,
         # Known aliases are archived; canonical keys stay live.
         "opd/gap_abs/high_fraction": 0.3,
         "opd/gap_abs/high_token_fraction": 0.3,
@@ -153,6 +158,7 @@ def test_balanced_routing_archives_high_cardinality_families_losslessly():
         "rollout_corr/chi2_seq",
         "response_end/ended_by_im_end_count",
         "distillation/token_reward_direct/p99",
+        "distillation/only_stu_teacher_topk/overlap_ratio_bin/0_512",
         "opd/gap_abs/high_fraction",
         "opd/overlap/teacher_sampled_prob_mean",
     }
@@ -171,6 +177,10 @@ def test_balanced_routing_archives_high_cardinality_families_losslessly():
     assert route.live_metrics["rollout_corr/kl"] == 0.1
     assert route.live_metrics["response_end/ended_by_im_end_ratio"] == 0.5
     assert route.live_metrics["distillation/token_reward_direct/mean"] == 0.25
+    assert route.live_metrics["distillation/token_reward_direct/teacher_on_student_topk_coverage"] == 0.98
+    assert route.live_metrics["distillation/only_stu_teacher_topk/overlap_ratio"] == 0.98
+    assert route.live_metrics["distillation/only_stu_teacher_topk/overlap_mass_student"] == 0.999
+    assert route.live_metrics["distillation/only_stu_teacher_topk/student_top1_hit_rate"] == 1.0
     assert route.live_metrics["metric_archive/archived_key_count"] == len(expected_archived)
     assert set(route.numeric_metrics) == {
         key for key in route.live_metrics | route.detailed_metrics if key != "opd/gap_abs_heatmap"

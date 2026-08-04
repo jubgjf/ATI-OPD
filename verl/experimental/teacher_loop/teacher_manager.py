@@ -83,13 +83,14 @@ def _get_teacher_sampling_params(
     if teacher_model_config.inference.temperature != 1.0:
         raise NotImplementedError("vLLM does not support temperature for prompt_logprobs.")
 
-    num_logprobs = (
-        prompt_logprobs
-        if prompt_logprobs is not None
-        else distillation_loss_config.topk
-        if distillation_loss_config.loss_settings.use_topk
-        else 0
-    )
+    if prompt_logprobs is not None:
+        num_logprobs = prompt_logprobs
+    elif getattr(distillation_loss_config, "top_k_strategy", "only_stu") == "only_stu_teacher_topk":
+        num_logprobs = distillation_loss_config.teacher_topk
+    elif distillation_loss_config.loss_settings.use_topk:
+        num_logprobs = distillation_loss_config.topk
+    else:
+        num_logprobs = 0
     if num_logprobs is None or num_logprobs < 0:
         raise ValueError(
             f"Teacher logprob scoring requires prompt_logprobs to be a non-negative integer, but got {num_logprobs!r}."
@@ -123,6 +124,8 @@ def _expected_prompt_logprob_width(
 ) -> int:
     if prompt_logprobs is not None:
         return max(prompt_logprobs, 1)
+    if getattr(distillation_loss_config, "top_k_strategy", "only_stu") == "only_stu_teacher_topk":
+        return distillation_loss_config.teacher_topk
     if distillation_loss_config.loss_settings.use_topk:
         if distillation_loss_config.topk is None:
             raise ValueError("distillation_loss.topk must be set when the selected loss uses top-k logprobs.")

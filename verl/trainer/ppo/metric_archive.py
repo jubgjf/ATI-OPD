@@ -165,7 +165,6 @@ _REDUNDANT_AGGREGATE_FIELDS = {
             "p90",
             "p95",
             "p99",
-            "teacher_on_student_topk_coverage",
         }
     ),
     "val-aux/response_length/": frozenset({"count", "p75", "p95", "std"}),

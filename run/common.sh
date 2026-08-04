@@ -259,6 +259,7 @@ run_npu_opd_job() {
     use_task_rewards=${USE_TASK_REWARDS:-False}
     use_policy_gradient=${USE_POLICY_GRADIENT:-True}
     distillation_topk=${DISTILLATION_TOPK:-16}
+    teacher_topk=${TEACHER_TOPK:-128}
     distillation_loss_max_clamp=${DISTILLATION_LOSS_MAX_CLAMP:-10.0}
     distillation_log_prob_min_clamp=${DISTILLATION_LOG_PROB_MIN_CLAMP:--10.0}
     teacher_intervention_rejection_token_cap=${TEACHER_INTERVENTION_REJECTION_TOKEN_CAP:-10.0}
@@ -582,6 +583,7 @@ _submit_npu_verl_job() {
         "distillation.teacher_models.teacher_model.inference.max_num_seqs=${teacher_max_num_seqs}"
         "distillation.distillation_loss.loss_mode=${distillation_loss_mode}"
         "distillation.distillation_loss.topk=${distillation_topk}"
+        "distillation.distillation_loss.teacher_topk=${teacher_topk}"
         "distillation.distillation_loss.top_k_strategy=${top_k_strategy}"
         "distillation.distillation_loss.reward_weight_mode=${reward_weight_mode}"
         "distillation.distillation_loss.use_task_rewards=${use_task_rewards}"

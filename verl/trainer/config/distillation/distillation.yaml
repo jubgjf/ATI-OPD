@@ -30,8 +30,13 @@ distillation_loss:
   # If distillation loss requires top-k logits, this is the value of k
   topk: 32
 
+  # Teacher support width for only_stu_teacher_topk. The student update still
+  # uses topk above.
+  teacher_topk: 128
+
   # Top-k support strategy for token-reward OPD.
   # only_stu keeps the historical teacher/student Top-K intersection approximation.
+  # only_stu_teacher_topk keeps the student Top-K fixed while expanding teacher support.
   # only_stu_rethinking_style queries exact teacher log-probs for every student Top-K id.
   top_k_strategy: only_stu
 

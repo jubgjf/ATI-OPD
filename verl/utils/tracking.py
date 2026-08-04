@@ -238,6 +238,7 @@ def _prepare_wandb_config(config: Any) -> Any:
         "distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size",
         "distillation.distillation_loss.loss_mode",
         "distillation.distillation_loss.topk",
+        "distillation.distillation_loss.teacher_topk",
         "distillation.distillation_loss.top_k_strategy",
         "distillation.distillation_loss.reward_weight_mode",
         "distillation.intervention.enabled",

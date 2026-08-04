@@ -154,6 +154,7 @@ else
 fi
 DISTILLATION_LOSS_MODE=${DISTILLATION_LOSS_MODE:-k1}
 DISTILLATION_TOPK=${DISTILLATION_TOPK:-16}
+TEACHER_TOPK=${TEACHER_TOPK:-128}
 TOP_K_STRATEGY=${TOP_K_STRATEGY:-only_stu}
 REWARD_WEIGHT_MODE=${REWARD_WEIGHT_MODE:-student_p}
 DISTILLATION_USE_TASK_REWARDS=${DISTILLATION_USE_TASK_REWARDS:-False}
@@ -452,6 +453,7 @@ COMMON_OVERRIDES=(
     "distillation.teacher_models.teacher_model.inference.skip_tokenizer_init=${SKIP_TOKENIZER_INIT}"
     "distillation.distillation_loss.loss_mode=${DISTILLATION_LOSS_MODE}"
     "distillation.distillation_loss.topk=${DISTILLATION_TOPK}"
+    "distillation.distillation_loss.teacher_topk=${TEACHER_TOPK}"
     "distillation.distillation_loss.top_k_strategy=${TOP_K_STRATEGY}"
     "distillation.distillation_loss.reward_weight_mode=${REWARD_WEIGHT_MODE}"
     "distillation.distillation_loss.use_task_rewards=${DISTILLATION_USE_TASK_REWARDS}"

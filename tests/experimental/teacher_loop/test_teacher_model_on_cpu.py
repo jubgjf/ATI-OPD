@@ -14,6 +14,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from verl.experimental.teacher_loop.teacher_model import TeacherModelManager
 from verl.workers.config.distillation import (
     RETHINKING_TARGET_PROMPT_LOGPROBS_CONFIG_KEY,
@@ -43,7 +45,8 @@ def test_rethinking_style_enables_target_patch_only_on_its_teacher_on_cpu(monkey
     assert inference.engine_kwargs == {"vllm": {"enable_prefix_caching": False, "max_num_seqs": 8}}
 
 
-def test_legacy_only_stu_does_not_enable_or_mutate_target_patch_config_on_cpu(monkeypatch):
+@pytest.mark.parametrize("top_k_strategy", ["only_stu", "only_stu_teacher_topk"])
+def test_ordinary_teacher_support_strategies_do_not_mutate_target_patch_config_on_cpu(monkeypatch, top_k_strategy):
     _disable_teacher_server_initialization(monkeypatch)
     inference = SimpleNamespace(
         name="vllm",
@@ -52,7 +55,7 @@ def test_legacy_only_stu_does_not_enable_or_mutate_target_patch_config_on_cpu(mo
         engine_kwargs={"vllm": {"enable_prefix_caching": True}},
     )
     teacher_config = SimpleNamespace(key="teacher", inference=inference)
-    distillation_config = SimpleNamespace(distillation_loss=SimpleNamespace(top_k_strategy="only_stu"))
+    distillation_config = SimpleNamespace(distillation_loss=SimpleNamespace(top_k_strategy=top_k_strategy))
 
     TeacherModelManager(distillation_config, teacher_config, resource_pool=object())
 

@@ -369,6 +369,46 @@ def test_distillation_rethinking_opd_diagnostics_requests_teacher_topk_on_cpu():
     assert teacher_config.inference.engine_kwargs["vllm"]["max_logprobs"] == 16
 
 
+def test_only_stu_teacher_topk_expands_teacher_backend_without_expanding_diagnostics_on_cpu():
+    config = DistillationConfig(
+        enabled=True,
+        use_actor_loss=False,
+        n_gpus_per_node=1,
+        nnodes=1,
+        distillation_loss=DistillationLossConfig(
+            loss_mode="k1",
+            topk=16,
+            teacher_topk=128,
+            top_k_strategy="only_stu_teacher_topk",
+        ),
+        diagnostics=DistillationDiagnosticsConfig(
+            collect_topk_overlap=True,
+            collect_rethinking_opd_metrics=True,
+            topk=16,
+        ),
+        teacher_models={
+            "teacher_model": DistillationTeacherModelConfig(
+                key="teacher",
+                model_path="dummy",
+                num_replicas=1,
+                inference=RolloutConfig(
+                    name="vllm",
+                    prompt_length=4,
+                    response_length=8,
+                    tensor_model_parallel_size=1,
+                    data_parallel_size=1,
+                    pipeline_model_parallel_size=1,
+                    engine_kwargs={"vllm": {}},
+                ),
+            )
+        },
+    )
+
+    teacher_config = next(iter(config.teacher_models.values()))
+    assert config.diagnostics.topk == 16
+    assert teacher_config.inference.engine_kwargs["vllm"]["max_logprobs"] == 128
+
+
 def test_compute_opd_diagnostics_metrics_logs_late_gap_and_entropy_on_cpu():
     student_logprobs = torch.tensor([[-1.0, -1.0, -1.0, -1.0], [-1.0, -1.0, -1.0, -1.0]])
     teacher_logprobs = torch.tensor([[-1.1, -1.1, -3.0, -3.0], [-1.0, -1.0, -1.0, -1.0]])

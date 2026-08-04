@@ -1689,12 +1689,14 @@ class AgentLoopWorker:
         algorithm_config = getattr(config, "algorithm", None)
         adv_estimator = getattr(algorithm_config, "adv_estimator", "")
         adv_estimator = getattr(adv_estimator, "value", adv_estimator)
+        top_k_strategy = getattr(loss_config, "top_k_strategy", "only_stu")
         if (
             loss_config is not None
             and str(adv_estimator) == "token_reward_direct"
-            and loss_config.top_k_strategy == "only_stu"
+            and top_k_strategy in {"only_stu", "only_stu_teacher_topk"}
         ):
-            prompt_logprobs = max(prompt_logprobs, int(loss_config.topk or 0))
+            strategy_topk = loss_config.teacher_topk if top_k_strategy == "only_stu_teacher_topk" else loss_config.topk
+            prompt_logprobs = max(prompt_logprobs, int(strategy_topk or 0))
         diagnostics_config = getattr(distillation_config, "diagnostics", None)
         if diagnostics_config is not None and (
             getattr(diagnostics_config, "collect_topk_overlap", False)

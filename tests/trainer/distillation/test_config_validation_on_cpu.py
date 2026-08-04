@@ -103,14 +103,28 @@ def test_outcome_transition_cross_config_requires_intervention_diagnostics_and_m
         validate_distillation_intervention_training_config(config)
 
 
-def test_distillation_loss_config_preserves_legacy_only_stu_default_and_accepts_rethinking_style_on_cpu():
-    assert DistillationLossConfig().top_k_strategy == "only_stu"
+def test_distillation_loss_config_preserves_legacy_default_and_accepts_student_support_strategies_on_cpu():
+    default_config = DistillationLossConfig()
+    assert default_config.top_k_strategy == "only_stu"
+    assert default_config.teacher_topk == 128
     assert (
         DistillationLossConfig(top_k_strategy="only_stu_rethinking_style").top_k_strategy == "only_stu_rethinking_style"
     )
+    teacher_topk_config = DistillationLossConfig(
+        topk=16,
+        teacher_topk=128,
+        top_k_strategy="only_stu_teacher_topk",
+    )
+    assert teacher_topk_config.topk == 16
+    assert teacher_topk_config.teacher_topk == 128
 
     with pytest.raises(ValueError, match="top_k_strategy"):
         DistillationLossConfig(top_k_strategy="unknown")
+    for invalid_teacher_topk in (0, -1):
+        with pytest.raises(ValueError, match="teacher_topk must be positive"):
+            DistillationLossConfig(teacher_topk=invalid_teacher_topk)
+    with pytest.raises(ValueError, match="greater than or equal to topk"):
+        DistillationLossConfig(topk=16, teacher_topk=8, top_k_strategy="only_stu_teacher_topk")
 
 
 def test_teacher_segment_loss_config_validates_mode_and_coefficient_on_cpu():
@@ -265,13 +279,19 @@ def test_distillation_intervention_allows_default_decoupled_rollout_correction_o
         {"enabled": True, "gap_metric": "topk_distribution_kl"},
         {
             "enabled": True,
+            "gap_metric": "k3",
+            "outcome_aware_candidate_selection_enabled": True,
+        },
+        {
+            "enabled": True,
             "gap_metric": "teacher_rejection",
             "train_on_teacher_segments": True,
             "teacher_segment_loss_mode": "sft",
         },
     ],
 )
-def test_rethinking_only_stu_is_compatible_with_vanilla_and_dmpd_intervention_settings_on_cpu(intervention):
+@pytest.mark.parametrize("top_k_strategy", ["only_stu_rethinking_style", "only_stu_teacher_topk"])
+def test_student_support_strategies_are_compatible_with_dmpd_settings_on_cpu(intervention, top_k_strategy):
     # Instantiate the intervention dataclass as well as the cross-feature
     # validator, so persistence and rejection-specific invariants are covered.
     DistillationInterventionConfig(**intervention)
@@ -280,7 +300,7 @@ def test_rethinking_only_stu_is_compatible_with_vanilla_and_dmpd_intervention_se
             "distillation": {
                 "enabled": True,
                 "use_actor_loss": False,
-                "distillation_loss": {"top_k_strategy": "only_stu_rethinking_style"},
+                "distillation_loss": {"top_k_strategy": top_k_strategy},
                 "intervention": intervention,
             },
             "algorithm": {
@@ -301,18 +321,20 @@ def test_rethinking_only_stu_is_compatible_with_vanilla_and_dmpd_intervention_se
         (False, "token_reward_direct", True, "bypass_mode=false"),
     ],
 )
-def test_rethinking_only_stu_rejects_silent_fallback_training_paths_on_cpu(
+@pytest.mark.parametrize("top_k_strategy", ["only_stu_rethinking_style", "only_stu_teacher_topk"])
+def test_student_support_strategies_reject_silent_fallback_training_paths_on_cpu(
     use_actor_loss,
     adv_estimator,
     bypass_mode,
     error,
+    top_k_strategy,
 ):
     config = OmegaConf.create(
         {
             "distillation": {
                 "enabled": True,
                 "use_actor_loss": use_actor_loss,
-                "distillation_loss": {"top_k_strategy": "only_stu_rethinking_style"},
+                "distillation_loss": {"top_k_strategy": top_k_strategy},
                 "intervention": {"enabled": False},
             },
             "algorithm": {

@@ -82,6 +82,7 @@ def test_rethinking_only_stu_defers_student_support_scoring_to_exact_teacher_pas
     worker.distillation_config = SimpleNamespace(
         distillation_loss=SimpleNamespace(
             topk=16,
+            teacher_topk=128,
             top_k_strategy="only_stu_rethinking_style",
             loss_settings=SimpleNamespace(use_topk=False),
         ),
@@ -92,6 +93,10 @@ def test_rethinking_only_stu_defers_student_support_scoring_to_exact_teacher_pas
     )
 
     assert AgentLoopWorker._teacher_prompt_logprobs(worker) == 0
+
+    # The asymmetric approximation expands only the ordinary teacher support.
+    worker.distillation_config.distillation_loss.top_k_strategy = "only_stu_teacher_topk"
+    assert AgentLoopWorker._teacher_prompt_logprobs(worker) == 128
 
     # The legacy strategy still requests teacher Top-K during rollout, which
     # protects the exact behavior of existing only_stu experiments.
@@ -2529,6 +2534,98 @@ async def test_teacher_intervention_topk_no_repair_reuses_scoring_for_training_l
     )
 
     assert teacher_manager.prompt_logprobs_calls == [3]
+
+
+@pytest.mark.asyncio
+async def test_only_stu_teacher_topk_reuses_expanded_intervention_scoring_on_cpu():
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[30], finish_reason="stop"),
+        topk_width=128,
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=4,
+        gap_threshold=999.0,
+    )
+    worker.config = SimpleNamespace(algorithm=SimpleNamespace(adv_estimator="token_reward_direct"))
+    worker.distillation_config.distillation_loss.topk = 16
+    worker.distillation_config.distillation_loss.teacher_topk = 128
+    worker.distillation_config.distillation_loss.top_k_strategy = "only_stu_teacher_topk"
+    worker.distillation_config.distillation_loss.loss_settings = SimpleNamespace(use_topk=False)
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4],
+        response_mask=[1, 1, 1, 1],
+        response_logprobs=[-0.1] * 4,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "teacher-topk-no-repair"},
+    )
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+    assert teacher_manager.prompt_logprobs_calls == [128]
+    assert output.extra_fields["teacher_logprobs"].shape[-1] == 128
+
+    await AgentLoopWorker._compute_teacher_logprobs(
+        worker,
+        output,
+        prompt_ids=output.prompt_ids,
+        response_ids=output.response_ids,
+        validate=False,
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert teacher_manager.prompt_logprobs_calls == [128]
+
+
+@pytest.mark.asyncio
+async def test_only_stu_teacher_topk_repair_reuses_expanded_final_scoring_on_cpu():
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[30, 31], stop_reason="completed", finish_reason="length"),
+        high_gap_start=2,
+        topk_width=128,
+    )
+    worker = _DirectInterventionWorker(teacher_manager=teacher_manager, response_length=6)
+    worker.config = SimpleNamespace(algorithm=SimpleNamespace(adv_estimator="token_reward_direct"))
+    worker.distillation_config.distillation_loss.topk = 16
+    worker.distillation_config.distillation_loss.teacher_topk = 128
+    worker.distillation_config.distillation_loss.top_k_strategy = "only_stu_teacher_topk"
+    worker.distillation_config.distillation_loss.loss_settings = SimpleNamespace(use_topk=False)
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "teacher-topk-repair"},
+    )
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert teacher_manager.prompt_logprobs_calls == [128, 128]
+    assert output.extra_fields["teacher_logprobs"].shape[-1] == 128
+
+    await AgentLoopWorker._compute_teacher_logprobs(
+        worker,
+        output,
+        prompt_ids=output.prompt_ids,
+        response_ids=output.response_ids,
+        validate=False,
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert teacher_manager.prompt_logprobs_calls == [128, 128]
 
 
 @pytest.mark.asyncio
