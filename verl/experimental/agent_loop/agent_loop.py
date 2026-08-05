@@ -89,6 +89,7 @@ DEFAULT_ROUTING_CACHE_SIZE = 10000
 MAX_NONFINITE_STUDENT_SUFFIX_LOGPROB_WARNINGS = 10
 INTERVENTION_TOPK_DISTRIBUTION_GAP_METRICS = {"topk_kl", "topk_distribution_kl", "topk_dist_kl"}
 INTERVENTION_FULL_DISTRIBUTION_GAP_METRICS = {"full_kl", "full_distribution_kl", "distribution_kl"}
+INTERVENTION_LOCAL_EFFECT_V2_WINDOWS = (1, 8, 16, 32, 64, 128)
 
 
 @dataclass
@@ -263,6 +264,23 @@ def _stable_fraction(key: str) -> float:
     return int.from_bytes(digest[:8], byteorder="big", signed=False) / float(1 << 64)
 
 
+def _boundary_structure_tags(left_text: str, right_text: str) -> list[str]:
+    """Describe lightweight surface structure at a decoded token seam."""
+    tags: list[str] = []
+    if not right_text:
+        tags.append("terminal")
+    if left_text.endswith(("\n", "\r")) or right_text.startswith(("\n", "\r")):
+        tags.append("newline")
+    left_stripped = left_text.rstrip()
+    if left_stripped.endswith((".", "?", "!", "。", "？", "！")):
+        tags.append("sentence_end")
+    if left_stripped.endswith((",", ";", ":", "，", "；", "：", "、")):
+        tags.append("clause_delimiter")
+    if (left_text and left_text[-1].isspace()) or (right_text and right_text[0].isspace()):
+        tags.append("whitespace")
+    return tags or ["none"]
+
+
 def _rank_min(values: dict[int, float]) -> dict[int, int]:
     """Rank smaller finite values first, assigning equal values the same minimum rank."""
     ordered = sorted(values.items(), key=lambda item: (item[1], item[0]))
@@ -346,7 +364,11 @@ def _compose_intervention_score(
             f"active_scores.shape={tuple(active_scores.shape)}, "
             f"teacher_rejection.shape={tuple(teacher_rejection.shape)}."
         )
-    components = {"teacher_rejection": teacher_rejection}
+    components = {
+        "teacher_rejection": teacher_rejection,
+        "student_nll": -student_logprobs.float(),
+        "teacher_nll": -teacher_logprobs.float(),
+    }
     components.setdefault(metric, active_scores)
     return _InterventionScoreResult(active_scores=active_scores, components=components)
 
@@ -1038,6 +1060,8 @@ def _initialize_local_effect_metadata(
     segment_length: int,
     gap_metric: str,
     gap_aggregation: str,
+    collect_v2: bool = False,
+    teacher_nonfinite_positions: Optional[list[int]] = None,
 ) -> dict[str, Any]:
     """Capture the next-segment baseline before applying the current intervention."""
     no_intervention_end = min(no_intervention_start + segment_length, score_result.active_scores.numel())
@@ -1072,6 +1096,47 @@ def _initialize_local_effect_metadata(
         metadata["local_effect_no_current_intervention_d"] = teacher_rejection
     if valid_tokens == 0:
         metadata["local_effect_unavailable_reason"] = "no_no_current_intervention_tokens"
+    if collect_v2:
+        invalid_positions = set(teacher_nonfinite_positions or ())
+        window_end = min(
+            no_intervention_start + max(INTERVENTION_LOCAL_EFFECT_V2_WINDOWS),
+            score_result.active_scores.numel(),
+        )
+        component_names = ("active", "teacher_rejection", "student_nll", "teacher_nll")
+        component_tensors = (
+            score_result.active_scores,
+            score_result.components["teacher_rejection"],
+            score_result.components["student_nll"],
+            score_result.components["teacher_nll"],
+        )
+        component_values = {name: [] for name in component_names}
+        invalid_counts = {"masked": 0, "teacher_nonfinite": 0, "value_nonfinite": 0}
+        for position in range(no_intervention_start, window_end):
+            if not response_mask[position]:
+                invalid_counts["masked"] += 1
+                continue
+            if position in invalid_positions:
+                invalid_counts["teacher_nonfinite"] += 1
+                continue
+            values = [float(tensor[position].item()) for tensor in component_tensors]
+            if not all(math.isfinite(value) for value in values):
+                invalid_counts["value_nonfinite"] += 1
+                continue
+            for name, value in zip(component_names, values, strict=True):
+                component_values[name].append(value)
+        metadata.update(
+            {
+                "_local_effect_v2_baseline_active_scores": component_values["active"],
+                "_local_effect_v2_baseline_teacher_rejection_scores": component_values["teacher_rejection"],
+                "_local_effect_v2_baseline_student_nll": component_values["student_nll"],
+                "_local_effect_v2_baseline_teacher_nll": component_values["teacher_nll"],
+                "local_effect_v2_baseline_available_tokens": len(component_values["active"]),
+                "local_effect_v2_baseline_span_tokens": max(window_end - no_intervention_start, 0),
+                "local_effect_v2_baseline_invalid_counts": invalid_counts,
+            }
+        )
+        if not component_values["active"]:
+            metadata["local_effect_v2_baseline_unavailable_reason"] = "no_finite_baseline_tokens"
     return metadata
 
 
@@ -1083,6 +1148,7 @@ def _finalize_local_effect_metadata(
     after_intervention_start: int,
     segment_length: int,
     gap_aggregation: str,
+    teacher_nonfinite_positions: Optional[list[int]] = None,
 ) -> None:
     """Pair a repaired suffix segment with its already-recorded pre-intervention baseline."""
     after_intervention_end = min(after_intervention_start + segment_length, score_result.active_scores.numel())
@@ -1127,6 +1193,37 @@ def _finalize_local_effect_metadata(
         metadata["local_effect_unavailable_reason"] = "no_after_intervention_tokens"
     else:
         metadata.setdefault("local_effect_unavailable_reason", "incomplete_local_effect_pair")
+
+    if "_local_effect_v2_baseline_active_scores" in metadata:
+        invalid_positions = set(teacher_nonfinite_positions or ())
+        window_end = min(
+            after_intervention_start + max(INTERVENTION_LOCAL_EFFECT_V2_WINDOWS),
+            score_result.active_scores.numel(),
+        )
+        active_values: list[float] = []
+        valid_offsets: list[int] = []
+        invalid_counts = {"masked": 0, "teacher_nonfinite": 0, "value_nonfinite": 0}
+        for position in range(after_intervention_start, window_end):
+            if not response_mask[position]:
+                invalid_counts["masked"] += 1
+                continue
+            if position in invalid_positions:
+                invalid_counts["teacher_nonfinite"] += 1
+                continue
+            value = float(score_result.active_scores[position].item())
+            if not math.isfinite(value):
+                invalid_counts["value_nonfinite"] += 1
+                continue
+            active_values.append(value)
+            valid_offsets.append(position - after_intervention_start)
+        metadata.update(
+            {
+                "_local_effect_v2_scored_after_active_scores": active_values,
+                "_local_effect_v2_scored_after_offsets": valid_offsets,
+                "local_effect_v2_scored_after_available_tokens": len(active_values),
+                "local_effect_v2_scored_after_invalid_counts": invalid_counts,
+            }
+        )
 
 
 def _mark_local_effect_unavailable(metadata: dict[str, Any], reason: str) -> None:
@@ -1749,11 +1846,121 @@ class AgentLoopWorker:
             return False
         return True
 
+    def _collect_intervention_boundary_metrics(self, *, validate: bool) -> bool:
+        """Return whether zero-extra-forward repair-boundary diagnostics are active."""
+        if validate:
+            return False
+        diagnostics_config = getattr(getattr(self, "distillation_config", None), "diagnostics", None)
+        return bool(
+            diagnostics_config is not None
+            and getattr(diagnostics_config, "enabled", False)
+            and getattr(diagnostics_config, "collect_intervention_metrics", False)
+            and getattr(diagnostics_config, "collect_intervention_boundary_metrics", False)
+        )
+
+    def _collect_intervention_boundary_text(self, *, validate: bool) -> bool:
+        """Return whether bounded text cases can be attached to the balanced archive."""
+        if not AgentLoopWorker._collect_intervention_boundary_metrics(self, validate=validate):
+            return False
+        diagnostics_config = getattr(self.distillation_config, "diagnostics", None)
+        if int(getattr(diagnostics_config, "intervention_boundary_text_samples_per_step", 0) or 0) <= 0:
+            return False
+        trainer_config = getattr(getattr(self, "config", None), "trainer", None)
+        metric_logging = _get_config_value(trainer_config, "metric_logging")
+        archive_config = _get_config_value(metric_logging, "archive")
+        return bool(
+            str(_get_config_value(metric_logging, "mode") or "full").lower() == "balanced"
+            and _get_config_value(archive_config, "enabled")
+        )
+
     def _outcome_case_limit(self) -> int:
         diagnostics_config = getattr(getattr(self, "distillation_config", None), "diagnostics", None)
         if diagnostics_config is None:
             return 0
         return int(getattr(diagnostics_config, "outcome_case_samples_per_transition", 0) or 0)
+
+    def _prepare_local_intervention_boundary_cases(self, inputs: list["_InternalAgentLoopOutput"]) -> None:
+        """Decode only the worker-local stable top-K repair-boundary cases."""
+        diagnostics_config = getattr(getattr(self, "distillation_config", None), "diagnostics", None)
+        case_limit = int(getattr(diagnostics_config, "intervention_boundary_text_samples_per_step", 0) or 0)
+        context_tokens = int(getattr(diagnostics_config, "intervention_boundary_text_context_tokens", 32) or 32)
+        candidates: list[tuple[float, int, int]] = []
+        for sample_index, input_item in enumerate(inputs):
+            interventions = input_item.extra_fields.get("teacher_interventions") or []
+            for intervention_index, intervention in enumerate(interventions):
+                if not isinstance(intervention, dict) or not intervention.get("boundary_final_span_available", True):
+                    continue
+                rank = intervention.get("boundary_case_rank")
+                if rank is not None and intervention.get("_teacher_segment_ids") is not None:
+                    candidates.append((float(rank), sample_index, intervention_index))
+
+        cases_by_sample: list[list[dict[str, Any]]] = [[] for _ in inputs]
+        for _, sample_index, intervention_index in sorted(candidates)[:case_limit]:
+            input_item = inputs[sample_index]
+            interventions = input_item.extra_fields.get("teacher_interventions") or []
+            intervention = interventions[intervention_index]
+            response_width = int(input_item.response_ids.shape[-1])
+            response_attention = input_item.attention_mask[0, -response_width:].detach().bool().cpu()
+            final_length = int(response_attention.sum().item())
+            final_ids = input_item.response_ids[0, :final_length].detach().cpu().tolist()
+            start = max(int(intervention.get("start", 0) or 0), 0)
+            teacher_ids = list(intervention.get("_teacher_segment_ids") or [])
+            original_ids = list(intervention.get("_original_student_segment_ids") or [])
+            teacher_end = min(start + len(teacher_ids), final_length)
+            later_starts = [
+                int(item.get("start", final_length) or final_length)
+                for item in interventions[intervention_index + 1 :]
+                if isinstance(item, dict)
+                and item.get("boundary_final_span_available", True)
+                and int(item.get("start", final_length) or final_length) >= teacher_end
+            ]
+            suffix_limit = min(later_starts, default=final_length)
+
+            prefix_tail_ids = final_ids[max(0, start - context_tokens) : start]
+            suffix_head_ids = final_ids[teacher_end : min(teacher_end + context_tokens, suffix_limit)]
+
+            def bounded_head_tail(token_ids: list[int]) -> tuple[list[int], list[int], bool]:
+                if len(token_ids) <= context_tokens:
+                    return token_ids, token_ids, False
+                if len(token_ids) <= 2 * context_tokens:
+                    return token_ids[:context_tokens], token_ids[context_tokens:], False
+                return token_ids[:context_tokens], token_ids[-context_tokens:], True
+
+            original_head_ids, original_tail_ids, original_truncated = bounded_head_tail(original_ids)
+            teacher_head_ids, teacher_tail_ids, teacher_truncated = bounded_head_tail(teacher_ids)
+
+            def decode(token_ids: list[int]) -> str:
+                return self.tokenizer.decode(token_ids, skip_special_tokens=False)
+
+            prefix_tail = decode(prefix_tail_ids)
+            suffix_head = decode(suffix_head_ids)
+            original_head = decode(original_head_ids)
+            original_tail = decode(original_tail_ids)
+            teacher_head = decode(teacher_head_ids)
+            teacher_tail = decode(teacher_tail_ids)
+            cases_by_sample[sample_index].append(
+                {
+                    "case_rank": float(intervention["boundary_case_rank"]),
+                    "attempt": intervention.get("attempt"),
+                    "start": start,
+                    "prefix_tail": prefix_tail,
+                    "original_student_segment_head": original_head,
+                    "original_student_segment_tail": original_tail,
+                    "original_student_segment_truncated": original_truncated,
+                    "teacher_segment_head": teacher_head,
+                    "teacher_segment_tail": teacher_tail,
+                    "teacher_segment_truncated": teacher_truncated,
+                    "student_suffix_head": suffix_head,
+                    "entry_structure_tags": _boundary_structure_tags(prefix_tail, teacher_head),
+                    "exit_structure_tags": _boundary_structure_tags(teacher_tail, suffix_head),
+                    "context_token_limit": context_tokens,
+                    "prefix_tokens_saved": len(prefix_tail_ids),
+                    "suffix_tokens_saved": len(suffix_head_ids),
+                }
+            )
+
+        for input_item, cases in zip(inputs, cases_by_sample, strict=True):
+            input_item.extra_fields["teacher_intervention_boundary_cases"] = cases or None
 
     def _prepare_local_intervention_outcome_cases(self, inputs: list["_InternalAgentLoopOutput"]) -> None:
         """Keep only the local top-K full-text cases per transition.
@@ -3086,6 +3293,8 @@ class AgentLoopWorker:
 
         intervention_config: DistillationInterventionConfig = self.teacher_intervention_config
         outcome_aware_selection = bool(intervention_config.outcome_aware_candidate_selection_enabled)
+        collect_boundary_metrics = AgentLoopWorker._collect_intervention_boundary_metrics(self, validate=validate)
+        collect_boundary_text = AgentLoopWorker._collect_intervention_boundary_text(self, validate=validate)
         outcome_metadata = output.extra_fields.get("teacher_intervention_outcome")
         if outcome_aware_selection and not isinstance(outcome_metadata, dict):
             raise RuntimeError(
@@ -3204,6 +3413,11 @@ class AgentLoopWorker:
                     after_intervention_start=after_intervention_start,
                     segment_length=intervention_config.student_segment_length,
                     gap_aggregation=intervention_config.gap_aggregation,
+                    teacher_nonfinite_positions=_response_relative_nonfinite_positions(
+                        teacher_result,
+                        prompt_len=len(prompt_ids),
+                        response_len=len(response_ids),
+                    ),
                 )
                 pending_local_effect = None
             gaps = score_result.active_scores
@@ -3250,6 +3464,12 @@ class AgentLoopWorker:
                 segment_length=intervention_config.student_segment_length,
                 gap_metric=intervention_config.gap_metric,
                 gap_aggregation=intervention_config.gap_aggregation,
+                collect_v2=collect_boundary_metrics,
+                teacher_nonfinite_positions=_response_relative_nonfinite_positions(
+                    teacher_result,
+                    prompt_len=len(prompt_ids),
+                    response_len=len(response_ids),
+                ),
             )
             original_student_segment_ids = response_ids[start:end]
             prefix_response_ids = response_ids[:start]
@@ -3542,6 +3762,40 @@ class AgentLoopWorker:
             gap_mask = candidate_gap_mask
             teacher_segment_mask = candidate_teacher_segment_mask
             cached_teacher_result = None
+            boundary_metadata: dict[str, Any] = {}
+            if collect_boundary_metrics:
+                teacher_segment_sha256 = _token_ids_sha256(teacher_segment_ids)
+                original_segment_sha256 = _token_ids_sha256(original_student_segment_ids)
+                stable_sample_parts = (
+                    (sample_kwargs or {}).get("data_source"),
+                    (sample_kwargs or {}).get("index"),
+                    (sample_kwargs or {}).get("global_steps"),
+                )
+                stable_sample_key = ":".join(str(value) for value in stable_sample_parts)
+                if all(value is None for value in stable_sample_parts):
+                    stable_sample_key = base_request_id
+                boundary_rank_key = (
+                    f"{stable_sample_key}:{attempt}:{start}:{original_segment_sha256}:{teacher_segment_sha256}"
+                )
+                boundary_metadata = {
+                    "gap_metric": str(intervention_config.gap_metric).lower(),
+                    "gap_threshold": float(intervention_config.gap_threshold),
+                    "gap_aggregation": str(intervention_config.gap_aggregation),
+                    "original_student_tokens": len(original_student_segment_ids),
+                    "original_student_segment_sha256": original_segment_sha256,
+                    "teacher_segment_sha256": teacher_segment_sha256,
+                    "teacher_terminal": teacher_terminal,
+                    "boundary_final_span_available": True,
+                    "boundary_case_rank": _stable_fraction(boundary_rank_key),
+                }
+                for previous_intervention in interventions:
+                    previous_start = int(previous_intervention.get("start", -1))
+                    previous_teacher_end = previous_start + int(previous_intervention.get("teacher_tokens", 0) or 0)
+                    if start <= previous_start or start < previous_teacher_end:
+                        previous_intervention["boundary_final_span_available"] = False
+                        previous_intervention["boundary_final_span_unavailable_reason"] = (
+                            "overwritten_by_later_intervention"
+                        )
             intervention_item = {
                 "attempt": attempt,
                 "start": start,
@@ -3559,8 +3813,11 @@ class AgentLoopWorker:
                 **local_effect_metadata,
                 **candidate_selection_metadata,
                 **student_suffix_logprob_metadata,
+                **boundary_metadata,
             }
-            if isinstance(outcome_metadata, dict) and outcome_metadata.get("transition_observation_event"):
+            if collect_boundary_text or (
+                isinstance(outcome_metadata, dict) and outcome_metadata.get("transition_observation_event")
+            ):
                 intervention_item.update(
                     {
                         "_original_student_segment_ids": list(original_student_segment_ids),
@@ -3675,6 +3932,8 @@ class AgentLoopWorker:
         validate: bool = False,
     ) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
+        if AgentLoopWorker._collect_intervention_boundary_text(self, validate=validate):
+            AgentLoopWorker._prepare_local_intervention_boundary_cases(self, inputs)
         AgentLoopWorker._prepare_local_intervention_outcome_cases(self, inputs)
         # Convert lists back to tensors and stack them to create a batch.
         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
@@ -3898,6 +4157,28 @@ class AgentLoopManager:
             if index not in selected:
                 cases[index] = None
 
+    def _cap_intervention_boundary_cases(self, output: DataProto) -> None:
+        """Apply the global stable cap after worker-local boundary-case selection."""
+        key = "teacher_intervention_boundary_cases"
+        if key not in output.non_tensor_batch:
+            return
+        diagnostics_config = getattr(getattr(self.config, "distillation", None), "diagnostics", None)
+        case_limit = int(getattr(diagnostics_config, "intervention_boundary_text_samples_per_step", 0) or 0)
+        sample_cases = output.non_tensor_batch[key]
+        candidates: list[tuple[float, int, int]] = []
+        for sample_index, cases in enumerate(sample_cases):
+            if not isinstance(cases, list):
+                continue
+            for case_index, case in enumerate(cases):
+                if isinstance(case, dict) and case.get("case_rank") is not None:
+                    candidates.append((float(case["case_rank"]), sample_index, case_index))
+        selected = {(sample_index, case_index) for _, sample_index, case_index in sorted(candidates)[:case_limit]}
+        for sample_index, cases in enumerate(sample_cases):
+            if not isinstance(cases, list):
+                continue
+            retained = [case for case_index, case in enumerate(cases) if (sample_index, case_index) in selected]
+            sample_cases[sample_index] = retained or None
+
     def _refresh_global_teacher_nll_calibration_blocking(self) -> None:
         """Blocking equivalent used by the TransferQueue rollout manager."""
         if self._global_teacher_nll_calibration is None:
@@ -3950,6 +4231,7 @@ class AgentLoopManager:
         )
         output = DataProto.concat(outputs)
         self._cap_intervention_outcome_cases(output)
+        self._cap_intervention_boundary_cases(output)
 
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]

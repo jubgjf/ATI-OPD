@@ -280,6 +280,9 @@ run_npu_opd_job() {
     opd_diagnostics_heatmap_history_steps=${OPD_DIAGNOSTICS_HEATMAP_HISTORY_STEPS:-80}
     opd_diagnostics_log_heatmap=${OPD_DIAGNOSTICS_LOG_HEATMAP:-True}
     opd_diagnostics_high_gap_threshold=${OPD_DIAGNOSTICS_HIGH_GAP_THRESHOLD:-1.0}
+    opd_diagnostics_collect_intervention_boundary_metrics=${OPD_DIAGNOSTICS_COLLECT_INTERVENTION_BOUNDARY_METRICS:-True}
+    opd_diagnostics_intervention_boundary_text_samples_per_step=${OPD_DIAGNOSTICS_INTERVENTION_BOUNDARY_TEXT_SAMPLES_PER_STEP:-8}
+    opd_diagnostics_intervention_boundary_text_context_tokens=${OPD_DIAGNOSTICS_INTERVENTION_BOUNDARY_TEXT_CONTEXT_TOKENS:-32}
     opd_diagnostics_bad_tail_min_position=${OPD_DIAGNOSTICS_BAD_TAIL_MIN_POSITION:-12000}
     opd_diagnostics_bad_tail_deep_position=${OPD_DIAGNOSTICS_BAD_TAIL_DEEP_POSITION:-16000}
     opd_diagnostics_bad_tail_extreme_position=${OPD_DIAGNOSTICS_BAD_TAIL_EXTREME_POSITION:-20000}
@@ -608,6 +611,9 @@ _submit_npu_verl_job() {
         "distillation.diagnostics.heatmap_history_steps=${opd_diagnostics_heatmap_history_steps}"
         "distillation.diagnostics.log_wandb_heatmap=${opd_diagnostics_log_heatmap}"
         "distillation.diagnostics.high_gap_threshold=${opd_diagnostics_high_gap_threshold}"
+        "distillation.diagnostics.collect_intervention_boundary_metrics=${opd_diagnostics_collect_intervention_boundary_metrics}"
+        "distillation.diagnostics.intervention_boundary_text_samples_per_step=${opd_diagnostics_intervention_boundary_text_samples_per_step}"
+        "distillation.diagnostics.intervention_boundary_text_context_tokens=${opd_diagnostics_intervention_boundary_text_context_tokens}"
         "distillation.diagnostics.bad_tail_min_position=${opd_diagnostics_bad_tail_min_position}"
         "distillation.diagnostics.bad_tail_deep_position=${opd_diagnostics_bad_tail_deep_position}"
         "distillation.diagnostics.bad_tail_extreme_position=${opd_diagnostics_bad_tail_extreme_position}"

@@ -914,6 +914,7 @@ class _DirectInterventionWorker:
         teacher_nll_healthy_probe_probability: float = 0.0,
         repair_for_evaluation: bool = False,
         collect_intervention_outcome_transitions: bool = False,
+        collect_intervention_boundary_metrics: bool = False,
         outcome_case_samples_per_transition: int = 8,
     ):
         self.tokenizer = _FakeTokenizer()
@@ -960,8 +961,9 @@ class _DirectInterventionWorker:
                 log_prob_min_clamp=-10.0,
             ),
             diagnostics=SimpleNamespace(
-                enabled=collect_intervention_outcome_transitions,
+                enabled=collect_intervention_outcome_transitions or collect_intervention_boundary_metrics,
                 collect_intervention_metrics=True,
+                collect_intervention_boundary_metrics=collect_intervention_boundary_metrics,
                 collect_intervention_outcome_transitions=collect_intervention_outcome_transitions,
                 outcome_case_samples_per_transition=outcome_case_samples_per_transition,
                 log_interval=1,
@@ -1111,6 +1113,83 @@ def test_agent_loop_manager_caps_full_text_outcome_cases_per_transition_by_stabl
 
     cases = output.non_tensor_batch["teacher_intervention_outcome_case"].tolist()
     assert [index for index, case in enumerate(cases) if case is not None] == [1, 4]
+
+
+def test_agent_loop_manager_globally_caps_boundary_cases_by_stable_rank_on_cpu():
+    manager = object.__new__(AgentLoopManager)
+    manager.config = OmegaConf.create(
+        {"distillation": {"diagnostics": {"intervention_boundary_text_samples_per_step": 2}}}
+    )
+    output = DataProto.from_single_dict(
+        {
+            "dummy": torch.arange(3).unsqueeze(-1),
+            "teacher_intervention_boundary_cases": np.array(
+                [
+                    [{"case_rank": 0.8}, {"case_rank": 0.2}],
+                    [{"case_rank": 0.1}],
+                    [{"case_rank": 0.5}],
+                ],
+                dtype=object,
+            ),
+        }
+    )
+
+    AgentLoopManager._cap_intervention_boundary_cases(manager, output)
+
+    cases = output.non_tensor_batch["teacher_intervention_boundary_cases"].tolist()
+    retained_ranks = [case["case_rank"] for sample_cases in cases if sample_cases for case in sample_cases]
+    assert retained_ranks == [0.2, 0.1]
+
+
+def test_agent_loop_worker_decodes_only_local_boundary_candidates_and_drops_private_token_ids_on_cpu():
+    worker = object.__new__(AgentLoopWorker)
+    worker.tokenizer = _FakeTokenizer()
+    worker.distillation_config = SimpleNamespace(
+        diagnostics=SimpleNamespace(
+            intervention_boundary_text_samples_per_step=1,
+            intervention_boundary_text_context_tokens=2,
+            outcome_case_samples_per_transition=0,
+        )
+    )
+    inputs = []
+    for rank, start in ((0.8, 1), (0.2, 2)):
+        inputs.append(
+            _to_internal(
+                output_prompt_ids=[101, 102],
+                output_response_ids=[1, 2, 30, 31, 40, 41],
+                output_response_mask=[1, 1, 0, 0, 1, 1],
+                metrics=AgentLoopMetrics(),
+                extra_fields={
+                    "teacher_interventions": [
+                        {
+                            "attempt": 0,
+                            "start": start,
+                            "teacher_tokens": 2,
+                            "boundary_case_rank": rank,
+                            "boundary_final_span_available": True,
+                            "_original_student_segment_ids": [7, 8, 9, 10, 11],
+                            "_teacher_segment_ids": [30, 31],
+                        }
+                    ]
+                },
+                num_turns=1,
+                prompt_len=4,
+                response_len=8,
+            )
+        )
+
+    AgentLoopWorker._prepare_local_intervention_boundary_cases(worker, inputs)
+    AgentLoopWorker._prepare_local_intervention_outcome_cases(worker, inputs)
+
+    assert inputs[0].extra_fields["teacher_intervention_boundary_cases"] is None
+    selected_cases = inputs[1].extra_fields["teacher_intervention_boundary_cases"]
+    assert isinstance(selected_cases, list) and len(selected_cases) == 1
+    assert selected_cases[0]["case_rank"] == 0.2
+    assert selected_cases[0]["context_token_limit"] == 2
+    for input_item in inputs:
+        intervention = input_item.extra_fields["teacher_interventions"][0]
+        assert "_original_student_segment_ids" not in intervention
+        assert "_teacher_segment_ids" not in intervention
 
 
 class _SequenceAwareRewardMethod:
@@ -2430,6 +2509,53 @@ async def test_teacher_rejection_records_boundary_aligned_on_policy_local_effect
     assert intervention["local_effect_no_current_intervention_d"] == pytest.approx(4.9)
     assert intervention["local_effect_after_intervention_d"] == pytest.approx(0.0)
     assert intervention["local_effect_d_reduction"] == pytest.approx(4.9)
+
+
+@pytest.mark.asyncio
+async def test_boundary_metrics_do_not_add_generation_or_scoring_calls_on_cpu():
+    async def run(collect_boundary_metrics: bool):
+        teacher_manager = _FixedGapTeacherManager(
+            TeacherGenerationResult(token_ids=[30], stop_reason="completed", finish_reason="length")
+        )
+        worker = _DirectInterventionWorker(
+            teacher_manager=teacher_manager,
+            response_length=6,
+            student_segment_length=2,
+            teacher_segment_length=1,
+            gap_metric="abs",
+            gap_threshold=1.0,
+            collect_intervention_boundary_metrics=collect_boundary_metrics,
+        )
+        output = AgentLoopOutput(
+            prompt_ids=[101, 102],
+            response_ids=[1, 2, 3, 4],
+            response_mask=[1, 1, 1, 1],
+            response_logprobs=[-0.1] * 4,
+            metrics=AgentLoopMetrics(),
+            extra_fields={"rollout_request_id": f"boundary-{collect_boundary_metrics}"},
+        )
+        await AgentLoopWorker._maybe_repair_with_teacher(
+            worker,
+            output,
+            validate=False,
+            sampling_params={"temperature": 0.8, "logprobs": True},
+            sample_kwargs={"data_source": "openai/gsm8k"},
+        )
+        return worker, teacher_manager, output
+
+    disabled_worker, disabled_teacher, disabled_output = await run(False)
+    enabled_worker, enabled_teacher, enabled_output = await run(True)
+
+    assert len(disabled_teacher.scored_sequences) == len(enabled_teacher.scored_sequences)
+    assert len(disabled_teacher.generated_prefixes) == len(enabled_teacher.generated_prefixes)
+    assert len(disabled_worker.llm_client.calls) == len(enabled_worker.llm_client.calls)
+    assert disabled_output.response_ids == enabled_output.response_ids
+    assert disabled_output.response_mask == enabled_output.response_mask
+    assert disabled_output.response_logprobs == enabled_output.response_logprobs
+    disabled_intervention = disabled_output.extra_fields["teacher_interventions"][0]
+    enabled_intervention = enabled_output.extra_fields["teacher_interventions"][0]
+    assert "_local_effect_v2_baseline_active_scores" not in disabled_intervention
+    assert "_local_effect_v2_baseline_active_scores" in enabled_intervention
 
 
 def test_teacher_intervention_full_kl_uses_full_vocab_support_on_cpu():

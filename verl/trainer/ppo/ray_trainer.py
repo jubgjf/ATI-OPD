@@ -51,6 +51,7 @@ from verl.trainer.distillation.diagnostics import (
     compute_entropy_heatmap_row,
     compute_gap_heatmap_row,
     compute_gap_high_heatmap_row,
+    compute_intervention_boundary_diagnostics,
     compute_intervention_metrics,
     compute_opd_diagnostics_metrics,
     compute_teacher_logprob_nonfinite_heatmap_row,
@@ -157,33 +158,102 @@ def _has_answer_pattern(text: Any) -> bool:
     return math_dapo.has_answer_label(text)
 
 
-def _snapshot_diagnostics_value(value: Any) -> Any:
+def _snapshot_diagnostics_value(value: Any, memo: dict[int, Any] | None = None) -> Any:
+    """Snapshot diagnostics data once, preserving shared tensor references."""
+    memo = {} if memo is None else memo
+    value_id = id(value)
+    if value_id in memo:
+        return memo[value_id]
     if isinstance(value, torch.Tensor):
-        snapshot = value.detach()
-        return snapshot.clone() if snapshot.device.type == "cpu" else snapshot.cpu()
-    return copy.deepcopy(value)
+        detached = value.detach()
+        snapshot = detached.clone() if detached.device.type == "cpu" else detached.cpu()
+        memo[value_id] = snapshot
+        return snapshot
+    if isinstance(value, dict):
+        snapshot = {key: _snapshot_diagnostics_value(item, memo) for key, item in value.items()}
+        memo[value_id] = snapshot
+        return snapshot
+    if isinstance(value, list):
+        snapshot = [_snapshot_diagnostics_value(item, memo) for item in value]
+        memo[value_id] = snapshot
+        return snapshot
+    if isinstance(value, tuple):
+        snapshot = tuple(_snapshot_diagnostics_value(item, memo) for item in value)
+        memo[value_id] = snapshot
+        return snapshot
+    snapshot = copy.deepcopy(value)
+    memo[value_id] = snapshot
+    return snapshot
 
 
 def _snapshot_diagnostics_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-    return {key: _snapshot_diagnostics_value(value) for key, value in kwargs.items()}
+    return _snapshot_diagnostics_value(kwargs)
+
+
+def _snapshot_diagnostics_payloads(*payloads: dict[str, Any] | None) -> tuple[dict[str, Any] | None, ...]:
+    """Snapshot related payloads with one device-to-host copy per shared tensor."""
+    memo: dict[int, Any] = {}
+    return tuple(None if payload is None else _snapshot_diagnostics_value(payload, memo) for payload in payloads)
+
+
+@dataclass(frozen=True, slots=True)
+class _OpdDiagnosticsResult:
+    metrics: dict[str, float]
+    intervention_records: tuple[dict[str, Any], ...] = ()
+
+
+def _compute_intervention_boundary_from_payloads(
+    diagnostics_kwargs: dict[str, Any],
+    intervention_kwargs: dict[str, Any] | None,
+    boundary_kwargs: dict[str, Any] | None,
+) -> tuple[dict[str, float], list[dict[str, Any]]]:
+    if boundary_kwargs is None or intervention_kwargs is None:
+        return {}, []
+    return compute_intervention_boundary_diagnostics(
+        global_step=boundary_kwargs["global_step"],
+        interventions=intervention_kwargs["interventions"],
+        intervention_outcomes=intervention_kwargs.get("intervention_outcomes"),
+        response_ids=diagnostics_kwargs["response_ids"],
+        response_mask=intervention_kwargs["response_mask"],
+        student_logprobs=diagnostics_kwargs["student_logprobs"],
+        teacher_logprobs=diagnostics_kwargs["teacher_logprobs"],
+        entropy=diagnostics_kwargs["entropy"],
+        student_topk_ids=diagnostics_kwargs["student_topk_ids"],
+        teacher_logprob_nonfinite_positions=diagnostics_kwargs["teacher_logprob_nonfinite_positions"],
+        boundary_text_cases=boundary_kwargs.get("boundary_text_cases"),
+        sample_uids=boundary_kwargs.get("sample_uids"),
+        data_sources=boundary_kwargs.get("data_sources"),
+        gap_metric=boundary_kwargs["gap_metric"],
+        teacher_rejection_token_cap=boundary_kwargs["teacher_rejection_token_cap"],
+        student_teacher_span_scores_available=bool(boundary_kwargs.get("student_teacher_span_scores_available", True)),
+    )
 
 
 def _compute_opd_diagnostics_background_metrics(
     diagnostics_kwargs: dict[str, Any],
     intervention_kwargs: dict[str, Any] | None,
-) -> dict[str, float]:
+    boundary_kwargs: dict[str, Any] | None = None,
+) -> _OpdDiagnosticsResult:
     start_time = time.perf_counter()
     metrics = compute_opd_diagnostics_metrics(**diagnostics_kwargs)
     if intervention_kwargs is not None:
         metrics.update(compute_intervention_metrics(**intervention_kwargs))
+    intervention_records: list[dict[str, Any]] = []
+    if boundary_kwargs is not None and intervention_kwargs is not None:
+        boundary_metrics, intervention_records = _compute_intervention_boundary_from_payloads(
+            diagnostics_kwargs,
+            intervention_kwargs,
+            boundary_kwargs,
+        )
+        metrics.update(boundary_metrics)
     metrics["opd/diagnostics_async/worker_compute_seconds"] = time.perf_counter() - start_time
-    return metrics
+    return _OpdDiagnosticsResult(metrics=metrics, intervention_records=tuple(intervention_records))
 
 
 @dataclass(slots=True)
 class _PendingOpdDiagnostics:
     source_step: int
-    future: Future[dict[str, float]]
+    future: Future[_OpdDiagnosticsResult]
     submitted_at: float
 
 
@@ -580,6 +650,19 @@ def _reward_info_dict_to_samples(reward_extra_info: dict[str, Any], *, sample_co
     return result
 
 
+def _without_boundary_private_fields(value: Any) -> Any:
+    """Remove transient numeric window buffers before unrelated archives are serialized."""
+    if isinstance(value, dict):
+        return {
+            key: _without_boundary_private_fields(item)
+            for key, item in value.items()
+            if not str(key).startswith("_local_effect_v2_")
+        }
+    if isinstance(value, list | tuple):
+        return [_without_boundary_private_fields(item) for item in value]
+    return copy.deepcopy(value)
+
+
 def _build_repair_evaluation_archive_records(
     *,
     evaluation_scope: str,
@@ -635,7 +718,7 @@ def _build_repair_evaluation_archive_records(
             "raw_output_sha256": hashlib.sha256(raw_outputs[index].encode("utf-8")).hexdigest(),
             "final_output_sha256": hashlib.sha256(final_outputs[index].encode("utf-8")).hexdigest(),
             "outcome": outcome,
-            "interventions": interventions[index],
+            "interventions": _without_boundary_private_fields(interventions[index]),
             "skipped_interventions": skipped_interventions[index],
             "oracle": bool(outcome.get("oracle_gate_used", False)),
             "case_included": isinstance(cases[index], dict),
@@ -697,7 +780,7 @@ def _build_training_intervention_outcome_archive_records(
             "uid": sample_uids[index],
             "data_source": data_sources[index],
             "outcome": outcome,
-            "interventions": interventions[index],
+            "interventions": _without_boundary_private_fields(interventions[index]),
             "skipped_interventions": skipped_interventions[index],
             "case_included": isinstance(cases[index], dict),
         }
@@ -3257,7 +3340,16 @@ class RayPPOTrainer:
         batch: DataProto,
         entropy: torch.Tensor | None,
         global_steps: int,
-    ) -> tuple[dict[str, Any], dict[str, Any] | None, torch.Tensor | None, list[Any] | None] | None:
+    ) -> (
+        tuple[
+            dict[str, Any],
+            dict[str, Any] | None,
+            dict[str, Any] | None,
+            torch.Tensor | None,
+            list[Any] | None,
+        ]
+        | None
+    ):
         diagnostics_config = self._distillation_diagnostics_config()
         if (
             diagnostics_config is None
@@ -3289,6 +3381,10 @@ class RayPPOTrainer:
             diagnostics_config.collect_topk_overlap
             or getattr(diagnostics_config, "collect_rethinking_opd_metrics", False)
         ) and global_steps % diagnostics_config.topk_log_interval == 0
+        collect_boundary_diagnostics = bool(
+            diagnostics_config.collect_intervention_metrics
+            and getattr(diagnostics_config, "collect_intervention_boundary_metrics", False)
+        )
         teacher_response_logprobs = self._extract_teacher_response_logprobs_for_diagnostics(batch)
         teacher_response_topk_ids, teacher_response_topk_logprobs = (
             self._extract_teacher_response_topk_for_diagnostics(batch) if collect_topk_diagnostics else (None, None)
@@ -3306,7 +3402,11 @@ class RayPPOTrainer:
             "response_ids": batch.batch.get("responses", None),
             "response_texts": response_texts,
             "teacher_logprobs": teacher_response_logprobs,
-            "student_topk_ids": batch.batch.get("student_topk_ids", None) if collect_topk_diagnostics else None,
+            "student_topk_ids": (
+                batch.batch.get("student_topk_ids", None)
+                if collect_topk_diagnostics or collect_boundary_diagnostics
+                else None
+            ),
             "student_topk_logprobs": batch.batch.get("student_topk_logprobs", None)
             if collect_topk_diagnostics
             else None,
@@ -3340,6 +3440,7 @@ class RayPPOTrainer:
             "bad_tail_entropy_threshold": diagnostics_config.bad_tail_entropy_threshold,
         }
         intervention_kwargs = None
+        boundary_kwargs = None
 
         if diagnostics_config.collect_intervention_metrics:
             intervention_config = getattr(self.distillation_config, "intervention", None)
@@ -3372,7 +3473,41 @@ class RayPPOTrainer:
                     "response_mask": response_mask,
                 }
 
-        return diagnostics_kwargs, intervention_kwargs, teacher_response_logprobs, teacher_logprob_nonfinite_positions
+                if collect_boundary_diagnostics:
+                    if diagnostics_kwargs["response_ids"] is None:
+                        raise RuntimeError(
+                            "Repair-boundary diagnostics require the existing response token tensor, but "
+                            "batch.batch['responses'] was unavailable."
+                        )
+                    boundary_kwargs = {
+                        "global_step": int(global_steps),
+                        "boundary_text_cases": (
+                            self._non_tensor_to_list(batch.non_tensor_batch["teacher_intervention_boundary_cases"])
+                            if "teacher_intervention_boundary_cases" in batch.non_tensor_batch
+                            else None
+                        ),
+                        "sample_uids": (
+                            self._non_tensor_to_list(batch.non_tensor_batch["uid"])
+                            if "uid" in batch.non_tensor_batch
+                            else None
+                        ),
+                        "data_sources": (
+                            self._non_tensor_to_list(batch.non_tensor_batch["data_source"])
+                            if "data_source" in batch.non_tensor_batch
+                            else None
+                        ),
+                        "gap_metric": str(intervention_config.gap_metric),
+                        "teacher_rejection_token_cap": float(intervention_config.teacher_rejection_token_cap),
+                        "student_teacher_span_scores_available": entropy is not None,
+                    }
+
+        return (
+            diagnostics_kwargs,
+            intervention_kwargs,
+            boundary_kwargs,
+            teacher_response_logprobs,
+            teacher_logprob_nonfinite_positions,
+        )
 
     def _compute_opd_diagnostics_metrics(
         self,
@@ -3389,13 +3524,41 @@ class RayPPOTrainer:
         if diagnostics_inputs is None:
             return {}
 
-        diagnostics_kwargs, intervention_kwargs, teacher_response_logprobs, teacher_logprob_nonfinite_positions = (
-            diagnostics_inputs
-        )
+        (
+            diagnostics_kwargs,
+            intervention_kwargs,
+            boundary_kwargs,
+            teacher_response_logprobs,
+            teacher_logprob_nonfinite_positions,
+        ) = diagnostics_inputs
+        if boundary_kwargs is not None:
+            diagnostics_snapshot, intervention_snapshot, boundary_snapshot = _snapshot_diagnostics_payloads(
+                diagnostics_kwargs,
+                intervention_kwargs,
+                boundary_kwargs,
+            )
+            if diagnostics_snapshot is None:
+                raise RuntimeError("OPD diagnostics snapshot unexpectedly dropped the required diagnostics payload.")
+            diagnostics_kwargs = diagnostics_snapshot
+            intervention_kwargs = intervention_snapshot
+            boundary_kwargs = boundary_snapshot
+            teacher_response_logprobs = diagnostics_kwargs["teacher_logprobs"]
+            teacher_logprob_nonfinite_positions = diagnostics_kwargs["teacher_logprob_nonfinite_positions"]
         metrics = compute_opd_diagnostics_metrics(**diagnostics_kwargs)
         metrics["opd/gap_abs/available"] = 1.0 if teacher_response_logprobs is not None else 0.0
         if intervention_kwargs is not None:
             metrics.update(compute_intervention_metrics(**intervention_kwargs))
+        if boundary_kwargs is not None and intervention_kwargs is not None:
+            boundary_metrics, records = _compute_intervention_boundary_from_payloads(
+                diagnostics_kwargs,
+                intervention_kwargs,
+                boundary_kwargs,
+            )
+            metrics.update(boundary_metrics)
+            self._queue_event_records_archive(
+                metric_key="opd_intervention/repair_boundary_records",
+                records=records,
+            )
 
         metrics.update(
             self._maybe_log_opd_heatmaps(
@@ -3433,14 +3596,24 @@ class RayPPOTrainer:
 
         join_started_at = time.perf_counter()
         try:
-            result = task.future.result()
+            raw_result = task.future.result()
         except Exception as exc:
             raise RuntimeError(f"Async OPD diagnostics failed for source step {task.source_step}.") from exc
         finally:
             self._opd_diagnostics_task = None
 
         finished_at = time.perf_counter()
-        result.update(
+        result = (
+            raw_result
+            if isinstance(raw_result, _OpdDiagnosticsResult)
+            else _OpdDiagnosticsResult(metrics=dict(raw_result))
+        )
+        metrics = dict(result.metrics)
+        self._queue_event_records_archive(
+            metric_key="opd_intervention/repair_boundary_records",
+            records=list(result.intervention_records),
+        )
+        metrics.update(
             {
                 "opd/diagnostics_async/completed": 1.0,
                 "opd/diagnostics_async/failed": 0.0,
@@ -3451,7 +3624,7 @@ class RayPPOTrainer:
                 "opd/diagnostics_async/join_wait_seconds": finished_at - join_started_at,
             }
         )
-        return result
+        return metrics
 
     def _shutdown_opd_diagnostics_executor(self) -> None:
         if self._opd_diagnostics_executor is not None:
@@ -3485,9 +3658,13 @@ class RayPPOTrainer:
                 f"active_source_step={active_step}, requested_source_step={global_steps}."
             )
 
-        diagnostics_kwargs, intervention_kwargs, teacher_response_logprobs, teacher_logprob_nonfinite_positions = (
-            diagnostics_inputs
-        )
+        (
+            diagnostics_kwargs,
+            intervention_kwargs,
+            boundary_kwargs,
+            teacher_response_logprobs,
+            teacher_logprob_nonfinite_positions,
+        ) = diagnostics_inputs
         metrics = self._maybe_log_opd_heatmaps(
             global_steps=global_steps,
             entropy=diagnostics_kwargs["entropy"],
@@ -3499,16 +3676,20 @@ class RayPPOTrainer:
         metrics["opd/gap_abs/available"] = 1.0 if teacher_response_logprobs is not None else 0.0
 
         snapshot_start = time.perf_counter()
-        snapshot_kwargs = _snapshot_diagnostics_kwargs(diagnostics_kwargs)
-        snapshot_intervention_kwargs = (
-            _snapshot_diagnostics_kwargs(intervention_kwargs) if intervention_kwargs is not None else None
+        snapshot_kwargs, snapshot_intervention_kwargs, snapshot_boundary_kwargs = _snapshot_diagnostics_payloads(
+            diagnostics_kwargs,
+            intervention_kwargs,
+            boundary_kwargs,
         )
+        if snapshot_kwargs is None:
+            raise RuntimeError("OPD diagnostics snapshot unexpectedly dropped the required diagnostics payload.")
         snapshot_seconds = time.perf_counter() - snapshot_start
         submitted_at = time.perf_counter()
         future = self._ensure_opd_diagnostics_executor().submit(
             _compute_opd_diagnostics_background_metrics,
             snapshot_kwargs,
             snapshot_intervention_kwargs,
+            snapshot_boundary_kwargs,
         )
         task = _PendingOpdDiagnostics(
             source_step=int(global_steps),

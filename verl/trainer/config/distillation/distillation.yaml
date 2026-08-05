@@ -172,6 +172,14 @@ diagnostics:
   log_wandb_heatmap: true
   high_gap_threshold: 1.0
   collect_intervention_metrics: true
+  # Collect repair-boundary diagnostics exclusively from tensors and scoring
+  # results already produced by training. This never requests extra rollout,
+  # forward, top-k, teacher scoring, or reward computation.
+  collect_intervention_boundary_metrics: false
+  # Full text is decoded only for the globally stable selected cases and is
+  # available only with balanced metric archival.
+  intervention_boundary_text_samples_per_step: 8
+  intervention_boundary_text_context_tokens: 32
   # Score the raw response and the final response after all repairs, then
   # report the four sample-level correctness transitions.
   collect_intervention_outcome_transitions: false

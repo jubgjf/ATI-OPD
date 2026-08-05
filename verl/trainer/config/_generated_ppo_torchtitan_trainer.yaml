@@ -854,6 +854,9 @@ distillation:
     log_wandb_heatmap: true
     high_gap_threshold: 1.0
     collect_intervention_metrics: true
+    collect_intervention_boundary_metrics: false
+    intervention_boundary_text_samples_per_step: 8
+    intervention_boundary_text_context_tokens: 32
     collect_intervention_outcome_transitions: false
     outcome_case_samples_per_transition: 8
     collect_topk_overlap: false

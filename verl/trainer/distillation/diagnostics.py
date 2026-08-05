@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -40,6 +41,15 @@ BAD_TAIL_TEACHER_PROB_THRESHOLD = 0.2
 BAD_TAIL_GAP_THRESHOLD = 1.0
 BAD_TAIL_REWARD_THRESHOLD = -2.0
 BAD_TAIL_ENTROPY_THRESHOLD = 4.0
+INTERVENTION_LOCAL_EFFECT_V2_WINDOWS = (1, 8, 16, 32, 64, 128)
+INTERVENTION_DISTRIBUTION_GAP_METRICS = {
+    "topk_kl",
+    "topk_distribution_kl",
+    "topk_dist_kl",
+    "full_kl",
+    "full_distribution_kl",
+    "distribution_kl",
+}
 
 
 @dataclass(frozen=True)
@@ -2407,6 +2417,573 @@ def compute_rewrite_overlap_metrics(original_student_segment_ids: Any, teacher_s
         "rewrite_lcs_ratio": _lcs_length(original_ids, teacher_ids) / max_len,
         "rewrite_length_ratio": min_len / max_len,
     }
+
+
+def _compute_sampled_intervention_gap(
+    student_logprobs: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    *,
+    metric: str,
+    teacher_rejection_token_cap: float,
+) -> Optional[torch.Tensor]:
+    """Reconstruct a sampled-token gate without requesting distribution scores."""
+    metric = str(metric).lower()
+    if metric in INTERVENTION_DISTRIBUTION_GAP_METRICS:
+        return None
+    student_logprobs = student_logprobs.float()
+    teacher_logprobs = teacher_logprobs.float()
+    if metric in {"kl", "k1"}:
+        return teacher_logprobs - student_logprobs
+    if metric == "abs":
+        return (student_logprobs - teacher_logprobs).abs()
+    if metric in {"mse", "k2"}:
+        return 0.5 * (student_logprobs - teacher_logprobs).square()
+    if metric in {"low_var_kl", "k3"}:
+        log_ratio = (teacher_logprobs - student_logprobs).clamp(min=-20, max=20)
+        return (torch.exp(log_ratio) - log_ratio - 1).clamp(min=-10, max=10)
+    if metric == "teacher_rejection":
+        return (student_logprobs - teacher_logprobs).clamp(min=0, max=teacher_rejection_token_cap)
+    return None
+
+
+def _finite_float_list(value: Any) -> list[float]:
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        value = value.detach().float().cpu().reshape(-1).tolist()
+    elif isinstance(value, np.ndarray):
+        value = value.reshape(-1).tolist()
+    result = []
+    for item in value:
+        item = float(item)
+        if math.isfinite(item):
+            result.append(item)
+    return result
+
+
+def _prefix_mean(values: list[float], limit: int) -> Optional[float]:
+    count = min(int(limit), len(values))
+    if count <= 0:
+        return None
+    return float(np.mean(np.asarray(values[:count], dtype=np.float64)))
+
+
+def _json_scalar(value: Any) -> Any:
+    if isinstance(value, torch.Tensor) and value.numel() == 1:
+        return value.detach().cpu().item()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def compute_intervention_boundary_diagnostics(
+    *,
+    global_step: int,
+    interventions: list[Any],
+    response_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    student_logprobs: torch.Tensor,
+    teacher_logprobs: Optional[torch.Tensor],
+    entropy: Optional[torch.Tensor],
+    student_topk_ids: Optional[torch.Tensor],
+    teacher_logprob_nonfinite_positions: Optional[list[Any]],
+    intervention_outcomes: Optional[list[Any]] = None,
+    boundary_text_cases: Optional[list[Any]] = None,
+    sample_uids: Optional[list[Any]] = None,
+    data_sources: Optional[list[Any]] = None,
+    gap_metric: str = "k3",
+    teacher_rejection_token_cap: float = 10.0,
+    student_teacher_span_scores_available: bool = True,
+) -> tuple[dict[str, float], list[dict[str, Any]]]:
+    """Build repair-boundary records solely from already-produced training data."""
+    if response_ids.shape != response_mask.shape or student_logprobs.shape != response_mask.shape:
+        raise ValueError(
+            "Repair-boundary tensors must align: "
+            f"response_ids={tuple(response_ids.shape)}, response_mask={tuple(response_mask.shape)}, "
+            f"student_logprobs={tuple(student_logprobs.shape)}."
+        )
+    if teacher_logprobs is not None and teacher_logprobs.shape != response_mask.shape:
+        raise ValueError(
+            "Repair-boundary teacher logprobs must align with response_mask, "
+            f"got {tuple(teacher_logprobs.shape)} and {tuple(response_mask.shape)}."
+        )
+    if entropy is not None and entropy.shape != response_mask.shape:
+        raise ValueError(
+            f"Repair-boundary entropy must align with response_mask, got {entropy.shape=} and {response_mask.shape=}."
+        )
+    if student_topk_ids is not None and student_topk_ids.shape[:2] != response_mask.shape:
+        raise ValueError(
+            "Repair-boundary student top-k must start with [batch, response], "
+            f"got {tuple(student_topk_ids.shape)} for response_mask={tuple(response_mask.shape)}."
+        )
+
+    batch_size, response_width = response_mask.shape
+    if len(interventions) != batch_size:
+        raise ValueError(f"Repair-boundary interventions has {len(interventions)} samples, expected {batch_size}.")
+
+    response_ids_cpu = response_ids.detach().long().cpu()
+    response_mask_cpu = response_mask.detach().bool().cpu()
+    student_logprobs_cpu = student_logprobs.detach().float().cpu()
+    teacher_logprobs_cpu = None if teacher_logprobs is None else teacher_logprobs.detach().float().cpu()
+    entropy_cpu = None if entropy is None else entropy.detach().float().cpu()
+    student_topk_ids_cpu = None if student_topk_ids is None else student_topk_ids.detach().long().cpu()
+
+    def normalize_samples(values: Optional[list[Any]], default: Any) -> list[Any]:
+        if values is None:
+            return [default for _ in range(batch_size)]
+        values = values.tolist() if hasattr(values, "tolist") else list(values)
+        if len(values) != batch_size:
+            raise ValueError(f"Repair-boundary metadata has {len(values)} samples, expected {batch_size}.")
+        return values
+
+    outcomes = normalize_samples(intervention_outcomes, None)
+    text_cases = normalize_samples(boundary_text_cases, None)
+    uids = normalize_samples(sample_uids, None)
+    sources = normalize_samples(data_sources, None)
+    nonfinite_positions = normalize_samples(teacher_logprob_nonfinite_positions, [])
+
+    metric_values: dict[str, list[float]] = {}
+    pair_counts = {window: 0 for window in INTERVENTION_LOCAL_EFFECT_V2_WINDOWS}
+    worsened_counts = {window: 0 for window in INTERVENTION_LOCAL_EFFECT_V2_WINDOWS}
+    improved_counts = {window: 0 for window in INTERVENTION_LOCAL_EFFECT_V2_WINDOWS}
+    unavailable_reasons: dict[str, int] = {}
+    records: list[dict[str, Any]] = []
+    intervention_total = 0
+
+    def add_metric(key: str, value: Optional[float]) -> None:
+        if value is not None and math.isfinite(float(value)):
+            metric_values.setdefault(key, []).append(float(value))
+
+    for sample_index, raw_sample_interventions in enumerate(interventions):
+        if isinstance(raw_sample_interventions, dict):
+            sample_interventions = [raw_sample_interventions]
+        elif isinstance(raw_sample_interventions, list | tuple):
+            sample_interventions = [item for item in raw_sample_interventions if isinstance(item, dict)]
+        else:
+            sample_interventions = []
+
+        final_span_interventions = [
+            item for item in sample_interventions if bool(item.get("boundary_final_span_available", True))
+        ]
+        attention_like_mask = response_mask_cpu[sample_index].clone()
+        for item in final_span_interventions:
+            teacher_start = max(int(item.get("start", 0) or 0), 0)
+            teacher_end = min(teacher_start + int(item.get("teacher_tokens", 0) or 0), response_width)
+            attention_like_mask[teacher_start:teacher_end] = True
+        valid_positions = attention_like_mask.nonzero(as_tuple=False).reshape(-1)
+        final_length = int(valid_positions[-1].item()) + 1 if valid_positions.numel() else 0
+
+        sample_nonfinite_positions = set(
+            _normalize_position_list(
+                nonfinite_positions[sample_index],
+                context="repair_boundary_teacher_nonfinite",
+                sample_idx=sample_index,
+            )
+        )
+        sample_text_map: dict[tuple[int, int], dict[str, Any]] = {}
+        if isinstance(text_cases[sample_index], list):
+            for case in text_cases[sample_index]:
+                if isinstance(case, dict):
+                    sample_text_map[(int(case.get("attempt", -1)), int(case.get("start", -1)))] = case
+
+        for intervention_index, item in enumerate(sample_interventions):
+            intervention_total += 1
+            start = max(int(item.get("start", 0) or 0), 0)
+            replaced_end = max(int(item.get("end", start) or start), start)
+            teacher_tokens = max(int(item.get("teacher_tokens", 0) or 0), 0)
+            teacher_end = min(start + teacher_tokens, final_length)
+            attempt = int(item.get("attempt", intervention_index) or 0)
+            final_span_available = bool(item.get("boundary_final_span_available", True))
+            later_starts = [
+                int(later.get("start", final_length) or final_length)
+                for later in sample_interventions[intervention_index + 1 :]
+                if isinstance(later, dict)
+                and bool(later.get("boundary_final_span_available", True))
+                and int(later.get("start", final_length) or final_length) >= teacher_end
+            ]
+            censor_end = min(later_starts, default=final_length)
+            censored_by_next = censor_end < final_length
+            teacher_terminal = bool(item.get("teacher_terminal", False))
+            reasons: list[str] = []
+            if teacher_logprobs_cpu is None:
+                reasons.append("teacher_sampled_logprobs_unavailable")
+            if entropy_cpu is None:
+                reasons.append("student_entropy_unavailable")
+            if student_topk_ids_cpu is None:
+                reasons.append("student_topk_unavailable")
+            if not student_teacher_span_scores_available:
+                reasons.append("student_teacher_span_scores_unavailable_without_actor_recompute")
+            if not final_span_available:
+                reasons.append(str(item.get("boundary_final_span_unavailable_reason", "final_span_unavailable")))
+            if start >= final_length or teacher_end <= start:
+                reasons.append("teacher_span_outside_final_response")
+
+            entry_positions = list(range(start, teacher_end)) if final_span_available else []
+            student_suffix_positions = (
+                [
+                    position
+                    for position in range(teacher_end, max(censor_end, teacher_end))
+                    if response_mask_cpu[sample_index, position]
+                ]
+                if final_span_available
+                else []
+            )
+
+            def tensor_values(
+                tensor: Optional[torch.Tensor],
+                positions: list[int],
+                sample_idx: int = sample_index,
+            ) -> list[float]:
+                if tensor is None:
+                    return []
+                values = []
+                for position in positions:
+                    value = float(tensor[sample_idx, position].item())
+                    if math.isfinite(value):
+                        values.append(value)
+                return values
+
+            entry_student_nll = (
+                [-value for value in tensor_values(student_logprobs_cpu, entry_positions)]
+                if student_teacher_span_scores_available
+                else []
+            )
+            finite_entry_teacher_positions = [
+                position for position in entry_positions if position not in sample_nonfinite_positions
+            ]
+            entry_teacher_nll = [
+                -value for value in tensor_values(teacher_logprobs_cpu, finite_entry_teacher_positions)
+            ]
+            entry_entropy = tensor_values(entropy_cpu, entry_positions)
+            entry_topk_support: list[float] = []
+            if student_topk_ids_cpu is not None and student_teacher_span_scores_available:
+                for position in entry_positions:
+                    token_id = int(response_ids_cpu[sample_index, position].item())
+                    entry_topk_support.append(
+                        float((student_topk_ids_cpu[sample_index, position] == token_id).any().item())
+                    )
+
+            paired_entry_positions = [
+                position
+                for position in entry_positions
+                if position not in sample_nonfinite_positions
+                and student_teacher_span_scores_available
+                and math.isfinite(float(student_logprobs_cpu[sample_index, position].item()))
+                and teacher_logprobs_cpu is not None
+                and math.isfinite(float(teacher_logprobs_cpu[sample_index, position].item()))
+            ]
+            entry_student_minus_teacher_nll = [
+                float(
+                    teacher_logprobs_cpu[sample_index, position].item()
+                    - student_logprobs_cpu[sample_index, position].item()
+                )
+                for position in paired_entry_positions
+            ]
+
+            finite_exit_positions = [
+                position
+                for position in student_suffix_positions
+                if position not in sample_nonfinite_positions
+                and math.isfinite(float(student_logprobs_cpu[sample_index, position].item()))
+                and teacher_logprobs_cpu is not None
+                and math.isfinite(float(teacher_logprobs_cpu[sample_index, position].item()))
+            ]
+            exit_student_lp = (
+                student_logprobs_cpu[sample_index, finite_exit_positions]
+                if finite_exit_positions
+                else torch.empty(0, dtype=torch.float32)
+            )
+            exit_teacher_lp = (
+                teacher_logprobs_cpu[sample_index, finite_exit_positions]
+                if teacher_logprobs_cpu is not None and finite_exit_positions
+                else torch.empty(0, dtype=torch.float32)
+            )
+            exit_teacher_rejection = (
+                (exit_student_lp - exit_teacher_lp).clamp(min=0, max=teacher_rejection_token_cap).tolist()
+                if finite_exit_positions
+                else []
+            )
+            active_gap_tensor = (
+                _compute_sampled_intervention_gap(
+                    exit_student_lp,
+                    exit_teacher_lp,
+                    metric=gap_metric,
+                    teacher_rejection_token_cap=teacher_rejection_token_cap,
+                )
+                if finite_exit_positions
+                else None
+            )
+            exit_active_gap = [] if active_gap_tensor is None else _finite_float_list(active_gap_tensor)
+            if str(gap_metric).lower() in INTERVENTION_DISTRIBUTION_GAP_METRICS:
+                scored_values = _finite_float_list(item.get("_local_effect_v2_scored_after_active_scores"))
+                scored_offsets = [int(value) for value in item.get("_local_effect_v2_scored_after_offsets", [])]
+                max_offset = max(censor_end - teacher_end, 0)
+                exit_active_gap = [
+                    value for value, offset in zip(scored_values, scored_offsets, strict=False) if offset < max_offset
+                ]
+                if not exit_active_gap:
+                    reasons.append("active_gap_distribution_scores_unavailable_after_repair")
+            elif active_gap_tensor is None and teacher_logprobs_cpu is not None:
+                reasons.append("active_gap_metric_unsupported_from_sampled_logprobs")
+
+            exit_student_nll = [-value for value in tensor_values(student_logprobs_cpu, student_suffix_positions)]
+            exit_teacher_nll = [-value for value in tensor_values(teacher_logprobs_cpu, finite_exit_positions)]
+            exit_entropy = tensor_values(entropy_cpu, student_suffix_positions)
+            if teacher_terminal and not student_suffix_positions:
+                reasons.append("teacher_terminal_no_student_suffix")
+            elif not student_suffix_positions:
+                reasons.append("no_student_suffix_tokens")
+
+            before_active = _finite_float_list(item.get("_local_effect_v2_baseline_active_scores"))
+            before_rejection = _finite_float_list(item.get("_local_effect_v2_baseline_teacher_rejection_scores"))
+            before_student_nll = _finite_float_list(item.get("_local_effect_v2_baseline_student_nll"))
+            before_teacher_nll = _finite_float_list(item.get("_local_effect_v2_baseline_teacher_nll"))
+            if not before_active:
+                reasons.append(str(item.get("local_effect_v2_baseline_unavailable_reason", "baseline_unavailable")))
+
+            entry_record: dict[str, Any] = {
+                "available_teacher_tokens": len(entry_positions),
+                "teacher_nonfinite_tokens": sum(position in sample_nonfinite_positions for position in entry_positions),
+                "selected_teacher_nll": item.get("selected_teacher_nll"),
+                "selected_student_nll": item.get("selected_student_nll"),
+                "windows": {},
+            }
+            exit_record: dict[str, Any] = {
+                "student_suffix_available_tokens": len(student_suffix_positions),
+                "finite_gap_tokens": len(finite_exit_positions),
+                "censored_by_next_intervention": censored_by_next,
+                "censor_end": censor_end,
+                "windows": {},
+            }
+            local_effect_record: dict[str, Any] = {
+                "active_gap": {},
+                "teacher_rejection": {},
+                "student_nll": {},
+                "teacher_nll": {},
+            }
+
+            for window in INTERVENTION_LOCAL_EFFECT_V2_WINDOWS:
+                entry_window = {
+                    "teacher_self_nll": _prefix_mean(entry_teacher_nll, window),
+                    "student_nll_on_teacher": _prefix_mean(entry_student_nll, window),
+                    "student_minus_teacher_nll": _prefix_mean(entry_student_minus_teacher_nll, window),
+                    "student_entropy": _prefix_mean(entry_entropy, window),
+                    "student_topk_support_fraction": _prefix_mean(entry_topk_support, window),
+                    "effective_teacher_tokens": min(window, len(entry_positions)),
+                    "teacher_self_nll_tokens": min(window, len(entry_teacher_nll)),
+                    "student_nll_tokens": min(window, len(entry_student_nll)),
+                    "student_entropy_tokens": min(window, len(entry_entropy)),
+                    "student_topk_support_tokens": min(window, len(entry_topk_support)),
+                }
+                exit_window = {
+                    "active_gap_after": _prefix_mean(exit_active_gap, window),
+                    "teacher_rejection_after": _prefix_mean(exit_teacher_rejection, window),
+                    "student_nll": _prefix_mean(exit_student_nll, window),
+                    "teacher_nll": _prefix_mean(exit_teacher_nll, window),
+                    "student_entropy": _prefix_mean(exit_entropy, window),
+                    "effective_student_tokens": min(window, len(student_suffix_positions)),
+                    "effective_gap_tokens": min(window, len(exit_active_gap)),
+                    "teacher_rejection_tokens": min(window, len(exit_teacher_rejection)),
+                    "student_nll_tokens": min(window, len(exit_student_nll)),
+                    "teacher_nll_tokens": min(window, len(exit_teacher_nll)),
+                    "student_entropy_tokens": min(window, len(exit_entropy)),
+                }
+                entry_record["windows"][str(window)] = entry_window
+                exit_record["windows"][str(window)] = exit_window
+                for name, value in entry_window.items():
+                    if not name.endswith("_tokens"):
+                        add_metric(
+                            f"opd_intervention/repair_boundary/entry/{name}_first{window}_mean",
+                            value,
+                        )
+                for name, value in exit_window.items():
+                    if not name.endswith("_tokens"):
+                        add_metric(
+                            f"opd_intervention/repair_boundary/exit/{name}_first{window}_mean",
+                            value,
+                        )
+
+                effective_active_tokens = min(window, len(before_active), len(exit_active_gap))
+                active_before = _prefix_mean(before_active, effective_active_tokens)
+                active_after = _prefix_mean(exit_active_gap, effective_active_tokens)
+                active_reduction = (
+                    active_before - active_after if active_before is not None and active_after is not None else None
+                )
+                local_effect_record["active_gap"][str(window)] = {
+                    "before": active_before,
+                    "after": active_after,
+                    "reduction": active_reduction,
+                    "improved": active_reduction is not None and active_reduction > 0,
+                    "worsened": active_reduction is not None and active_reduction < 0,
+                    "effective_tokens": effective_active_tokens,
+                }
+                if active_reduction is not None and effective_active_tokens > 0:
+                    pair_counts[window] += 1
+                    improved_counts[window] += int(active_reduction > 0)
+                    worsened_counts[window] += int(active_reduction < 0)
+                    add_metric(
+                        f"opd_intervention/local_effect_v2/active_gap/before_first{window}_mean",
+                        active_before,
+                    )
+                    add_metric(
+                        f"opd_intervention/local_effect_v2/active_gap/after_first{window}_mean",
+                        active_after,
+                    )
+                    add_metric(
+                        f"opd_intervention/local_effect_v2/active_gap/reduction_first{window}_mean",
+                        active_reduction,
+                    )
+                    add_metric(
+                        f"opd_intervention/local_effect_v2/effective_tokens_first{window}_mean",
+                        float(effective_active_tokens),
+                    )
+
+                effective_rejection_tokens = min(window, len(before_rejection), len(exit_teacher_rejection))
+                rejection_before = _prefix_mean(before_rejection, effective_rejection_tokens)
+                rejection_after = _prefix_mean(exit_teacher_rejection, effective_rejection_tokens)
+                rejection_reduction = (
+                    rejection_before - rejection_after
+                    if rejection_before is not None and rejection_after is not None
+                    else None
+                )
+                local_effect_record["teacher_rejection"][str(window)] = {
+                    "before": rejection_before,
+                    "after": rejection_after,
+                    "reduction": rejection_reduction,
+                    "effective_tokens": effective_rejection_tokens,
+                }
+                add_metric(
+                    f"opd_intervention/local_effect_v2/teacher_rejection/reduction_first{window}_mean",
+                    rejection_reduction,
+                )
+                for nll_name, before_values, after_values in (
+                    ("student_nll", before_student_nll, exit_student_nll),
+                    ("teacher_nll", before_teacher_nll, exit_teacher_nll),
+                ):
+                    effective_nll_tokens = min(window, len(before_values), len(after_values))
+                    nll_before = _prefix_mean(before_values, effective_nll_tokens)
+                    nll_after = _prefix_mean(after_values, effective_nll_tokens)
+                    nll_delta = nll_after - nll_before if nll_before is not None and nll_after is not None else None
+                    local_effect_record[nll_name][str(window)] = {
+                        "before": nll_before,
+                        "after": nll_after,
+                        "delta": nll_delta,
+                        "reduction": -nll_delta if nll_delta is not None else None,
+                        "effective_tokens": effective_nll_tokens,
+                    }
+                    add_metric(
+                        f"opd_intervention/local_effect_v2/{nll_name}/delta_first{window}_mean",
+                        nll_delta,
+                    )
+
+            outcome = outcomes[sample_index] if isinstance(outcomes[sample_index], dict) else None
+            outcome_record: dict[str, Any] = {
+                "attribution_scope": "sample_after_all_repairs",
+                "attributable_to_this_intervention": False,
+                "available": outcome is not None,
+            }
+            if outcome is not None:
+                outcome_record.update(
+                    {
+                        key: _json_scalar(outcome.get(key))
+                        for key in (
+                            "raw_reward_score",
+                            "final_reward_score",
+                            "raw_correctness_value",
+                            "final_correctness_value",
+                            "raw_correct",
+                            "final_correct",
+                            "transition",
+                            "repair_effective",
+                            "repair_ineffective",
+                        )
+                        if key in outcome
+                    }
+                )
+            else:
+                reasons.append("sample_outcome_unavailable")
+
+            for reason in set(reasons):
+                unavailable_reasons[reason] = unavailable_reasons.get(reason, 0) + 1
+            record = {
+                "schema_version": 1,
+                "global_step": int(global_step),
+                "sample_index": sample_index,
+                "uid": _json_scalar(uids[sample_index]),
+                "data_source": _json_scalar(sources[sample_index]),
+                "intervention_index": intervention_index,
+                "attempt": attempt,
+                "position": {
+                    "start": start,
+                    "replaced_end": replaced_end,
+                    "relative_start": start / max(final_length, 1),
+                    "teacher_end": teacher_end,
+                    "final_response_length": final_length,
+                },
+                "tokens": {
+                    "original_student": int(item.get("original_student_tokens", replaced_end - start) or 0),
+                    "teacher": teacher_tokens,
+                    "student_suffix_at_repair": int(item.get("student_suffix_tokens", 0) or 0),
+                    "original_student_segment_sha256": item.get("original_student_segment_sha256"),
+                    "teacher_segment_sha256": item.get("teacher_segment_sha256"),
+                },
+                "trigger": {
+                    "gap_metric": str(item.get("gap_metric", gap_metric)),
+                    "threshold": item.get("gap_threshold"),
+                    "score": item.get("score"),
+                    "aggregation": item.get("gap_aggregation"),
+                    "persistence_score": item.get("teacher_rejection_persistence_score"),
+                    "persistence_threshold": item.get("teacher_rejection_persistence_threshold"),
+                    "persistence_tokens": item.get("teacher_rejection_persistence_tokens"),
+                },
+                "entry": entry_record,
+                "exit": exit_record,
+                "local_effect_v2": {
+                    **local_effect_record,
+                },
+                "outcome": outcome_record,
+                "completeness": {
+                    "availability": {
+                        "teacher_sampled_logprobs": teacher_logprobs_cpu is not None,
+                        "student_teacher_span_scores": student_teacher_span_scores_available,
+                        "student_entropy": entropy_cpu is not None,
+                        "student_topk": student_topk_ids_cpu is not None,
+                        "sample_outcome": outcome is not None,
+                        "active_gap_after": bool(exit_active_gap),
+                    },
+                    "final_span_available": final_span_available,
+                    "teacher_terminal": teacher_terminal,
+                    "short_student_suffix": len(student_suffix_positions) < max(INTERVENTION_LOCAL_EFFECT_V2_WINDOWS),
+                    "censored_by_next_intervention": censored_by_next,
+                    "teacher_nonfinite_positions_in_entry": sorted(
+                        position for position in entry_positions if position in sample_nonfinite_positions
+                    ),
+                    "unavailable_reasons": sorted(set(reasons)),
+                },
+            }
+            text_case = sample_text_map.get((attempt, start))
+            if text_case is not None:
+                record["text_context"] = dict(text_case)
+            records.append(record)
+
+    metrics = {key: float(np.mean(values)) for key, values in metric_values.items() if values}
+    for window in INTERVENTION_LOCAL_EFFECT_V2_WINDOWS:
+        pair_count = pair_counts[window]
+        metrics[f"opd_intervention/local_effect_v2/pair_count_first{window}"] = float(pair_count)
+        metrics[f"opd_intervention/local_effect_v2/pair_fraction_first{window}"] = (
+            pair_count / intervention_total if intervention_total else 0.0
+        )
+        metrics[f"opd_intervention/local_effect_v2/active_gap/improved_fraction_first{window}"] = (
+            improved_counts[window] / pair_count if pair_count else 0.0
+        )
+        metrics[f"opd_intervention/local_effect_v2/active_gap/worsened_fraction_first{window}"] = (
+            worsened_counts[window] / pair_count if pair_count else 0.0
+        )
+    metrics["opd_intervention/repair_boundary/record_count"] = float(intervention_total)
+    unavailable_total = max(sum(unavailable_reasons.values()), 1)
+    for reason, count in unavailable_reasons.items():
+        metrics[f"opd_intervention/repair_boundary/unavailable_reason/{reason}"] = count / unavailable_total
+    return metrics, records
 
 
 def compute_intervention_metrics(

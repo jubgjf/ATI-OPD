@@ -105,12 +105,18 @@ _REPAIR_EVAL_SCOPES = ("val-oracle-repair", "test-oracle-repair", "val-repair", 
 _REPAIR_EVAL_AUX_PREFIXES = tuple(f"{scope}-aux/" for scope in _REPAIR_EVAL_SCOPES)
 _REPAIR_EVAL_CORE_PREFIXES = tuple(f"{scope}-core/" for scope in _REPAIR_EVAL_SCOPES)
 _REPAIR_EVAL_LIVE_CORE_RE = re.compile(r"/(?:acc|reward)/(?:mean|paired_delta)@\d+$")
-_LIVE_INTERVENTION_OUTCOME_KEYS = frozenset(
+_LIVE_INTERVENTION_KEYS = frozenset(
     {
-        "opd_intervention/outcome/pre_correct_post_correct_fraction_among_repaired",
+        "opd_intervention/rate",
+        "opd_intervention/first_position_frac_mean",
+        "opd_intervention/repair_boundary/entry/teacher_self_nll_first16_mean",
+        "opd_intervention/repair_boundary/entry/student_nll_on_teacher_first16_mean",
+        "opd_intervention/repair_boundary/exit/active_gap_after_first16_mean",
+        "opd_intervention/local_effect_v2/active_gap/reduction_first16_mean",
+        "opd_intervention/local_effect_v2/active_gap/worsened_fraction_first16",
+        "opd_intervention/local_effect_v2/pair_fraction_first16",
         "opd_intervention/outcome/pre_correct_post_wrong_fraction_among_repaired",
         "opd_intervention/outcome/pre_wrong_post_correct_fraction_among_repaired",
-        "opd_intervention/outcome/pre_wrong_post_wrong_fraction_among_repaired",
         "opd_intervention/outcome/net_accuracy_delta_all_samples",
     }
 )
@@ -1557,8 +1563,8 @@ def _coerce_numeric(value: Any) -> tuple[float, str] | None:
 
 
 def _should_archive_metric(metric_key: str, configured_topk: int | None) -> bool:
-    if metric_key.startswith("opd_intervention/outcome/"):
-        return metric_key not in _LIVE_INTERVENTION_OUTCOME_KEYS
+    if metric_key.startswith("opd_intervention/"):
+        return metric_key not in _LIVE_INTERVENTION_KEYS
     if metric_key.startswith(_REPAIR_EVAL_AUX_PREFIXES):
         return True
     if metric_key.startswith(_REPAIR_EVAL_CORE_PREFIXES):

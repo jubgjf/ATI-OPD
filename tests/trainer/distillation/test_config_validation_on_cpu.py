@@ -48,9 +48,16 @@ def test_intervention_outcome_observation_config_defaults_and_validation_on_cpu(
 
     assert diagnostics.collect_intervention_outcome_transitions is False
     assert diagnostics.outcome_case_samples_per_transition == 8
+    assert diagnostics.collect_intervention_boundary_metrics is False
+    assert diagnostics.intervention_boundary_text_samples_per_step == 8
+    assert diagnostics.intervention_boundary_text_context_tokens == 32
 
     with pytest.raises(ValueError, match="outcome_case_samples_per_transition"):
         DistillationDiagnosticsConfig(outcome_case_samples_per_transition=-1)
+    with pytest.raises(ValueError, match="intervention_boundary_text_samples_per_step"):
+        DistillationDiagnosticsConfig(intervention_boundary_text_samples_per_step=-1)
+    with pytest.raises(ValueError, match="intervention_boundary_text_context_tokens"):
+        DistillationDiagnosticsConfig(intervention_boundary_text_context_tokens=0)
 
     with pytest.raises(ValueError, match="repair_for_evaluation=true"):
         DistillationInterventionConfig(repair_for_evaluation=True)

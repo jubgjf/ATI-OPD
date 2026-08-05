@@ -23,14 +23,17 @@ import torch
 import verl.trainer.ppo.ray_trainer as ray_trainer_module
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
+    _compute_intervention_boundary_from_payloads,
     _compute_opd_diagnostics_background_metrics,
+    _OpdDiagnosticsResult,
     _PendingOpdDiagnostics,
     _snapshot_diagnostics_kwargs,
+    _snapshot_diagnostics_payloads,
 )
 
 
-def _completed_future(result: dict[str, float]) -> Future[dict[str, float]]:
-    future: Future[dict[str, float]] = Future()
+def _completed_future(result: Any) -> Future[Any]:
+    future: Future[Any] = Future()
     future.set_result(result)
     return future
 
@@ -50,6 +53,16 @@ def test_diagnostics_snapshot_is_independent_from_mutable_training_inputs_on_cpu
     assert snapshot["metadata"] == {"positions": [1, 2]}
 
 
+def test_related_diagnostics_payloads_snapshot_shared_tensor_only_once_on_cpu():
+    tensor = torch.tensor([[1.0, 2.0]])
+
+    first, second = _snapshot_diagnostics_payloads({"tensor": tensor}, {"same_tensor": tensor})
+
+    assert first is not None and second is not None
+    assert first["tensor"] is second["same_tensor"]
+    assert first["tensor"].data_ptr() != tensor.data_ptr()
+
+
 def test_background_diagnostics_combines_opd_and_intervention_metrics_on_cpu(monkeypatch):
     monkeypatch.setattr(
         ray_trainer_module,
@@ -62,11 +75,107 @@ def test_background_diagnostics_combines_opd_and_intervention_metrics_on_cpu(mon
         lambda **kwargs: {"intervention/value": float(kwargs["value"])},
     )
 
-    metrics = _compute_opd_diagnostics_background_metrics({"value": 2}, {"value": 3})
+    result = _compute_opd_diagnostics_background_metrics({"value": 2}, {"value": 3})
 
-    assert metrics["opd/value"] == 2.0
-    assert metrics["intervention/value"] == 3.0
-    assert metrics["opd/diagnostics_async/worker_compute_seconds"] >= 0.0
+    assert result.metrics["opd/value"] == 2.0
+    assert result.metrics["intervention/value"] == 3.0
+    assert result.metrics["opd/diagnostics_async/worker_compute_seconds"] >= 0.0
+    assert result.intervention_records == ()
+
+
+def test_background_diagnostics_returns_boundary_records_without_extra_inputs_on_cpu(monkeypatch):
+    monkeypatch.setattr(ray_trainer_module, "compute_opd_diagnostics_metrics", lambda **_kwargs: {})
+    monkeypatch.setattr(ray_trainer_module, "compute_intervention_metrics", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        ray_trainer_module,
+        "compute_intervention_boundary_diagnostics",
+        lambda **_kwargs: ({"opd_intervention/boundary": 1.0}, [{"attempt": 0}]),
+    )
+    response = torch.ones((1, 2))
+    diagnostics_kwargs = {
+        "response_ids": response.long(),
+        "student_logprobs": response,
+        "teacher_logprobs": response,
+        "entropy": response,
+        "student_topk_ids": None,
+        "teacher_logprob_nonfinite_positions": [[]],
+    }
+    intervention_kwargs = {
+        "interventions": [[{"attempt": 0}]],
+        "intervention_outcomes": None,
+        "response_mask": response.bool(),
+    }
+    boundary_kwargs = {
+        "global_step": 2,
+        "gap_metric": "k3",
+        "teacher_rejection_token_cap": 10.0,
+    }
+
+    result = _compute_opd_diagnostics_background_metrics(
+        diagnostics_kwargs,
+        intervention_kwargs,
+        boundary_kwargs,
+    )
+
+    assert result.metrics["opd_intervention/boundary"] == 1.0
+    assert result.intervention_records == ({"attempt": 0},)
+
+
+def test_boundary_diagnostics_payload_is_identical_after_async_snapshot_on_cpu():
+    response_ids = torch.tensor([[10, 20, 30]])
+    response_mask = torch.tensor([[1, 0, 1]], dtype=torch.bool)
+    diagnostics_kwargs = {
+        "response_ids": response_ids,
+        "student_logprobs": torch.full((1, 3), -2.0),
+        "teacher_logprobs": torch.full((1, 3), -1.0),
+        "entropy": torch.ones((1, 3)),
+        "student_topk_ids": None,
+        "teacher_logprob_nonfinite_positions": [[]],
+    }
+    intervention_kwargs = {
+        "interventions": [
+            [
+                {
+                    "attempt": 0,
+                    "start": 1,
+                    "end": 2,
+                    "teacher_tokens": 1,
+                    "student_suffix_tokens": 1,
+                    "boundary_final_span_available": True,
+                    "_local_effect_v2_baseline_active_scores": [2.0],
+                    "_local_effect_v2_baseline_teacher_rejection_scores": [1.0],
+                }
+            ]
+        ],
+        "intervention_outcomes": None,
+        "response_mask": response_mask,
+    }
+    boundary_kwargs = {
+        "global_step": 2,
+        "gap_metric": "k3",
+        "teacher_rejection_token_cap": 10.0,
+    }
+
+    direct = _compute_intervention_boundary_from_payloads(
+        diagnostics_kwargs,
+        intervention_kwargs,
+        boundary_kwargs,
+    )
+    snapshot_diagnostics, snapshot_intervention, snapshot_boundary = _snapshot_diagnostics_payloads(
+        diagnostics_kwargs,
+        intervention_kwargs,
+        boundary_kwargs,
+    )
+    assert snapshot_diagnostics is not None
+    assert snapshot_intervention is not None
+    assert snapshot_boundary is not None
+    snapshotted = _compute_intervention_boundary_from_payloads(
+        snapshot_diagnostics,
+        snapshot_intervention,
+        snapshot_boundary,
+    )
+
+    assert snapshotted == direct
 
 
 def test_finish_diagnostics_blocks_until_current_source_step_is_ready_on_cpu():
@@ -109,6 +218,28 @@ def test_finish_diagnostics_rejects_wrong_commit_step_on_cpu():
     assert trainer._opd_diagnostics_task is task
 
 
+def test_finish_diagnostics_queues_boundary_records_for_current_archive_event_on_cpu():
+    trainer = object.__new__(RayPPOTrainer)
+    queued = []
+    result = _OpdDiagnosticsResult(
+        metrics={"opd/value": 1.0},
+        intervention_records=({"global_step": 4, "attempt": 0},),
+    )
+    task = _PendingOpdDiagnostics(source_step=4, future=_completed_future(result), submitted_at=0.0)
+    trainer._opd_diagnostics_task = task
+    trainer._queue_event_records_archive = lambda **kwargs: queued.append(kwargs)
+
+    metrics = trainer._finish_opd_diagnostics_for_step(task, expected_step=4)
+
+    assert metrics["opd/value"] == 1.0
+    assert queued == [
+        {
+            "metric_key": "opd_intervention/repair_boundary_records",
+            "records": [{"global_step": 4, "attempt": 0}],
+        }
+    ]
+
+
 def test_finish_diagnostics_failure_prevents_source_step_commit_on_cpu():
     trainer = object.__new__(RayPPOTrainer)
     future: Future[dict[str, float]] = Future()
@@ -142,6 +273,7 @@ def test_async_submit_allows_only_one_task_and_preserves_source_step_on_cpu():
             "response_mask": torch.tensor([[True]]),
             "entropy": None,
         },
+        None,
         None,
         torch.tensor([[0.5]]),
         None,
@@ -179,6 +311,63 @@ def test_sync_diagnostics_path_returns_metrics_without_task_on_cpu():
 
     assert metrics == {"opd/value": 3.0}
     assert task is None
+
+
+def test_sync_boundary_diagnostics_reuses_one_shared_cpu_snapshot_on_cpu(monkeypatch):
+    shared_mask = torch.tensor([[True, False]])
+    shared_teacher_logprobs = torch.tensor([[-1.0, -2.0]])
+    diagnostics_kwargs = {
+        "student_logprobs": torch.tensor([[-2.0, -3.0]]),
+        "teacher_logprobs": shared_teacher_logprobs,
+        "teacher_logprob_nonfinite_positions": [[]],
+        "response_mask": shared_mask,
+        "entropy": None,
+    }
+    intervention_kwargs = {
+        "interventions": [[]],
+        "response_mask": shared_mask,
+    }
+    boundary_kwargs = {"global_step": 2}
+    trainer = object.__new__(RayPPOTrainer)
+    trainer._build_opd_diagnostics_inputs = lambda **_kwargs: (
+        diagnostics_kwargs,
+        intervention_kwargs,
+        boundary_kwargs,
+        shared_teacher_logprobs,
+        [[]],
+    )
+    trainer._maybe_log_opd_heatmaps = lambda **_kwargs: {}
+    trainer._queue_event_records_archive = lambda **_kwargs: None
+    snapshots = {}
+
+    def record_opd_snapshot(**kwargs):
+        snapshots["opd_mask"] = kwargs["response_mask"]
+        snapshots["opd_teacher"] = kwargs["teacher_logprobs"]
+        return {}
+
+    def record_boundary_snapshot(diagnostics, intervention, boundary):
+        snapshots["boundary_mask"] = intervention["response_mask"]
+        snapshots["boundary_teacher"] = diagnostics["teacher_logprobs"]
+        snapshots["boundary"] = boundary
+        return {}, []
+
+    monkeypatch.setattr(ray_trainer_module, "compute_opd_diagnostics_metrics", record_opd_snapshot)
+    monkeypatch.setattr(ray_trainer_module, "compute_intervention_metrics", lambda **_kwargs: {})
+    monkeypatch.setattr(ray_trainer_module, "_compute_intervention_boundary_from_payloads", record_boundary_snapshot)
+
+    metrics = RayPPOTrainer._compute_opd_diagnostics_metrics(
+        trainer,
+        batch=object(),
+        entropy=None,
+        global_steps=2,
+    )
+
+    assert metrics["opd/gap_abs/available"] == 1.0
+    assert snapshots["opd_mask"] is snapshots["boundary_mask"]
+    assert snapshots["opd_teacher"] is snapshots["boundary_teacher"]
+    assert snapshots["opd_mask"].data_ptr() != shared_mask.data_ptr()
+    assert snapshots["opd_teacher"].data_ptr() != shared_teacher_logprobs.data_ptr()
+    assert snapshots["boundary"] is not boundary_kwargs
 
 
 class _FakeTrackingLogger:

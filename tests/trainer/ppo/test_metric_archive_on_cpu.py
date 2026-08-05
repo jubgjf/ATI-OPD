@@ -218,10 +218,8 @@ def test_balanced_routing_keeps_only_fixed_outcome_and_paired_repair_surface_liv
     route = MetricRouter("balanced").route(metrics)
 
     expected_live = {
-        f"{outcome_prefix}/pre_correct_post_correct_fraction_among_repaired",
         f"{outcome_prefix}/pre_correct_post_wrong_fraction_among_repaired",
         f"{outcome_prefix}/pre_wrong_post_correct_fraction_among_repaired",
-        f"{outcome_prefix}/pre_wrong_post_wrong_fraction_among_repaired",
         f"{outcome_prefix}/net_accuracy_delta_all_samples",
         "test-repair-core/aime24/acc/mean@16",
         "test-repair-core/aime24/acc/paired_delta@16",
@@ -229,11 +227,43 @@ def test_balanced_routing_keeps_only_fixed_outcome_and_paired_repair_surface_liv
         "val-oracle-repair-core/math/reward/paired_delta@4",
     }
     assert expected_live <= set(route.live_metrics)
+    assert f"{outcome_prefix}/pre_correct_post_correct_fraction_among_repaired" in route.detailed_metrics
+    assert f"{outcome_prefix}/pre_wrong_post_wrong_fraction_among_repaired" in route.detailed_metrics
     assert set(route.detailed_metrics) == set(metrics) - expected_live
     assert _parse_metric_dimensions("test-repair-core/aime24/acc/mean@16")["eval_scope"] == "test-repair"
     assert (
         _parse_metric_dimensions("val-oracle-repair-aux/math/outcome/sample_count")["eval_scope"] == "val-oracle-repair"
     )
+
+
+def test_balanced_routing_keeps_only_compact_dmpd_boundary_allowlist_live_on_cpu():
+    live_keys = {
+        "opd_intervention/rate",
+        "opd_intervention/first_position_frac_mean",
+        "opd_intervention/repair_boundary/entry/teacher_self_nll_first16_mean",
+        "opd_intervention/repair_boundary/entry/student_nll_on_teacher_first16_mean",
+        "opd_intervention/repair_boundary/exit/active_gap_after_first16_mean",
+        "opd_intervention/local_effect_v2/active_gap/reduction_first16_mean",
+        "opd_intervention/local_effect_v2/active_gap/worsened_fraction_first16",
+        "opd_intervention/local_effect_v2/pair_fraction_first16",
+        "opd_intervention/outcome/pre_wrong_post_correct_fraction_among_repaired",
+        "opd_intervention/outcome/pre_correct_post_wrong_fraction_among_repaired",
+        "opd_intervention/outcome/net_accuracy_delta_all_samples",
+    }
+    detailed_keys = {
+        "opd_intervention/count_mean",
+        "opd_intervention/local_effect_v2/active_gap/reduction_first8_mean",
+        "opd_intervention/repair_boundary/unavailable_reason/student_topk_unavailable",
+    }
+    metrics = {key: float(index) for index, key in enumerate(sorted(live_keys | detailed_keys))}
+
+    balanced = MetricRouter("balanced").route(metrics)
+    full = MetricRouter("full").route(metrics)
+
+    assert live_keys <= set(balanced.live_metrics)
+    assert detailed_keys <= set(balanced.detailed_metrics)
+    assert set(full.live_metrics) == set(metrics)
+    assert full.detailed_metrics == {}
 
 
 def test_23k_128_token_bins_and_bootstrap_metrics_collapse_to_small_live_surface():

@@ -395,6 +395,9 @@ class DistillationDiagnosticsConfig(BaseConfig):
     log_wandb_heatmap: bool = True
     high_gap_threshold: float = 1.0
     collect_intervention_metrics: bool = True
+    collect_intervention_boundary_metrics: bool = False
+    intervention_boundary_text_samples_per_step: int = 8
+    intervention_boundary_text_context_tokens: int = 32
     collect_intervention_outcome_transitions: bool = False
     outcome_case_samples_per_transition: int = 8
     collect_topk_overlap: bool = False
@@ -436,6 +439,10 @@ class DistillationDiagnosticsConfig(BaseConfig):
             )
         if self.outcome_case_samples_per_transition < 0:
             raise ValueError("diagnostics.outcome_case_samples_per_transition must be non-negative.")
+        if self.intervention_boundary_text_samples_per_step < 0:
+            raise ValueError("diagnostics.intervention_boundary_text_samples_per_step must be non-negative.")
+        if self.intervention_boundary_text_context_tokens <= 0:
+            raise ValueError("diagnostics.intervention_boundary_text_context_tokens must be positive.")
         if self.topk is not None and self.topk <= 0:
             raise ValueError("diagnostics.topk must be positive.")
         if self.repetition_tail_chars <= 0:

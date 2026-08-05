@@ -27,6 +27,7 @@ from verl.trainer.distillation.diagnostics import (
     compute_entropy_heatmap_row,
     compute_gap_heatmap_row,
     compute_gap_high_heatmap_row,
+    compute_intervention_boundary_diagnostics,
     compute_intervention_metrics,
     compute_opd_diagnostics_metrics,
     compute_overlap_diagnostics,
@@ -1193,3 +1194,191 @@ def test_compute_intervention_metrics_aggregates_paired_local_effect_on_cpu():
     assert metrics["opd_intervention/local_effect/no_current_intervention_tokens_mean"] == 4.0
     assert metrics["opd_intervention/local_effect/after_intervention_tokens_mean"] == 3.0
     assert metrics["opd_intervention/local_effect/unavailable_reason/terminal_response"] == 1.0
+
+
+def test_intervention_boundary_v2_pairs_short_terminal_student_suffix_on_cpu():
+    response_ids = torch.tensor([[10, 11, 20, 21, 30, 31, 99, 0, 0, 0]])
+    response_mask = torch.tensor([[1, 1, 0, 0, 1, 1, 1, 0, 0, 0]], dtype=torch.bool)
+    student_logprobs = torch.full((1, 10), -2.0)
+    teacher_logprobs = torch.full((1, 10), -1.0)
+    teacher_logprobs[0, 2] = -0.2
+    teacher_logprobs[0, 3] = -0.4
+    entropy = torch.full((1, 10), 0.75)
+    student_topk_ids = torch.zeros((1, 10, 2), dtype=torch.long)
+    student_topk_ids[0, 2] = torch.tensor([20, 99])
+    student_topk_ids[0, 3] = torch.tensor([98, 99])
+    intervention = {
+        "attempt": 0,
+        "start": 2,
+        "end": 4,
+        "score": 3.0,
+        "gap_metric": "k3",
+        "gap_threshold": 0.15,
+        "gap_aggregation": "mean",
+        "teacher_tokens": 2,
+        "student_suffix_tokens": 3,
+        "teacher_terminal": False,
+        "boundary_final_span_available": True,
+        "selected_teacher_nll": 0.3,
+        "selected_student_nll": 0.5,
+        "_local_effect_v2_baseline_active_scores": [5.0, 4.0, 3.0, 2.0],
+        "_local_effect_v2_baseline_teacher_rejection_scores": [2.0, 2.0, 2.0, 2.0],
+        "_local_effect_v2_baseline_student_nll": [3.0, 3.0, 3.0, 3.0],
+        "_local_effect_v2_baseline_teacher_nll": [1.0, 1.0, 1.0, 1.0],
+    }
+
+    metrics, records = compute_intervention_boundary_diagnostics(
+        global_step=7,
+        interventions=[[intervention]],
+        response_ids=response_ids,
+        response_mask=response_mask,
+        student_logprobs=student_logprobs,
+        teacher_logprobs=teacher_logprobs,
+        entropy=entropy,
+        student_topk_ids=student_topk_ids,
+        teacher_logprob_nonfinite_positions=[[3, 5]],
+        intervention_outcomes=[
+            {
+                "raw_correct": False,
+                "final_correct": True,
+                "raw_reward_score": 0.0,
+                "final_reward_score": 1.0,
+                "transition": "pre_wrong_post_correct",
+            }
+        ],
+        boundary_text_cases=[
+            [
+                {
+                    "attempt": 0,
+                    "start": 2,
+                    "case_rank": 0.1,
+                    "prefix_tail": "prefix",
+                    "teacher_segment_head": "repair",
+                }
+            ]
+        ],
+        sample_uids=["uid-0"],
+        data_sources=["math"],
+        gap_metric="k3",
+    )
+
+    assert len(records) == 1
+    record = records[0]
+    assert record["uid"] == "uid-0"
+    assert record["entry"]["windows"]["16"]["teacher_self_nll"] == pytest.approx(0.2)
+    assert record["entry"]["windows"]["16"]["student_nll_on_teacher"] == pytest.approx(2.0)
+    assert record["entry"]["windows"]["16"]["student_topk_support_fraction"] == pytest.approx(0.5)
+    assert record["entry"]["selected_teacher_nll"] == pytest.approx(0.3)
+    assert record["entry"]["selected_student_nll"] == pytest.approx(0.5)
+    assert record["local_effect_v2"]["active_gap"]["16"]["effective_tokens"] == 2
+    assert record["completeness"]["short_student_suffix"] is True
+    assert record["outcome"]["attribution_scope"] == "sample_after_all_repairs"
+    assert record["outcome"]["attributable_to_this_intervention"] is False
+    assert record["text_context"]["prefix_tail"] == "prefix"
+    assert "_local_effect_v2" not in str(record)
+    assert metrics["opd_intervention/local_effect_v2/pair_fraction_first16"] == 1.0
+    assert metrics["opd_intervention/local_effect_v2/active_gap/worsened_fraction_first16"] == 0.0
+    assert metrics["opd_intervention/repair_boundary/entry/teacher_self_nll_first16_mean"] == pytest.approx(0.2)
+
+
+def test_intervention_boundary_v2_marks_teacher_terminal_without_suffix_unavailable_on_cpu():
+    metrics, records = compute_intervention_boundary_diagnostics(
+        global_step=3,
+        interventions=[
+            [
+                {
+                    "attempt": 0,
+                    "start": 1,
+                    "end": 2,
+                    "teacher_tokens": 2,
+                    "student_suffix_tokens": 0,
+                    "teacher_terminal": True,
+                    "boundary_final_span_available": True,
+                    "_local_effect_v2_baseline_active_scores": [2.0, 1.0],
+                    "_local_effect_v2_baseline_teacher_rejection_scores": [1.0, 1.0],
+                }
+            ]
+        ],
+        response_ids=torch.tensor([[10, 20, 21, 0, 0]]),
+        response_mask=torch.tensor([[1, 0, 0, 0, 0]], dtype=torch.bool),
+        student_logprobs=torch.full((1, 5), -2.0),
+        teacher_logprobs=torch.full((1, 5), -1.0),
+        entropy=None,
+        student_topk_ids=None,
+        teacher_logprob_nonfinite_positions=[[]],
+        gap_metric="k3",
+    )
+
+    assert metrics["opd_intervention/local_effect_v2/pair_fraction_first16"] == 0.0
+    assert "teacher_terminal_no_student_suffix" in records[0]["completeness"]["unavailable_reasons"]
+    assert records[0]["exit"]["windows"]["16"]["effective_student_tokens"] == 0
+
+
+def test_intervention_boundary_v2_censors_each_exit_at_the_next_teacher_repair_on_cpu():
+    response_ids = torch.arange(14).unsqueeze(0)
+    response_mask = torch.tensor([[1] * 13 + [0]], dtype=torch.bool)
+    base = {
+        "teacher_tokens": 2,
+        "teacher_terminal": False,
+        "boundary_final_span_available": True,
+        "_local_effect_v2_baseline_active_scores": [3.0] * 16,
+        "_local_effect_v2_baseline_teacher_rejection_scores": [2.0] * 16,
+    }
+    interventions = [
+        [
+            {**base, "attempt": 0, "start": 2, "end": 4, "student_suffix_tokens": 9},
+            {**base, "attempt": 1, "start": 8, "end": 10, "student_suffix_tokens": 3},
+        ]
+    ]
+
+    metrics, records = compute_intervention_boundary_diagnostics(
+        global_step=4,
+        interventions=interventions,
+        response_ids=response_ids,
+        response_mask=response_mask,
+        student_logprobs=torch.full((1, 14), -2.0),
+        teacher_logprobs=torch.full((1, 14), -1.0),
+        entropy=torch.ones((1, 14)),
+        student_topk_ids=None,
+        teacher_logprob_nonfinite_positions=[[]],
+        gap_metric="teacher_rejection",
+    )
+
+    assert len(records) == 2
+    assert records[0]["exit"]["censored_by_next_intervention"] is True
+    assert records[0]["exit"]["windows"]["8"]["effective_student_tokens"] == 4
+    assert records[1]["exit"]["windows"]["8"]["effective_student_tokens"] == 3
+    assert records[0]["local_effect_v2"]["active_gap"]["8"]["effective_tokens"] == 4
+    assert records[1]["local_effect_v2"]["active_gap"]["8"]["effective_tokens"] == 3
+    assert metrics["opd_intervention/local_effect_v2/pair_fraction_first8"] == 1.0
+
+
+def test_intervention_boundary_v2_reuses_existing_distribution_scores_on_cpu():
+    intervention = {
+        "attempt": 0,
+        "start": 1,
+        "end": 2,
+        "teacher_tokens": 1,
+        "student_suffix_tokens": 3,
+        "boundary_final_span_available": True,
+        "_local_effect_v2_baseline_active_scores": [4.0, 3.0, 2.0],
+        "_local_effect_v2_baseline_teacher_rejection_scores": [2.0, 2.0, 2.0],
+        "_local_effect_v2_scored_after_active_scores": [1.0, 1.5, 2.0],
+        "_local_effect_v2_scored_after_offsets": [0, 1, 2],
+    }
+    metrics, records = compute_intervention_boundary_diagnostics(
+        global_step=5,
+        interventions=[[intervention]],
+        response_ids=torch.tensor([[10, 20, 30, 31, 32]]),
+        response_mask=torch.tensor([[1, 0, 1, 1, 1]], dtype=torch.bool),
+        student_logprobs=torch.full((1, 5), -2.0),
+        teacher_logprobs=torch.full((1, 5), -1.0),
+        entropy=torch.ones((1, 5)),
+        student_topk_ids=None,
+        teacher_logprob_nonfinite_positions=[[]],
+        gap_metric="topk_kl",
+    )
+
+    assert metrics["opd_intervention/local_effect_v2/pair_fraction_first8"] == 1.0
+    assert records[0]["local_effect_v2"]["active_gap"]["8"]["before"] == 3.0
+    assert records[0]["local_effect_v2"]["active_gap"]["8"]["after"] == 1.5
