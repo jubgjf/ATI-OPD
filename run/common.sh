@@ -108,6 +108,7 @@ _configure_wandb_storage() {
         WANDB_DIR=${WANDB_DIR:-$training_workspace/wandb_logs}
         WANDB_DATA_DIR=${WANDB_DATA_DIR:-$training_workspace/wandb_logs/wandb-data/$run_name}
     fi
+    WANDB_CACHE_DIR=${WANDB_CACHE_DIR:-${WANDB_DIR%/}/wandb-cache/$run_name}
 
     case "$WANDB_DIR" in
         /*) ;;
@@ -123,9 +124,42 @@ _configure_wandb_storage() {
             return 1
             ;;
     esac
+    case "$WANDB_CACHE_DIR" in
+        /*) ;;
+        *)
+            echo "WANDB_CACHE_DIR must be an absolute path, got: $WANDB_CACHE_DIR" >&2
+            return 1
+            ;;
+    esac
 
-    mkdir -p "$WANDB_DIR" "$WANDB_DATA_DIR"
-    export WANDB_DIR WANDB_DATA_DIR
+    mkdir -p "$WANDB_DIR" "$WANDB_DATA_DIR" "$WANDB_CACHE_DIR"
+    export WANDB_DIR WANDB_DATA_DIR WANDB_CACHE_DIR
+}
+
+_configure_in_training_evaluation() {
+    in_train_evaluation=${IN_TRAIN_EVALUATION:-False}
+    case "$in_train_evaluation" in
+        False | false | 0)
+            in_train_evaluation=False
+            val_before_train=False
+            test_before_train=False
+            teacher_val_before_train=False
+            test_freq=-1
+            test_benchmarks_freq=-1
+            ;;
+        True | true | 1)
+            in_train_evaluation=True
+            val_before_train=${VAL_BEFORE_TRAIN:-True}
+            test_before_train=${TEST_BEFORE_TRAIN:-True}
+            teacher_val_before_train=${TEACHER_VAL_BEFORE_TRAIN:-False}
+            test_freq=${TEST_FREQ:-10}
+            test_benchmarks_freq=${TEST_BENCHMARKS_FREQ:-20}
+            ;;
+        *)
+            echo "IN_TRAIN_EVALUATION must be True or False, got: $in_train_evaluation" >&2
+            return 1
+            ;;
+    esac
 }
 
 run_npu_opd_job() {
@@ -303,9 +337,7 @@ run_npu_opd_job() {
     reward_manager_name=${REWARD_MANAGER_NAME:-naive}
     trainer_logger=${TRAINER_LOGGER:-'["console","wandb"]'}
     trainer_device=${TRAINER_DEVICE:-npu}
-    val_before_train=${VAL_BEFORE_TRAIN:-True}
-    test_before_train=${TEST_BEFORE_TRAIN:-True}
-    teacher_val_before_train=${TEACHER_VAL_BEFORE_TRAIN:-False}
+    _configure_in_training_evaluation || exit 1
     distillation_enabled=${DISTILLATION_ENABLED:-True}
 
     project_name=${PROJECT_NAME:-DMPD}
@@ -315,6 +347,7 @@ run_npu_opd_job() {
     default_local_dir=${DEFAULT_LOCAL_DIR:-$WORKSPACE/outputs/${experiment_name}}
     total_epochs=${TOTAL_EPOCHS:-1}
     save_freq=${SAVE_FREQ:-20}
+    checkpoint_evaluation_manifest=${CHECKPOINT_EVALUATION_MANIFEST:-True}
     metric_logging_mode=${METRIC_LOGGING_MODE:-balanced}
     metric_logging_resume_policy=${METRIC_LOGGING_RESUME_POLICY:-strict}
     metric_logging_live_key_warning_threshold=${METRIC_LOGGING_LIVE_KEY_WARNING_THRESHOLD:-250}
@@ -334,8 +367,6 @@ run_npu_opd_job() {
         echo "METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS must be a positive integer, got: $metric_logging_archive_shard_interval_steps" >&2
         exit 1
     fi
-    test_freq=${TEST_FREQ:-10}
-    test_benchmarks_freq=${TEST_BENCHMARKS_FREQ:-20}
     test_benchmarks_max_response_length=${TEST_BENCHMARKS_MAX_RESPONSE_LENGTH:-$max_response_length}
     log_test_generations=${LOG_TEST_GENERATIONS:-0}
     resume_required=${RESUME_REQUIRED:-False}
@@ -359,8 +390,9 @@ run_npu_opd_job() {
     esac
 
     echo "Metric logging: mode=$metric_logging_mode, archive=$metric_logging_archive_enabled, shard_interval=$metric_logging_archive_shard_interval_steps, upload=$metric_logging_archive_upload_to_wandb"
+    echo "In-training evaluation: enabled=$in_train_evaluation, val_before=$val_before_train, test_before=$test_before_train, teacher_val_before=$teacher_val_before_train, val_freq=$test_freq, benchmark_freq=$test_benchmarks_freq"
     echo "W&B resume: mode=$WANDB_MODE, required=$resume_required, run_id=${WANDB_RUN_ID:-unset}, resume=${WANDB_RESUME:-unset}"
-    echo "W&B storage: run_root=$WANDB_DIR, upload_staging_root=$WANDB_DATA_DIR"
+    echo "W&B storage: run_root=$WANDB_DIR, upload_staging_root=$WANDB_DATA_DIR, cache_root=$WANDB_CACHE_DIR"
 
     export NODE_RANK=${NODE_RANK:-$VC_TASK_INDEX}
     export MASTER_ADDR=${MASTER_ADDR:-"${MA_VJ_NAME}-${MA_TASK_NAME}-0.${MA_VJ_NAME}"}
@@ -561,6 +593,7 @@ _submit_npu_verl_job() {
         "trainer.nnodes=${STUDENT_NNODES}"
         "trainer.device=${trainer_device}"
         "trainer.default_local_dir=${default_local_dir}"
+        "trainer.checkpoint_evaluation_manifest=${checkpoint_evaluation_manifest}"
         "trainer.val_before_train=${val_before_train}"
         "trainer.test_before_train=${test_before_train}"
         "trainer.teacher_val_before_train=${teacher_val_before_train}"

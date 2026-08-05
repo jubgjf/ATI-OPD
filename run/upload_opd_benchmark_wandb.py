@@ -27,6 +27,7 @@ import json
 import math
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -48,6 +49,7 @@ REQUIRED_RESULT_FILES = (
     LENGTH_BINS_FILENAME,
 )
 SYNC_FILENAME = "wandb-sync.json"
+OFFLINE_SYNC_COMMANDS_FILENAME = "wandb-offline-sync.sh"
 SYNC_UNIT_KEY = "sync/unit_key"
 SYNC_FINGERPRINT_KEY = "sync/result_fingerprint"
 
@@ -76,6 +78,12 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     temporary.replace(path)
+
+
+def absolute_path(path: str | Path) -> Path:
+    """Return an absolute path without resolving portable shared-storage symlinks."""
+
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
 
 
 def finite_float(value: Any) -> float | None:
@@ -125,7 +133,7 @@ def _validate_completed_unit(output_dir: Path) -> tuple[bool, str]:
 
 
 def discover_units(result_root: str | Path) -> dict[tuple[str, int], Path]:
-    root = Path(result_root).expanduser().resolve()
+    root = absolute_path(result_root)
     units: dict[tuple[str, int], Path] = {}
     benchmarks_root = root / BENCHMARKS_DIRNAME
     if not benchmarks_root.is_dir():
@@ -177,14 +185,23 @@ def _finite_metric(payload: dict[str, Any], key: str, value: Any) -> None:
         payload[key] = parsed
 
 
-def unit_metric_payload(summary: dict[str, Any], result_fingerprint: str) -> dict[str, Any]:
+def unit_metric_payload(
+    summary: dict[str, Any],
+    result_fingerprint: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+    checkpoint_timing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     benchmark = summary.get("benchmark") or {}
     benchmark_id = str(benchmark["id"])
     benchmark_path = str(benchmark["path"])
+    benchmark_name = str(benchmark.get("name") or Path(benchmark_path).name)
     global_step = int(summary["global_step"])
     metrics = summary.get("metrics") or {}
     response_tokens = metrics.get("response_tokens") or {}
     prefix = f"benchmark/{benchmark_id}"
+    rollout_n = int(summary.get("rollout_n") or 16)
+    test_prefix = f"test-core/{benchmark_name}"
     payload: dict[str, Any] = {
         "eval/global_step": global_step,
         SYNC_UNIT_KEY: unit_sync_key(benchmark_path, global_step),
@@ -210,6 +227,21 @@ def unit_metric_payload(summary: dict[str, Any], result_fingerprint: str) -> dic
     for name, value in direct_metrics.items():
         _finite_metric(payload, f"{prefix}/{name}", value)
 
+    raw_accuracy = summary.get("accuracy_at_n") or {}
+    for name in ("mean", "maj", "best"):
+        _finite_metric(payload, f"{test_prefix}/acc/{name}@{rollout_n}", raw_accuracy.get(name))
+    for name, value in {
+        "response_length/mean": response_tokens.get("mean"),
+        "response_length/p90": response_tokens.get("p90"),
+        "response_length/p99": response_tokens.get("p99"),
+        "clip_ratio": metrics.get("truncation_rate"),
+        "eos_success_rate": metrics.get("eos_success_rate"),
+        "repetition/token_zlib_rate": metrics.get("repetition_token_zlib_rate"),
+        "repetition/text_zlib_rate": metrics.get("repetition_text_zlib_rate"),
+        "repetition/tail_ngram_fraction": metrics.get("tail_ngram_repeat_fraction_mean"),
+    }.items():
+        _finite_metric(payload, f"{test_prefix}/{name}", value)
+
     tail_gap = (metrics.get("gap_regions") or {}).get("last_window") or {}
     for name, value in {
         "tail_sampled_forward_kl": tail_gap.get("sampled_forward_kl_token_weighted"),
@@ -217,10 +249,59 @@ def unit_metric_payload(summary: dict[str, Any], result_fingerprint: str) -> dic
         "tail_high_gap_rate": tail_gap.get("high_gap_rate_token_weighted"),
     }.items():
         _finite_metric(payload, f"{prefix}/{name}", value)
+        _finite_metric(payload, f"{test_prefix}/teacher_student_gap/{name}", value)
 
     acc_ci = (summary.get("question_cluster_bootstrap_ci95") or {}).get("acc") or {}
     _finite_metric(payload, f"{prefix}/acc_ci95_low", acc_ci.get("ci95_low"))
     _finite_metric(payload, f"{prefix}/acc_ci95_high", acc_ci.get("ci95_high"))
+
+    repair = summary.get("repair") or {}
+    repair_metrics = repair.get("metrics") or {}
+    repair_accuracy = repair.get("accuracy_at_n") or {}
+    paired = repair.get("paired") or {}
+    if repair:
+        repair_prefix = f"test-repair-core/{benchmark_name}"
+        for name in ("mean", "maj", "best"):
+            _finite_metric(payload, f"{repair_prefix}/acc/{name}@{rollout_n}", repair_accuracy.get(name))
+        _finite_metric(payload, f"{repair_prefix}/acc/paired_delta@{rollout_n}", paired.get("paired_delta"))
+        repair_response_tokens = repair_metrics.get("response_tokens") or {}
+        for name, value in {
+            "repair/execution_rate": paired.get("repair_execution_rate"),
+            "repair/trigger_rate": paired.get("trigger_rate"),
+            "repair/intervention_count_mean": (paired.get("intervention_count") or {}).get("mean"),
+            "repair/first_position_mean": (paired.get("first_intervention_position") or {}).get("mean"),
+            "teacher_student_gap/initial_mean": (paired.get("initial_gap_mean") or {}).get("mean"),
+            "teacher_student_gap/initial_max": (paired.get("initial_gap_max") or {}).get("mean"),
+            "teacher_student_gap/initial_p95": (paired.get("initial_gap_p95") or {}).get("mean"),
+            "teacher_student_gap/selected_segment_score": (paired.get("selected_segment_score") or {}).get("mean"),
+            "teacher/nonfinite_token_fraction": paired.get("teacher_nonfinite_token_fraction"),
+            "response_length/mean": repair_response_tokens.get("mean"),
+            "response_length/p90": repair_response_tokens.get("p90"),
+            "clip_ratio": repair_metrics.get("truncation_rate"),
+            "eos_success_rate": repair_metrics.get("eos_success_rate"),
+            "repetition/token_zlib_rate": repair_metrics.get("repetition_token_zlib_rate"),
+            "repetition/text_zlib_rate": repair_metrics.get("repetition_text_zlib_rate"),
+            "repetition/tail_ngram_fraction": repair_metrics.get("tail_ngram_repeat_fraction_mean"),
+        }.items():
+            _finite_metric(payload, f"{repair_prefix}/{name}", value)
+        for name, value in (paired.get("transitions") or {}).items():
+            _finite_metric(payload, f"{repair_prefix}/transition/{name}", value)
+
+    metadata = metadata or {}
+    for name, value in {
+        "raw_generation_seconds": metadata.get("generation_elapsed_seconds"),
+        "teacher_scoring_seconds": metadata.get("teacher_scoring_elapsed_seconds"),
+        "repair_seconds": metadata.get("repair_elapsed_seconds"),
+    }.items():
+        _finite_metric(payload, f"eval/timing/{benchmark_name}/{name}", value)
+    checkpoint_timing = checkpoint_timing or {}
+    for name, value in {
+        "model_load_seconds": checkpoint_timing.get("model_load_seconds"),
+        "teacher_model_load_seconds": checkpoint_timing.get("teacher_model_load_seconds"),
+        "checkpoint_total_seconds": checkpoint_timing.get("checkpoint_total_seconds"),
+        "failure_retry_count": checkpoint_timing.get("failure_retry_count"),
+    }.items():
+        _finite_metric(payload, f"eval/timing/{name}", value)
     return payload
 
 
@@ -235,11 +316,13 @@ def _load_experiment_name(result_root: Path) -> str:
 
 
 def discover_experiment_roots(base_dir: Path, experiments: list[str] | None) -> list[Path]:
-    root = base_dir.expanduser().resolve()
+    root = absolute_path(base_dir)
     if experiments:
-        result = [(root / experiment).resolve() for experiment in experiments]
+        result = [absolute_path(root / experiment) for experiment in experiments]
     else:
-        result = sorted(path.resolve() for path in root.iterdir() if path.is_dir() and not path.name.startswith("."))
+        result = sorted(
+            absolute_path(path) for path in root.iterdir() if path.is_dir() and not path.name.startswith(".")
+        )
     missing = [path for path in result if not path.is_dir()]
     if missing:
         raise FileNotFoundError(f"Evaluation experiment directories do not exist: {missing}")
@@ -356,10 +439,129 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _load_unit(unit_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def _load_unit(unit_dir: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     marker = json.loads((unit_dir / COMPLETION_FILENAME).read_text(encoding="utf-8"))
     summary = json.loads((unit_dir / SUMMARY_FILENAME).read_text(encoding="utf-8"))
-    return marker, summary
+    metadata = json.loads((unit_dir / METADATA_FILENAME).read_text(encoding="utf-8"))
+    return marker, summary, metadata
+
+
+def _checkpoint_timing(result_root: Path, global_step: int) -> dict[str, Any]:
+    path = result_root / "checkpoint_timings" / f"global_step_{global_step}.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _empty_sync_manifest(
+    *,
+    entity: str,
+    project: str,
+    run_id: str,
+    experiment: str,
+    source_training_run_id: str | None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "entity": entity,
+        "project": project,
+        "run_id": run_id,
+        "experiment": experiment,
+        "source_training_run_id": source_training_run_id,
+        "units": {},
+        "artifacts": {},
+        "offline_segments": [],
+    }
+
+
+def _load_local_sync_manifest(
+    result_root: Path,
+    *,
+    entity: str,
+    project: str,
+    run_id: str,
+    experiment: str,
+    source_training_run_id: str | None,
+) -> dict[str, Any]:
+    expected = _empty_sync_manifest(
+        entity=entity,
+        project=project,
+        run_id=run_id,
+        experiment=experiment,
+        source_training_run_id=source_training_run_id,
+    )
+    path = result_root / SYNC_FILENAME
+    if not path.is_file():
+        return expected
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for key in ("entity", "project", "run_id", "experiment"):
+        actual = payload.get(key)
+        if actual is not None and str(actual) != str(expected[key]):
+            raise RuntimeError(
+                f"Local W&B sync manifest identity changed at {path}: {key}={actual!r}, expected={expected[key]!r}."
+            )
+    stored_source = payload.get("source_training_run_id")
+    if stored_source and source_training_run_id and str(stored_source) != str(source_training_run_id):
+        raise RuntimeError(
+            "Local W&B sync manifest points at another source training run: "
+            f"stored={stored_source!r}, requested={source_training_run_id!r}."
+        )
+    expected["units"] = {str(key): str(value) for key, value in dict(payload.get("units") or {}).items()}
+    expected["artifacts"] = {str(key): str(value) for key, value in dict(payload.get("artifacts") or {}).items()}
+    expected["offline_segments"] = [str(value) for value in list(payload.get("offline_segments") or [])]
+    return expected
+
+
+def _write_offline_sync_commands(result_root: Path, manifest: dict[str, Any]) -> None:
+    segments = [str(absolute_path(value)) for value in manifest.get("offline_segments") or []]
+    command_path = result_root / OFFLINE_SYNC_COMMANDS_FILENAME
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "",
+        "command -v wandb >/dev/null 2>&1 || { echo 'wandb CLI is required on the sync host.' >&2; exit 127; }",
+        "",
+    ]
+    for index, segment in enumerate(segments):
+        synced_marker = segment if segment.endswith(".synced") else f"{segment}.synced"
+        parts = ["wandb", "sync"]
+        if index:
+            parts.append("--append")
+        if manifest.get("entity"):
+            parts.extend(["--entity", str(manifest["entity"])])
+        parts.extend(["--project", str(manifest["project"]), "--id", str(manifest["run_id"]), segment])
+        lines.append(f"if [[ ! -f {shlex.quote(synced_marker)} ]]; then")
+        lines.append(f"    if [[ ! -f {shlex.quote(segment)} ]]; then")
+        lines.append(
+            "        echo "
+            + shlex.quote("Offline W&B segment is not visible at its recorded absolute path: " + segment)
+            + " >&2"
+        )
+        lines.append(
+            "        echo 'Use one shared absolute path on both hosts, or set EVAL_PORTABLE_RESULT_ROOT "
+            "before evaluation.' >&2"
+        )
+        lines.append("        exit 2")
+        lines.append("    fi")
+        lines.append(f"    {' '.join(shlex.quote(part) for part in parts)}")
+        lines.append("fi")
+    temporary = command_path.with_name(command_path.name + ".tmp")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temporary.chmod(0o755)
+    temporary.replace(command_path)
+
+
+def _offline_sync_target(run_directory: Path) -> Path:
+    candidates = sorted(run_directory.glob("*.wandb"))
+    if not candidates:
+        candidates = sorted(run_directory.glob("*.wandb.synced"))
+    if not candidates:
+        raise RuntimeError(f"Offline W&B run did not produce a sync file under {run_directory}.")
+    return absolute_path(candidates[-1])
 
 
 def _check_remote_conflict(remote_state: dict[str, str], key: str, fingerprint: str) -> bool:
@@ -374,6 +576,19 @@ def _check_remote_conflict(remote_state: dict[str, str], key: str, fingerprint: 
     return True
 
 
+def _wandb_settings(wandb_module: Any) -> Any | None:
+    settings_class = getattr(wandb_module, "Settings", None)
+    if settings_class is None:
+        return None
+    fields = getattr(settings_class, "model_fields", {})
+    kwargs: dict[str, Any] = {"disable_git": True}
+    if "x_disable_stats" in fields:
+        kwargs["x_disable_stats"] = True
+    elif "_disable_stats" in fields:
+        kwargs["_disable_stats"] = True
+    return settings_class(**kwargs)
+
+
 def sync_experiment(args: argparse.Namespace, result_root: Path) -> int:
     units = discover_units(result_root)
     if not units:
@@ -381,6 +596,10 @@ def sync_experiment(args: argparse.Namespace, result_root: Path) -> int:
         return 0
     experiment = _load_experiment_name(result_root)
     candidate_run_id = args.run_id or stable_run_id(args.entity, args.project, experiment)
+    mode = str(args.mode).lower()
+    if mode == "disabled":
+        print(f"[wandb] disabled: experiment={experiment}")
+        return 0
     if args.dry_run:
         print(
             canonical_json(
@@ -388,6 +607,7 @@ def sync_experiment(args: argparse.Namespace, result_root: Path) -> int:
                     "experiment": experiment,
                     "result_root": result_root,
                     "run_id": candidate_run_id,
+                    "mode": mode,
                     "run_id_note": (
                         "explicit" if args.run_id else "stable candidate; dry-run does not query legacy runs"
                     ),
@@ -397,53 +617,134 @@ def sync_experiment(args: argparse.Namespace, result_root: Path) -> int:
         )
         return 0
 
-    import wandb
+    api = None
+    if mode == "online":
+        import wandb
 
-    api = wandb.Api()
-    run_id = args.run_id or resolve_run_id(
-        api,
-        args.entity,
-        args.project,
-        experiment,
-        adopt_existing_name=args.adopt_existing_name,
-    )
-    run = wandb.init(
+        api = wandb.Api()
+        run_id = args.run_id or resolve_run_id(
+            api,
+            args.entity,
+            args.project,
+            experiment,
+            adopt_existing_name=args.adopt_existing_name,
+        )
+    elif mode == "offline":
+        # Offline operation must not contact the Public API. Every restart uses
+        # the same deterministic ID and creates an appendable local segment.
+        run_id = candidate_run_id
+    else:
+        raise ValueError(f"Unsupported W&B mode: {mode!r}")
+
+    local_manifest = _load_local_sync_manifest(
+        result_root,
         entity=args.entity,
         project=args.project,
-        id=run_id,
-        resume="allow",
-        name=experiment,
-        job_type="standalone-benchmark-evaluation",
-        config={"evaluation_experiment": experiment, "evaluation_schema_version": 2},
-        reinit=True,
+        run_id=run_id,
+        experiment=experiment,
+        source_training_run_id=args.source_training_run_id,
+    )
+    if mode == "offline":
+        pending = False
+        for (benchmark_path, global_step), unit_dir in units.items():
+            marker, summary, _ = _load_unit(unit_dir)
+            fingerprint = str(marker["result_fingerprint"])
+            key = unit_sync_key(benchmark_path, global_step)
+            metrics_done = _check_remote_conflict(local_manifest["units"], key, fingerprint)
+            benchmark = summary.get("benchmark") or {}
+            name = artifact_name(experiment, str(benchmark["id"]), global_step)
+            content_fingerprint = artifact_fingerprint(unit_dir, include_rollouts=args.include_rollouts)
+            artifact_done = local_manifest["artifacts"].get(name) == content_fingerprint
+            pending = pending or not (metrics_done and artifact_done)
+        if not pending:
+            print(f"[wandb] all offline units already staged: experiment={experiment} run_id={run_id}")
+            _write_offline_sync_commands(result_root, local_manifest)
+            return 0
+
+    wandb_dir = absolute_path(args.wandb_dir) if args.wandb_dir else result_root / ".wandb"
+    wandb_dir.mkdir(parents=True, exist_ok=True)
+    if mode == "offline":
+        # Keep every file needed by ``wandb sync`` on shared storage. In
+        # particular, Artifact staging must never fall back to the NPU node's
+        # unshared HOME directory.
+        os.environ["WANDB_DIR"] = str(wandb_dir)
+        os.environ["WANDB_DATA_DIR"] = str(
+            absolute_path(args.wandb_data_dir) if args.wandb_data_dir else result_root / ".wandb-data"
+        )
+        os.environ["WANDB_CACHE_DIR"] = str(
+            absolute_path(args.wandb_cache_dir) if args.wandb_cache_dir else result_root / ".wandb-cache"
+        )
+        Path(os.environ["WANDB_DATA_DIR"]).mkdir(parents=True, exist_ok=True)
+        Path(os.environ["WANDB_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+        import wandb
+
+    init_kwargs = {
+        "entity": args.entity,
+        "project": args.project,
+        "id": run_id,
+        "resume": "allow",
+        "name": experiment,
+        "job_type": "standalone-benchmark-evaluation",
+        "config": {
+            "evaluation_experiment": experiment,
+            "evaluation_schema_version": 2,
+            "source_training_run_id": args.source_training_run_id,
+        },
+        "mode": mode,
+        "dir": str(wandb_dir),
+        "reinit": True,
+    }
+    settings = _wandb_settings(wandb)
+    if settings is not None:
+        init_kwargs["settings"] = settings
+    run = wandb.init(
+        **init_kwargs,
     )
     if run is None:
         raise RuntimeError("wandb.init returned no run")
+    offline_run_directory = absolute_path(Path(run.dir).parent) if mode == "offline" else None
     synced = 0
     skipped = 0
     artifacts_updated = 0
     try:
-        remote_state = _remote_history_state(api, args.entity, args.project, run_id) if run.resumed else {}
-        summary_state = {
-            str(key): str(value) for key, value in dict(run.summary.get("benchmark_sync_manifest") or {}).items()
-        }
-        for key, fingerprint in summary_state.items():
-            existing = remote_state.get(key)
-            if existing is not None and existing != fingerprint:
-                raise RuntimeError(f"W&B history and run summary disagree for {key}: {existing} != {fingerprint}")
-            remote_state[key] = fingerprint
-        sync_manifest = dict(remote_state)
+        if mode == "online":
+            assert api is not None
+            remote_state = _remote_history_state(api, args.entity, args.project, run_id) if run.resumed else {}
+            summary_state = {
+                str(key): str(value) for key, value in dict(run.summary.get("benchmark_sync_manifest") or {}).items()
+            }
+            for key, fingerprint in summary_state.items():
+                existing = remote_state.get(key)
+                if existing is not None and existing != fingerprint:
+                    raise RuntimeError(f"W&B history and run summary disagree for {key}: {existing} != {fingerprint}")
+                remote_state[key] = fingerprint
+            sync_manifest = dict(remote_state)
+            artifact_manifest = dict(local_manifest["artifacts"])
+        else:
+            remote_state = dict(local_manifest["units"])
+            sync_manifest = dict(remote_state)
+            artifact_manifest = dict(local_manifest["artifacts"])
         run.define_metric("eval/global_step")
         run.define_metric("benchmark/*", step_metric="eval/global_step")
+        run.define_metric("test-core/*", step_metric="eval/global_step")
+        run.define_metric("test-repair-core/*", step_metric="eval/global_step")
+        run.define_metric("eval/timing/*", step_metric="eval/global_step")
         for (benchmark_path, global_step), unit_dir in units.items():
-            marker, summary = _load_unit(unit_dir)
+            marker, summary, metadata = _load_unit(unit_dir)
             fingerprint = str(marker["result_fingerprint"])
             key = unit_sync_key(benchmark_path, global_step)
             metrics_already_synced = _check_remote_conflict(remote_state, key, fingerprint)
             benchmark = summary.get("benchmark") or {}
             name = artifact_name(experiment, str(benchmark["id"]), global_step)
             content_fingerprint = artifact_fingerprint(unit_dir, include_rollouts=args.include_rollouts)
-            if not _remote_artifact_matches(api, args.entity, args.project, name, content_fingerprint):
+            if mode == "online":
+                assert api is not None
+                artifact_already_synced = _remote_artifact_matches(
+                    api, args.entity, args.project, name, content_fingerprint
+                )
+            else:
+                artifact_already_synced = artifact_manifest.get(name) == content_fingerprint
+            if not artifact_already_synced:
                 artifact = wandb.Artifact(
                     name=name,
                     type="benchmark-evaluation",
@@ -459,45 +760,55 @@ def sync_experiment(args: argparse.Namespace, result_root: Path) -> int:
                 for file_path in _iter_artifact_files(unit_dir, include_rollouts=args.include_rollouts):
                     artifact.add_file(str(file_path), name=str(file_path.relative_to(unit_dir)))
                 logged_artifact = run.log_artifact(artifact, aliases=["latest", f"step-{global_step}"])
-                logged_artifact.wait()
+                if mode == "online":
+                    logged_artifact.wait()
+                artifact_manifest[name] = content_fingerprint
+                local_manifest["artifacts"] = artifact_manifest
+                write_json_atomic(result_root / SYNC_FILENAME, local_manifest)
                 artifacts_updated += 1
-                print(f"[wandb] artifact uploaded: {key}")
+                print(f"[wandb] artifact {'uploaded' if mode == 'online' else 'staged'}: {key}")
             if metrics_already_synced:
                 sync_manifest[key] = fingerprint
                 run.summary["benchmark_sync_manifest"] = sync_manifest
+                local_manifest["units"] = sync_manifest
+                local_manifest["artifacts"] = artifact_manifest
                 write_json_atomic(
                     result_root / SYNC_FILENAME,
-                    {
-                        "entity": args.entity,
-                        "project": args.project,
-                        "run_id": run_id,
-                        "experiment": experiment,
-                        "units": sync_manifest,
-                    },
+                    local_manifest,
                 )
                 skipped += 1
-                print(f"[wandb] metrics already synced: {key}")
+                print(f"[wandb] metrics already {'synced' if mode == 'online' else 'staged'}: {key}")
                 continue
-            run.log(unit_metric_payload(summary, fingerprint))
+            run.log(
+                unit_metric_payload(
+                    summary,
+                    fingerprint,
+                    metadata=metadata,
+                    checkpoint_timing=_checkpoint_timing(result_root, global_step),
+                )
+            )
             remote_state[key] = fingerprint
             sync_manifest[key] = fingerprint
             run.summary["benchmark_sync_manifest"] = sync_manifest
+            local_manifest["units"] = sync_manifest
+            local_manifest["artifacts"] = artifact_manifest
             write_json_atomic(
                 result_root / SYNC_FILENAME,
-                {
-                    "entity": args.entity,
-                    "project": args.project,
-                    "run_id": run_id,
-                    "experiment": experiment,
-                    "units": sync_manifest,
-                },
+                local_manifest,
             )
             synced += 1
-            print(f"[wandb] synced: {key}")
+            print(f"[wandb] {'synced' if mode == 'online' else 'staged'}: {key}")
     finally:
         run.finish()
+        if mode == "offline":
+            assert offline_run_directory is not None
+            segment = str(_offline_sync_target(offline_run_directory))
+            if segment not in local_manifest["offline_segments"]:
+                local_manifest["offline_segments"].append(segment)
+            write_json_atomic(result_root / SYNC_FILENAME, local_manifest)
+            _write_offline_sync_commands(result_root, local_manifest)
     print(
-        f"[wandb] experiment={experiment} run_id={run_id} "
+        f"[wandb] mode={mode} experiment={experiment} run_id={run_id} "
         f"metrics_synced={synced} metrics_skipped={skipped} artifacts_updated={artifacts_updated}"
     )
     return 0
@@ -509,6 +820,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--experiments", nargs="+", default=None)
     parser.add_argument("--entity", default="jubgjf")
     parser.add_argument("--project", default="DMPD-eval")
+    parser.add_argument(
+        "--mode",
+        choices=["online", "offline", "disabled"],
+        default=os.environ.get("WANDB_MODE", "offline"),
+        help="Offline mode never calls the W&B Public API and emits ordered wandb sync commands.",
+    )
+    parser.add_argument(
+        "--wandb-dir",
+        default=None,
+        help="Local W&B staging root; defaults to <experiment-result-root>/.wandb.",
+    )
+    parser.add_argument("--wandb-data-dir", default=None)
+    parser.add_argument("--wandb-cache-dir", default=None)
+    parser.add_argument(
+        "--source-training-run-id",
+        default=None,
+        help="Source training run ID recorded in config; evaluation still uses an independent run.",
+    )
     parser.add_argument(
         "--run-id",
         default=None,

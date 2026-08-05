@@ -198,6 +198,22 @@ class _GlobalTeacherNLLCalibration:
             self.version += 1
         return self.snapshot()
 
+    def export_state(self) -> dict[str, Any]:
+        """Return a JSON-safe snapshot for read-only standalone evaluation."""
+
+        snapshot = self.snapshot()
+        return {
+            "quantile": self.quantile,
+            "window": self.history.maxlen,
+            "min_samples": self.min_samples,
+            "initial_threshold": self.initial_threshold,
+            "history": list(self.history),
+            "threshold": snapshot.threshold,
+            "source": snapshot.source,
+            "count": snapshot.count,
+            "version": snapshot.version,
+        }
+
 
 def _as_single_float(value: Any, *, context: str) -> float:
     """Normalize a reward-manager scalar without silently reducing a batch."""
@@ -3282,8 +3298,10 @@ class AgentLoopWorker:
         output.extra_fields["teacher_intervention_count"] = 0
         output.extra_fields["teacher_interventions"] = []
         output.extra_fields["teacher_intervention_skipped"] = []
+        output.extra_fields["teacher_intervention_gap_diagnostics"] = []
         interventions: list[dict[str, Any]] = output.extra_fields["teacher_interventions"]
         skipped_interventions: list[dict[str, Any]] = output.extra_fields["teacher_intervention_skipped"]
+        gap_diagnostics: list[dict[str, Any]] = output.extra_fields["teacher_intervention_gap_diagnostics"]
 
         if output.routed_experts is not None:
             raise NotImplementedError(
@@ -3422,6 +3440,35 @@ class AgentLoopWorker:
                 pending_local_effect = None
             gaps = score_result.active_scores
             bad_segment = _select_intervention_segment(gaps, gap_mask, intervention_config)
+            if validate and repair_for_evaluation:
+                # Keep standalone/evaluation diagnostics device-agnostic. In
+                # particular, torch.quantile need not be implemented by the
+                # NPU backend because this tiny summary is computed on CPU.
+                valid_mask = torch.tensor(gap_mask, dtype=torch.bool)
+                valid_gaps = gaps.detach().float().cpu()[valid_mask]
+                finite_gaps = valid_gaps[torch.isfinite(valid_gaps)]
+                gap_diagnostic = {
+                    "attempt": attempt,
+                    "gap_metric": str(intervention_config.gap_metric).lower(),
+                    "gap_threshold": float(intervention_config.gap_threshold),
+                    "gap_aggregation": str(intervention_config.gap_aggregation),
+                    "valid_token_count": int(valid_gaps.numel()),
+                    "finite_token_count": int(finite_gaps.numel()),
+                    "mean": float(finite_gaps.mean().item()) if finite_gaps.numel() else None,
+                    "max": float(finite_gaps.max().item()) if finite_gaps.numel() else None,
+                    "p95": float(torch.quantile(finite_gaps, 0.95).item()) if finite_gaps.numel() else None,
+                    "selected_segment_start": None if bad_segment is None else int(bad_segment[0]),
+                    "selected_segment_end": None if bad_segment is None else int(bad_segment[1]),
+                    "selected_segment_score": None if bad_segment is None else float(bad_segment[2]),
+                    "teacher_nonfinite_token_count": len(
+                        _response_relative_nonfinite_positions(
+                            teacher_result,
+                            prompt_len=len(prompt_ids),
+                            response_len=len(response_ids),
+                        )
+                    ),
+                }
+                gap_diagnostics.append(gap_diagnostic)
             if bad_segment is None or len(interventions) >= intervention_config.max_interventions_per_sample:
                 break
 
@@ -3861,6 +3908,7 @@ class AgentLoopWorker:
         output.extra_fields["teacher_intervention_count"] = len(interventions)
         output.extra_fields["teacher_interventions"] = interventions
         output.extra_fields["teacher_intervention_skipped"] = skipped_interventions
+        output.extra_fields["teacher_intervention_gap_diagnostics"] = gap_diagnostics
         if cached_teacher_result is not None:
             _store_teacher_scoring_result(
                 output,
@@ -4122,6 +4170,13 @@ class AgentLoopManager:
         if self._global_teacher_nll_calibration is None:
             return None
         return self._global_teacher_nll_calibration.add_updates(worker_updates)
+
+    def export_teacher_nll_calibration_state(self) -> Optional[dict[str, Any]]:
+        """Export the manager-owned calibration without mutating evaluation state."""
+
+        if self._global_teacher_nll_calibration is None:
+            return None
+        return self._global_teacher_nll_calibration.export_state()
 
     async def _refresh_global_teacher_nll_calibration(self) -> None:
         """Aggregate the previous batch's updates and broadcast one snapshot before the next batch."""

@@ -19,8 +19,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from omegaconf import OmegaConf
 
 from verl.utils.evaluation import opd_benchmark as benchmark
+from verl.utils.evaluation import teacher_intervention
+from verl.utils.evaluation.checkpoint_evaluation import write_evaluation_spec, write_evaluation_state
 
 
 def test_benchmark_id_uses_full_path_and_rejects_traversal_on_cpu():
@@ -167,6 +170,73 @@ def test_evaluate_one_prefers_exact_vllm_token_ids_on_cpu():
     assert record["error"] is None
     assert record["response_token_ids"] == [101, 102, 151645]
     assert record["response_token_ids_source"] == "vllm"
+
+
+def test_evaluate_one_reuses_generation_logprobs_without_echo_forward_on_cpu():
+    requests: list[dict] = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            requests.append(kwargs)
+            assert kwargs.get("echo") is None
+            choice = SimpleNamespace(
+                text=r"final answer is \boxed{1}",
+                finish_reason="stop",
+                stop_reason=2,
+                token_ids=[101, 102],
+                logprobs=SimpleNamespace(token_logprobs=[-0.2, -0.3]),
+            )
+            return SimpleNamespace(choices=[choice], usage=SimpleNamespace(completion_tokens=2))
+
+    class FakeTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            del text, add_special_tokens
+            return [999]
+
+    args = SimpleNamespace(
+        served_model_name="student",
+        max_tokens=32,
+        temperature=0.7,
+        top_p=0.95,
+        top_k=-1,
+        require_exact_token_ids=True,
+        score_student_logprobs=True,
+        verifier="math_dapo",
+        repetition_tail_chars=100,
+        repetition_threshold=10.0,
+        repetition_tail_token_window=32,
+        ngram_size=4,
+    )
+    task = benchmark.RolloutTask(
+        flat_index=0,
+        task_id="task",
+        benchmark_id="bench",
+        benchmark_name="aime24",
+        benchmark_path="math-ai/aime24",
+        question_index=0,
+        sample_id="0",
+        problem="1+0?",
+        ground_truth="1",
+        prompt_token_ids=[1, 2],
+        rollout_index=0,
+        seed=42,
+    )
+    record = asyncio.run(
+        benchmark.evaluate_one(
+            client=SimpleNamespace(completions=FakeCompletions()),
+            generation_semaphore=asyncio.Semaphore(1),
+            scoring_semaphore=asyncio.Semaphore(1),
+            args=args,
+            tokenizer=FakeTokenizer(),
+            task=task,
+            fingerprint="fingerprint",
+        )
+    )
+
+    assert len(requests) == 1
+    assert requests[0]["logprobs"] == 1
+    assert record["student_logprobs"] == [-0.2, -0.3]
+    assert record["student_logprobs_source"] == "generation_response"
 
 
 def _write_complete_unit(output_dir: Path) -> dict:
@@ -427,4 +497,226 @@ def test_teacher_scoring_failure_preserves_generation_and_resumes_on_cpu(tmp_pat
     assert completed_metadata["teacher_scored"] is True
     assert completed_metadata["teacher_scoring_complete"] is True
     assert not (output_dir / benchmark.WORK_DIRNAME).exists()
+    assert benchmark.validate_completed_unit(output_dir) == (True, "complete")
+
+
+def test_repair_failure_preserves_raw_unit_and_resumes_only_missing_shards_on_cpu(tmp_path, monkeypatch):
+    checkpoint_root = tmp_path / "checkpoints"
+    config = OmegaConf.create(
+        {
+            "trainer": {
+                "experiment_name": "exp",
+                "project_name": "DMPD",
+                "test_benchmarks_max_response_length": 32,
+            },
+            "actor_rollout_ref": {
+                "model": {"path": "student", "tokenizer_path": None, "chat_template_from_model": "teacher"},
+                "rollout": {
+                    "max_model_len": 64,
+                    "test_kwargs": {"n": 1, "temperature": 0.7, "top_p": 0.95, "top_k": -1},
+                },
+            },
+            "data": {
+                "trust_remote_code": False,
+                "max_prompt_length": 32,
+                "max_response_length": 32,
+                "seed": 42,
+                "test_benchmarks": {
+                    "root": "datasets",
+                    "names": ["math-ai/aime24"],
+                    "reward_data_source": "math_dapo",
+                },
+            },
+            "reward": {"reward_manager": {"name": "naive"}},
+            "distillation": {
+                "enabled": True,
+                "teacher_key": "default",
+                "teacher_models": {"default": {"model_path": "teacher"}},
+                "distillation_loss": {"log_prob_min_clamp": -10.0},
+                "intervention": {
+                    "_target_": "verl.workers.config.DistillationInterventionConfig",
+                    "enabled": True,
+                    "protect_thinking_blocks": False,
+                    "gap_metric": "k3",
+                },
+            },
+        }
+    )
+    spec = write_evaluation_spec(checkpoint_root, config, training_run_id="training-id")
+    checkpoint_dir = checkpoint_root / "global_step_20"
+    write_evaluation_state(
+        checkpoint_dir,
+        checkpoint_step=20,
+        spec_fingerprint=spec["spec_fingerprint"],
+        teacher_nll_calibration=None,
+    )
+
+    class FakeTokenizer:
+        chat_template = "template"
+        bos_token_id = 0
+        eos_token_id = 1
+        pad_token_id = 0
+        unk_token_id = None
+
+        def get_vocab(self):
+            return {"a": 0, "b": 1, "c": 2, "d": 3}
+
+        def __len__(self):
+            return 4
+
+        def decode(self, token_ids, skip_special_tokens=True):
+            del token_ids, skip_special_tokens
+            return r"final answer is \boxed{1}"
+
+    tokenizer = FakeTokenizer()
+    result_root = tmp_path / "results"
+    output_dir = benchmark.unit_output_dir(result_root, "math-ai/aime24", 20)
+    metadata = _write_complete_unit(output_dir)
+    metadata.update(
+        {
+            "experiment": "exp",
+            "student_tokenizer": benchmark.tokenizer_metadata(tokenizer, "student"),
+            "request": {
+                "rollout_n": 1,
+                "score_student_logprobs": True,
+                "temperature": 0.7,
+                "top_p": 0.95,
+                "top_k": -1,
+                "max_tokens": 32,
+                "verifier": "math_dapo",
+            },
+            "analysis": benchmark._legacy_analysis({}),
+        }
+    )
+    records = []
+    for index, task_id in enumerate(("task-a", "task-b")):
+        records.append(
+            {
+                "schema_version": benchmark.SCHEMA_VERSION,
+                "generation_fingerprint": "generation",
+                "task_id": task_id,
+                "flat_index": index,
+                "benchmark": "aime24",
+                "benchmark_path": "math-ai/aime24",
+                "question_index": index,
+                "sample_id": str(index),
+                "rollout_index": 0,
+                "problem_fingerprint": f"problem-{index}",
+                "prompt_token_ids": [1],
+                "response_token_ids": [2, 3],
+                "student_logprobs": [-0.2, -0.3],
+                "response_tokens": 2,
+                "ground_truth": "1",
+                "finish_reason": "stop",
+                "acc": False,
+                "repetition": {},
+                "error": None,
+            }
+        )
+    benchmark.write_json_atomic(output_dir / benchmark.METADATA_FILENAME, metadata)
+    benchmark.write_jsonl_gz_atomic(output_dir / benchmark.ROLLOUTS_FILENAME, records)
+    benchmark.write_completion_marker(output_dir, metadata)
+
+    class FakeModels:
+        async def list(self):
+            return SimpleNamespace(data=[SimpleNamespace(id="student"), SimpleNamespace(id="teacher")])
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs):
+            del kwargs
+            self.models = FakeModels()
+
+        async def close(self):
+            return None
+
+    class FakeAdapter:
+        def __init__(self, **kwargs):
+            del kwargs
+
+    class FakeAdapterConfig:
+        def __init__(self, **kwargs):
+            del kwargs
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            del kwargs
+
+    failed_once = {"value": True}
+    calls: list[str] = []
+
+    async def fake_repair_one_record(**kwargs):
+        record = dict(kwargs["record"])
+        task_id = record["task_id"]
+        calls.append(task_id)
+        if task_id == "task-b" and failed_once["value"]:
+            record["repair"] = {"fingerprint": kwargs["repair_fingerprint"], "error": "temporary failure"}
+            return record
+        record["repair"] = {
+            "fingerprint": kwargs["repair_fingerprint"],
+            "text": r"final answer is \boxed{1}",
+            "response_token_ids": [2, 3],
+            "response_tokens": 2,
+            "finish_reason": "stop",
+            "eos_success": True,
+            "truncated": False,
+            "acc": True,
+            "pred": "1",
+            "answer_extractable": True,
+            "has_answer_pattern": True,
+            "has_boxed_pattern": True,
+            "accepted_answer_format": True,
+            "repetition": {},
+            "trigger_detected": True,
+            "repair_executed": True,
+            "intervention_count": 1,
+            "first_intervention_position": 0,
+            "teacher_interventions": [],
+            "teacher_intervention_skipped": [],
+            "gap_diagnostics": [],
+            "error": None,
+        }
+        return record
+
+    monkeypatch.setattr(benchmark.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: tokenizer)
+    monkeypatch.setattr(benchmark, "repair_one_record", fake_repair_one_record)
+    monkeypatch.setattr(teacher_intervention, "OpenAICompletionAdapter", FakeAdapter)
+    monkeypatch.setattr(teacher_intervention, "OpenAICompletionAdapterConfig", FakeAdapterConfig)
+    monkeypatch.setattr(teacher_intervention, "StandaloneTeacherInterventionRunner", FakeRunner)
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(AsyncOpenAI=FakeAsyncOpenAI))
+    args = SimpleNamespace(
+        result_root=str(result_root),
+        benchmark="math-ai/aime24",
+        global_step=20,
+        evaluation_spec=str(checkpoint_root / "evaluation_spec.json"),
+        evaluation_state=str(checkpoint_dir / "evaluation_state.json"),
+        student_base_url="http://student/v1",
+        student_api_key="EMPTY",
+        student_served_model_name="student",
+        teacher_base_url="http://teacher/v1",
+        teacher_api_key="EMPTY",
+        teacher_served_model_name="teacher",
+        teacher_model_fingerprint="teacher-fingerprint",
+        student_tokenizer_model="student",
+        teacher_tokenizer_model="teacher",
+        trust_remote_code=False,
+        allow_tokenizer_mismatch=False,
+        request_timeout_seconds=10,
+        max_retries=0,
+        max_in_flight=2,
+        max_pending=2,
+        print_every=0,
+        overwrite=False,
+    )
+
+    assert asyncio.run(benchmark.repair_main(args)) == 1
+    assert benchmark.validate_completed_unit(output_dir) == (True, "complete")
+    assert calls.count("task-a") == 1
+    assert calls.count("task-b") == 1
+
+    failed_once["value"] = False
+    assert asyncio.run(benchmark.repair_main(args)) == 0
+    assert calls.count("task-a") == 1
+    assert calls.count("task-b") == 2
+    completed_metadata = json.loads((output_dir / benchmark.METADATA_FILENAME).read_text(encoding="utf-8"))
+    assert completed_metadata["repair_complete"] is True
     assert benchmark.validate_completed_unit(output_dir) == (True, "complete")

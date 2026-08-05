@@ -941,20 +941,30 @@ async def _request_completion(
     task: RolloutTask,
 ) -> tuple[Any, bool]:
     extra_body: dict[str, Any] = {"top_k": args.top_k, "return_token_ids": True}
+    if args.score_student_logprobs:
+        extra_body["return_tokens_as_token_ids"] = True
     if task.seed is not None:
         extra_body["seed"] = task.seed
 
     async def request(body: dict[str, Any]) -> Any:
         async with semaphore:
+            request_kwargs: dict[str, Any] = {
+                "model": args.served_model_name,
+                "prompt": task.prompt_token_ids,
+                "n": 1,
+                "max_tokens": args.max_tokens,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "stream": False,
+                "extra_body": body,
+            }
+            if args.score_student_logprobs:
+                # vLLM returns the realized-token probability as part of the
+                # generation response. This avoids a second echo forward in the
+                # normal standalone-repair path.
+                request_kwargs["logprobs"] = 1
             return await client.completions.create(
-                model=args.served_model_name,
-                prompt=task.prompt_token_ids,
-                n=1,
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                stream=False,
-                extra_body=body,
+                **request_kwargs,
             )
 
     try:
@@ -1041,14 +1051,28 @@ async def evaluate_one(
 
         student_logprobs: list[float | None] | None = None
         scoring_fallback: bool | None = None
+        student_logprobs_source: str | None = None
         if args.score_student_logprobs:
-            student_logprobs, scoring_fallback = await score_sequence_logprobs(
-                client=client,
-                semaphore=scoring_semaphore,
-                served_model_name=args.served_model_name,
-                prompt_token_ids=task.prompt_token_ids,
-                response_token_ids=response_token_ids,
-            )
+            choice_logprobs = object_field(choice, "logprobs")
+            direct_values = object_field(choice_logprobs, "token_logprobs")
+            values = list(direct_values) if direct_values is not None else []
+            if direct_values is not None and len(values) >= len(response_token_ids):
+                values = values[-len(response_token_ids) :] if response_token_ids else []
+                student_logprobs = [None if value is None else float(value) for value in values]
+                scoring_fallback = False
+                student_logprobs_source = "generation_response"
+            else:
+                # Compatibility fallback for older vLLM builds that accept the
+                # request but omit generation logprobs. It is recorded so the
+                # watcher can surface the extra forward instead of hiding it.
+                student_logprobs, scoring_fallback = await score_sequence_logprobs(
+                    client=client,
+                    semaphore=scoring_semaphore,
+                    served_model_name=args.served_model_name,
+                    prompt_token_ids=task.prompt_token_ids,
+                    response_token_ids=response_token_ids,
+                )
+                student_logprobs_source = "echo_scoring_fallback"
         response_tokens = usage_completion_tokens if usage_completion_tokens is not None else len(response_token_ids)
         scored = score_completion(
             text,
@@ -1084,6 +1108,7 @@ async def evaluate_one(
             "response_token_ids": response_token_ids,
             "response_token_ids_source": token_ids_source,
             "student_logprobs": student_logprobs,
+            "student_logprobs_source": student_logprobs_source,
             "teacher_logprobs": None,
             "gap_metrics": None,
             "finish_reason": finish_reason,
@@ -1186,6 +1211,155 @@ def lightweight_record(record: dict[str, Any]) -> dict[str, Any]:
 
 def load_lightweight_records(rollouts_path: Path) -> list[dict[str, Any]]:
     return [lightweight_record(record) for record in iter_jsonl_gz(rollouts_path)]
+
+
+def repair_lightweight_record(record: dict[str, Any]) -> dict[str, Any] | None:
+    repair = record.get("repair")
+    if not isinstance(repair, dict):
+        return None
+    if repair.get("error"):
+        return {
+            "benchmark": record.get("benchmark"),
+            "sample_id": record.get("sample_id"),
+            "rollout_index": record.get("rollout_index"),
+            "error": repair.get("error"),
+        }
+    repetition = repair.get("repetition") or {}
+    return {
+        "benchmark": record.get("benchmark"),
+        "benchmark_path": record.get("benchmark_path"),
+        "question_index": record.get("question_index"),
+        "sample_id": str(record.get("sample_id")),
+        "problem_fingerprint": record.get("problem_fingerprint"),
+        "rollout_index": record.get("rollout_index"),
+        "acc": float(bool(repair.get("acc"))),
+        "eos_success": float(bool(repair.get("eos_success"))),
+        "answer_extractable": float(bool(repair.get("answer_extractable"))),
+        "has_answer_pattern": float(bool(repair.get("has_answer_pattern"))),
+        "accepted_answer_format": float(bool(repair.get("accepted_answer_format"))),
+        "has_boxed_pattern": float(bool(repair.get("has_boxed_pattern"))),
+        "truncated": float(bool(repair.get("truncated"))),
+        "response_tokens": int(repair.get("response_tokens", 0)),
+        "repetition_text_zlib": float(bool(repetition.get("repetition_text_zlib"))),
+        "repetition_text_zlib_eligible": float(bool(repetition.get("repetition_text_zlib_eligible"))),
+        "repetition_text_zlib_ratio": repetition.get("repetition_text_zlib_ratio"),
+        "repetition_token_zlib": float(bool(repetition.get("repetition_token_zlib"))),
+        "repetition_token_zlib_eligible": float(bool(repetition.get("repetition_token_zlib_eligible"))),
+        "repetition_token_zlib_ratio": repetition.get("repetition_token_zlib_ratio"),
+        "tail_ngram_repeat_fraction": repetition.get("tail_ngram_repeat_fraction"),
+        "repair_executed": float(bool(repair.get("repair_executed"))),
+        "intervention_count": int(repair.get("intervention_count", 0) or 0),
+        "first_intervention_position": repair.get("first_intervention_position"),
+        "error": None,
+    }
+
+
+def _accuracy_at_n(records: list[dict[str, Any]], *, repair_branch: bool) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        branch = record.get("repair") if repair_branch else record
+        if not isinstance(branch, dict) or branch.get("error"):
+            continue
+        grouped[str(record.get("sample_id"))].append(branch)
+    if not grouped:
+        return {"mean": None, "maj": None, "best": None, "question_count": 0}
+
+    all_correct: list[float] = []
+    majority_correct: list[float] = []
+    best_correct: list[float] = []
+    for group in grouped.values():
+        all_correct.extend(float(bool(item.get("acc"))) for item in group)
+        best_correct.append(float(any(bool(item.get("acc")) for item in group)))
+        by_prediction: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in group:
+            by_prediction[str(item.get("pred", ""))].append(item)
+        # Stable tie-breaking avoids depending on request completion order.
+        majority_prediction = min(by_prediction, key=lambda pred: (-len(by_prediction[pred]), pred))
+        majority_group = by_prediction[majority_prediction]
+        majority_correct.append(float(any(bool(item.get("acc")) for item in majority_group)))
+    return {
+        "mean": statistics.fmean(all_correct),
+        "maj": statistics.fmean(majority_correct),
+        "best": statistics.fmean(best_correct),
+        "question_count": len(grouped),
+    }
+
+
+def _paired_repair_metrics(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    paired = [
+        record for record in records if isinstance(record.get("repair"), dict) and not record["repair"].get("error")
+    ]
+    if not paired:
+        return None
+    deltas = [float(bool(record["repair"].get("acc"))) - float(bool(record.get("acc"))) for record in paired]
+    transitions = {
+        "pre_correct_post_correct": 0,
+        "pre_correct_post_wrong": 0,
+        "pre_wrong_post_correct": 0,
+        "pre_wrong_post_wrong": 0,
+    }
+    intervention_counts: list[int] = []
+    first_positions: list[int] = []
+    initial_gap_means: list[float] = []
+    initial_gap_maxima: list[float] = []
+    initial_gap_p95: list[float] = []
+    selected_segment_scores: list[float] = []
+    teacher_nonfinite_tokens = 0
+    teacher_scored_tokens = 0
+    trigger_count = 0
+    repair_count = 0
+    for record in paired:
+        repair = record["repair"]
+        raw_correct = bool(record.get("acc"))
+        final_correct = bool(repair.get("acc"))
+        transition = (
+            "pre_correct_post_correct"
+            if raw_correct and final_correct
+            else "pre_correct_post_wrong"
+            if raw_correct
+            else "pre_wrong_post_correct"
+            if final_correct
+            else "pre_wrong_post_wrong"
+        )
+        transitions[transition] += 1
+        intervention_count = int(repair.get("intervention_count", 0) or 0)
+        intervention_counts.append(intervention_count)
+        repair_count += int(intervention_count > 0)
+        trigger_count += int(bool(repair.get("trigger_detected")))
+        first_position = repair.get("first_intervention_position")
+        if first_position is not None:
+            first_positions.append(int(first_position))
+        diagnostics = repair.get("gap_diagnostics") or []
+        if diagnostics:
+            initial = diagnostics[0]
+            for destination, key in (
+                (initial_gap_means, "mean"),
+                (initial_gap_maxima, "max"),
+                (initial_gap_p95, "p95"),
+                (selected_segment_scores, "selected_segment_score"),
+            ):
+                value = finite_float(initial.get(key))
+                if value is not None:
+                    destination.append(value)
+            teacher_nonfinite_tokens += int(initial.get("teacher_nonfinite_token_count", 0) or 0)
+            teacher_scored_tokens += int(initial.get("valid_token_count", 0) or 0)
+    count = len(paired)
+    return {
+        "rollout_count": count,
+        "paired_delta": statistics.fmean(deltas),
+        "repair_execution_rate": repair_count / count,
+        "trigger_rate": trigger_count / count,
+        "transitions": {name: value / count for name, value in transitions.items()},
+        "intervention_count": distribution(intervention_counts),
+        "first_intervention_position": distribution(first_positions),
+        "initial_gap_mean": distribution(initial_gap_means),
+        "initial_gap_max": distribution(initial_gap_maxima),
+        "initial_gap_p95": distribution(initial_gap_p95),
+        "selected_segment_score": distribution(selected_segment_scores),
+        "teacher_nonfinite_token_fraction": (
+            teacher_nonfinite_tokens / teacher_scored_tokens if teacher_scored_tokens else None
+        ),
+    }
 
 
 def aggregate_gap_region(records: list[dict[str, Any]], region_name: str) -> dict[str, Any] | None:
@@ -1393,7 +1567,8 @@ def build_length_bin_rows(records: list[dict[str, Any]], edges: list[int]) -> li
 
 
 def write_summary_artifacts(output_dir: Path, metadata: dict[str, Any]) -> dict[str, Any]:
-    records = load_lightweight_records(output_dir / ROLLOUTS_FILENAME)
+    full_records = list(iter_jsonl_gz(output_dir / ROLLOUTS_FILENAME))
+    records = [lightweight_record(record) for record in full_records]
     failures = [record for record in records if record.get("error")]
     successful = [record for record in records if not record.get("error")]
     per_problem = question_rows(successful)
@@ -1419,6 +1594,7 @@ def write_summary_artifacts(output_dir: Path, metadata: dict[str, Any]) -> dict[
         "rollout_count": len(records),
         "failed_rollout_count": len(failures),
         "metrics": aggregate_records(records),
+        "accuracy_at_n": _accuracy_at_n(full_records, repair_branch=False),
         "question_cluster_bootstrap_ci95": bootstrap,
         "metric_definitions": {
             "eos_success": "finish_reason is stop/eos; this is reported separately from length truncation.",
@@ -1432,6 +1608,49 @@ def write_summary_artifacts(output_dir: Path, metadata: dict[str, Any]) -> dict[
             "bootstrap": "Confidence intervals resample questions, preserving dependence among rollouts per question.",
         },
     }
+    repair_records = [item for record in full_records if (item := repair_lightweight_record(record)) is not None]
+    if repair_records:
+        repair_successful = [record for record in repair_records if not record.get("error")]
+        repair_per_problem = question_rows(repair_successful)
+        repair_records_by_sample: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for record in repair_successful:
+            repair_records_by_sample[str(record["sample_id"])].append(record)
+        for row in repair_per_problem:
+            group = repair_records_by_sample[str(row["sample_id"])]
+            row["repair_executed"] = mean_present(record.get("repair_executed") for record in group)
+            row["intervention_count"] = mean_present(record.get("intervention_count") for record in group)
+            row["first_intervention_position"] = mean_present(
+                record.get("first_intervention_position") for record in group
+            )
+        repair_by_sample = {str(row["sample_id"]): row for row in repair_per_problem}
+        for row in per_problem:
+            repair_row = repair_by_sample.get(str(row["sample_id"]))
+            if repair_row is None:
+                continue
+            for key, value in repair_row.items():
+                if key not in {"sample_id", "problem_fingerprint"}:
+                    target = key if key == "repair_executed" else f"repair_{key}"
+                    row[target] = value
+            raw_acc = finite_float(row.get("acc"))
+            repaired_acc = finite_float(repair_row.get("acc"))
+            row["repair_acc_delta"] = (
+                repaired_acc - raw_acc if raw_acc is not None and repaired_acc is not None else None
+            )
+        summary["repair"] = {
+            "complete": bool(metadata.get("repair_complete")),
+            "rollout_count": len(repair_records),
+            "failed_rollout_count": len(repair_records) - len(repair_successful),
+            "metrics": aggregate_records(repair_records),
+            "accuracy_at_n": _accuracy_at_n(full_records, repair_branch=True),
+            "paired": _paired_repair_metrics(full_records),
+            "question_cluster_bootstrap_ci95": bootstrap_metrics(
+                repair_per_problem,
+                metrics=DEFAULT_BOOTSTRAP_METRICS,
+                resamples=int(metadata["analysis"]["bootstrap_resamples"]),
+                bootstrap_seed=int(metadata["analysis"]["bootstrap_seed"]),
+                identity=f"{identity}:repair",
+            ),
+        }
     write_json_atomic(output_dir / SUMMARY_FILENAME, summary)
     per_problem_fields = sorted({key for row in per_problem for key in row})
     preferred = ["sample_id", "rollout_count", "problem_fingerprint"]
@@ -2190,6 +2409,492 @@ async def teacher_score_main(args: argparse.Namespace) -> int:
         return 0
 
 
+def _repair_part_path(parts_dir: Path, task_id: str) -> Path:
+    return parts_dir / f"{task_id}.json.gz"
+
+
+def _load_repair_part(path: Path, *, task_id: str, repair_fingerprint: str) -> dict[str, Any] | None:
+    record = read_single_json_gz(path) if path.is_file() else None
+    repair = record.get("repair") if isinstance(record, dict) else None
+    if (
+        not isinstance(repair, dict)
+        or repair.get("error")
+        or record.get("task_id") != task_id
+        or repair.get("fingerprint") != repair_fingerprint
+    ):
+        return None
+    return record
+
+
+def _repair_finish_reason(raw_record: dict[str, Any], interventions: list[dict[str, Any]]) -> str | None:
+    if not interventions:
+        value = raw_record.get("finish_reason")
+        return str(value).lower() if value is not None else None
+    last = interventions[-1]
+    value = last.get("student_suffix_finish_reason") or last.get("teacher_finish_reason")
+    if value is None:
+        value = raw_record.get("finish_reason")
+    return str(value).lower() if value is not None else None
+
+
+def _sanitize_raw_student_logprobs(values: list[Any], *, floor: float) -> tuple[list[float], list[int]]:
+    result: list[float] = []
+    replaced: list[int] = []
+    for index, value in enumerate(values):
+        parsed = finite_float(value)
+        if parsed is None:
+            parsed = floor
+            replaced.append(index)
+        if parsed > 1e-5:
+            raise RuntimeError(f"Raw student logprob at response position {index} is positive: {parsed!r}.")
+        result.append(float(parsed))
+    return result, replaced
+
+
+async def repair_one_record(
+    *,
+    record: dict[str, Any],
+    runner: Any,
+    tokenizer: Any,
+    metadata: dict[str, Any],
+    repair_fingerprint: str,
+    logprob_floor: float,
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    try:
+        prompt_ids = [int(value) for value in record["prompt_token_ids"]]
+        response_ids = [int(value) for value in record["response_token_ids"]]
+        raw_student_logprobs = list(record.get("student_logprobs") or [])
+        if len(raw_student_logprobs) != len(response_ids):
+            raise RuntimeError(
+                "Raw generation did not retain one student logprob per token: "
+                f"response_tokens={len(response_ids)}, student_logprobs={len(raw_student_logprobs)}."
+            )
+        student_logprobs, replaced_positions = _sanitize_raw_student_logprobs(
+            raw_student_logprobs,
+            floor=logprob_floor,
+        )
+        request = metadata.get("request") or {}
+        sampling_params = {
+            "temperature": float(request.get("temperature", 0.7)),
+            "top_p": float(request.get("top_p", 0.95)),
+            "top_k": int(request.get("top_k", -1)),
+            "max_tokens": int(request.get("max_tokens", len(response_ids) or 1)),
+        }
+        raw_acc = float(bool(record.get("acc")))
+        output = await runner.repair(
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+            response_logprobs=student_logprobs,
+            raw_reward_score=raw_acc,
+            raw_reward_extra_info={"acc": raw_acc},
+            raw_correctness_value=raw_acc,
+            raw_correct=bool(record.get("acc")),
+            finish_reason=record.get("finish_reason"),
+            sampling_params=sampling_params,
+            request_id=f"standalone-repair:{record['task_id']}",
+            sample_kwargs={
+                "data_source": record.get("benchmark_path"),
+                "index": record.get("sample_id"),
+                "global_steps": metadata.get("global_step"),
+            },
+        )
+        repaired_ids = [int(value) for value in output.response_ids]
+        repaired_text = tokenizer.decode(repaired_ids, skip_special_tokens=True)
+        interventions = [dict(item) for item in output.extra_fields.get("teacher_interventions", [])]
+        skipped_interventions = [dict(item) for item in output.extra_fields.get("teacher_intervention_skipped", [])]
+        gap_diagnostics = [dict(item) for item in output.extra_fields.get("teacher_intervention_gap_diagnostics", [])]
+        finish_reason = _repair_finish_reason(record, interventions)
+        scored = score_completion(
+            repaired_text,
+            record["ground_truth"],
+            finish_reason=finish_reason,
+            response_token_count=len(repaired_ids),
+            verifier=str(request.get("verifier", "math_verify")),
+            extra_info={
+                "benchmark": record.get("benchmark"),
+                "benchmark_path": record.get("benchmark_path"),
+                "question_id": record.get("question_id"),
+                "answer_type": record.get("answer_type"),
+                "grader": record.get("grader"),
+            },
+        )
+        analysis = metadata.get("analysis") or {}
+        repetition = text_repetition_metrics(
+            repaired_text,
+            tail_chars=int(analysis.get("repetition_tail_chars", 10000)),
+            threshold=float(analysis.get("repetition_threshold", 10.0)),
+        )
+        repetition.update(
+            token_repetition_metrics(
+                repaired_ids,
+                tail_token_window=int(analysis.get("repetition_tail_token_window", 4096)),
+                threshold=float(analysis.get("repetition_threshold", 10.0)),
+                ngram_size=int(analysis.get("ngram_size", 4)),
+            )
+        )
+        intervention_count = len(interventions)
+        final_correct = bool(scored.acc)
+        raw_correct = bool(record.get("acc"))
+        transition = (
+            "pre_correct_post_correct"
+            if raw_correct and final_correct
+            else "pre_correct_post_wrong"
+            if raw_correct
+            else "pre_wrong_post_correct"
+            if final_correct
+            else "pre_wrong_post_wrong"
+        )
+        outcome = dict(output.extra_fields.get("teacher_intervention_outcome") or {})
+        outcome.update(
+            {
+                "final_reward_score": float(final_correct),
+                "final_reward_extra_info": {"acc": float(final_correct)},
+                "final_correctness_value": float(final_correct),
+                "final_correct": final_correct,
+                "final_response_length": len(repaired_ids),
+                "final_finish_reason": finish_reason,
+                "intervention_count": intervention_count,
+                "repair_executed": intervention_count > 0,
+                "repair_effective": intervention_count > 0 and not raw_correct and final_correct,
+                "repair_ineffective": intervention_count > 0 and not raw_correct and not final_correct,
+                "transition": transition,
+            }
+        )
+        if interventions:
+            interventions[0].update(
+                {
+                    "sample_outcome_summary": True,
+                    "raw_correctness_value": float(raw_correct),
+                    "raw_correct": raw_correct,
+                    "final_correctness_value": float(final_correct),
+                    "final_correct": final_correct,
+                    "repair_effective": outcome["repair_effective"],
+                    "repair_ineffective": outcome["repair_ineffective"],
+                    "transition": transition,
+                }
+            )
+        first_position = min((int(item["start"]) for item in interventions), default=None)
+        repaired = dict(record)
+        repaired["repair"] = {
+            "fingerprint": repair_fingerprint,
+            "text": repaired_text,
+            "response_token_ids": repaired_ids,
+            "response_tokens": len(repaired_ids),
+            "response_token_id_count": len(repaired_ids),
+            "finish_reason": finish_reason,
+            "stop_reason": None,
+            "eos_success": finish_reason in {"stop", "eos"},
+            "truncated": finish_reason == "length",
+            "acc": final_correct,
+            "pred": str(scored.pred),
+            "final_content": str(scored.final_content),
+            "invalid_pred": bool(scored.invalid_pred),
+            "answer_extractable": not bool(scored.invalid_pred),
+            "has_answer_pattern": bool(scored.has_answer_pattern),
+            "has_boxed_pattern": bool(scored.has_boxed_pattern),
+            "accepted_answer_format": bool(scored.has_accepted_answer_format),
+            "verified_by": str(scored.verified_by),
+            "math_verify_score": scored.math_verify_score,
+            "repetition": repetition,
+            "trigger_detected": bool(outcome.get("trigger_detected")),
+            "repair_executed": intervention_count > 0,
+            "intervention_count": intervention_count,
+            "first_intervention_position": first_position,
+            "teacher_interventions": interventions,
+            "teacher_intervention_skipped": skipped_interventions,
+            "gap_diagnostics": gap_diagnostics,
+            "outcome": outcome,
+            "raw_student_logprob_nonfinite_count": len(replaced_positions),
+            "raw_student_logprob_nonfinite_positions": replaced_positions,
+            "raw_student_logprob_nonfinite_replacement": logprob_floor if replaced_positions else None,
+            "elapsed_seconds": time.perf_counter() - started_at,
+            "error": None,
+        }
+        return repaired
+    except Exception as exc:
+        failed = dict(record)
+        failed["repair"] = {
+            "fingerprint": repair_fingerprint,
+            "elapsed_seconds": time.perf_counter() - started_at,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        return failed
+
+
+def _validate_repair_spec_against_unit(
+    *,
+    spec: dict[str, Any],
+    state: dict[str, Any],
+    metadata: dict[str, Any],
+) -> None:
+    semantic = spec.get("semantic_config") or {}
+    if str(semantic.get("experiment_name")) != str(metadata.get("experiment")):
+        raise RuntimeError(
+            "Evaluation spec experiment does not match the generated unit: "
+            f"spec={semantic.get('experiment_name')!r}, unit={metadata.get('experiment')!r}."
+        )
+    if int(state.get("checkpoint_step", -1)) != int(metadata.get("global_step", -2)):
+        raise RuntimeError("Evaluation state checkpoint step does not match the generated unit.")
+    intervention = (semantic.get("distillation") or {}).get("intervention") or {}
+    if intervention.get("outcome_aware_candidate_selection_enabled") and state.get("teacher_nll_calibration") is None:
+        raise RuntimeError(
+            "Outcome-aware repair requires the checkpoint's saved teacher-NLL calibration; "
+            "evaluation will not fit a threshold on test data."
+        )
+
+
+async def repair_main(args: argparse.Namespace) -> int:
+    if args.max_in_flight <= 0 or args.max_pending <= 0:
+        raise ValueError("--max-in-flight and --max-pending must be positive.")
+    output_dir = unit_output_dir(args.result_root, args.benchmark, args.global_step)
+    with unit_lock(output_dir):
+        metadata = _read_metadata(output_dir)
+        if (
+            metadata is None
+            or not metadata.get("generation_complete")
+            or not (output_dir / ROLLOUTS_FILENAME).is_file()
+        ):
+            raise RuntimeError(f"Raw student generation is incomplete under {output_dir}.")
+        if not metadata.get("request", {}).get("score_student_logprobs"):
+            raise RuntimeError("Paired repair requires raw generation with --score-student-logprobs.")
+
+        from verl.utils.evaluation.checkpoint_evaluation import load_evaluation_spec, load_evaluation_state
+        from verl.utils.evaluation.teacher_intervention import (
+            OpenAICompletionAdapter,
+            OpenAICompletionAdapterConfig,
+            StandaloneTeacherInterventionRunner,
+        )
+
+        spec_path = Path(args.evaluation_spec).expanduser().resolve()
+        state_path = Path(args.evaluation_state).expanduser().resolve()
+        spec = load_evaluation_spec(spec_path.parent)
+        state = load_evaluation_state(
+            state_path.parent,
+            expected_step=args.global_step,
+            expected_spec_fingerprint=str(spec["spec_fingerprint"]),
+        )
+        _validate_repair_spec_against_unit(spec=spec, state=state, metadata=metadata)
+        semantic = spec["semantic_config"]
+        intervention_config = dict((semantic.get("distillation") or {}).get("intervention") or {})
+        logprob_floor = float((semantic.get("distillation") or {}).get("log_prob_min_clamp", -10.0))
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.student_tokenizer_model,
+            trust_remote_code=args.trust_remote_code,
+            local_files_only=True,
+        )
+        student_tokenizer_info = tokenizer_metadata(tokenizer, args.student_tokenizer_model)
+        unit_tokenizer_info = metadata.get("student_tokenizer") or {}
+        if student_tokenizer_info.get("fingerprint_sha256") != unit_tokenizer_info.get(
+            "fingerprint_sha256"
+        ) or student_tokenizer_info.get("vocab_size") != unit_tokenizer_info.get("vocab_size"):
+            raise RuntimeError("Repair tokenizer vocabulary differs from the raw-generation tokenizer.")
+        teacher_tokenizer = AutoTokenizer.from_pretrained(
+            args.teacher_tokenizer_model,
+            trust_remote_code=args.trust_remote_code,
+            local_files_only=True,
+        )
+        teacher_tokenizer_info = tokenizer_metadata(teacher_tokenizer, args.teacher_tokenizer_model)
+        tokenizers_match = teacher_tokenizer_info.get("fingerprint_sha256") == student_tokenizer_info.get(
+            "fingerprint_sha256"
+        ) and teacher_tokenizer_info.get("vocab_size") == student_tokenizer_info.get("vocab_size")
+        if not tokenizers_match and not args.allow_tokenizer_mismatch:
+            raise RuntimeError(
+                "Student and teacher tokenizer vocabularies/IDs differ; token-ID segment splicing would be invalid."
+            )
+
+        repair_request = {
+            "generation_fingerprint": metadata["generation_fingerprint"],
+            "spec_fingerprint": spec["spec_fingerprint"],
+            "state_fingerprint": state["state_fingerprint"],
+            "student_served_model_name": args.student_served_model_name,
+            "teacher_served_model_name": args.teacher_served_model_name,
+            "teacher_model_fingerprint": args.teacher_model_fingerprint,
+            "student_tokenizer": student_tokenizer_info,
+            "teacher_tokenizer": teacher_tokenizer_info,
+            "intervention": intervention_config,
+            "logprob_floor": logprob_floor,
+        }
+        repair_fingerprint = payload_fingerprint(repair_request)
+        existing_fingerprint = metadata.get("repair_fingerprint")
+        if metadata.get("repair_complete") and not args.overwrite:
+            if existing_fingerprint != repair_fingerprint:
+                raise RuntimeError(
+                    "Completed paired repair used a different configuration; pass --overwrite only if replacing it "
+                    "is intentional."
+                )
+            valid, reason = validate_completed_unit(output_dir, validate_inputs=False)
+            if valid:
+                print(f"[repair] already complete: {output_dir}")
+                return 0
+            raise RuntimeError(f"Completed paired repair artifacts are invalid: {reason}")
+
+        work_root = output_dir / WORK_DIRNAME / "repair"
+        if args.overwrite and work_root.is_dir():
+            shutil.rmtree(work_root)
+        parts_dir = work_root / "parts"
+        failures_dir = work_root / "failures"
+        parts_dir.mkdir(parents=True, exist_ok=True)
+        failures_dir.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(
+            work_root / "repair-state.json",
+            {"repair_fingerprint": repair_fingerprint, "repair_request": repair_request},
+        )
+
+        source_records = list(iter_jsonl_gz(output_dir / ROLLOUTS_FILENAME))
+        completed: dict[str, dict[str, Any]] = {}
+        pending: list[dict[str, Any]] = []
+        for record in source_records:
+            task_id = str(record["task_id"])
+            completed_record = _load_repair_part(
+                _repair_part_path(parts_dir, task_id),
+                task_id=task_id,
+                repair_fingerprint=repair_fingerprint,
+            )
+            if completed_record is None:
+                existing_repair = record.get("repair")
+                if isinstance(existing_repair, dict) and existing_repair.get("fingerprint") == repair_fingerprint:
+                    if not existing_repair.get("error"):
+                        completed_record = record
+            if completed_record is None:
+                pending.append(record)
+            else:
+                completed[task_id] = completed_record
+
+        started_at = time.perf_counter()
+        failures: list[dict[str, Any]] = []
+        if pending:
+            try:
+                from openai import AsyncOpenAI
+            except ImportError as exc:
+                raise RuntimeError("Paired repair requires the 'openai' Python client.") from exc
+            student_openai = AsyncOpenAI(
+                base_url=normalize_base_url(args.student_base_url),
+                api_key=args.student_api_key,
+                timeout=args.request_timeout_seconds,
+                max_retries=args.max_retries,
+            )
+            teacher_openai = AsyncOpenAI(
+                base_url=normalize_base_url(args.teacher_base_url),
+                api_key=args.teacher_api_key,
+                timeout=args.request_timeout_seconds,
+                max_retries=args.max_retries,
+            )
+            student_adapter = OpenAICompletionAdapter(
+                client=student_openai,
+                config=OpenAICompletionAdapterConfig(
+                    served_model_name=args.student_served_model_name,
+                    logprob_floor=logprob_floor,
+                ),
+                semaphore=asyncio.Semaphore(args.max_in_flight),
+            )
+            teacher_adapter = OpenAICompletionAdapter(
+                client=teacher_openai,
+                config=OpenAICompletionAdapterConfig(
+                    served_model_name=args.teacher_served_model_name,
+                    logprob_floor=logprob_floor,
+                ),
+                semaphore=asyncio.Semaphore(args.max_in_flight),
+            )
+            runner = StandaloneTeacherInterventionRunner(
+                tokenizer=tokenizer,
+                intervention_config=intervention_config,
+                max_response_length=int((semantic.get("sampling") or {}).get("max_response_length")),
+                logprob_floor=logprob_floor,
+                student_client=student_adapter,
+                teacher_client=teacher_adapter,
+                teacher_nll_calibration=state.get("teacher_nll_calibration"),
+                teacher_key=str((semantic.get("teacher") or {}).get("teacher_key") or "default"),
+            )
+
+            async def worker(record: dict[str, Any]) -> dict[str, Any]:
+                return await repair_one_record(
+                    record=record,
+                    runner=runner,
+                    tokenizer=tokenizer,
+                    metadata=metadata,
+                    repair_fingerprint=repair_fingerprint,
+                    logprob_floor=logprob_floor,
+                )
+
+            processed = 0
+            try:
+                await check_served_model(student_openai, args.student_served_model_name)
+                await check_served_model(teacher_openai, args.teacher_served_model_name)
+                async for repaired_record in bounded_results(pending, worker, max_pending=args.max_pending):
+                    task_id = str(repaired_record["task_id"])
+                    repair = repaired_record["repair"]
+                    if repair.get("error"):
+                        failures.append(repaired_record)
+                        write_json_atomic(failures_dir / f"{task_id}.json", repaired_record)
+                    else:
+                        write_json_gz_atomic(_repair_part_path(parts_dir, task_id), repaired_record)
+                        completed[task_id] = repaired_record
+                        (failures_dir / f"{task_id}.json").unlink(missing_ok=True)
+                    processed += 1
+                    if args.print_every and (processed % args.print_every == 0 or processed == len(pending)):
+                        print(
+                            f"repair_progress={len(completed)}/{len(source_records)} errors={len(failures)} "
+                            f"elapsed_seconds={time.perf_counter() - started_at:.1f}",
+                            flush=True,
+                        )
+            finally:
+                await student_openai.close()
+                await teacher_openai.close()
+
+        if failures:
+            repair_state = json.loads((work_root / "repair-state.json").read_text(encoding="utf-8"))
+            repair_state.update(
+                {
+                    "repair_complete": False,
+                    "repair_error_count": len(failures),
+                    "repair_completed_rollout_count": len(completed),
+                    "repair_elapsed_seconds": time.perf_counter() - started_at,
+                }
+            )
+            write_json_atomic(work_root / "repair-state.json", repair_state)
+            print(
+                f"ERROR: paired repair failed for {len(failures)} rollouts; resumable shards retained",
+                file=sys.stderr,
+            )
+            return 1
+
+        ordered: list[dict[str, Any]] = []
+        for source_record in source_records:
+            task_id = str(source_record["task_id"])
+            repaired_record = completed.get(task_id) or _load_repair_part(
+                _repair_part_path(parts_dir, task_id),
+                task_id=task_id,
+                repair_fingerprint=repair_fingerprint,
+            )
+            if repaired_record is None:
+                raise RuntimeError(f"Missing completed repair shard for task {task_id}.")
+            ordered.append(repaired_record)
+        staged_rollouts = work_root / ROLLOUTS_FILENAME
+        write_jsonl_gz_atomic(staged_rollouts, ordered)
+        staged_rollouts.replace(output_dir / ROLLOUTS_FILENAME)
+        metadata.update(
+            {
+                "repair_complete": True,
+                "repair_request": repair_request,
+                "repair_fingerprint": repair_fingerprint,
+                "repair_error_count": 0,
+                "repair_completed_rollout_count": len(ordered),
+                "repair_elapsed_seconds": time.perf_counter() - started_at,
+                "repair_student_served_model_name": args.student_served_model_name,
+                "repair_teacher_served_model_name": args.teacher_served_model_name,
+                "repair_teacher_tokenizer_matches_student": tokenizers_match,
+            }
+        )
+        write_json_atomic(output_dir / METADATA_FILENAME, metadata)
+        write_summary_artifacts(output_dir, metadata)
+        marker = write_completion_marker(output_dir, metadata)
+        shutil.rmtree(work_root)
+        print(f"[repair] complete: {output_dir} fingerprint={marker['result_fingerprint']}")
+        return 0
+
+
 def discover_units(result_root: str | Path) -> dict[tuple[str, int], Path]:
     root = Path(result_root).expanduser().resolve()
     units: dict[tuple[str, int], Path] = {}
@@ -2490,8 +3195,8 @@ def status_main(args: argparse.Namespace) -> int:
         allow_legacy=args.allow_legacy,
     )
     if valid:
+        metadata = _read_metadata(output_dir) or {}
         if args.require_teacher:
-            metadata = _read_metadata(output_dir) or {}
             if not metadata.get("teacher_scored") or not metadata.get("teacher_scoring_complete"):
                 print(f"incomplete output_dir={output_dir} reason=teacher scoring is incomplete", file=sys.stderr)
                 return 1
@@ -2504,6 +3209,9 @@ def status_main(args: argparse.Namespace) -> int:
                         file=sys.stderr,
                     )
                     return 1
+        if args.require_repair and not metadata.get("repair_complete"):
+            print(f"incomplete output_dir={output_dir} reason=paired repair is incomplete", file=sys.stderr)
+            return 1
         print(f"complete output_dir={output_dir}")
         return 0
     print(f"incomplete output_dir={output_dir} reason={reason}", file=sys.stderr)
@@ -2765,6 +3473,28 @@ def build_parser() -> argparse.ArgumentParser:
     teacher.add_argument("--bootstrap-seed", type=int, default=20260722)
     teacher.add_argument("--overwrite", action="store_true")
 
+    repair = subparsers.add_parser("repair", help="Run paired DMPD repair on completed raw rollouts")
+    add_unit_arguments(repair)
+    repair.add_argument("--evaluation-spec", required=True)
+    repair.add_argument("--evaluation-state", required=True)
+    repair.add_argument("--student-base-url", required=True)
+    repair.add_argument("--student-api-key", default="EMPTY")
+    repair.add_argument("--student-served-model-name", required=True)
+    repair.add_argument("--teacher-base-url", required=True)
+    repair.add_argument("--teacher-api-key", default="EMPTY")
+    repair.add_argument("--teacher-served-model-name", required=True)
+    repair.add_argument("--teacher-model-fingerprint", required=True)
+    repair.add_argument("--student-tokenizer-model", required=True)
+    repair.add_argument("--teacher-tokenizer-model", required=True)
+    repair.add_argument("--trust-remote-code", action="store_true")
+    repair.add_argument("--allow-tokenizer-mismatch", action="store_true")
+    repair.add_argument("--request-timeout-seconds", type=float, default=7200.0)
+    repair.add_argument("--max-retries", type=int, default=2)
+    repair.add_argument("--max-in-flight", type=int, default=128)
+    repair.add_argument("--max-pending", type=int, default=256)
+    repair.add_argument("--print-every", type=int, default=50)
+    repair.add_argument("--overwrite", action="store_true")
+
     status = subparsers.add_parser("status", help="Validate one benchmark-step completion marker")
     add_unit_arguments(status)
     status.add_argument("--expect", action="append", default=[], help="Expected request value in KEY=JSON_VALUE form")
@@ -2772,6 +3502,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--verify-checksums", action="store_true")
     status.add_argument("--allow-legacy", action="store_true")
     status.add_argument("--require-teacher", action="store_true")
+    status.add_argument("--require-repair", action="store_true")
 
     report = subparsers.add_parser("report", help="Print all completed benchmark-step summaries")
     report.add_argument("--result-root", required=True)
@@ -2809,6 +3540,8 @@ def main() -> int:
         return asyncio.run(generate_main(args))
     if args.command == "teacher-score":
         return asyncio.run(teacher_score_main(args))
+    if args.command == "repair":
+        return asyncio.run(repair_main(args))
     if args.command == "status":
         return status_main(args)
     if args.command == "report":

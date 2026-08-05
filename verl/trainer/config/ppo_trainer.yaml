@@ -241,6 +241,10 @@ trainer:
   # Default local directory for saving checkpoints
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
 
+  # Write the immutable spec and checkpoint-local online state consumed by the
+  # standalone checkpoint evaluation workflow.
+  checkpoint_evaluation_manifest: false
+
   # Maximum number of actor checkpoints to keep
   max_actor_ckpt_to_keep: null
 

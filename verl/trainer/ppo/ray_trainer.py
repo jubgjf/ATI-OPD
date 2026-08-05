@@ -1282,6 +1282,7 @@ class RayPPOTrainer:
         self._offline_live_metric_buffer: list[tuple[int, dict[str, Any]]] = []
         self._pending_event_record_archives: list[_PendingEventRecordsArchive] = []
         self._event_record_archive_warning_emitted = False
+        self._checkpoint_evaluation_spec: dict[str, Any] | None = None
 
     def _create_dataloader(
         self,
@@ -2559,7 +2560,69 @@ class RayPPOTrainer:
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
+        self._write_checkpoint_evaluation_state(local_global_step_folder)
         return local_global_step_folder
+
+    def _checkpoint_evaluation_manifest_enabled(self) -> bool:
+        return bool(self.config.trainer.get("checkpoint_evaluation_manifest", False))
+
+    def _initialize_checkpoint_evaluation_manifest(self, logger) -> None:
+        if not self._checkpoint_evaluation_manifest_enabled():
+            return
+        retention = self.config.trainer.get("max_actor_ckpt_to_keep", None)
+        if isinstance(retention, int) and not isinstance(retention, bool) and retention > 0:
+            print(
+                "WARNING: standalone checkpoint evaluation is enabled while max_actor_ckpt_to_keep="
+                f"{retention}. A slow evaluator can lose queued checkpoints before consuming them; "
+                "the safe default is null (retain all actor checkpoints)."
+            )
+        from verl.utils.evaluation.checkpoint_evaluation import write_evaluation_spec
+
+        run_info = logger.wandb_run_info
+        training_run_id = (
+            run_info.run_id
+            if run_info is not None and run_info.run_id is not None
+            else self._logical_run_id or os.environ.get("WANDB_RUN_ID")
+        )
+        self._checkpoint_evaluation_spec = write_evaluation_spec(
+            self.config.trainer.default_local_dir,
+            self.config,
+            training_run_id=training_run_id,
+        )
+        print(
+            "Standalone checkpoint evaluation manifest ready: "
+            f"root={os.path.abspath(self.config.trainer.default_local_dir)!r}, "
+            f"fingerprint={self._checkpoint_evaluation_spec['spec_fingerprint']}."
+        )
+
+    def _write_checkpoint_evaluation_state(self, checkpoint_dir: str) -> None:
+        if not self._checkpoint_evaluation_manifest_enabled():
+            return
+        if self._checkpoint_evaluation_spec is None:
+            raise RuntimeError("Checkpoint evaluation manifest was not initialized before checkpoint saving.")
+
+        intervention_config = self.config.distillation.intervention
+        outcome_aware = bool(intervention_config.get("outcome_aware_candidate_selection_enabled", False))
+        calibration_state = None
+        if outcome_aware:
+            manager = getattr(self, "async_rollout_manager", None)
+            exporter = getattr(manager, "export_teacher_nll_calibration_state", None)
+            if exporter is None:
+                raise RuntimeError(
+                    "Outcome-aware checkpoint evaluation requires the manager-owned teacher-NLL calibration state."
+                )
+            calibration_state = exporter()
+            if calibration_state is None:
+                raise RuntimeError("Outcome-aware checkpoint evaluation received an empty teacher-NLL calibration.")
+
+        from verl.utils.evaluation.checkpoint_evaluation import write_evaluation_state
+
+        write_evaluation_state(
+            checkpoint_dir,
+            checkpoint_step=self.global_steps,
+            spec_fingerprint=str(self._checkpoint_evaluation_spec["spec_fingerprint"]),
+            teacher_nll_calibration=calibration_state,
+        )
 
     def _commit_checkpoint_tracker(self, checkpoint_step: int) -> None:
         """Atomically make a fully written checkpoint visible to resume discovery."""
@@ -3945,6 +4008,7 @@ class RayPPOTrainer:
                 config=OmegaConf.to_container(self.config, resolve=True),
                 wandb_resume=wandb_resume,
             )
+            self._initialize_checkpoint_evaluation_manifest(logger)
             if self._metric_archive_writer is not None:
                 run_info = logger.wandb_run_info
                 self._metric_archive_writer.register_wandb_session(
