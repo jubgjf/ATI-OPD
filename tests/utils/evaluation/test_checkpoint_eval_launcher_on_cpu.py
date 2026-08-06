@@ -26,6 +26,9 @@ def test_checkpoint_eval_launcher_is_valid_and_replaces_legacy_launcher_on_cpu()
 
     assert LAUNCHER.is_file()
     assert not (REPO_ROOT / "run" / "opd_benchmark_eval.sh").exists()
+    source = LAUNCHER.read_text(encoding="utf-8")
+    assert "set -euo pipefail" in source
+    assert "EVAL_SHELL_TRACE:-0" in source
 
 
 def test_checkpoint_eval_launcher_is_device_agnostic_and_keeps_prefix_caching_on_cpu():
@@ -72,6 +75,15 @@ def test_checkpoint_eval_launcher_scans_all_experiments_and_bootstraps_npu_envir
     assert "/usr/local/Ascend/ascend-toolkit/set_env.sh" in source
     assert "verl-conda-env-20260617.tar.gz" in source
     assert "EVAL_SETUP_MODE" in source
+
+
+def test_checkpoint_eval_launcher_validates_direct_merge_before_starting_vllm_on_cpu():
+    source = LAUNCHER.read_text(encoding="utf-8")
+
+    assert '--target_dir "$target"' in source
+    assert 'if ! hf_checkpoint_ready "$target"' in source
+    assert "Failed to merge FSDP checkpoint" in source
+    assert 'mv -- "$temporary" "$target"' not in source
 
 
 def test_checkpoint_eval_launcher_uses_default_local_dir_parent_as_search_root_on_cpu(tmp_path):

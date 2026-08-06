@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Persistent two-role checkpoint evaluation for every DMPD/OPD experiment below one output root.
 
-set -euo pipefail
+set -x
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
@@ -650,16 +650,26 @@ ensure_hf_checkpoint() {
         printf '%s\n' "$target"
         return 0
     fi
-    mkdir -p "$cache_step"
-    local temporary="$cache_step/.huggingface.tmp.$$"
-    rm -rf -- "$temporary"
-    python -m verl.model_merger merge --backend fsdp --local_dir "$actor_dir" --target_dir "$temporary" >&2
-    if ! hf_checkpoint_ready "$temporary"; then
-        echo "Merged Hugging Face checkpoint is incomplete: $temporary" >&2
+    # Match the proven legacy standalone evaluator's direct-merge behavior:
+    # some NPU shared filesystems reject renaming a populated directory even
+    # within the same parent. Keep the output in an independent cache rather
+    # than mutating actor/huggingface; the controller lock guarantees one writer.
+    if ! mkdir -p "$cache_step" || ! rm -rf -- "$target" "$cache_step"/.huggingface.tmp.*; then
+        echo "Failed to prepare merged-checkpoint cache: $target" >&2
         return 1
     fi
-    rm -rf -- "$target"
-    mv -- "$temporary" "$target"
+    if ! python -m verl.model_merger merge \
+        --backend fsdp \
+        --local_dir "$actor_dir" \
+        --target_dir "$target" >&2
+    then
+        echo "Failed to merge FSDP checkpoint: $actor_dir" >&2
+        return 1
+    fi
+    if ! hf_checkpoint_ready "$target"; then
+        echo "Merged Hugging Face checkpoint is incomplete: $target" >&2
+        return 1
+    fi
     printf '%s\n' "$target"
 }
 
