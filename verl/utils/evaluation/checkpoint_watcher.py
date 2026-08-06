@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -47,6 +48,25 @@ class CheckpointCandidate:
     evaluation_state: str
     hf_checkpoint: str | None
     needs_merge: bool
+
+
+@dataclass(frozen=True)
+class SearchCheckpointCandidate:
+    """A committed checkpoint plus the experiment root that owns it."""
+
+    step: int
+    checkpoint_dir: str
+    actor_dir: str
+    evaluation_state: str
+    hf_checkpoint: str | None
+    needs_merge: bool
+    checkpoint_root: str
+    evaluation_spec: str
+    experiment_name: str
+    training_project: str
+    training_run_id: str | None
+    spec_fingerprint: str
+    checkpoint_mtime_ns: int
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -207,12 +227,75 @@ def pending_checkpoints(
     ]
 
 
+def discover_experiment_roots(search_root: str | Path) -> list[Path]:
+    """Find checkpoint roots below a training-output directory without walking model payloads."""
+
+    root = Path(search_root).expanduser().resolve()
+    if not root.is_dir():
+        return []
+    experiment_roots: list[Path] = []
+    pruned_names = {
+        ".eval-cache",
+        ".standalone-eval",
+        "actor",
+        "critic",
+        "huggingface",
+        "wandb_logs",
+    }
+    for current, directory_names, file_names in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if name not in pruned_names and not name.startswith("global_step_") and not name.startswith(".")
+        ]
+        if EVALUATION_SPEC_FILENAME in file_names:
+            experiment_roots.append(current_path.resolve())
+            directory_names[:] = []
+    return sorted(set(experiment_roots))
+
+
+def discover_search_root_checkpoints(search_root: str | Path) -> list[SearchCheckpointCandidate]:
+    """Discover committed checkpoints across every manifest-enabled experiment below ``search_root``."""
+
+    candidates: list[SearchCheckpointCandidate] = []
+    for checkpoint_root in discover_experiment_roots(search_root):
+        try:
+            spec = load_evaluation_spec(checkpoint_root)
+        except Exception:
+            continue
+        semantic = spec.get("semantic_config") or {}
+        experiment_name = str(semantic.get("experiment_name") or checkpoint_root.name)
+        training_project = str(semantic.get("training_project") or "DMPD")
+        training_run_id = spec.get("training_run_id")
+        for checkpoint in discover_committed_checkpoints(checkpoint_root):
+            checkpoint_path = Path(checkpoint.checkpoint_dir)
+            candidates.append(
+                SearchCheckpointCandidate(
+                    **asdict(checkpoint),
+                    checkpoint_root=str(checkpoint_root),
+                    evaluation_spec=str(checkpoint_root / EVALUATION_SPEC_FILENAME),
+                    experiment_name=experiment_name,
+                    training_project=training_project,
+                    training_run_id=None if training_run_id is None else str(training_run_id),
+                    spec_fingerprint=str(spec["spec_fingerprint"]),
+                    checkpoint_mtime_ns=checkpoint_path.stat().st_mtime_ns,
+                )
+            )
+    return sorted(
+        candidates,
+        key=lambda item: (item.checkpoint_mtime_ns, item.experiment_name, item.step, item.checkpoint_root),
+    )
+
+
 def write_endpoint_descriptor(
     path: str | Path,
     *,
     base_url: str,
     served_model_name: str,
     model_path: str | Path,
+    request_id: str | None = None,
+    model_load_seconds: float | None = None,
 ) -> dict[str, Any]:
     model_path = Path(model_path).expanduser().resolve()
     metadata_names = (
@@ -249,6 +332,10 @@ def write_endpoint_descriptor(
         "model_path": str(model_path),
         "model_fingerprint": payload_fingerprint(model_identity),
     }
+    if request_id is not None:
+        payload["request_id"] = str(request_id)
+    if model_load_seconds is not None:
+        payload["model_load_seconds"] = float(model_load_seconds)
     write_json_atomic(path, payload)
     return payload
 
@@ -271,11 +358,15 @@ def build_parser() -> argparse.ArgumentParser:
     discover = subparsers.add_parser("discover")
     discover.add_argument("--checkpoint-root", required=True)
     discover.add_argument("--completed-step", type=int, action="append", default=[])
+    discover_tree = subparsers.add_parser("discover-tree")
+    discover_tree.add_argument("--search-root", required=True)
     endpoint = subparsers.add_parser("write-endpoint")
     endpoint.add_argument("--path", required=True)
     endpoint.add_argument("--base-url", required=True)
     endpoint.add_argument("--served-model-name", required=True)
     endpoint.add_argument("--model-path", required=True)
+    endpoint.add_argument("--request-id")
+    endpoint.add_argument("--model-load-seconds", type=float)
     return parser
 
 
@@ -288,12 +379,18 @@ def main() -> int:
         ):
             print(json.dumps(asdict(candidate), sort_keys=True))
         return 0
+    if args.command == "discover-tree":
+        for candidate in discover_search_root_checkpoints(args.search_root):
+            print(json.dumps(asdict(candidate), sort_keys=True))
+        return 0
     if args.command == "write-endpoint":
         payload = write_endpoint_descriptor(
             args.path,
             base_url=args.base_url,
             served_model_name=args.served_model_name,
             model_path=args.model_path,
+            request_id=args.request_id,
+            model_load_seconds=args.model_load_seconds,
         )
         print(json.dumps(payload, sort_keys=True))
         return 0

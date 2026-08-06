@@ -19,17 +19,19 @@ from omegaconf import OmegaConf
 from verl.utils.evaluation.checkpoint_evaluation import write_evaluation_spec, write_evaluation_state
 from verl.utils.evaluation.checkpoint_watcher import (
     discover_committed_checkpoints,
+    discover_experiment_roots,
+    discover_search_root_checkpoints,
     load_endpoint_descriptor,
     pending_checkpoints,
     write_endpoint_descriptor,
 )
 
 
-def _config(*, metric_logging_mode: str = "full"):
+def _config(*, metric_logging_mode: str = "full", experiment_name: str = "watcher-test"):
     return OmegaConf.create(
         {
             "trainer": {
-                "experiment_name": "watcher-test",
+                "experiment_name": experiment_name,
                 "project_name": "DMPD",
                 "metric_logging": {"mode": metric_logging_mode},
                 "save_freq": 20,
@@ -99,6 +101,27 @@ def test_watcher_does_not_synthesize_global_step_zero(tmp_path):
     assert [candidate.step for candidate in discover_committed_checkpoints(tmp_path)] == [20]
 
 
+def test_search_root_watcher_discovers_checkpoints_across_experiments(tmp_path):
+    outputs = tmp_path / "outputs"
+    run_a = outputs / "experiment-a"
+    run_b = outputs / "nested-project" / "experiment-b"
+    spec_a = write_evaluation_spec(run_a, _config(experiment_name="experiment-a"), training_run_id="run-a")
+    spec_b = write_evaluation_spec(run_b, _config(experiment_name="experiment-b"), training_run_id="run-b")
+    checkpoint_a = _write_fsdp_checkpoint(run_a, 20, spec_a)
+    checkpoint_b = _write_fsdp_checkpoint(run_b, 10, spec_b)
+    (run_a / "latest_checkpointed_iteration.txt").write_text("20", encoding="utf-8")
+    (run_b / "latest_checkpointed_iteration.txt").write_text("10", encoding="utf-8")
+
+    assert discover_experiment_roots(outputs) == [run_a.resolve(), run_b.resolve()]
+    candidates = discover_search_root_checkpoints(outputs)
+    by_experiment = {candidate.experiment_name: candidate for candidate in candidates}
+    assert set(by_experiment) == {"experiment-a", "experiment-b"}
+    assert by_experiment["experiment-a"].checkpoint_root == str(run_a.resolve())
+    assert by_experiment["experiment-a"].checkpoint_dir == str(checkpoint_a.resolve())
+    assert by_experiment["experiment-b"].checkpoint_root == str(run_b.resolve())
+    assert by_experiment["experiment-b"].checkpoint_dir == str(checkpoint_b.resolve())
+
+
 def test_balanced_watcher_requires_checkpoint_local_metric_commit(tmp_path):
     spec = write_evaluation_spec(tmp_path, _config(metric_logging_mode="balanced"), training_run_id="run")
     checkpoint = _write_fsdp_checkpoint(tmp_path, 20, spec, balanced=False)
@@ -147,9 +170,13 @@ def test_endpoint_descriptor_round_trip(tmp_path):
         base_url="http://teacher:8001/v1/",
         served_model_name="teacher",
         model_path=model,
+        request_id="request-a",
+        model_load_seconds=12.5,
     )
     assert load_endpoint_descriptor(endpoint_path) == written
     assert written["base_url"] == "http://teacher:8001/v1"
+    assert written["request_id"] == "request-a"
+    assert written["model_load_seconds"] == 12.5
 
     (model / "model.safetensors").write_bytes(b"weights")
     changed = write_endpoint_descriptor(

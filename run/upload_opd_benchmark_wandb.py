@@ -542,8 +542,8 @@ def _write_offline_sync_commands(result_root: Path, manifest: dict[str, Any]) ->
             + " >&2"
         )
         lines.append(
-            "        echo 'Use one shared absolute path on both hosts, or set EVAL_PORTABLE_RESULT_ROOT "
-            "before evaluation.' >&2"
+            "        echo 'Keep EVAL_WANDB_ROOT on shared storage. The NPU launcher configures its "
+            "jump-host-visible spelling through WANDB_PORTABLE_DATASET_DIR.' >&2"
         )
         lines.append("        exit 2")
         lines.append("    fi")

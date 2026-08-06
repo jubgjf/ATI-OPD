@@ -350,7 +350,8 @@ def test_offline_sync_never_uses_public_api_and_is_locally_idempotent_on_cpu(tmp
     commands = (result_root / uploader.OFFLINE_SYNC_COMMANDS_FILENAME).read_text(encoding="utf-8")
     assert "wandb sync " in commands
     assert "command -v wandb" in commands
-    assert "EVAL_PORTABLE_RESULT_ROOT" in commands
+    assert "EVAL_WANDB_ROOT" in commands
+    assert "WANDB_PORTABLE_DATASET_DIR" in commands
     assert "--append" not in commands
 
     _write_completed_unit(result_root, step=40)
