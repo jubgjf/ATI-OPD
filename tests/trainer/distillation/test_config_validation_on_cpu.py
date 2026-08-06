@@ -31,6 +31,12 @@ def test_teacher_segment_loss_config_defaults_to_legacy_opd_on_cpu():
     assert config.teacher_rejection_persistence_window_tokens == 64
     assert config.teacher_rejection_persistence_threshold is None
     assert config.teacher_rejection_persistence_min_valid_tokens == 32
+    assert config.skip_correct is False
+    assert config.confirmation_mode == "none"
+    assert config.future_gap_window_tokens == 64
+    assert config.future_gap_min_valid_tokens == 32
+    assert config.future_gap_max_threshold is None
+    assert config.future_gap_min_reduction == 0.0
     assert config.outcome_aware_candidate_selection_enabled is False
     assert config.outcome_correctness_key == "acc"
     assert config.teacher_candidate_count == 4
@@ -41,6 +47,32 @@ def test_teacher_segment_loss_config_defaults_to_legacy_opd_on_cpu():
     assert config.teacher_nll_initial_threshold is None
     assert config.teacher_nll_healthy_probe_probability == 0.1
     assert config.repair_for_evaluation is False
+
+
+def test_future_gap_and_skip_correct_config_validation_on_cpu():
+    config = DistillationInterventionConfig(
+        enabled=True,
+        max_interventions_per_sample=1,
+        confirmation_mode="future_gap",
+        skip_correct=True,
+    )
+    assert config.confirmation_mode == "future_gap"
+    assert config.skip_correct is True
+
+    with pytest.raises(ValueError, match="confirmation_mode"):
+        DistillationInterventionConfig(confirmation_mode="unknown")
+    with pytest.raises(ValueError, match="max_interventions_per_sample=1"):
+        DistillationInterventionConfig(enabled=True, confirmation_mode="future_gap")
+    with pytest.raises(ValueError, match="future_gap_window_tokens"):
+        DistillationInterventionConfig(future_gap_window_tokens=0)
+    with pytest.raises(ValueError, match="future_gap_min_valid_tokens"):
+        DistillationInterventionConfig(future_gap_window_tokens=8, future_gap_min_valid_tokens=9)
+    with pytest.raises(ValueError, match="future_gap_max_threshold"):
+        DistillationInterventionConfig(future_gap_max_threshold=float("nan"))
+    with pytest.raises(ValueError, match="future_gap_min_reduction"):
+        DistillationInterventionConfig(future_gap_min_reduction=-0.1)
+    with pytest.raises(ValueError, match="skip_correct=true"):
+        DistillationInterventionConfig(skip_correct=True)
 
 
 def test_intervention_outcome_observation_config_defaults_and_validation_on_cpu():
@@ -295,9 +327,28 @@ def test_distillation_intervention_allows_default_decoupled_rollout_correction_o
             "train_on_teacher_segments": True,
             "teacher_segment_loss_mode": "sft",
         },
+        {
+            "enabled": True,
+            "gap_metric": "k3",
+            "max_interventions_per_sample": 1,
+            "confirmation_mode": "future_gap",
+            "skip_correct": True,
+            "outcome_aware_candidate_selection_enabled": True,
+            "train_on_teacher_segments": True,
+            "teacher_segment_loss_mode": "opd",
+        },
+        {
+            "enabled": True,
+            "gap_metric": "teacher_rejection",
+            "teacher_rejection_persistence_enabled": True,
+            "teacher_rejection_persistence_window_tokens": 32,
+            "teacher_rejection_persistence_min_valid_tokens": 16,
+            "max_interventions_per_sample": 1,
+            "confirmation_mode": "future_gap",
+        },
     ],
 )
-@pytest.mark.parametrize("top_k_strategy", ["only_stu_rethinking_style", "only_stu_teacher_topk"])
+@pytest.mark.parametrize("top_k_strategy", ["only_stu", "only_stu_rethinking_style", "only_stu_teacher_topk"])
 def test_student_support_strategies_are_compatible_with_dmpd_settings_on_cpu(intervention, top_k_strategy):
     # Instantiate the intervention dataclass as well as the cross-feature
     # validator, so persistence and rejection-specific invariants are covered.

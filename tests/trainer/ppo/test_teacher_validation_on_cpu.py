@@ -172,6 +172,7 @@ def test_training_outcome_archive_keeps_all_compact_rows_and_only_selected_case_
             },
         ],
         interventions=[[{"start": 4, "teacher_tokens": 2}], []],
+        proposals=[[], []],
         skipped_interventions=[[], [{"reason": "below_threshold"}]],
         cases=[
             {

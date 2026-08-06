@@ -22,6 +22,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import math
 import os
 import shlex
 import time
@@ -48,6 +49,7 @@ from verl.trainer.distillation.batch_filter import to_tensordict_without_distill
 from verl.trainer.distillation.config_validation import validate_distillation_intervention_training_config
 from verl.trainer.distillation.diagnostics import (
     OpdDiagnosticsTracker,
+    build_future_gap_proposal_records,
     compute_entropy_heatmap_row,
     compute_gap_heatmap_row,
     compute_gap_high_heatmap_row,
@@ -200,6 +202,7 @@ def _snapshot_diagnostics_payloads(*payloads: dict[str, Any] | None) -> tuple[di
 class _OpdDiagnosticsResult:
     metrics: dict[str, float]
     intervention_records: tuple[dict[str, Any], ...] = ()
+    future_gap_records: tuple[dict[str, Any], ...] = ()
 
 
 def _compute_intervention_boundary_from_payloads(
@@ -246,8 +249,15 @@ def _compute_opd_diagnostics_background_metrics(
             boundary_kwargs,
         )
         metrics.update(boundary_metrics)
+    future_gap_records = build_future_gap_proposal_records(
+        intervention_kwargs.get("intervention_proposals") if intervention_kwargs is not None else None
+    )
     metrics["opd/diagnostics_async/worker_compute_seconds"] = time.perf_counter() - start_time
-    return _OpdDiagnosticsResult(metrics=metrics, intervention_records=tuple(intervention_records))
+    return _OpdDiagnosticsResult(
+        metrics=metrics,
+        intervention_records=tuple(intervention_records),
+        future_gap_records=tuple(future_gap_records),
+    )
 
 
 @dataclass(slots=True)
@@ -677,6 +687,7 @@ def _build_repair_evaluation_archive_records(
     data_sources: list[Any],
     outcomes: list[dict[str, Any]],
     interventions: list[Any],
+    proposals: list[Any],
     skipped_interventions: list[Any],
     cases: list[Any],
 ) -> list[dict[str, Any]]:
@@ -692,6 +703,7 @@ def _build_repair_evaluation_archive_records(
         "data_sources": data_sources,
         "outcomes": outcomes,
         "interventions": interventions,
+        "proposals": proposals,
         "skipped_interventions": skipped_interventions,
         "cases": cases,
     }
@@ -707,6 +719,14 @@ def _build_repair_evaluation_archive_records(
         outcome = copy.deepcopy(outcomes[index])
         outcome.pop("raw_response", None)
         outcome.pop("_raw_response_ids", None)
+        sample_proposals = proposals[index]
+        sample_proposals = [sample_proposals] if isinstance(sample_proposals, dict) else list(sample_proposals or [])
+        candidate_outputs = [
+            str(item["candidate_response"])
+            for item in sample_proposals
+            if isinstance(item, dict) and item.get("candidate_response") is not None
+        ]
+        sanitized_proposals = build_future_gap_proposal_records([sample_proposals])
         record = {
             "evaluation_scope": evaluation_scope,
             "global_step": int(global_step),
@@ -719,10 +739,13 @@ def _build_repair_evaluation_archive_records(
             "final_output_sha256": hashlib.sha256(final_outputs[index].encode("utf-8")).hexdigest(),
             "outcome": outcome,
             "interventions": _without_boundary_private_fields(interventions[index]),
+            "future_gap_proposals": sanitized_proposals,
             "skipped_interventions": skipped_interventions[index],
             "oracle": bool(outcome.get("oracle_gate_used", False)),
             "case_included": isinstance(cases[index], dict),
         }
+        if candidate_outputs:
+            record["rejected_candidate_outputs"] = candidate_outputs
         if isinstance(cases[index], dict):
             record.update(
                 {
@@ -742,6 +765,7 @@ def _build_training_intervention_outcome_archive_records(
     global_step: int,
     outcomes: list[Any],
     interventions: list[Any],
+    proposals: list[Any],
     skipped_interventions: list[Any],
     cases: list[Any],
     sample_uids: list[Any],
@@ -753,6 +777,7 @@ def _build_training_intervention_outcome_archive_records(
     sample_count = len(outcomes)
     fields = {
         "interventions": interventions,
+        "proposals": proposals,
         "skipped_interventions": skipped_interventions,
         "cases": cases,
         "sample_uids": sample_uids,
@@ -781,6 +806,7 @@ def _build_training_intervention_outcome_archive_records(
             "data_source": data_sources[index],
             "outcome": outcome,
             "interventions": _without_boundary_private_fields(interventions[index]),
+            "future_gap_proposals": build_future_gap_proposal_records([proposals[index]]),
             "skipped_interventions": skipped_interventions[index],
             "case_included": isinstance(cases[index], dict),
         }
@@ -796,6 +822,192 @@ def _build_training_intervention_outcome_archive_records(
             )
         records.append(record)
     return records
+
+
+def _average_ranks(values: np.ndarray) -> np.ndarray:
+    """Return deterministic average ranks for a one-dimensional array."""
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(values.size, dtype=np.float64)
+    start = 0
+    while start < values.size:
+        end = start + 1
+        while end < values.size and values[order[end]] == values[order[start]]:
+            end += 1
+        ranks[order[start:end]] = (start + end - 1) / 2.0
+        start = end
+    return ranks
+
+
+def _correctness_transition(raw_correct: bool, candidate_correct: bool) -> str:
+    if raw_correct:
+        return "pre_correct_post_correct" if candidate_correct else "pre_correct_post_wrong"
+    return "pre_wrong_post_correct" if candidate_correct else "pre_wrong_post_wrong"
+
+
+def _build_future_gap_evaluation_summary(
+    *,
+    evaluation_scope: str,
+    global_step: int,
+    data_sources: list[Any],
+    outcomes: list[dict[str, Any]],
+    proposals: list[Any],
+) -> tuple[dict[str, float], list[dict[str, Any]]]:
+    """Summarize future-gap/outcome association over the complete evaluation event."""
+    if not (len(data_sources) == len(outcomes) == len(proposals)):
+        raise ValueError("Future-gap evaluation inputs must have identical sample counts.")
+    sample_rows: list[dict[str, Any]] = []
+    for data_source, outcome, sample_proposals in zip(data_sources, outcomes, proposals, strict=True):
+        if not isinstance(outcome, dict):
+            continue
+        proposal_items = (
+            [sample_proposals]
+            if isinstance(sample_proposals, dict)
+            else [item for item in (sample_proposals or []) if isinstance(item, dict)]
+        )
+        proposal = proposal_items[0] if proposal_items else None
+        raw_correct = bool(outcome.get("raw_correct", False))
+        gated_correct = bool(outcome.get("final_correct", raw_correct))
+        candidate_available = bool(proposal and proposal.get("candidate_outcome_available", False))
+        candidate_correct = bool(proposal.get("candidate_correct")) if candidate_available else raw_correct
+        sample_rows.append(
+            {
+                "data_source": str(data_source),
+                "raw_correct": raw_correct,
+                "gated_correct": gated_correct,
+                "always_candidate_correct": candidate_correct,
+                "proposal": proposal,
+                "candidate_available": candidate_available,
+            }
+        )
+
+    group_names = ["overall", *sorted({row["data_source"] for row in sample_rows})]
+    metrics: dict[str, float] = {}
+    records: list[dict[str, Any]] = []
+    for group_name in group_names:
+        rows = sample_rows if group_name == "overall" else [r for r in sample_rows if r["data_source"] == group_name]
+        if not rows:
+            continue
+        raw_accuracy = float(np.mean([row["raw_correct"] for row in rows]))
+        gated_accuracy = float(np.mean([row["gated_correct"] for row in rows]))
+        always_accuracy = float(np.mean([row["always_candidate_correct"] for row in rows]))
+        proposal_rows = [row for row in rows if row["proposal"] is not None]
+        paired_rows = [row for row in proposal_rows if row["candidate_available"]]
+        transition_counts = {
+            transition: 0
+            for transition in (
+                "pre_correct_post_correct",
+                "pre_correct_post_wrong",
+                "pre_wrong_post_correct",
+                "pre_wrong_post_wrong",
+            )
+        }
+        transition_counts_by_decision = {
+            decision: dict.fromkeys(transition_counts, 0) for decision in ("accepted", "rejected")
+        }
+        accepted_help = accepted_harm = all_help = all_harm = accepted_count = 0
+        reductions: list[float] = []
+        correctness_deltas: list[float] = []
+        for row in paired_rows:
+            proposal = row["proposal"]
+            transition = _correctness_transition(bool(row["raw_correct"]), bool(row["always_candidate_correct"]))
+            transition_counts[transition] += 1
+            accepted = bool(proposal.get("accepted", False))
+            decision = "accepted" if accepted else "rejected"
+            transition_counts_by_decision[decision][transition] += 1
+            accepted_count += int(accepted)
+            is_help = transition == "pre_wrong_post_correct"
+            is_harm = transition == "pre_correct_post_wrong"
+            all_help += int(is_help)
+            all_harm += int(is_harm)
+            accepted_help += int(accepted and is_help)
+            accepted_harm += int(accepted and is_harm)
+            reduction = proposal.get("future_gap_reduction")
+            if reduction is not None and math.isfinite(float(reduction)):
+                reductions.append(float(reduction))
+                correctness_deltas.append(float(row["always_candidate_correct"]) - float(row["raw_correct"]))
+
+        prefix = f"{evaluation_scope}-aux/future_gap/{group_name}"
+        metrics.update(
+            {
+                f"{prefix}/sample_count": float(len(rows)),
+                f"{prefix}/proposal_count": float(len(proposal_rows)),
+                f"{prefix}/candidate_outcome_pair_count": float(len(paired_rows)),
+                f"{prefix}/raw_accuracy": raw_accuracy,
+                f"{prefix}/always_candidate_accuracy": always_accuracy,
+                f"{prefix}/gated_accuracy": gated_accuracy,
+                f"{prefix}/always_candidate_delta": always_accuracy - raw_accuracy,
+                f"{prefix}/gated_delta": gated_accuracy - raw_accuracy,
+                f"{prefix}/help_probability_among_accepted": accepted_help / accepted_count if accepted_count else 0.0,
+                f"{prefix}/harm_probability_among_accepted": accepted_harm / accepted_count if accepted_count else 0.0,
+                f"{prefix}/benefit_recall": accepted_help / all_help if all_help else 0.0,
+                f"{prefix}/harm_acceptance_rate": accepted_harm / all_harm if all_harm else 0.0,
+            }
+        )
+        for transition, count in transition_counts.items():
+            metrics[f"{prefix}/{transition}_count"] = float(count)
+        for decision, decision_counts in transition_counts_by_decision.items():
+            for transition, count in decision_counts.items():
+                metrics[f"{prefix}/{decision}/{transition}_count"] = float(count)
+
+        correlation_available = False
+        pearson = spearman = None
+        if len(reductions) >= 8:
+            reduction_array = np.asarray(reductions, dtype=np.float64)
+            delta_array = np.asarray(correctness_deltas, dtype=np.float64)
+            if np.ptp(reduction_array) > 0 and np.ptp(delta_array) > 0:
+                pearson = float(np.corrcoef(reduction_array, delta_array)[0, 1])
+                spearman = float(np.corrcoef(_average_ranks(reduction_array), _average_ranks(delta_array))[0, 1])
+                correlation_available = math.isfinite(pearson) and math.isfinite(spearman)
+        if correlation_available:
+            metrics[f"{prefix}/reduction_correctness_pearson"] = pearson
+            metrics[f"{prefix}/reduction_correctness_spearman"] = spearman
+
+        quantile_bins = []
+        if reductions:
+            reduction_array = np.asarray(reductions, dtype=np.float64)
+            delta_array = np.asarray(correctness_deltas, dtype=np.float64)
+            edges = np.quantile(reduction_array, [0.0, 0.25, 0.5, 0.75, 1.0])
+            assignments = np.searchsorted(edges[1:-1], reduction_array, side="right")
+            for bin_index in range(4):
+                selected = assignments == bin_index
+                selected_deltas = delta_array[selected]
+                quantile_bins.append(
+                    {
+                        "bin": bin_index,
+                        "lower": float(edges[bin_index]),
+                        "upper": float(edges[bin_index + 1]),
+                        "count": int(selected.sum()),
+                        "correctness_delta_mean": (float(selected_deltas.mean()) if selected_deltas.size else None),
+                        "help_fraction": (float((selected_deltas > 0).mean()) if selected_deltas.size else None),
+                        "harm_fraction": (float((selected_deltas < 0).mean()) if selected_deltas.size else None),
+                    }
+                )
+        records.append(
+            {
+                "schema_version": 1,
+                "evaluation_scope": evaluation_scope,
+                "global_step": int(global_step),
+                "data_source": None if group_name == "overall" else group_name,
+                "conditional_population": "coarse_triggered_proposals",
+                "sample_count": len(rows),
+                "proposal_count": len(proposal_rows),
+                "candidate_outcome_pair_count": len(paired_rows),
+                "raw_accuracy": raw_accuracy,
+                "always_candidate_accuracy": always_accuracy,
+                "gated_accuracy": gated_accuracy,
+                "transition_counts": transition_counts,
+                "transition_counts_by_decision": transition_counts_by_decision,
+                "correlation_pair_count": len(reductions),
+                "correlation_available": correlation_available,
+                "correlation_unavailable_reason": (
+                    None if correlation_available else "requires_at_least_8_pairs_and_nonconstant_variables"
+                ),
+                "reduction_correctness_pearson": pearson if correlation_available else None,
+                "reduction_correctness_spearman": spearman if correlation_available else None,
+                "reduction_quantile_bins": quantile_bins,
+            }
+        )
+    return metrics, records
 
 
 def _cap_ranked_outcome_cases(cases: list[Any], *, case_limit: int) -> list[Any]:
@@ -1602,6 +1814,7 @@ class RayPPOTrainer:
             global_step=global_steps,
             outcomes=outcomes,
             interventions=values_or_default("teacher_interventions", []),
+            proposals=values_or_default("teacher_intervention_proposals", []),
             skipped_interventions=values_or_default("teacher_intervention_skipped", []),
             cases=values_or_default("teacher_intervention_outcome_case", None),
             sample_uids=values_or_default("uid", None),
@@ -1719,8 +1932,11 @@ class RayPPOTrainer:
         repair_finish_reasons: list[Any] = []
         repair_outcomes: list[dict[str, Any]] = []
         repair_interventions: list[Any] = []
+        repair_proposals: list[Any] = []
         repair_skipped_interventions: list[Any] = []
         repair_cases: list[Any] = []
+        future_gap_eval_metrics: dict[str, float] = {}
+        future_gap_eval_records: list[dict[str, Any]] = []
         processed_samples = 0
 
         for test_data in dataloader:
@@ -1855,6 +2071,12 @@ class RayPPOTrainer:
                         np.asarray([[] for _ in batch_outcomes], dtype=object),
                     ).tolist()
                 )
+                repair_proposals.extend(
+                    test_output_gen_batch.non_tensor_batch.get(
+                        "teacher_intervention_proposals",
+                        np.asarray([[] for _ in batch_outcomes], dtype=object),
+                    ).tolist()
+                )
                 repair_skipped_interventions.extend(
                     test_output_gen_batch.non_tensor_batch.get(
                         "teacher_intervention_skipped",
@@ -1903,6 +2125,17 @@ class RayPPOTrainer:
                 repair_cases,
                 case_limit=int(getattr(diagnostics_config, "outcome_case_samples_per_transition", 0) or 0),
             )
+            assert repair_metric_prefix is not None
+            intervention_config = getattr(getattr(self, "distillation_config", None), "intervention", None)
+            if getattr(intervention_config, "confirmation_mode", "none") == "future_gap":
+                flattened_data_sources = np.concatenate(data_source_lst, axis=0).tolist()
+                future_gap_eval_metrics, future_gap_eval_records = _build_future_gap_evaluation_summary(
+                    evaluation_scope=repair_metric_prefix,
+                    global_step=self.global_steps,
+                    data_sources=flattened_data_sources,
+                    outcomes=repair_outcomes,
+                    proposals=repair_proposals,
+                )
 
         sample_records = (
             _build_validation_sample_records(
@@ -1959,6 +2192,7 @@ class RayPPOTrainer:
                     data_sources=flattened_data_sources,
                     outcomes=repair_outcomes,
                     interventions=repair_interventions,
+                    proposals=repair_proposals,
                     skipped_interventions=repair_skipped_interventions,
                     cases=repair_cases,
                 )
@@ -1966,6 +2200,11 @@ class RayPPOTrainer:
                     metric_key=f"{repair_metric_prefix}/paired_outcomes",
                     records=repair_archive_records,
                 )
+                if future_gap_eval_records:
+                    self._queue_event_records_archive(
+                        metric_key=f"{repair_metric_prefix}/future_gap_summary",
+                        records=future_gap_eval_records,
+                    )
             validation_media = self._maybe_log_val_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
@@ -1999,6 +2238,7 @@ class RayPPOTrainer:
                 == len(repair_outputs)
                 == len(repair_outcomes)
                 == len(repair_interventions)
+                == len(repair_proposals)
                 == len(repair_skipped_interventions)
                 == len(repair_cases)
             ):
@@ -2057,6 +2297,7 @@ class RayPPOTrainer:
                     repeat_times=repeat_times,
                 )
             )
+            metrics.update(future_gap_eval_metrics)
             if include_format_metrics:
                 for metric_name, value in _compute_validation_format_metrics(
                     repair_outputs,
@@ -3513,11 +3754,20 @@ class RayPPOTrainer:
                 and "teacher_interventions" in batch.non_tensor_batch
                 and "teacher_intervention_skipped" in batch.non_tensor_batch
             )
+            future_gap_enabled = bool(
+                intervention_enabled and getattr(intervention_config, "confirmation_mode", "none") == "future_gap"
+            )
+            has_future_gap_field = "teacher_intervention_proposals" in batch.non_tensor_batch
             if intervention_enabled and not has_intervention_fields:
                 raise RuntimeError(
                     "OPD intervention diagnostics are enabled, but rollout output did not include "
                     "'teacher_intervention_count', 'teacher_interventions', and 'teacher_intervention_skipped'. "
                     "Check that the DMPD agent-loop intervention path is active for every training sample."
+                )
+            if future_gap_enabled and not has_future_gap_field:
+                raise RuntimeError(
+                    "future_gap intervention diagnostics require 'teacher_intervention_proposals' from every "
+                    "rollout sample. Check that the updated DMPD agent-loop path is active."
                 )
             if has_intervention_fields:
                 intervention_kwargs = {
@@ -3525,6 +3775,11 @@ class RayPPOTrainer:
                         batch.non_tensor_batch["teacher_intervention_count"]
                     ),
                     "interventions": self._non_tensor_to_list(batch.non_tensor_batch["teacher_interventions"]),
+                    "intervention_proposals": (
+                        self._non_tensor_to_list(batch.non_tensor_batch["teacher_intervention_proposals"])
+                        if has_future_gap_field
+                        else None
+                    ),
                     "intervention_skipped": self._non_tensor_to_list(
                         batch.non_tensor_batch["teacher_intervention_skipped"]
                     ),
@@ -3622,6 +3877,13 @@ class RayPPOTrainer:
                 metric_key="opd_intervention/repair_boundary_records",
                 records=records,
             )
+        if intervention_kwargs is not None:
+            future_gap_records = build_future_gap_proposal_records(intervention_kwargs.get("intervention_proposals"))
+            if future_gap_records:
+                self._queue_event_records_archive(
+                    metric_key="opd_intervention/future_gap_records",
+                    records=future_gap_records,
+                )
 
         metrics.update(
             self._maybe_log_opd_heatmaps(
@@ -3676,6 +3938,11 @@ class RayPPOTrainer:
             metric_key="opd_intervention/repair_boundary_records",
             records=list(result.intervention_records),
         )
+        if result.future_gap_records:
+            self._queue_event_records_archive(
+                metric_key="opd_intervention/future_gap_records",
+                records=list(result.future_gap_records),
+            )
         metrics.update(
             {
                 "opd/diagnostics_async/completed": 1.0,
@@ -4073,11 +4340,20 @@ class RayPPOTrainer:
                 f"current_step={global_step}, pending={descriptions}."
             )
         ready = [item for item in pending if item.global_step == global_step]
+        future_gap_serialization_seconds = 0.0
         for item in ready:
+            started_at = time.perf_counter()
             self._metric_archive_writer.add_event_records(
                 item.records,
                 global_step=global_step,
                 metric_key=item.metric_key,
+            )
+            if item.metric_key == "opd_intervention/future_gap_records":
+                future_gap_serialization_seconds += time.perf_counter() - started_at
+        if future_gap_serialization_seconds:
+            previous_value = getattr(self, "_future_gap_archive_serialization_seconds_pending", None)
+            self._future_gap_archive_serialization_seconds_pending = future_gap_serialization_seconds + float(
+                previous_value or 0.0
             )
         self._pending_event_record_archives = [item for item in pending if item.global_step > global_step]
 
@@ -4139,6 +4415,16 @@ class RayPPOTrainer:
 
         routed_input = dict(metrics)
         routed_input.update(self._metric_archive_writer.health_metrics())
+        future_gap_serialization_seconds = getattr(
+            self,
+            "_future_gap_archive_serialization_seconds_pending",
+            None,
+        )
+        if future_gap_serialization_seconds is not None:
+            routed_input["opd_intervention/future_gap/archive_serialization_cpu_seconds_previous_event"] = float(
+                future_gap_serialization_seconds
+            )
+            self._future_gap_archive_serialization_seconds_pending = None
         if checkpoint_payload_path is not None:
             routed_input["metric_archive/last_committed_step"] = float(self.global_steps)
         route = self._metric_router.route(routed_input)

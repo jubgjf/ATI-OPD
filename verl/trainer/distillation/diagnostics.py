@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from collections import deque
 from dataclasses import dataclass, field
@@ -2990,6 +2991,7 @@ def compute_intervention_metrics(
     *,
     intervention_counts: list[Any],
     interventions: list[Any],
+    intervention_proposals: list[Any] | None = None,
     intervention_skipped: list[Any] | None = None,
     intervention_outcomes: list[Any] | None = None,
     response_mask: torch.Tensor,
@@ -3009,6 +3011,69 @@ def compute_intervention_metrics(
 
     total_valid_tokens = int(valid_lengths_tensor.sum().item())
     metrics["opd_intervention/trainable_token_fraction"] = total_valid_tokens / max(response_mask.numel(), 1)
+    if intervention_proposals is not None:
+        proposal_lists: list[list[dict[str, Any]]] = []
+        for sample_proposals in intervention_proposals:
+            if isinstance(sample_proposals, dict):
+                proposal_lists.append([sample_proposals])
+            elif isinstance(sample_proposals, list | tuple):
+                proposal_lists.append([item for item in sample_proposals if isinstance(item, dict)])
+            else:
+                proposal_lists.append([])
+        proposal_items = [item for items in proposal_lists for item in items]
+        proposal_count = len(proposal_items)
+        accepted_items = [item for item in proposal_items if bool(item.get("accepted", False))]
+        measurable_items = [item for item in proposal_items if bool(item.get("future_gap_pair_available", False))]
+        metrics.update(
+            {
+                "opd_intervention/future_gap/proposal_count": float(proposal_count),
+                "opd_intervention/future_gap/proposal_rate": (
+                    sum(bool(items) for items in proposal_lists) / len(proposal_lists) if proposal_lists else 0.0
+                ),
+                "opd_intervention/future_gap/acceptance_fraction_among_proposals": (
+                    len(accepted_items) / proposal_count if proposal_count else 0.0
+                ),
+                "opd_intervention/future_gap/measurable_fraction_among_proposals": (
+                    len(measurable_items) / proposal_count if proposal_count else 0.0
+                ),
+            }
+        )
+
+        def finite_values(items: list[dict[str, Any]], key: str) -> list[float]:
+            result = []
+            for item in items:
+                value = item.get(key)
+                if value is not None and math.isfinite(float(value)):
+                    result.append(float(value))
+            return result
+
+        for subset_name, subset in (
+            ("all", measurable_items),
+            ("accepted", accepted_items),
+            ("rejected", [item for item in measurable_items if not bool(item.get("accepted", False))]),
+        ):
+            for value_name, key in (
+                ("before", "future_gap_before"),
+                ("after", "future_gap_after"),
+                ("reduction", "future_gap_reduction"),
+            ):
+                values = finite_values(subset, key)
+                if values:
+                    metrics[f"opd_intervention/future_gap/active_gap/{value_name}_mean_among_{subset_name}"] = float(
+                        np.mean(values)
+                    )
+        reason_counts: dict[str, int] = {}
+        for item in proposal_items:
+            if item.get("accepted"):
+                continue
+            reason = str(item.get("reason") or "unknown")
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        rejected_count = max(sum(reason_counts.values()), 1)
+        for reason, count in reason_counts.items():
+            metrics[f"opd_intervention/future_gap/rejected_reason/{reason}"] = count / rejected_count
+        gate_times = finite_values(proposal_items, "future_gap_gate_cpu_seconds")
+        if gate_times:
+            metrics["opd_intervention/future_gap/gate_cpu_seconds_mean"] = float(np.mean(gate_times))
     teacher_tokens = 0
     suffix_tokens = 0
     first_positions = []
@@ -3140,6 +3205,7 @@ def compute_intervention_metrics(
 
     skipped_counts = []
     skipped_reason_counts: dict[str, int] = {}
+    skip_correct_samples = 0
     for sample_skipped in intervention_skipped or []:
         if sample_skipped is None:
             skipped_counts.append(0)
@@ -3151,6 +3217,8 @@ def compute_intervention_metrics(
         else:
             skipped_items = []
         skipped_counts.append(len(skipped_items))
+        if any(str(item.get("reason")) == "skip_correct" for item in skipped_items):
+            skip_correct_samples += 1
         for item in skipped_items:
             reason = item.get("reason")
             if reason is not None:
@@ -3160,6 +3228,9 @@ def compute_intervention_metrics(
     metrics["opd_intervention/skipped_count_max"] = float(skipped_array.max()) if skipped_array.size else 0.0
     metrics["opd_intervention/skipped_sample_fraction"] = (
         float((skipped_array > 0).mean()) if skipped_array.size else 0.0
+    )
+    metrics["opd_intervention/skip_correct/sample_fraction"] = (
+        skip_correct_samples / len(skipped_counts) if skipped_counts else 0.0
     )
     skipped_denom = max(int(skipped_array.sum()), 1)
     for reason, count in skipped_reason_counts.items():
@@ -3388,6 +3459,26 @@ def compute_intervention_metrics(
         for reason, count in invalid_candidate_reason_counts.items():
             metrics[f"opd_intervention/candidates/invalid_reason/{reason}"] = count / invalid_candidate_denom
     return metrics
+
+
+def build_future_gap_proposal_records(intervention_proposals: list[Any] | None) -> list[dict[str, Any]]:
+    """Flatten scalar proposal metadata while excluding transient or full-text fields."""
+    records: list[dict[str, Any]] = []
+    for sample_proposals in intervention_proposals or []:
+        if isinstance(sample_proposals, dict):
+            items = [sample_proposals]
+        elif isinstance(sample_proposals, list | tuple):
+            items = [item for item in sample_proposals if isinstance(item, dict)]
+        else:
+            items = []
+        for item in items:
+            record = {
+                str(key): copy.deepcopy(value)
+                for key, value in item.items()
+                if not str(key).startswith("_") and key != "candidate_response"
+            }
+            records.append(record)
+    return records
 
 
 @dataclass

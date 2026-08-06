@@ -2502,6 +2502,7 @@ async def repair_one_record(
         repaired_ids = [int(value) for value in output.response_ids]
         repaired_text = tokenizer.decode(repaired_ids, skip_special_tokens=True)
         interventions = [dict(item) for item in output.extra_fields.get("teacher_interventions", [])]
+        proposals = [dict(item) for item in output.extra_fields.get("teacher_intervention_proposals", [])]
         skipped_interventions = [dict(item) for item in output.extra_fields.get("teacher_intervention_skipped", [])]
         gap_diagnostics = [dict(item) for item in output.extra_fields.get("teacher_intervention_gap_diagnostics", [])]
         finish_reason = _repair_finish_reason(record, interventions)
@@ -2602,6 +2603,7 @@ async def repair_one_record(
             "intervention_count": intervention_count,
             "first_intervention_position": first_position,
             "teacher_interventions": interventions,
+            "teacher_intervention_proposals": proposals,
             "teacher_intervention_skipped": skipped_interventions,
             "gap_diagnostics": gap_diagnostics,
             "outcome": outcome,

@@ -221,6 +221,16 @@ class DistillationInterventionConfig(BaseConfig):
     teacher_rejection_persistence_threshold: Optional[float] = None
     teacher_rejection_persistence_min_valid_tokens: int = 32
     max_interventions_per_sample: int = 4
+    # Optional second-stage confirmation after a complete repair candidate has
+    # already been generated and scored. ``none`` preserves the legacy path.
+    skip_correct: bool = False
+    confirmation_mode: str = "none"
+    future_gap_window_tokens: int = 64
+    future_gap_min_valid_tokens: int = 32
+    # null reuses gap_threshold so the confirmation stays on the active gap's
+    # native scale (for example K3 versus teacher rejection).
+    future_gap_max_threshold: Optional[float] = None
+    future_gap_min_reduction: float = 0.0
     train_on_teacher_segments: bool = False
     teacher_segment_loss_mode: str = "opd"
     teacher_segment_sft_loss_coef: float = 1.0
@@ -268,6 +278,27 @@ class DistillationInterventionConfig(BaseConfig):
             raise ValueError("teacher_segment_length must be positive.")
         if self.max_interventions_per_sample < 0:
             raise ValueError("max_interventions_per_sample must be non-negative.")
+        if self.confirmation_mode not in {"none", "future_gap"}:
+            raise ValueError(
+                f"confirmation_mode must be one of {{'none', 'future_gap'}}, got {self.confirmation_mode!r}."
+            )
+        if self.skip_correct and not self.enabled:
+            raise ValueError("skip_correct=true requires distillation.intervention.enabled=true.")
+        if self.confirmation_mode == "future_gap" and self.max_interventions_per_sample != 1:
+            raise ValueError(
+                "confirmation_mode='future_gap' currently requires max_interventions_per_sample=1 so each "
+                "sample has one attributable repair proposal."
+            )
+        if self.future_gap_window_tokens <= 0:
+            raise ValueError("future_gap_window_tokens must be positive.")
+        if self.future_gap_min_valid_tokens <= 0:
+            raise ValueError("future_gap_min_valid_tokens must be positive.")
+        if self.future_gap_min_valid_tokens > self.future_gap_window_tokens:
+            raise ValueError("future_gap_min_valid_tokens must not exceed future_gap_window_tokens.")
+        if self.future_gap_max_threshold is not None and not math.isfinite(self.future_gap_max_threshold):
+            raise ValueError("future_gap_max_threshold must be finite when set.")
+        if not math.isfinite(self.future_gap_min_reduction) or self.future_gap_min_reduction < 0:
+            raise ValueError("future_gap_min_reduction must be finite and non-negative.")
         if self.teacher_segment_loss_mode not in {"opd", "sft"}:
             raise ValueError(
                 f"teacher_segment_loss_mode must be one of {{'opd', 'sft'}}, got {self.teacher_segment_loss_mode!r}."

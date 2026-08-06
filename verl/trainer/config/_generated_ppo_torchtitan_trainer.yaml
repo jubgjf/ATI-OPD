@@ -818,6 +818,12 @@ distillation:
     teacher_rejection_persistence_threshold: null
     teacher_rejection_persistence_min_valid_tokens: 32
     max_interventions_per_sample: 4
+    skip_correct: false
+    confirmation_mode: none
+    future_gap_window_tokens: 64
+    future_gap_min_valid_tokens: 32
+    future_gap_max_threshold: null
+    future_gap_min_reduction: 0.0
     train_on_teacher_segments: false
     teacher_segment_loss_mode: opd
     teacher_segment_sft_loss_coef: 1.0

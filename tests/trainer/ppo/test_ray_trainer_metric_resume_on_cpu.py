@@ -407,6 +407,10 @@ def test_balanced_checkpoint_event_commits_ledger_before_tracker_and_replays_com
         metric_key="opd_intervention/outcome_pairs",
         records=[{"uid": "uid-1", "transition": "pre_wrong_post_correct"}],
     )
+    trainer._queue_event_records_archive(
+        metric_key="opd_intervention/future_gap_records",
+        records=[{"uid": "uid-1", "accepted": True, "future_gap_reduction": 0.2}],
+    )
 
     class _Logger:
         wandb_run_info = WandbRunInfo(
@@ -447,12 +451,14 @@ def test_balanced_checkpoint_event_commits_ledger_before_tracker_and_replays_com
         "val/generations_full",
         "test/generations_full",
         "opd_intervention/outcome_pairs",
+        "opd_intervention/future_gap_records",
     }
     with gzip.open(event_files["val/generations_full"].path, "rt", encoding="utf-8") as stream:
         assert [json.loads(line) for line in stream] == [
             {"input": "val question", "output": "complete val answer", "score": 1.0}
         ]
     assert trainer._pending_event_record_archives == []
+    assert trainer._future_gap_archive_serialization_seconds_pending > 0
     assert [backend for _data, _step, backend in logger.calls] == [["console"], ["wandb"]]
     assert all("bucket/bin/0000_0128/token_count" not in data for data, _step, _backend in logger.calls)
     session = trainer._metric_archive_writer.manifest["sessions"][trainer._metric_archive_writer.session_id]

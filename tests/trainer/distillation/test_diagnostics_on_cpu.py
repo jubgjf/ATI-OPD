@@ -20,6 +20,7 @@ from verl.trainer.distillation.diagnostics import (
     OpdDiagnosticsTracker,
     SpecialTokenIds,
     binary_auc,
+    build_future_gap_proposal_records,
     compute_binned_event_rates,
     compute_binned_token_means,
     compute_bucket_denominator_metrics,
@@ -943,6 +944,52 @@ def test_compute_intervention_metrics_counts_zero_trainable_samples_on_cpu():
 
     assert metrics["opd_intervention/zero_trainable_sample_fraction"] == 0.5
     assert metrics["opd_intervention/trainable_token_fraction"] == 1 / 6
+
+
+def test_compute_intervention_metrics_aggregates_future_gap_proposals_on_cpu():
+    proposals = [
+        [
+            {
+                "accepted": True,
+                "future_gap_pair_available": True,
+                "future_gap_before": 0.5,
+                "future_gap_after": 0.1,
+                "future_gap_reduction": 0.4,
+                "future_gap_gate_cpu_seconds": 0.002,
+                "candidate_response": "private text",
+                "_candidate_response_ids": [1, 2],
+            }
+        ],
+        [
+            {
+                "accepted": False,
+                "reason": "future_gap_after_threshold",
+                "future_gap_pair_available": True,
+                "future_gap_before": 0.4,
+                "future_gap_after": 0.6,
+                "future_gap_reduction": -0.2,
+                "future_gap_gate_cpu_seconds": 0.004,
+            }
+        ],
+    ]
+    metrics = compute_intervention_metrics(
+        intervention_counts=[1, 0],
+        interventions=[[{"start": 1}], []],
+        intervention_proposals=proposals,
+        intervention_skipped=[[], [{"reason": "future_gap_after_threshold"}]],
+        response_mask=torch.ones((2, 4), dtype=torch.long),
+    )
+
+    assert metrics["opd_intervention/future_gap/proposal_rate"] == 1.0
+    assert metrics["opd_intervention/future_gap/acceptance_fraction_among_proposals"] == 0.5
+    assert metrics["opd_intervention/future_gap/measurable_fraction_among_proposals"] == 1.0
+    assert metrics["opd_intervention/future_gap/active_gap/reduction_mean_among_accepted"] == pytest.approx(0.4)
+    assert metrics["opd_intervention/future_gap/rejected_reason/future_gap_after_threshold"] == 1.0
+
+    records = build_future_gap_proposal_records(proposals)
+    assert len(records) == 2
+    assert "candidate_response" not in records[0]
+    assert "_candidate_response_ids" not in records[0]
 
 
 def test_compute_intervention_metrics_aggregates_outcome_and_candidate_selection_on_cpu():

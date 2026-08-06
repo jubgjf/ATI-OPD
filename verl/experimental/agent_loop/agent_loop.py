@@ -34,6 +34,7 @@ import logging
 import math
 import os
 import random
+import time
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
@@ -110,6 +111,22 @@ class _InterventionScoreResult:
 
     active_scores: torch.Tensor
     components: dict[str, torch.Tensor]
+
+
+@dataclass
+class _PendingFutureGapConfirmation:
+    """One fully generated repair awaiting its already-scheduled suffix score."""
+
+    proposal: dict[str, Any]
+    intervention: dict[str, Any]
+    after_intervention_start: int
+    baseline_values: list[float]
+    raw_response_ids: list[int]
+    raw_response_mask: list[int]
+    raw_response_logprobs: list[float]
+    raw_gap_mask: list[int]
+    raw_teacher_segment_mask: Optional[list[int]]
+    raw_teacher_result: TeacherLogprobScoringResult
 
 
 @dataclass
@@ -273,6 +290,24 @@ def _outcome_transition(raw_correct: bool, final_correct: bool) -> str:
 
 def _token_ids_sha256(token_ids: list[int]) -> str:
     return hashlib.sha256(np.asarray(token_ids, dtype=np.int64).tobytes()).hexdigest()
+
+
+def _metadata_scalar(value: Any) -> Any:
+    """Normalize scalar rollout metadata for JSON-safe diagnostic records."""
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, torch.Tensor) and value.numel() == 1:
+        return value.detach().cpu().item()
+    if isinstance(value, np.ndarray) and value.size == 1:
+        return value.reshape(-1)[0].item()
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            pass
+    return str(value)
 
 
 def _stable_fraction(key: str) -> float:
@@ -1066,6 +1101,138 @@ def _compute_teacher_rejection_persistence(
     if valid_tokens < intervention_config.teacher_rejection_persistence_min_valid_tokens:
         return None, valid_tokens
     return score, valid_tokens
+
+
+def _future_gap_threshold(intervention_config: DistillationInterventionConfig) -> float:
+    threshold = intervention_config.future_gap_max_threshold
+    return float(intervention_config.gap_threshold if threshold is None else threshold)
+
+
+def _collect_future_gap_values(
+    *,
+    scores: torch.Tensor,
+    response_mask: list[int],
+    start: int,
+    window_tokens: int,
+    teacher_nonfinite_positions: Optional[list[int]] = None,
+) -> tuple[list[float], dict[str, int]]:
+    """Copy at most one small score window to CPU and retain finite trainable values."""
+    if len(response_mask) != scores.numel():
+        raise RuntimeError(
+            "Future-gap response mask is not aligned with score values: "
+            f"len(response_mask)={len(response_mask)}, num_scores={scores.numel()}."
+        )
+    if start < 0 or start > scores.numel():
+        raise ValueError(f"Invalid future-gap start={start} for {scores.numel()} token scores.")
+    end = min(start + window_tokens, scores.numel())
+    invalid_counts = {"masked": 0, "teacher_nonfinite": 0, "value_nonfinite": 0}
+    if end <= start:
+        return [], invalid_counts
+
+    span = scores[start:end].detach().float().cpu()
+    mask = torch.tensor(response_mask[start:end], dtype=torch.bool)
+    invalid_counts["masked"] = int((~mask).sum().item())
+
+    teacher_nonfinite_mask = torch.zeros(end - start, dtype=torch.bool)
+    for position in teacher_nonfinite_positions or ():
+        if start <= position < end:
+            teacher_nonfinite_mask[position - start] = True
+    invalid_counts["teacher_nonfinite"] = int((mask & teacher_nonfinite_mask).sum().item())
+
+    finite_mask = torch.isfinite(span)
+    invalid_counts["value_nonfinite"] = int((mask & ~teacher_nonfinite_mask & ~finite_mask).sum().item())
+    valid_mask = mask & ~teacher_nonfinite_mask & finite_mask
+    return [float(value) for value in span[valid_mask].tolist()], invalid_counts
+
+
+def _evaluate_future_gap_confirmation(
+    *,
+    proposal: dict[str, Any],
+    baseline_values: list[float],
+    repaired_values: list[float],
+    intervention_config: DistillationInterventionConfig,
+) -> bool:
+    """Populate scalar gate diagnostics and return whether the repair is accepted."""
+    started_at = time.perf_counter()
+    effective_tokens = min(
+        intervention_config.future_gap_window_tokens,
+        len(baseline_values),
+        len(repaired_values),
+    )
+    threshold = _future_gap_threshold(intervention_config)
+    proposal.update(
+        {
+            "future_gap_window_tokens": int(intervention_config.future_gap_window_tokens),
+            "future_gap_min_valid_tokens": int(intervention_config.future_gap_min_valid_tokens),
+            "future_gap_max_threshold": threshold,
+            "future_gap_min_reduction": float(intervention_config.future_gap_min_reduction),
+            "future_gap_effective_tokens": effective_tokens,
+        }
+    )
+    baseline_invalid_counts = proposal.get("future_gap_baseline_invalid_counts") or {}
+    repaired_invalid_counts = proposal.get("future_gap_repaired_invalid_counts") or {}
+    nonfinite_count = sum(
+        int(invalid_counts.get(key, 0) or 0)
+        for invalid_counts in (baseline_invalid_counts, repaired_invalid_counts)
+        for key in ("teacher_nonfinite", "value_nonfinite")
+    )
+    if nonfinite_count:
+        proposal.update(
+            {
+                "future_gap_pair_available": False,
+                "future_gap_nonfinite_count": nonfinite_count,
+                "accepted": False,
+                "status": "rejected",
+                "rejection_stage": "future_gap_confirmation",
+                "reason": "future_gap_nonfinite_pair",
+                "future_gap_gate_cpu_seconds": time.perf_counter() - started_at,
+            }
+        )
+        return False
+    if effective_tokens < intervention_config.future_gap_min_valid_tokens:
+        proposal.update(
+            {
+                "future_gap_pair_available": False,
+                "accepted": False,
+                "status": "rejected",
+                "rejection_stage": "future_gap_confirmation",
+                "reason": "future_gap_insufficient_valid_tokens",
+                "future_gap_gate_cpu_seconds": time.perf_counter() - started_at,
+            }
+        )
+        return False
+
+    before = math.fsum(baseline_values[:effective_tokens]) / effective_tokens
+    after = math.fsum(repaired_values[:effective_tokens]) / effective_tokens
+    reduction = before - after
+    finite = all(math.isfinite(value) for value in (before, after, reduction))
+    passes_absolute = finite and after < threshold
+    passes_reduction = finite and reduction > intervention_config.future_gap_min_reduction
+    accepted = passes_absolute and passes_reduction
+    if not finite:
+        reason = "future_gap_nonfinite_pair"
+    elif not passes_absolute:
+        reason = "future_gap_after_threshold"
+    elif not passes_reduction:
+        reason = "future_gap_insufficient_reduction"
+    else:
+        reason = None
+    proposal.update(
+        {
+            "future_gap_pair_available": finite,
+            "future_gap_before": before if finite else None,
+            "future_gap_after": after if finite else None,
+            "future_gap_reduction": reduction if finite else None,
+            "future_gap_passes_absolute_threshold": passes_absolute,
+            "future_gap_passes_min_reduction": passes_reduction,
+            "accepted": accepted,
+            "status": "accepted" if accepted else "rejected",
+            "rejection_stage": None if accepted else "future_gap_confirmation",
+            "reason": reason,
+            "future_gap_gate_cpu_seconds": time.perf_counter() - started_at,
+        }
+    )
+    return accepted
 
 
 def _initialize_local_effect_metadata(
@@ -2233,6 +2400,9 @@ class AgentLoopWorker:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
         if getattr(self, "teacher_intervention_enabled", False):
+            skip_correct = bool(
+                self.teacher_intervention_config is not None and self.teacher_intervention_config.skip_correct
+            )
             outcome_aware_selection = bool(
                 self.teacher_intervention_config is not None
                 and self.teacher_intervention_config.outcome_aware_candidate_selection_enabled
@@ -2242,7 +2412,10 @@ class AgentLoopWorker:
                 validate=bool(validate),
             )
             observe_outcome = bool(
-                collect_training_outcomes or (outcome_aware_selection and not validate) or repair_for_evaluation
+                skip_correct
+                or collect_training_outcomes
+                or (outcome_aware_selection and not validate)
+                or repair_for_evaluation
             )
             if observe_outcome:
                 # The raw student answer must be judged before any token is
@@ -2263,6 +2436,7 @@ class AgentLoopWorker:
                     "raw_correct": raw_correct,
                     "trigger_detected": False,
                     "repair_executed": False,
+                    "skip_correct_enabled": skip_correct,
                 }
                 if transition_observation_event:
                     outcome_metadata.update(
@@ -2287,9 +2461,14 @@ class AgentLoopWorker:
                 output,
                 validate=validate,
                 repair_for_evaluation=repair_for_evaluation,
+                retain_rejected_candidate_for_outcome=(
+                    repair_for_evaluation and self.teacher_intervention_config.confirmation_mode == "future_gap"
+                ),
                 sampling_params=sampling_params,
                 sample_kwargs=kwargs,
             )
+            if repair_for_evaluation and self.teacher_intervention_config.confirmation_mode == "future_gap":
+                await self._score_rejected_future_gap_candidate(output, kwargs=kwargs)
             if (
                 not validate
                 and self.teacher_intervention_config is not None
@@ -2507,6 +2686,40 @@ class AgentLoopWorker:
                 )
                 if transition is not None:
                     interventions[0]["transition"] = transition
+            proposals = output.extra_fields.get("teacher_intervention_proposals") or []
+            for proposal in proposals:
+                if not isinstance(proposal, dict):
+                    continue
+                if proposal.get("accepted"):
+                    proposal.update(
+                        {
+                            "candidate_outcome_available": True,
+                            "candidate_reward_score": output.reward_score,
+                            "candidate_correctness_value": final_correctness_value,
+                            "candidate_correct": final_correct,
+                            "candidate_response_length": len(output.response_ids),
+                            "candidate_output_token_sha256": _token_ids_sha256(output.response_ids),
+                            "candidate_is_final": True,
+                            "outcome_scope": (
+                                "evaluation_candidate_pair"
+                                if outcome_metadata.get("evaluation_pair")
+                                else "accepted_observational"
+                            ),
+                        }
+                    )
+                candidate_correct = proposal.get("candidate_correct")
+                if candidate_correct is None:
+                    continue
+                proposal.update(
+                    {
+                        "raw_correctness_value": outcome_metadata["raw_correctness_value"],
+                        "raw_correct": raw_correct,
+                        "gated_correctness_value": final_correctness_value,
+                        "gated_correct": final_correct,
+                        "candidate_correctness_delta": int(bool(candidate_correct)) - int(raw_correct),
+                        "candidate_transition": _outcome_transition(raw_correct, bool(candidate_correct)),
+                    }
+                )
         await self._compute_teacher_logprobs(
             output,
             prompt_ids=output.prompt_ids,
@@ -2709,6 +2922,65 @@ class AgentLoopWorker:
                 final_output.reward_score = result["reward_score"]
                 final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
             final_output.metrics.compute_score = timing["compute_score"]
+
+    async def _score_rejected_future_gap_candidate(
+        self,
+        output: AgentLoopOutput,
+        *,
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Evaluate an already-generated rejected candidate without retaining private token arrays."""
+        proposals = output.extra_fields.get("teacher_intervention_proposals") or []
+        for proposal in proposals:
+            if not isinstance(proposal, dict):
+                continue
+            candidate_ids = proposal.pop("_candidate_response_ids", None)
+            candidate_mask = proposal.pop("_candidate_response_mask", None)
+            if candidate_ids is None:
+                continue
+            if proposal.get("accepted"):
+                raise RuntimeError("Accepted future-gap proposals must reuse the final evaluation reward.")
+            candidate_ids = list(candidate_ids)
+            candidate_mask = list(candidate_mask or [1] * len(candidate_ids))
+            safe_extra_fields = {
+                key: value
+                for key, value in output.extra_fields.items()
+                if not str(key).startswith("teacher_intervention") and key != "reward_extra_info"
+            }
+            candidate_output = AgentLoopOutput(
+                prompt_ids=list(output.prompt_ids),
+                response_ids=candidate_ids,
+                response_mask=candidate_mask,
+                response_logprobs=None,
+                routed_experts=None,
+                multi_modal_data=output.multi_modal_data,
+                reward_score=None,
+                num_turns=output.num_turns,
+                metrics=AgentLoopMetrics(),
+                extra_fields=safe_extra_fields,
+                mm_processor_kwargs=output.mm_processor_kwargs,
+            )
+            await self._compute_score([candidate_output], kwargs=kwargs)
+            if candidate_output.reward_score is None:
+                proposal["candidate_outcome_available"] = False
+                proposal["candidate_outcome_unavailable_reason"] = "reward_score_unavailable"
+                continue
+            candidate_correct, candidate_correctness_value = _extract_outcome_correctness(
+                candidate_output,
+                self.teacher_intervention_config,
+            )
+            proposal.update(
+                {
+                    "candidate_outcome_available": True,
+                    "candidate_reward_score": float(candidate_output.reward_score),
+                    "candidate_correctness_value": candidate_correctness_value,
+                    "candidate_correct": candidate_correct,
+                    "candidate_response": self.tokenizer.decode(candidate_ids, skip_special_tokens=True),
+                    "candidate_response_length": len(candidate_ids),
+                    "candidate_output_token_sha256": _token_ids_sha256(candidate_ids),
+                    "outcome_scope": "evaluation_candidate_pair",
+                }
+            )
 
     def _teacher_routing_key(self, sample_kwargs: Optional[dict[str, Any]]) -> Optional[str]:
         routing_key = None
@@ -3284,6 +3556,7 @@ class AgentLoopWorker:
         *,
         validate: bool,
         repair_for_evaluation: bool = False,
+        retain_rejected_candidate_for_outcome: bool = False,
         sampling_params: Optional[dict[str, Any]],
         sample_kwargs: Optional[dict[str, Any]],
     ) -> None:
@@ -3303,17 +3576,53 @@ class AgentLoopWorker:
         skipped_interventions: list[dict[str, Any]] = output.extra_fields["teacher_intervention_skipped"]
         gap_diagnostics: list[dict[str, Any]] = output.extra_fields["teacher_intervention_gap_diagnostics"]
 
+        intervention_config: DistillationInterventionConfig = self.teacher_intervention_config
+        future_gap_confirmation = intervention_config.confirmation_mode == "future_gap"
+        proposals: list[dict[str, Any]] = []
+        if future_gap_confirmation:
+            output.extra_fields["teacher_intervention_proposals"] = proposals
+        outcome_metadata = output.extra_fields.get("teacher_intervention_outcome")
+        if intervention_config.skip_correct:
+            if not isinstance(outcome_metadata, dict) or "raw_correct" not in outcome_metadata:
+                raise RuntimeError(
+                    "skip_correct requires the raw on-policy reward to be computed before teacher intervention. "
+                    "Call _agent_loop_postprocess instead of invoking _maybe_repair_with_teacher directly."
+                )
+            if bool(outcome_metadata["raw_correct"]):
+                response_length = min(len(output.response_ids), self.rollout_config.response_length)
+                if (
+                    intervention_config.train_on_teacher_segments
+                    and intervention_config.teacher_segment_loss_mode == "sft"
+                ):
+                    output.teacher_segment_mask = [0] * response_length
+                _record_skipped_intervention(
+                    skipped_interventions,
+                    reason="skip_correct",
+                    attempt=0,
+                    start=0,
+                    end=0,
+                    candidate_response_ids=list(output.response_ids[:response_length]),
+                    candidate_response_mask=list(output.response_mask[:response_length]),
+                )
+                outcome_metadata.update(
+                    {
+                        "skip_correct_applied": True,
+                        "skip_reason": "skip_correct",
+                        "trigger_detected": False,
+                        "repair_executed": False,
+                    }
+                )
+                return
+
         if output.routed_experts is not None:
             raise NotImplementedError(
                 "distillation.intervention.enabled cannot repair outputs that already contain routed_experts. "
                 "Repaired tokens would need fresh router decisions; disable intervention or routing replay."
             )
 
-        intervention_config: DistillationInterventionConfig = self.teacher_intervention_config
         outcome_aware_selection = bool(intervention_config.outcome_aware_candidate_selection_enabled)
         collect_boundary_metrics = AgentLoopWorker._collect_intervention_boundary_metrics(self, validate=validate)
         collect_boundary_text = AgentLoopWorker._collect_intervention_boundary_text(self, validate=validate)
-        outcome_metadata = output.extra_fields.get("teacher_intervention_outcome")
         if outcome_aware_selection and not isinstance(outcome_metadata, dict):
             raise RuntimeError(
                 "Outcome-aware teacher intervention requires the raw outcome gate to run before repair. "
@@ -3376,6 +3685,7 @@ class AgentLoopWorker:
         cached_teacher_result = None
         eos_token_ids = _tokenizer_eos_token_ids(self.tokenizer)
         pending_local_effect: Optional[tuple[dict[str, Any], int]] = None
+        pending_future_gap: Optional[_PendingFutureGapConfirmation] = None
 
         for attempt in range(intervention_config.max_interventions_per_sample + 1):
             teacher_result = await self._score_sequence_for_intervention(
@@ -3422,6 +3732,11 @@ class AgentLoopWorker:
                 teacher_rejection_token_cap=float(getattr(intervention_config, "teacher_rejection_token_cap", 10.0)),
                 distribution_scores=distribution_scores,
             )
+            teacher_nonfinite_positions = _response_relative_nonfinite_positions(
+                teacher_result,
+                prompt_len=len(prompt_ids),
+                response_len=len(response_ids),
+            )
             if pending_local_effect is not None:
                 pending_metadata, after_intervention_start = pending_local_effect
                 _finalize_local_effect_metadata(
@@ -3431,11 +3746,7 @@ class AgentLoopWorker:
                     after_intervention_start=after_intervention_start,
                     segment_length=intervention_config.student_segment_length,
                     gap_aggregation=intervention_config.gap_aggregation,
-                    teacher_nonfinite_positions=_response_relative_nonfinite_positions(
-                        teacher_result,
-                        prompt_len=len(prompt_ids),
-                        response_len=len(response_ids),
-                    ),
+                    teacher_nonfinite_positions=teacher_nonfinite_positions,
                 )
                 pending_local_effect = None
             gaps = score_result.active_scores
@@ -3460,15 +3771,59 @@ class AgentLoopWorker:
                     "selected_segment_start": None if bad_segment is None else int(bad_segment[0]),
                     "selected_segment_end": None if bad_segment is None else int(bad_segment[1]),
                     "selected_segment_score": None if bad_segment is None else float(bad_segment[2]),
-                    "teacher_nonfinite_token_count": len(
-                        _response_relative_nonfinite_positions(
-                            teacher_result,
-                            prompt_len=len(prompt_ids),
-                            response_len=len(response_ids),
-                        )
-                    ),
+                    "teacher_nonfinite_token_count": len(teacher_nonfinite_positions),
                 }
                 gap_diagnostics.append(gap_diagnostic)
+            if pending_future_gap is not None:
+                repaired_values, repaired_invalid_counts = _collect_future_gap_values(
+                    scores=score_result.active_scores,
+                    response_mask=gap_mask,
+                    start=pending_future_gap.after_intervention_start,
+                    window_tokens=intervention_config.future_gap_window_tokens,
+                    teacher_nonfinite_positions=teacher_nonfinite_positions,
+                )
+                proposal = pending_future_gap.proposal
+                proposal["future_gap_repaired_available_tokens"] = len(repaired_values)
+                proposal["future_gap_repaired_invalid_counts"] = repaired_invalid_counts
+                accepted = _evaluate_future_gap_confirmation(
+                    proposal=proposal,
+                    baseline_values=pending_future_gap.baseline_values,
+                    repaired_values=repaired_values,
+                    intervention_config=intervention_config,
+                )
+                if accepted:
+                    interventions.append(pending_future_gap.intervention)
+                    if isinstance(outcome_metadata, dict):
+                        outcome_metadata["repair_executed"] = True
+                    proposal["intervention_index"] = len(interventions) - 1
+                else:
+                    if validate and repair_for_evaluation and retain_rejected_candidate_for_outcome:
+                        # These references are consumed and removed before the
+                        # worker output is padded or transferred to the trainer.
+                        proposal["_candidate_response_ids"] = response_ids
+                        proposal["_candidate_response_mask"] = response_mask
+                    _record_skipped_intervention(
+                        skipped_interventions,
+                        reason=str(proposal.get("reason") or "future_gap_rejected"),
+                        attempt=int(proposal.get("attempt", attempt - 1)),
+                        start=int(proposal.get("start", 0)),
+                        end=int(proposal.get("end", 0)),
+                        candidate_response_ids=response_ids,
+                        candidate_response_mask=response_mask,
+                        teacher_tokens=int(proposal.get("teacher_tokens", 0)),
+                        student_suffix_tokens=int(proposal.get("student_suffix_tokens", 0)),
+                    )
+                    response_ids = pending_future_gap.raw_response_ids
+                    response_mask = pending_future_gap.raw_response_mask
+                    response_logprobs = pending_future_gap.raw_response_logprobs
+                    gap_mask = pending_future_gap.raw_gap_mask
+                    teacher_segment_mask = pending_future_gap.raw_teacher_segment_mask
+                    cached_teacher_result = pending_future_gap.raw_teacher_result
+                    if isinstance(outcome_metadata, dict):
+                        outcome_metadata["repair_executed"] = False
+                        outcome_metadata["future_gap_rejected"] = True
+                pending_future_gap = None
+                break
             if bad_segment is None or len(interventions) >= intervention_config.max_interventions_per_sample:
                 break
 
@@ -3504,6 +3859,45 @@ class AgentLoopWorker:
                 start,
                 end,
             )
+            future_gap_proposal: Optional[dict[str, Any]] = None
+            future_gap_baseline_values: list[float] = []
+            if future_gap_confirmation:
+                future_gap_baseline_values, baseline_invalid_counts = _collect_future_gap_values(
+                    scores=score_result.active_scores,
+                    response_mask=gap_mask,
+                    start=end,
+                    window_tokens=intervention_config.future_gap_window_tokens,
+                    teacher_nonfinite_positions=teacher_nonfinite_positions,
+                )
+                future_gap_proposal = {
+                    "schema_version": 1,
+                    "confirmation_mode": "future_gap",
+                    "global_step": _metadata_scalar((sample_kwargs or {}).get("global_steps")),
+                    "uid": _metadata_scalar((sample_kwargs or {}).get("uid")),
+                    "sample_index": _metadata_scalar((sample_kwargs or {}).get("index")),
+                    "data_source": _metadata_scalar((sample_kwargs or {}).get("data_source")),
+                    "attempt": attempt,
+                    "start": start,
+                    "end": end,
+                    "start_fraction": start / max(len(response_ids), 1),
+                    "trigger_gap_metric": str(intervention_config.gap_metric).lower(),
+                    "trigger_gap_aggregation": str(intervention_config.gap_aggregation),
+                    "trigger_score": float(score),
+                    "trigger_threshold": float(intervention_config.gap_threshold),
+                    "future_gap_window_tokens": int(intervention_config.future_gap_window_tokens),
+                    "future_gap_min_valid_tokens": int(intervention_config.future_gap_min_valid_tokens),
+                    "future_gap_max_threshold": _future_gap_threshold(intervention_config),
+                    "future_gap_min_reduction": float(intervention_config.future_gap_min_reduction),
+                    "future_gap_baseline_available_tokens": len(future_gap_baseline_values),
+                    "future_gap_baseline_invalid_counts": baseline_invalid_counts,
+                    "skip_correct": bool(intervention_config.skip_correct),
+                    "train_on_teacher_segments": bool(intervention_config.train_on_teacher_segments),
+                    "teacher_segment_loss_mode": str(intervention_config.teacher_segment_loss_mode),
+                    "accepted": False,
+                    "status": "triggered",
+                    **persistence_metadata,
+                }
+                proposals.append(future_gap_proposal)
             local_effect_metadata = _initialize_local_effect_metadata(
                 score_result=score_result,
                 response_mask=gap_mask,
@@ -3512,11 +3906,7 @@ class AgentLoopWorker:
                 gap_metric=intervention_config.gap_metric,
                 gap_aggregation=intervention_config.gap_aggregation,
                 collect_v2=collect_boundary_metrics,
-                teacher_nonfinite_positions=_response_relative_nonfinite_positions(
-                    teacher_result,
-                    prompt_len=len(prompt_ids),
-                    response_len=len(response_ids),
-                ),
+                teacher_nonfinite_positions=teacher_nonfinite_positions,
             )
             original_student_segment_ids = response_ids[start:end]
             prefix_response_ids = response_ids[:start]
@@ -3678,6 +4068,16 @@ class AgentLoopWorker:
                     skipped_interventions[-1]["tokenizer_vocab_size"] = _tokenizer_vocab_size(self.tokenizer)
                     break
             rewrite_overlap_metrics = compute_rewrite_overlap_metrics(original_student_segment_ids, teacher_segment_ids)
+            if future_gap_proposal is not None:
+                future_gap_proposal.update(
+                    {
+                        "original_student_tokens": len(original_student_segment_ids),
+                        "original_student_segment_sha256": _token_ids_sha256(original_student_segment_ids),
+                        "teacher_tokens": len(teacher_segment_ids),
+                        "teacher_segment_sha256": _token_ids_sha256(teacher_segment_ids),
+                        **rewrite_overlap_metrics,
+                    }
+                )
 
             teacher_terminal = _generation_is_terminal(
                 token_ids=teacher_segment_ids,
@@ -3751,6 +4151,14 @@ class AgentLoopWorker:
                 candidate_response_ids,
                 prompt_ids=prompt_ids,
             )
+            if future_gap_proposal is not None:
+                future_gap_proposal.update(
+                    {
+                        "thinking_state_valid": thinking_state.valid,
+                        "thinking_state_open": thinking_state.open,
+                        "thinking_state_reason": thinking_state.reason,
+                    }
+                )
             if not thinking_state.valid:
                 _record_skipped_intervention(
                     skipped_interventions,
@@ -3767,6 +4175,22 @@ class AgentLoopWorker:
                 skipped_interventions[-1].update(student_suffix_logprob_metadata)
                 break
             candidate_terminal = teacher_terminal or student_suffix_result.terminal
+            if future_gap_proposal is not None:
+                future_gap_proposal.update(
+                    {
+                        "student_suffix_tokens": len(student_suffix_result.token_ids),
+                        "student_suffix_sha256": _token_ids_sha256(student_suffix_result.token_ids),
+                        "candidate_response_tokens": len(candidate_response_ids),
+                        "candidate_response_sha256": _token_ids_sha256(candidate_response_ids),
+                        "teacher_terminal": teacher_terminal,
+                        "candidate_terminal": candidate_terminal,
+                        "teacher_stop_reason": teacher_generation.stop_reason,
+                        "teacher_finish_reason": teacher_generation.finish_reason,
+                        "student_suffix_stop_reason": student_suffix_result.stop_reason,
+                        "student_suffix_finish_reason": student_suffix_result.finish_reason,
+                        **student_suffix_logprob_metadata,
+                    }
+                )
             if (
                 candidate_terminal
                 and thinking_state.open
@@ -3784,6 +4208,37 @@ class AgentLoopWorker:
                     student_suffix_tokens=len(student_suffix_result.token_ids),
                 )
                 skipped_interventions[-1].update(student_suffix_logprob_metadata)
+                break
+            if future_gap_confirmation and candidate_terminal:
+                if future_gap_proposal is None:
+                    raise RuntimeError("future_gap terminal candidate lost its proposal metadata.")
+                future_gap_proposal.update(
+                    {
+                        "future_gap_pair_available": False,
+                        "future_gap_effective_tokens": 0,
+                        "accepted": False,
+                        "status": "rejected",
+                        "rejection_stage": "candidate_terminal",
+                        "reason": "future_gap_terminal_response",
+                    }
+                )
+                if validate and repair_for_evaluation and retain_rejected_candidate_for_outcome:
+                    future_gap_proposal["_candidate_response_ids"] = candidate_response_ids
+                    future_gap_proposal["_candidate_response_mask"] = candidate_response_mask
+                _record_skipped_intervention(
+                    skipped_interventions,
+                    reason="future_gap_terminal_response",
+                    attempt=attempt,
+                    start=start,
+                    end=end,
+                    candidate_response_ids=candidate_response_ids,
+                    candidate_response_mask=candidate_response_mask,
+                    teacher_tokens=len(teacher_segment_ids),
+                    student_suffix_tokens=len(student_suffix_result.token_ids),
+                )
+                if isinstance(outcome_metadata, dict):
+                    outcome_metadata["repair_executed"] = False
+                    outcome_metadata["future_gap_rejected"] = True
                 break
             candidate_trainable_tokens = sum(candidate_response_mask)
             if candidate_teacher_segment_mask is not None:
@@ -3803,6 +4258,12 @@ class AgentLoopWorker:
                 skipped_interventions[-1].update(student_suffix_logprob_metadata)
                 break
 
+            raw_response_ids = response_ids
+            raw_response_mask = response_mask
+            raw_response_logprobs = response_logprobs
+            raw_gap_mask = gap_mask
+            raw_teacher_segment_mask = teacher_segment_mask
+            raw_teacher_result = teacher_result
             response_ids = candidate_response_ids
             response_mask = candidate_response_mask
             response_logprobs = candidate_response_logprobs
@@ -3871,17 +4332,69 @@ class AgentLoopWorker:
                         "_teacher_segment_ids": list(teacher_segment_ids),
                     }
                 )
-            interventions.append(intervention_item)
-            if isinstance(outcome_metadata, dict):
-                outcome_metadata["repair_executed"] = True
-            if candidate_terminal:
-                _mark_local_effect_unavailable(intervention_item, "terminal_response")
-                break
-            pending_local_effect = (intervention_item, start + len(teacher_segment_ids))
+            if future_gap_confirmation:
+                if future_gap_proposal is None:
+                    raise RuntimeError("future_gap confirmation lost its proposal metadata before commit.")
+                pending_local_effect = (intervention_item, start + len(teacher_segment_ids))
+                pending_future_gap = _PendingFutureGapConfirmation(
+                    proposal=future_gap_proposal,
+                    intervention=intervention_item,
+                    after_intervention_start=start + len(teacher_segment_ids),
+                    baseline_values=future_gap_baseline_values,
+                    raw_response_ids=raw_response_ids,
+                    raw_response_mask=raw_response_mask,
+                    raw_response_logprobs=raw_response_logprobs,
+                    raw_gap_mask=raw_gap_mask,
+                    raw_teacher_segment_mask=raw_teacher_segment_mask,
+                    raw_teacher_result=raw_teacher_result,
+                )
+            else:
+                interventions.append(intervention_item)
+                if isinstance(outcome_metadata, dict):
+                    outcome_metadata["repair_executed"] = True
+                if candidate_terminal:
+                    _mark_local_effect_unavailable(intervention_item, "terminal_response")
+                    break
+                pending_local_effect = (intervention_item, start + len(teacher_segment_ids))
 
         if pending_local_effect is not None:
             pending_metadata, _ = pending_local_effect
             _mark_local_effect_unavailable(pending_metadata, "repaired_response_not_rescored")
+        if pending_future_gap is not None:
+            proposal = pending_future_gap.proposal
+            proposal.update(
+                {
+                    "future_gap_pair_available": False,
+                    "accepted": False,
+                    "status": "rejected",
+                    "rejection_stage": "future_gap_confirmation",
+                    "reason": "future_gap_repaired_response_not_rescored",
+                }
+            )
+            response_ids = pending_future_gap.raw_response_ids
+            response_mask = pending_future_gap.raw_response_mask
+            response_logprobs = pending_future_gap.raw_response_logprobs
+            gap_mask = pending_future_gap.raw_gap_mask
+            teacher_segment_mask = pending_future_gap.raw_teacher_segment_mask
+            cached_teacher_result = pending_future_gap.raw_teacher_result
+            pending_future_gap = None
+
+        if future_gap_confirmation:
+            for proposal in proposals:
+                if proposal.get("status") != "triggered":
+                    continue
+                reason = "future_gap_candidate_unavailable"
+                if skipped_interventions:
+                    reason = str(skipped_interventions[-1].get("reason") or reason)
+                proposal.update(
+                    {
+                        "future_gap_pair_available": False,
+                        "accepted": False,
+                        "status": "rejected",
+                        "rejection_stage": "candidate_construction",
+                        "reason": reason,
+                    }
+                )
 
         if isinstance(outcome_metadata, dict) and interventions:
             # The reward currently belongs to the untouched on-policy answer.
@@ -3909,6 +4422,8 @@ class AgentLoopWorker:
         output.extra_fields["teacher_interventions"] = interventions
         output.extra_fields["teacher_intervention_skipped"] = skipped_interventions
         output.extra_fields["teacher_intervention_gap_diagnostics"] = gap_diagnostics
+        if future_gap_confirmation:
+            output.extra_fields["teacher_intervention_proposals"] = proposals
         if cached_teacher_result is not None:
             _store_teacher_scoring_result(
                 output,

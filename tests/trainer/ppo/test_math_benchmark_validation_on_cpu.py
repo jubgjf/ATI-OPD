@@ -23,6 +23,7 @@ from verl import DataProto
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     _as_sample_values,
+    _build_future_gap_evaluation_summary,
     _cap_ranked_outcome_cases,
     _with_reward_data_source,
 )
@@ -60,6 +61,50 @@ def test_evaluation_case_cap_is_global_across_accumulated_batches_on_cpu():
     capped = _cap_ranked_outcome_cases(cases, case_limit=1)
 
     assert [index for index, case in enumerate(capped) if case is not None] == [1, 3]
+
+
+def test_future_gap_evaluation_summary_correlates_reduction_with_candidate_correctness_on_cpu():
+    reductions = [float(index) for index in range(12)]
+    candidate_correct = [index >= 6 for index in range(12)]
+    accepted = [index >= 6 for index in range(12)]
+    proposals = [
+        [
+            {
+                "candidate_outcome_available": True,
+                "candidate_correct": is_correct,
+                "accepted": is_accepted,
+                "future_gap_reduction": reduction,
+            }
+        ]
+        for reduction, is_correct, is_accepted in zip(reductions, candidate_correct, accepted, strict=True)
+    ]
+    outcomes = [
+        {"raw_correct": False, "final_correct": is_correct and is_accepted}
+        for is_correct, is_accepted in zip(candidate_correct, accepted, strict=True)
+    ]
+
+    metrics, records = _build_future_gap_evaluation_summary(
+        evaluation_scope="val-repair",
+        global_step=4,
+        data_sources=["math-a" if index < 6 else "math-b" for index in range(12)],
+        outcomes=outcomes,
+        proposals=proposals,
+    )
+
+    prefix = "val-repair-aux/future_gap/overall"
+    assert metrics[f"{prefix}/raw_accuracy"] == 0.0
+    assert metrics[f"{prefix}/always_candidate_accuracy"] == 0.5
+    assert metrics[f"{prefix}/gated_accuracy"] == 0.5
+    assert metrics[f"{prefix}/accepted/pre_wrong_post_correct_count"] == 6.0
+    assert metrics[f"{prefix}/rejected/pre_wrong_post_wrong_count"] == 6.0
+    assert metrics[f"{prefix}/reduction_correctness_pearson"] > 0.8
+    assert metrics[f"{prefix}/reduction_correctness_spearman"] > 0.8
+    overall = next(record for record in records if record["data_source"] is None)
+    assert overall["conditional_population"] == "coarse_triggered_proposals"
+    assert overall["correlation_available"] is True
+    assert overall["transition_counts_by_decision"]["accepted"]["pre_wrong_post_correct"] == 6
+    assert overall["transition_counts_by_decision"]["rejected"]["pre_wrong_post_wrong"] == 6
+    assert len(overall["reduction_quantile_bins"]) == 4
 
 
 def test_math_benchmark_metrics_use_test_core_and_mean_at_16_on_cpu():

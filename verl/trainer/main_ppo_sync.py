@@ -410,6 +410,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             extra_fields = field.get("extra_fields", {})
             field["teacher_intervention_count"] = extra_fields.get("teacher_intervention_count", 0)
             field["teacher_interventions"] = extra_fields.get("teacher_interventions", [])
+            if "teacher_intervention_proposals" in extra_fields:
+                field["teacher_intervention_proposals"] = extra_fields["teacher_intervention_proposals"]
             field["teacher_intervention_skipped"] = extra_fields.get("teacher_intervention_skipped", [])
             field["teacher_intervention_outcome"] = extra_fields.get("teacher_intervention_outcome")
             field["teacher_logprob_nonfinite_count"] = extra_fields.get("teacher_logprob_nonfinite_count", 0)
@@ -1650,6 +1652,9 @@ class PPOTrainer:
                         "teacher_intervention_outcome",
                     ]
                 )
+                intervention_config = getattr(self.distillation_config, "intervention", None)
+                if getattr(intervention_config, "confirmation_mode", "none") == "future_gap":
+                    fields.append("teacher_intervention_proposals")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
         num_turns = np.array(data.pop("num_turns").tolist())
         prompt_length = data["prompts"].offsets().diff()
@@ -1659,6 +1664,7 @@ class PPOTrainer:
         teacher_logprob_nonfinite_positions = None
         intervention_counts = []
         intervention_items = []
+        intervention_proposals = None
         intervention_skipped = []
         intervention_outcomes = []
         if diagnostics_enabled:
@@ -1676,6 +1682,8 @@ class PPOTrainer:
                     intervention_counts = self._non_tensor_to_list(data.pop("teacher_intervention_count"))
                 if "teacher_interventions" in data.keys():
                     intervention_items = self._non_tensor_to_list(data.pop("teacher_interventions"))
+                if "teacher_intervention_proposals" in data.keys():
+                    intervention_proposals = self._non_tensor_to_list(data.pop("teacher_intervention_proposals"))
                 if "teacher_intervention_skipped" in data.keys():
                     intervention_skipped = self._non_tensor_to_list(data.pop("teacher_intervention_skipped"))
                 if "teacher_intervention_outcome" in data.keys():
@@ -1766,6 +1774,7 @@ class PPOTrainer:
                     compute_intervention_metrics(
                         intervention_counts=intervention_counts,
                         interventions=intervention_items,
+                        intervention_proposals=intervention_proposals,
                         intervention_skipped=intervention_skipped,
                         intervention_outcomes=intervention_outcomes,
                         response_mask=diagnostics_batch["response_mask"],

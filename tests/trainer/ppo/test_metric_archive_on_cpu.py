@@ -240,6 +240,9 @@ def test_balanced_routing_keeps_only_compact_dmpd_boundary_allowlist_live_on_cpu
     live_keys = {
         "opd_intervention/rate",
         "opd_intervention/first_position_frac_mean",
+        "opd_intervention/future_gap/proposal_rate",
+        "opd_intervention/future_gap/acceptance_fraction_among_proposals",
+        "opd_intervention/future_gap/active_gap/reduction_mean_among_accepted",
         "opd_intervention/repair_boundary/entry/teacher_self_nll_first16_mean",
         "opd_intervention/repair_boundary/entry/student_nll_on_teacher_first16_mean",
         "opd_intervention/repair_boundary/exit/active_gap_after_first16_mean",
@@ -254,6 +257,10 @@ def test_balanced_routing_keeps_only_compact_dmpd_boundary_allowlist_live_on_cpu
         "opd_intervention/count_mean",
         "opd_intervention/local_effect_v2/active_gap/reduction_first8_mean",
         "opd_intervention/repair_boundary/unavailable_reason/student_topk_unavailable",
+        "opd_intervention/future_gap/active_gap/reduction_mean_among_rejected",
+        "opd_intervention/future_gap/rejected_reason/future_gap_after_threshold",
+        "opd_intervention/future_gap/gate_cpu_seconds_mean",
+        "opd_intervention/future_gap/archive_serialization_cpu_seconds_previous_event",
     }
     metrics = {key: float(index) for index, key in enumerate(sorted(live_keys | detailed_keys))}
 
