@@ -592,6 +592,31 @@ class _FakeRepairStudentClient:
         return TokenOutput(token_ids=[40, 41], log_probs=[-0.2, -0.2])
 
 
+class _SequencedRepairStudentClient(_FakeRepairStudentClient):
+    def __init__(self, outputs: list[TokenOutput]):
+        super().__init__()
+        self.outputs = outputs
+
+    async def generate(
+        self,
+        request_id: str,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    ) -> TokenOutput:
+        del image_data, video_data, audio_data, mm_processor_kwargs
+        self.calls.append(
+            {"request_id": request_id, "prompt_ids": list(prompt_ids), "sampling_params": sampling_params}
+        )
+        if len(self.calls) > len(self.outputs):
+            raise AssertionError("Student generation received more calls than the test configured.")
+        return self.outputs[len(self.calls) - 1]
+
+
 class _NonfiniteRepairStudentClient(_FakeRepairStudentClient):
     async def generate(
         self,
@@ -3616,6 +3641,17 @@ async def test_future_gap_accepts_improved_candidate_for_supported_trigger_metri
         train_on_teacher_segments=True,
         teacher_segment_loss_mode="opd",
     )
+    worker.llm_client = _SequencedRepairStudentClient(
+        [
+            TokenOutput(token_ids=[40, 41], log_probs=[-0.2, -0.2], extra_fields={"finish_reason": "length"}),
+            TokenOutput(
+                token_ids=[42, 43],
+                log_probs=[-0.3, -0.3],
+                stop_reason="completed",
+                extra_fields={"finish_reason": "stop"},
+            ),
+        ]
+    )
     output = _future_gap_output(f"future-gap-accept-{gap_metric}")
 
     await AgentLoopWorker._maybe_repair_with_teacher(
@@ -3626,8 +3662,8 @@ async def test_future_gap_accepts_improved_candidate_for_supported_trigger_metri
         sample_kwargs={"data_source": "openai/gsm8k", "global_steps": 3, "uid": "sample"},
     )
 
-    assert output.response_ids == [30, 31, 40, 41]
-    assert output.response_mask == [1, 1, 1, 1]
+    assert output.response_ids == [30, 31, 40, 41, 42, 43]
+    assert output.response_mask == [1, 1, 1, 1, 1, 1]
     assert output.extra_fields["teacher_intervention_count"] == 1
     proposal = output.extra_fields["teacher_intervention_proposals"][0]
     assert proposal["accepted"] is True
@@ -3635,18 +3671,27 @@ async def test_future_gap_accepts_improved_candidate_for_supported_trigger_metri
     assert proposal["future_gap_effective_tokens"] == 2
     assert proposal["future_gap_after"] < proposal["future_gap_max_threshold"]
     assert proposal["future_gap_reduction"] > 0
+    assert proposal["schema_version"] == 2
+    assert proposal["future_gap_rollout_mode"] == "short_horizon_counterfactual"
+    assert proposal["future_gap_confirmation_generated_tokens"] == 2
+    assert proposal["future_gap_continuation_generated_tokens"] == 2
+    assert proposal["future_gap_final_candidate_complete"] is True
     assert len(teacher_manager.scored_sequences) == 2
     assert len(teacher_manager.generated_prefixes) == 1
-    assert len(worker.llm_client.calls) == 1
+    assert len(worker.llm_client.calls) == 2
+    assert worker.llm_client.calls[0]["prompt_ids"] == [101, 102, 30, 31]
+    assert worker.llm_client.calls[0]["sampling_params"]["max_tokens"] == 2
+    assert worker.llm_client.calls[1]["prompt_ids"] == [101, 102, 30, 31, 40, 41]
+    assert worker.llm_client.calls[1]["sampling_params"]["max_tokens"] == 2
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("train_on_teacher_segments", "teacher_segment_loss_mode", "expected_response_mask", "expected_teacher_mask"),
     [
-        (False, "opd", [0, 0, 1, 1], None),
-        (True, "opd", [1, 1, 1, 1], None),
-        (True, "sft", [0, 0, 1, 1], [1, 1, 0, 0]),
+        (False, "opd", [0, 0, 1, 1, 1, 1], None),
+        (True, "opd", [1, 1, 1, 1, 1, 1], None),
+        (True, "sft", [0, 0, 1, 1, 1, 1], [1, 1, 0, 0, 0, 0]),
     ],
 )
 async def test_future_gap_acceptance_preserves_teacher_segment_training_mode_on_cpu(
@@ -3727,7 +3772,7 @@ async def test_future_gap_rejection_restores_exact_raw_state_and_teacher_score_o
 
 
 @pytest.mark.asyncio
-async def test_future_gap_rejects_terminal_candidate_without_extra_scoring_on_cpu():
+async def test_future_gap_rejects_teacher_terminal_candidate_without_comparable_suffix_on_cpu():
     teacher_manager = _FixedGapTeacherManager(
         TeacherGenerationResult(token_ids=[30], stop_reason="completed", finish_reason="stop"),
         high_gap_start=0,
@@ -3755,9 +3800,55 @@ async def test_future_gap_rejects_terminal_candidate_without_extra_scoring_on_cp
 
     assert output.response_ids == [1, 2, 3, 4, 5, 6]
     assert output.extra_fields["teacher_intervention_count"] == 0
-    assert output.extra_fields["teacher_intervention_proposals"][0]["reason"] == "future_gap_terminal_response"
-    assert len(teacher_manager.scored_sequences) == 1
+    proposal = output.extra_fields["teacher_intervention_proposals"][0]
+    assert proposal["reason"] == "future_gap_insufficient_valid_tokens"
+    assert proposal["future_gap_confirmation_terminal"] is True
+    assert proposal["future_gap_confirmation_requested_tokens"] == 0
+    assert proposal["future_gap_effective_tokens"] == 0
+    assert len(teacher_manager.scored_sequences) == 2
     assert worker.llm_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_future_gap_scores_and_accepts_early_terminal_student_suffix_on_cpu():
+    teacher_manager = _FutureGapTeacherManager(improved=True)
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=8,
+        gap_metric="k3",
+        gap_threshold=0.15,
+        confirmation_mode="future_gap",
+        future_gap_window_tokens=4,
+        future_gap_min_valid_tokens=2,
+    )
+    worker.llm_client = _SequencedRepairStudentClient(
+        [
+            TokenOutput(
+                token_ids=[40, 41],
+                log_probs=[-0.2, -0.2],
+                stop_reason="completed",
+                extra_fields={"finish_reason": "stop"},
+            )
+        ]
+    )
+    output = _future_gap_output("future-gap-early-terminal")
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    proposal = output.extra_fields["teacher_intervention_proposals"][0]
+    assert proposal["accepted"] is True
+    assert proposal["future_gap_confirmation_terminal"] is True
+    assert proposal["future_gap_effective_tokens"] == 2
+    assert proposal["future_gap_continuation_requested_tokens"] == 0
+    assert output.response_ids == [30, 31, 40, 41]
+    assert len(teacher_manager.scored_sequences) == 2
+    assert len(worker.llm_client.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -3790,7 +3881,7 @@ async def test_future_gap_rejects_candidate_with_too_few_matched_tokens_on_cpu()
 
 
 @pytest.mark.asyncio
-async def test_future_gap_does_not_add_generation_or_scoring_calls_vs_single_hard_repair_on_cpu():
+async def test_future_gap_adds_continuation_only_after_short_horizon_gate_accepts_on_cpu():
     call_counts = {}
     for confirmation_mode in ("none", "future_gap"):
         teacher_manager = _FutureGapTeacherManager(improved=True)
@@ -3817,7 +3908,7 @@ async def test_future_gap_does_not_add_generation_or_scoring_calls_vs_single_har
             len(worker.llm_client.calls),
         )
 
-    assert call_counts == {"none": (2, 1, 1), "future_gap": (2, 1, 1)}
+    assert call_counts == {"none": (2, 1, 1), "future_gap": (2, 1, 2)}
 
 
 @pytest.mark.asyncio
@@ -3852,8 +3943,9 @@ async def test_future_gap_runs_after_existing_outcome_aware_candidate_selection_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("confirmation_mode", ["none", "future_gap"])
 async def test_future_gap_does_not_add_training_reward_calls_on_cpu(confirmation_mode):
+    teacher_manager = _FutureGapTeacherManager(improved=True)
     worker = _DirectInterventionWorker(
-        teacher_manager=_FutureGapTeacherManager(improved=True),
+        teacher_manager=teacher_manager,
         response_length=6,
         gap_metric="k3",
         gap_threshold=0.15,
@@ -3864,7 +3956,7 @@ async def test_future_gap_does_not_add_training_reward_calls_on_cpu(confirmation
     reward_handle = _SequenceAwareRewardHandle()
     worker.reward_loop_worker_handles = [reward_handle]
 
-    await AgentLoopWorker._agent_loop_postprocess(
+    internal = await AgentLoopWorker._agent_loop_postprocess(
         worker,
         _future_gap_output(f"future-gap-reward-count-{confirmation_mode}"),
         validate=False,
@@ -3873,7 +3965,10 @@ async def test_future_gap_does_not_add_training_reward_calls_on_cpu(confirmation
         data_source="openai/gsm8k",
     )
 
-    assert reward_handle.compute_score.responses == [[30, 31, 40, 41]]
+    expected_response = [30, 31, 40, 41, 40, 41] if confirmation_mode == "future_gap" else [30, 31, 40, 41]
+    assert reward_handle.compute_score.responses == [expected_response]
+    assert len(teacher_manager.scored_sequences) == (3 if confirmation_mode == "future_gap" else 2)
+    assert internal.teacher_logprobs is not None
 
 
 @pytest.mark.asyncio
@@ -3951,15 +4046,16 @@ async def test_skip_correct_allows_incorrect_on_policy_answer_to_continue_throug
         sample_kwargs={"data_source": "openai/gsm8k"},
     )
 
-    assert output.response_ids == [30, 31, 40, 41]
+    expected_response = [30, 31, 40, 41, 40, 41] if confirmation_mode == "future_gap" else [30, 31, 40, 41]
+    assert output.response_ids == expected_response
     assert output.extra_fields["teacher_intervention_count"] == 1
     assert len(teacher_manager.scored_sequences) == 2
+    assert len(worker.llm_client.calls) == (2 if confirmation_mode == "future_gap" else 1)
     assert len(teacher_manager.generated_prefixes) == 1
-    assert len(worker.llm_client.calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_future_gap_rejected_candidate_gets_evaluation_only_outcome_pair_on_cpu():
+async def test_future_gap_rejected_candidate_is_completed_only_for_evaluation_outcome_on_cpu():
     teacher_manager = _FutureGapTeacherManager(improved=False)
     worker = _DirectInterventionWorker(
         teacher_manager=teacher_manager,
@@ -3988,7 +4084,10 @@ async def test_future_gap_rejected_candidate_gets_evaluation_only_outcome_pair_o
         global_steps=5,
     )
 
-    assert reward_handle.compute_score.responses == [[1, 2, 3, 4, 5, 6], [30, 31, 40, 41]]
+    assert reward_handle.compute_score.responses == [
+        [1, 2, 3, 4, 5, 6],
+        [30, 31, 40, 41, 40, 41],
+    ]
     assert internal.response_ids[0, :6].tolist() == [1, 2, 3, 4, 5, 6]
     proposal = internal.extra_fields["teacher_intervention_proposals"][0]
     assert proposal["accepted"] is False
@@ -3998,4 +4097,7 @@ async def test_future_gap_rejected_candidate_gets_evaluation_only_outcome_pair_o
     assert proposal["candidate_transition"] == "pre_wrong_post_correct"
     assert proposal["outcome_scope"] == "evaluation_candidate_pair"
     assert proposal["candidate_response"]
+    assert proposal["future_gap_rejected_eval_continuation_requested_tokens"] == 2
+    assert proposal["future_gap_rejected_eval_continuation_generated_tokens"] == 2
+    assert len(worker.llm_client.calls) == 2
     assert not any(str(key).startswith("_candidate") for key in proposal)

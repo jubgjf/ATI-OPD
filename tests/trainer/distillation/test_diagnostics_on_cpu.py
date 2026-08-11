@@ -956,6 +956,10 @@ def test_compute_intervention_metrics_aggregates_future_gap_proposals_on_cpu():
                 "future_gap_after": 0.1,
                 "future_gap_reduction": 0.4,
                 "future_gap_gate_cpu_seconds": 0.002,
+                "future_gap_confirmation_generated_tokens": 64,
+                "future_gap_continuation_generated_tokens": 128,
+                "future_gap_confirmation_terminal": False,
+                "future_gap_final_candidate_complete": True,
                 "candidate_response": "private text",
                 "_candidate_response_ids": [1, 2],
             }
@@ -969,6 +973,10 @@ def test_compute_intervention_metrics_aggregates_future_gap_proposals_on_cpu():
                 "future_gap_after": 0.6,
                 "future_gap_reduction": -0.2,
                 "future_gap_gate_cpu_seconds": 0.004,
+                "future_gap_confirmation_generated_tokens": 24,
+                "future_gap_continuation_generated_tokens": 0,
+                "future_gap_confirmation_terminal": True,
+                "future_gap_final_candidate_complete": True,
             }
         ],
     ]
@@ -985,6 +993,10 @@ def test_compute_intervention_metrics_aggregates_future_gap_proposals_on_cpu():
     assert metrics["opd_intervention/future_gap/measurable_fraction_among_proposals"] == 1.0
     assert metrics["opd_intervention/future_gap/active_gap/reduction_mean_among_accepted"] == pytest.approx(0.4)
     assert metrics["opd_intervention/future_gap/rejected_reason/future_gap_after_threshold"] == 1.0
+    assert metrics["opd_intervention/future_gap/confirmation_tokens_mean"] == 44.0
+    assert metrics["opd_intervention/future_gap/continuation_tokens_mean_among_accepted"] == 128.0
+    assert metrics["opd_intervention/future_gap/confirmation_terminal_fraction"] == 0.5
+    assert metrics["opd_intervention/future_gap/final_candidate_complete_fraction_among_accepted"] == 1.0
 
     records = build_future_gap_proposal_records(proposals)
     assert len(records) == 2

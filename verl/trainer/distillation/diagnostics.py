@@ -3074,6 +3074,24 @@ def compute_intervention_metrics(
         gate_times = finite_values(proposal_items, "future_gap_gate_cpu_seconds")
         if gate_times:
             metrics["opd_intervention/future_gap/gate_cpu_seconds_mean"] = float(np.mean(gate_times))
+        confirmation_tokens = finite_values(proposal_items, "future_gap_confirmation_generated_tokens")
+        if confirmation_tokens:
+            metrics["opd_intervention/future_gap/confirmation_tokens_mean"] = float(np.mean(confirmation_tokens))
+        continuation_tokens = finite_values(accepted_items, "future_gap_continuation_generated_tokens")
+        if continuation_tokens:
+            metrics["opd_intervention/future_gap/continuation_tokens_mean_among_accepted"] = float(
+                np.mean(continuation_tokens)
+            )
+        terminal_items = [item for item in proposal_items if "future_gap_confirmation_terminal" in item]
+        if terminal_items:
+            metrics["opd_intervention/future_gap/confirmation_terminal_fraction"] = sum(
+                bool(item["future_gap_confirmation_terminal"]) for item in terminal_items
+            ) / len(terminal_items)
+        complete_accepted_items = [item for item in accepted_items if "future_gap_final_candidate_complete" in item]
+        if complete_accepted_items:
+            metrics["opd_intervention/future_gap/final_candidate_complete_fraction_among_accepted"] = sum(
+                bool(item["future_gap_final_candidate_complete"]) for item in complete_accepted_items
+            ) / len(complete_accepted_items)
     teacher_tokens = 0
     suffix_tokens = 0
     first_positions = []

@@ -112,9 +112,11 @@ intervention:
   teacher_rejection_persistence_threshold: null
   teacher_rejection_persistence_min_valid_tokens: 32
   max_interventions_per_sample: 4
-  # Optional post-candidate confirmation. future_gap commits a repair only
-  # when its matched student suffix has both a safe absolute gap and a strict
-  # reduction relative to the original on-policy suffix.
+  # Optional short-horizon counterfactual confirmation. future_gap first
+  # generates only future_gap_window_tokens after the teacher segment, then
+  # commits and continues from the exact token-ID prefix only when that suffix
+  # has both a safe absolute gap and a strict reduction relative to the
+  # original on-policy suffix.
   # Independent pre-trigger gate: a correct raw on-policy answer bypasses all
   # intervention scoring and generation.
   skip_correct: false

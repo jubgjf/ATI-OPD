@@ -115,7 +115,7 @@ class _InterventionScoreResult:
 
 @dataclass
 class _PendingFutureGapConfirmation:
-    """One fully generated repair awaiting its already-scheduled suffix score."""
+    """One short-horizon repair candidate awaiting its already-scheduled score."""
 
     proposal: dict[str, Any]
     intervention: dict[str, Any]
@@ -127,6 +127,7 @@ class _PendingFutureGapConfirmation:
     raw_gap_mask: list[int]
     raw_teacher_segment_mask: Optional[list[int]]
     raw_teacher_result: TeacherLogprobScoringResult
+    confirmation_suffix_result: _StudentSuffixGenerationResult
 
 
 @dataclass
@@ -148,6 +149,48 @@ class _TeacherRepairCandidate:
     student_rank: Optional[int] = None
     rank_sum: Optional[int] = None
     invalid_reason: Optional[str] = None
+
+
+def _merge_student_suffix_results(
+    confirmation: _StudentSuffixGenerationResult,
+    continuation: _StudentSuffixGenerationResult,
+) -> _StudentSuffixGenerationResult:
+    """Combine two token-ID continuation calls into one logical student suffix."""
+    confirmation_length = len(confirmation.token_ids)
+    return _StudentSuffixGenerationResult(
+        token_ids=confirmation.token_ids + continuation.token_ids,
+        logprobs=confirmation.logprobs + continuation.logprobs,
+        stop_reason=continuation.stop_reason,
+        finish_reason=continuation.finish_reason,
+        terminal=continuation.terminal,
+        eos_truncated=continuation.eos_truncated,
+        nonfinite_logprob_offsets=(
+            confirmation.nonfinite_logprob_offsets
+            + tuple(confirmation_length + offset for offset in continuation.nonfinite_logprob_offsets)
+        ),
+        nonfinite_logprob_replacement=(
+            confirmation.nonfinite_logprob_replacement
+            if confirmation.nonfinite_logprob_replacement is not None
+            else continuation.nonfinite_logprob_replacement
+        ),
+    )
+
+
+def _student_suffix_logprob_metadata(
+    result: _StudentSuffixGenerationResult,
+    *,
+    response_start: int,
+) -> dict[str, Any]:
+    """Build response-relative diagnostics for sanitized student suffix logprobs."""
+    if not result.nonfinite_logprob_offsets:
+        return {}
+    response_positions = [response_start + offset for offset in result.nonfinite_logprob_offsets]
+    return {
+        "student_suffix_logprob_nonfinite_count": len(response_positions),
+        "student_suffix_logprob_nonfinite_offsets": list(result.nonfinite_logprob_offsets),
+        "student_suffix_logprob_nonfinite_response_positions": response_positions,
+        "student_suffix_logprob_nonfinite_replacement": result.nonfinite_logprob_replacement,
+    }
 
 
 @dataclass
@@ -3775,33 +3818,198 @@ class AgentLoopWorker:
                 }
                 gap_diagnostics.append(gap_diagnostic)
             if pending_future_gap is not None:
+                pending = pending_future_gap
                 repaired_values, repaired_invalid_counts = _collect_future_gap_values(
                     scores=score_result.active_scores,
                     response_mask=gap_mask,
-                    start=pending_future_gap.after_intervention_start,
+                    start=pending.after_intervention_start,
                     window_tokens=intervention_config.future_gap_window_tokens,
                     teacher_nonfinite_positions=teacher_nonfinite_positions,
                 )
-                proposal = pending_future_gap.proposal
+                proposal = pending.proposal
                 proposal["future_gap_repaired_available_tokens"] = len(repaired_values)
                 proposal["future_gap_repaired_invalid_counts"] = repaired_invalid_counts
                 accepted = _evaluate_future_gap_confirmation(
                     proposal=proposal,
-                    baseline_values=pending_future_gap.baseline_values,
+                    baseline_values=pending.baseline_values,
                     repaired_values=repaired_values,
                     intervention_config=intervention_config,
                 )
+                proposal["future_gap_confirmation_accepted"] = accepted
                 if accepted:
-                    interventions.append(pending_future_gap.intervention)
+                    confirmation_terminal = bool(proposal.get("future_gap_confirmation_terminal", False))
+                    continuation_budget = 0
+                    combined_suffix_result = pending.confirmation_suffix_result
+                    if not confirmation_terminal:
+                        continuation_budget = max(self.rollout_config.response_length - len(response_ids), 0)
+                    proposal["future_gap_continuation_requested_tokens"] = continuation_budget
+                    if continuation_budget > 0:
+                        continuation_result = await self._generate_student_suffix(
+                            request_id=(
+                                f"{base_request_id}:future-gap-continue:{int(proposal.get('attempt', attempt - 1))}"
+                            ),
+                            prefix_ids=prompt_ids + response_ids,
+                            max_tokens=continuation_budget,
+                            sampling_params=sampling_params,
+                            output=output,
+                        )
+                        continuation_gap_mask = [1] * len(continuation_result.token_ids)
+                        for suffix_offset in continuation_result.nonfinite_logprob_offsets:
+                            continuation_gap_mask[suffix_offset] = 0
+                        response_ids += continuation_result.token_ids
+                        response_mask += [1] * len(continuation_result.token_ids)
+                        response_logprobs += continuation_result.logprobs
+                        gap_mask += continuation_gap_mask
+                        if teacher_segment_mask is not None:
+                            teacher_segment_mask += [0] * len(continuation_result.token_ids)
+                        combined_suffix_result = _merge_student_suffix_results(
+                            pending.confirmation_suffix_result,
+                            continuation_result,
+                        )
+                        cached_teacher_result = None
+                        _validate_intervention_state(
+                            context="after accepted future-gap continuation",
+                            response_ids=response_ids,
+                            response_mask=response_mask,
+                            response_logprobs=response_logprobs,
+                            gap_mask=gap_mask,
+                            response_length_limit=self.rollout_config.response_length,
+                            teacher_segment_mask=teacher_segment_mask,
+                        )
+                        final_thinking_state = AgentLoopWorker._teacher_intervention_thinking_state(
+                            self,
+                            response_ids,
+                            prompt_ids=prompt_ids,
+                        )
+                        final_terminal = continuation_result.terminal
+                        proposal.update(
+                            {
+                                "future_gap_continuation_generated_tokens": len(continuation_result.token_ids),
+                                "future_gap_final_candidate_complete": (
+                                    final_terminal or len(response_ids) >= self.rollout_config.response_length
+                                ),
+                                "thinking_state_valid": final_thinking_state.valid,
+                                "thinking_state_open": final_thinking_state.open,
+                                "thinking_state_reason": final_thinking_state.reason,
+                            }
+                        )
+                        if not final_thinking_state.valid:
+                            accepted = False
+                            proposal.update(
+                                {
+                                    "accepted": False,
+                                    "status": "rejected",
+                                    "rejection_stage": "post_confirmation_continuation",
+                                    "reason": "invalid_thinking_block",
+                                }
+                            )
+                        elif (
+                            final_terminal
+                            and final_thinking_state.open
+                            and getattr(intervention_config, "require_closed_thinking_on_terminal", True)
+                        ):
+                            accepted = False
+                            proposal.update(
+                                {
+                                    "accepted": False,
+                                    "status": "rejected",
+                                    "rejection_stage": "post_confirmation_continuation",
+                                    "reason": "terminal_open_thinking_block",
+                                }
+                            )
+                    else:
+                        final_terminal = confirmation_terminal
+                        proposal["future_gap_final_candidate_complete"] = (
+                            final_terminal or len(response_ids) >= self.rollout_config.response_length
+                        )
+
+                    combined_logprob_metadata = _student_suffix_logprob_metadata(
+                        combined_suffix_result,
+                        response_start=pending.after_intervention_start,
+                    )
+                    final_candidate_metadata = {
+                        "student_suffix_tokens": len(combined_suffix_result.token_ids),
+                        "student_suffix_sha256": _token_ids_sha256(combined_suffix_result.token_ids),
+                        "student_suffix_stop_reason": combined_suffix_result.stop_reason,
+                        "student_suffix_finish_reason": combined_suffix_result.finish_reason,
+                        "candidate_response_tokens": len(response_ids),
+                        "candidate_response_sha256": _token_ids_sha256(response_ids),
+                        "candidate_terminal": final_terminal,
+                        **combined_logprob_metadata,
+                    }
+                    proposal.update(final_candidate_metadata)
+                    pending.intervention.update(
+                        {
+                            "student_suffix_tokens": len(combined_suffix_result.token_ids),
+                            "student_suffix_stop_reason": combined_suffix_result.stop_reason,
+                            "student_suffix_finish_reason": combined_suffix_result.finish_reason,
+                            "terminated": final_terminal,
+                            **combined_logprob_metadata,
+                        }
+                    )
+                    candidate_trainable_tokens = sum(response_mask)
+                    if teacher_segment_mask is not None:
+                        candidate_trainable_tokens += sum(teacher_segment_mask)
+                    if accepted and candidate_trainable_tokens < min_trainable_tokens:
+                        accepted = False
+                        proposal.update(
+                            {
+                                "accepted": False,
+                                "status": "rejected",
+                                "rejection_stage": "post_confirmation_candidate_validation",
+                                "reason": "insufficient_trainable_tokens",
+                            }
+                        )
+
+                if accepted:
+                    interventions.append(pending.intervention)
                     if isinstance(outcome_metadata, dict):
                         outcome_metadata["repair_executed"] = True
                     proposal["intervention_index"] = len(interventions) - 1
                 else:
                     if validate and repair_for_evaluation and retain_rejected_candidate_for_outcome:
-                        # These references are consumed and removed before the
-                        # worker output is padded or transferred to the trainer.
-                        proposal["_candidate_response_ids"] = response_ids
-                        proposal["_candidate_response_mask"] = response_mask
+                        outcome_candidate_ids = response_ids
+                        outcome_candidate_mask = response_mask
+                        outcome_candidate_complete = bool(proposal.get("future_gap_final_candidate_complete", False))
+                        diagnostic_continuation_budget = 0
+                        if not outcome_candidate_complete:
+                            diagnostic_continuation_budget = max(
+                                self.rollout_config.response_length - len(response_ids),
+                                0,
+                            )
+                        proposal["future_gap_rejected_eval_continuation_requested_tokens"] = (
+                            diagnostic_continuation_budget
+                        )
+                        if diagnostic_continuation_budget > 0:
+                            diagnostic_continuation = await self._generate_student_suffix(
+                                request_id=(
+                                    f"{base_request_id}:future-gap-rejected-eval-continue:"
+                                    f"{int(proposal.get('attempt', attempt - 1))}"
+                                ),
+                                prefix_ids=prompt_ids + response_ids,
+                                max_tokens=diagnostic_continuation_budget,
+                                sampling_params=sampling_params,
+                                output=output,
+                            )
+                            outcome_candidate_ids = response_ids + diagnostic_continuation.token_ids
+                            outcome_candidate_mask = response_mask + [1] * len(diagnostic_continuation.token_ids)
+                            outcome_candidate_complete = (
+                                diagnostic_continuation.terminal
+                                or len(outcome_candidate_ids) >= self.rollout_config.response_length
+                            )
+                            proposal["future_gap_rejected_eval_continuation_generated_tokens"] = len(
+                                diagnostic_continuation.token_ids
+                            )
+                        if outcome_candidate_complete:
+                            # These references are consumed and removed before
+                            # the worker output is padded or transferred.
+                            proposal["_candidate_response_ids"] = outcome_candidate_ids
+                            proposal["_candidate_response_mask"] = outcome_candidate_mask
+                        else:
+                            proposal["candidate_outcome_available"] = False
+                            proposal["candidate_outcome_unavailable_reason"] = (
+                                "short_horizon_counterfactual_not_completed"
+                            )
                     _record_skipped_intervention(
                         skipped_interventions,
                         reason=str(proposal.get("reason") or "future_gap_rejected"),
@@ -3813,12 +4021,12 @@ class AgentLoopWorker:
                         teacher_tokens=int(proposal.get("teacher_tokens", 0)),
                         student_suffix_tokens=int(proposal.get("student_suffix_tokens", 0)),
                     )
-                    response_ids = pending_future_gap.raw_response_ids
-                    response_mask = pending_future_gap.raw_response_mask
-                    response_logprobs = pending_future_gap.raw_response_logprobs
-                    gap_mask = pending_future_gap.raw_gap_mask
-                    teacher_segment_mask = pending_future_gap.raw_teacher_segment_mask
-                    cached_teacher_result = pending_future_gap.raw_teacher_result
+                    response_ids = pending.raw_response_ids
+                    response_mask = pending.raw_response_mask
+                    response_logprobs = pending.raw_response_logprobs
+                    gap_mask = pending.raw_gap_mask
+                    teacher_segment_mask = pending.raw_teacher_segment_mask
+                    cached_teacher_result = pending.raw_teacher_result
                     if isinstance(outcome_metadata, dict):
                         outcome_metadata["repair_executed"] = False
                         outcome_metadata["future_gap_rejected"] = True
@@ -3870,7 +4078,7 @@ class AgentLoopWorker:
                     teacher_nonfinite_positions=teacher_nonfinite_positions,
                 )
                 future_gap_proposal = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "confirmation_mode": "future_gap",
                     "global_step": _metadata_scalar((sample_kwargs or {}).get("global_steps")),
                     "uid": _metadata_scalar((sample_kwargs or {}).get("uid")),
@@ -4094,12 +4302,27 @@ class AgentLoopWorker:
             # and train_on_teacher_segments=True drops rollout logprobs so the actor recomputes them.
             teacher_segment_logprobs = [0.0] * len(teacher_segment_ids)
             remaining_tokens = self.rollout_config.response_length - len(prefix_response_ids) - len(teacher_segment_ids)
+            student_suffix_max_tokens = remaining_tokens
+            if future_gap_confirmation:
+                # Generate only the counterfactual horizon needed by the gate. A
+                # candidate that passes is continued from these exact token IDs
+                # after the teacher has scored the short suffix.
+                student_suffix_max_tokens = min(
+                    remaining_tokens,
+                    intervention_config.future_gap_window_tokens,
+                )
             student_suffix_result = _StudentSuffixGenerationResult(token_ids=[], logprobs=[])
+            student_suffix_requested_tokens = 0
             if not teacher_terminal:
+                student_suffix_requested_tokens = student_suffix_max_tokens
                 student_suffix_result = await self._generate_student_suffix(
-                    request_id=base_request_id,
+                    request_id=(
+                        f"{base_request_id}:future-gap-confirm:{attempt}"
+                        if future_gap_confirmation
+                        else base_request_id
+                    ),
                     prefix_ids=prompt_ids + prefix_response_ids + teacher_segment_ids,
-                    max_tokens=remaining_tokens,
+                    max_tokens=student_suffix_max_tokens,
                     sampling_params=sampling_params,
                     output=output,
                 )
@@ -4114,22 +4337,10 @@ class AgentLoopWorker:
             for suffix_offset in student_suffix_result.nonfinite_logprob_offsets:
                 suffix_gap_mask[suffix_offset] = 0
             candidate_gap_mask = prefix_gap_mask + [0] * len(teacher_segment_ids) + suffix_gap_mask
-            student_suffix_nonfinite_response_positions = [
-                len(prefix_response_ids) + len(teacher_segment_ids) + suffix_offset
-                for suffix_offset in student_suffix_result.nonfinite_logprob_offsets
-            ]
-            student_suffix_logprob_metadata = {}
-            if student_suffix_nonfinite_response_positions:
-                student_suffix_logprob_metadata = {
-                    "student_suffix_logprob_nonfinite_count": len(student_suffix_nonfinite_response_positions),
-                    "student_suffix_logprob_nonfinite_offsets": list(student_suffix_result.nonfinite_logprob_offsets),
-                    "student_suffix_logprob_nonfinite_response_positions": (
-                        student_suffix_nonfinite_response_positions
-                    ),
-                    "student_suffix_logprob_nonfinite_replacement": (
-                        student_suffix_result.nonfinite_logprob_replacement
-                    ),
-                }
+            student_suffix_logprob_metadata = _student_suffix_logprob_metadata(
+                student_suffix_result,
+                response_start=len(prefix_response_ids) + len(teacher_segment_ids),
+            )
             candidate_teacher_segment_mask = None
             if prefix_teacher_segment_mask is not None:
                 candidate_teacher_segment_mask = (
@@ -4178,6 +4389,20 @@ class AgentLoopWorker:
             if future_gap_proposal is not None:
                 future_gap_proposal.update(
                     {
+                        "future_gap_rollout_mode": "short_horizon_counterfactual",
+                        "future_gap_confirmation_requested_tokens": int(student_suffix_requested_tokens),
+                        "future_gap_confirmation_generated_tokens": len(student_suffix_result.token_ids),
+                        "future_gap_confirmation_terminal": candidate_terminal,
+                        "future_gap_confirmation_candidate_tokens": len(candidate_response_ids),
+                        "future_gap_confirmation_candidate_sha256": _token_ids_sha256(candidate_response_ids),
+                        "future_gap_confirmation_thinking_state_valid": thinking_state.valid,
+                        "future_gap_confirmation_thinking_state_open": thinking_state.open,
+                        "future_gap_confirmation_thinking_state_reason": thinking_state.reason,
+                        "future_gap_continuation_requested_tokens": 0,
+                        "future_gap_continuation_generated_tokens": 0,
+                        "future_gap_final_candidate_complete": (
+                            candidate_terminal or len(candidate_response_ids) >= self.rollout_config.response_length
+                        ),
                         "student_suffix_tokens": len(student_suffix_result.token_ids),
                         "student_suffix_sha256": _token_ids_sha256(student_suffix_result.token_ids),
                         "candidate_response_tokens": len(candidate_response_ids),
@@ -4209,41 +4434,10 @@ class AgentLoopWorker:
                 )
                 skipped_interventions[-1].update(student_suffix_logprob_metadata)
                 break
-            if future_gap_confirmation and candidate_terminal:
-                if future_gap_proposal is None:
-                    raise RuntimeError("future_gap terminal candidate lost its proposal metadata.")
-                future_gap_proposal.update(
-                    {
-                        "future_gap_pair_available": False,
-                        "future_gap_effective_tokens": 0,
-                        "accepted": False,
-                        "status": "rejected",
-                        "rejection_stage": "candidate_terminal",
-                        "reason": "future_gap_terminal_response",
-                    }
-                )
-                if validate and repair_for_evaluation and retain_rejected_candidate_for_outcome:
-                    future_gap_proposal["_candidate_response_ids"] = candidate_response_ids
-                    future_gap_proposal["_candidate_response_mask"] = candidate_response_mask
-                _record_skipped_intervention(
-                    skipped_interventions,
-                    reason="future_gap_terminal_response",
-                    attempt=attempt,
-                    start=start,
-                    end=end,
-                    candidate_response_ids=candidate_response_ids,
-                    candidate_response_mask=candidate_response_mask,
-                    teacher_tokens=len(teacher_segment_ids),
-                    student_suffix_tokens=len(student_suffix_result.token_ids),
-                )
-                if isinstance(outcome_metadata, dict):
-                    outcome_metadata["repair_executed"] = False
-                    outcome_metadata["future_gap_rejected"] = True
-                break
             candidate_trainable_tokens = sum(candidate_response_mask)
             if candidate_teacher_segment_mask is not None:
                 candidate_trainable_tokens += sum(candidate_teacher_segment_mask)
-            if candidate_trainable_tokens < min_trainable_tokens:
+            if not future_gap_confirmation and candidate_trainable_tokens < min_trainable_tokens:
                 _record_skipped_intervention(
                     skipped_interventions,
                     reason="insufficient_trainable_tokens",
@@ -4347,6 +4541,7 @@ class AgentLoopWorker:
                     raw_gap_mask=raw_gap_mask,
                     raw_teacher_segment_mask=raw_teacher_segment_mask,
                     raw_teacher_result=raw_teacher_result,
+                    confirmation_suffix_result=student_suffix_result,
                 )
             else:
                 interventions.append(intervention_item)

@@ -221,8 +221,10 @@ class DistillationInterventionConfig(BaseConfig):
     teacher_rejection_persistence_threshold: Optional[float] = None
     teacher_rejection_persistence_min_valid_tokens: int = 32
     max_interventions_per_sample: int = 4
-    # Optional second-stage confirmation after a complete repair candidate has
-    # already been generated and scored. ``none`` preserves the legacy path.
+    # Optional second-stage confirmation. ``future_gap`` first generates and
+    # scores only ``future_gap_window_tokens`` after the teacher segment; a
+    # passing candidate is then continued from that exact token-ID prefix.
+    # ``none`` preserves the legacy full-suffix path.
     skip_correct: bool = False
     confirmation_mode: str = "none"
     future_gap_window_tokens: int = 64
