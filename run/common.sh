@@ -166,40 +166,26 @@ run_npu_opd_job() {
     HOME=/home/ma-user
     DATASET_DIR=/opt/huawei/dataset/jnguan
     WORKSPACE=$DATASET_DIR/code/DMPD
-    NETRC_PATH=$DATASET_DIR/apps/configs/dotnetrc
 
     _load_external_train_config || exit 1
 
     npu-smi info
-    echo ============================
 
     . /usr/local/Ascend/ascend-toolkit/set_env.sh
     . /usr/local/Ascend/nnal/atb/set_env.sh
-    sudo chown -R ma-user:ma-group /usr/local/Ascend/ascend-toolkit
-    sudo chown -R ma-user:ma-group /usr/local/Ascend/nnal
-    python -c "import acl;print(acl.get_soc_name())"
-    echo ============================
 
-    sudo yum install jemalloc jq tmux -y
+    python -c "import acl;print(acl.get_soc_name())"
+
     ls -l /usr/lib64/libjemalloc.so.2
     export LD_PRELOAD=/usr/lib64/libjemalloc.so.2:${LD_PRELOAD}
-    echo ============================
 
-    rm -rf "$HOME"/vllm*
-    tar -xf "$DATASET_DIR"/libs/vllm-build.tar.gz -C "$HOME"
     . "$HOME"/anaconda3/etc/profile.d/conda.sh
-    mkdir -p "$HOME"/anaconda3/envs/verl
-    tar -xf "$DATASET_DIR"/libs/verl-conda-env-20260617.tar.gz -C "$HOME"/anaconda3/envs/verl
     conda env list
     conda activate verl
-    echo ============================
 
     cd "$WORKSPACE"
-    pip install -r requirements-npu.txt
     pip install -e .
     echo ============================
-
-    ln -sfnT "$NETRC_PATH" "$HOME"/.netrc
 
     export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-3600}
     export HCCL_LOG_LEVEL=${HCCL_LOG_LEVEL:-0}
@@ -372,7 +358,7 @@ run_npu_opd_job() {
     log_test_generations=${LOG_TEST_GENERATIONS:-0}
     resume_required=${RESUME_REQUIRED:-False}
 
-    export WANDB_MODE=${WANDB_MODE:-online}
+    export WANDB_MODE=${WANDB_MODE:-offline}
     export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
     _configure_wandb_storage "$DATASET_DIR" "$WORKSPACE" "$experiment_name" "$WANDB_MODE" || exit 1
     case "$resume_required" in
