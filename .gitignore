@@ -133,3 +133,5 @@ outputs
 .history
 
 analysis_artifacts
+eval-results*
+wandb*

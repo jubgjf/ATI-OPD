@@ -79,8 +79,9 @@ _configure_wandb_storage() {
                         return 1
                     fi
                 else
-                    mkdir -p "$(dirname "$portable_dataset_dir")"
-                    if ! ln -s "$training_dataset_dir" "$portable_dataset_dir"; then
+                    portable_parent=$(dirname -- "$portable_dataset_dir")
+                    sudo mkdir -p "$portable_parent"
+                    if ! sudo ln -s "$training_dataset_dir" "$portable_dataset_dir"; then
                         if [[ ! "$portable_dataset_dir" -ef "$training_dataset_dir" ]]; then
                             echo "Failed to create a portable W&B path for the NPU dataset mount:" >&2
                             echo "  portable=$portable_dataset_dir" >&2

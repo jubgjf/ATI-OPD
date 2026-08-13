@@ -154,7 +154,7 @@ configure_eval_wandb_storage() {
         portable_dataset_dir=${portable_dataset_dir%/}
         if [[ "$WORKSPACE" == "$DATASET_DIR"/* ]]; then
             if [[ "$portable_dataset_dir" != "${DATASET_DIR%/}" ]]; then
-                mkdir -p "$(dirname -- "$portable_dataset_dir")"
+                sudo mkdir -p "$(dirname -- "$portable_dataset_dir")"
                 if [[ -e "$portable_dataset_dir" || -L "$portable_dataset_dir" ]]; then
                     if [[ ! "$portable_dataset_dir" -ef "$DATASET_DIR" ]]; then
                         echo "WANDB_PORTABLE_DATASET_DIR does not resolve to DATASET_DIR:" >&2
@@ -163,7 +163,7 @@ configure_eval_wandb_storage() {
                         return 1
                     fi
                 else
-                    ln -s "$DATASET_DIR" "$portable_dataset_dir"
+                    sudo ln -s "$DATASET_DIR" "$portable_dataset_dir"
                 fi
             fi
             portable_workspace="$portable_dataset_dir/${WORKSPACE#"${DATASET_DIR%/}"/}"
