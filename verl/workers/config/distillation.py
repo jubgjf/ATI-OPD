@@ -97,6 +97,16 @@ class DistillationLossConfig(BaseConfig):
         Whether to include task rewards alongside distillation loss.
     distillation_loss_coef (float):
         Coefficient for distillation loss when combined with task rewards.
+    rlvr_loss_coef (float):
+        Coefficient for the independent RLVR policy-loss branch when
+        ``ADV_ESTIMATOR=token_reward_direct``.
+    rlvr_adv_estimator (str):
+        Advantage estimator for the independent RLVR branch. The initial
+        implementation supports GRPO only.
+    rlvr_credit_mode (str):
+        Credit-assignment policy for teacher-repaired trajectories. The
+        initial ``no_intervention_only`` mode trains RLVR only on trajectories
+        whose final tokens are unchanged by teacher intervention.
     loss_max_clamp (float, optional):
         Maximum value to clamp distillation loss. If None, no clamping is applied.
     log_prob_min_clamp (float, optional):
@@ -128,6 +138,9 @@ class DistillationLossConfig(BaseConfig):
     reward_weight_mode: str = "student_p"
     use_task_rewards: bool = True
     distillation_loss_coef: float = 1.0
+    rlvr_loss_coef: float = 1.0
+    rlvr_adv_estimator: str = "grpo"
+    rlvr_credit_mode: str = "no_intervention_only"
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 
@@ -175,6 +188,19 @@ class DistillationLossConfig(BaseConfig):
             raise ValueError(
                 "distillation_loss.reward_weight_mode must be one of 'student_p', 'teacher_p', or 'none', "
                 f"got {self.reward_weight_mode!r}."
+            )
+        if not math.isfinite(self.rlvr_loss_coef) or self.rlvr_loss_coef < 0:
+            raise ValueError(
+                f"distillation_loss.rlvr_loss_coef must be finite and non-negative, got {self.rlvr_loss_coef!r}."
+            )
+        if self.rlvr_adv_estimator != "grpo":
+            raise NotImplementedError(
+                f"distillation_loss.rlvr_adv_estimator currently supports only 'grpo', got {self.rlvr_adv_estimator!r}."
+            )
+        if self.rlvr_credit_mode != "no_intervention_only":
+            raise NotImplementedError(
+                "distillation_loss.rlvr_credit_mode currently supports only 'no_intervention_only', "
+                f"got {self.rlvr_credit_mode!r}."
             )
 
         if self.policy_loss_mode != "vanilla":

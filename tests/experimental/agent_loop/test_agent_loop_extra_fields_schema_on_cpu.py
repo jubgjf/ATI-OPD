@@ -1011,6 +1011,7 @@ class _DirectInterventionWorker:
         collect_intervention_outcome_transitions: bool = False,
         collect_intervention_boundary_metrics: bool = False,
         outcome_case_samples_per_transition: int = 8,
+        joint_rlvr: bool = False,
     ):
         self.tokenizer = _FakeTokenizer()
         self.rollout_config = OmegaConf.create({"prompt_length": 4, "response_length": response_length})
@@ -1056,10 +1057,12 @@ class _DirectInterventionWorker:
         self.teacher_server_manager = teacher_manager
         self.llm_client = _FakeRepairStudentClient()
         self.distillation_config = SimpleNamespace(
+            use_actor_loss=not joint_rlvr,
             distillation_loss=SimpleNamespace(
                 topk=topk or 64,
                 loss_settings=SimpleNamespace(use_topk=topk is not None),
                 log_prob_min_clamp=-10.0,
+                use_task_rewards=joint_rlvr,
             ),
             diagnostics=SimpleNamespace(
                 enabled=collect_intervention_outcome_transitions or collect_intervention_boundary_metrics,
@@ -1072,6 +1075,8 @@ class _DirectInterventionWorker:
                 topk=diagnostics_topk or 64,
             ),
         )
+        if joint_rlvr:
+            self.config = SimpleNamespace(algorithm=SimpleNamespace(adv_estimator="token_reward_direct"))
         self._teacher_intervention_logged_samples = 0
         self._teacher_intervention_logged_step = None
         self._teacher_nll_calibration_snapshot = _TeacherNLLCalibrationSnapshot(
@@ -1413,6 +1418,47 @@ async def test_intervention_outcome_diagnostics_scores_raw_and_final_without_out
     training_batch = AgentLoopWorker._postprocess(worker, [internal], validate=False)
     assert training_batch.batch["rm_scores"].sum().item() == 1.0
     assert "raw_reward_score" not in training_batch.batch
+    assert training_batch.non_tensor_batch["teacher_intervention_outcome"][0]["raw_reward_score"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_joint_rlvr_collects_raw_reward_without_enabling_outcome_diagnostics_on_cpu():
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[31, 31], finish_reason="length"),
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        joint_rlvr=True,
+    )
+    reward_handle = _SequenceAwareRewardHandle()
+    worker.reward_loop_worker_handles = [reward_handle]
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4, 5, 6],
+        response_mask=[1, 1, 1, 1, 1, 1],
+        response_logprobs=[-0.1] * 6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "joint-rlvr-raw-final"},
+    )
+
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        data_source="openai/gsm8k",
+    )
+
+    assert reward_handle.compute_score.responses == [[1, 2, 3, 4, 5, 6], [31, 31, 40, 41]]
+    outcome = internal.extra_fields["teacher_intervention_outcome"]
+    assert outcome["raw_reward_score"] == 0.0
+    assert outcome["final_reward_score"] == 1.0
+    assert outcome["repair_executed"] is True
+    assert "transition_observation_event" not in outcome
+    assert "_raw_response_ids" not in outcome
+    training_batch = AgentLoopWorker._postprocess(worker, [internal], validate=False)
     assert training_batch.non_tensor_batch["teacher_intervention_outcome"][0]["raw_reward_score"] == 0.0
 
 

@@ -1130,6 +1130,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
         teacher_segment_sft_enabled = bool(
             tu.get_non_tensor_data(data=micro_batch, key="teacher_segment_sft_enabled", default=False)
         )
+        joint_token_reward_rlvr = bool(
+            tu.get_non_tensor_data(data=micro_batch, key="joint_token_reward_rlvr", default=False)
+        )
+        needs_response_token_log_probs = bool(
+            token_reward_direct_topk > 0 and (teacher_segment_sft_enabled or joint_token_reward_rlvr)
+        )
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -1169,7 +1175,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     inplace_backward = False
                 if diagnostics_student_topk > 0:
                     inplace_backward = False
-                if teacher_segment_sft_enabled and token_reward_direct_topk > 0:
+                if needs_response_token_log_probs:
                     inplace_backward = False
                 log_probs = logprobs_from_logits(
                     logits=logits_rmpad,
@@ -1274,7 +1280,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
             if pad_mode == DatasetPadMode.NO_PADDING:
                 output_offsets = output_args["output_offsets"]
                 # (bsz, j1), for each sample, is the length of each sample: [real_prompt length + real_response length]
-                if teacher_segment_sft_enabled and token_reward_direct_log_probs is not None:
+                if needs_response_token_log_probs and token_reward_direct_log_probs is not None:
                     response_token_log_probs = tu.jagged_tensor_parts_from_values(
                         log_probs,
                         output_offsets,
@@ -1349,7 +1355,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
                         labels=input_ids_rmpad_rolled,
-                        inplace_backward=not (teacher_segment_sft_enabled and token_reward_direct_topk > 0),
+                        inplace_backward=not needs_response_token_log_probs,
                     )
                     if token_reward_direct_topk > 0:
                         target_ids_rmpad = self._response_target_ids_rmpad(
@@ -1363,7 +1369,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                             target_ids_rmpad,
                         )
                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
-                    if teacher_segment_sft_enabled and token_reward_direct_log_probs is not None:
+                    if needs_response_token_log_probs and token_reward_direct_log_probs is not None:
                         response_token_log_probs = tu.jagged_tensor_parts_from_values(
                             log_probs,
                             output_offsets,

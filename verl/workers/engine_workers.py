@@ -33,6 +33,7 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.trainer.distillation import (
     distillation_ppo_loss,
     is_distillation_enabled,
+    is_joint_token_reward_rlvr_enabled,
     is_teacher_segment_sft_enabled,
 )
 from verl.utils import tensordict_utils as tu
@@ -317,6 +318,14 @@ class TrainingWorker(Worker, DistProfilerExtension):
                         device=get_device_id(),
                     )
                     tu.assign_non_tensor(mini_batch_td, batch_num_policy_tokens=batch_num_policy_tokens)
+                if "rlvr_response_mask" in mini_batch_td:
+                    batch_num_rlvr_tokens = _global_policy_token_count(
+                        mini_batch_td["rlvr_response_mask"],
+                        dp_size=self.engine.get_data_parallel_size(),
+                        dp_group=self.engine.get_data_parallel_group(),
+                        device=get_device_id(),
+                    )
+                    tu.assign_non_tensor(mini_batch_td, batch_num_rlvr_tokens=batch_num_rlvr_tokens)
 
                 # add global token num
                 if "input_ids" in mini_batch_td:
@@ -610,6 +619,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 assert self.config.actor.ppo_micro_batch_size_per_gpu is not None
             if self.distillation_enabled and (
                 getattr(distillation_config, "use_actor_loss", True)
+                or is_joint_token_reward_rlvr_enabled(distillation_config)
                 or is_teacher_segment_sft_enabled(distillation_config)
             ):
                 self.loss_fn = partial(

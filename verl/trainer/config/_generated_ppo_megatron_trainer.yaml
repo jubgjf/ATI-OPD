@@ -854,6 +854,9 @@ distillation:
     reward_weight_mode: student_p
     use_task_rewards: true
     distillation_loss_coef: 1.0
+    rlvr_loss_coef: 1.0
+    rlvr_adv_estimator: grpo
+    rlvr_credit_mode: no_intervention_only
     loss_max_clamp: null
     log_prob_min_clamp: null
     use_policy_gradient: false

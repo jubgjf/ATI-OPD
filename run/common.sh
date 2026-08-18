@@ -278,6 +278,9 @@ run_npu_opd_job() {
     top_k_strategy=${TOP_K_STRATEGY:-only_stu_rethinking_style}
     reward_weight_mode=${REWARD_WEIGHT_MODE:-student_p}
     use_task_rewards=${USE_TASK_REWARDS:-False}
+    rlvr_loss_coef=${RLVR_LOSS_COEF:-1.0}
+    rlvr_adv_estimator=${RLVR_ADV_ESTIMATOR:-grpo}
+    rlvr_credit_mode=${RLVR_CREDIT_MODE:-no_intervention_only}
     use_policy_gradient=${USE_POLICY_GRADIENT:-True}
     distillation_topk=${DISTILLATION_TOPK:-16}
     teacher_topk=${TEACHER_TOPK:-128}
@@ -611,6 +614,9 @@ _submit_npu_verl_job() {
         "distillation.distillation_loss.top_k_strategy=${top_k_strategy}"
         "distillation.distillation_loss.reward_weight_mode=${reward_weight_mode}"
         "distillation.distillation_loss.use_task_rewards=${use_task_rewards}"
+        "distillation.distillation_loss.rlvr_loss_coef=${rlvr_loss_coef}"
+        "distillation.distillation_loss.rlvr_adv_estimator=${rlvr_adv_estimator}"
+        "distillation.distillation_loss.rlvr_credit_mode=${rlvr_credit_mode}"
         "distillation.distillation_loss.use_policy_gradient=${use_policy_gradient}"
         "distillation.distillation_loss.loss_max_clamp=${distillation_loss_max_clamp}"
         "distillation.distillation_loss.log_prob_min_clamp=${distillation_log_prob_min_clamp}"

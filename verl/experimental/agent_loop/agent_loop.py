@@ -2072,6 +2072,21 @@ class AgentLoopWorker:
             return False
         return True
 
+    def _needs_joint_rlvr_raw_outcome(self, *, validate: bool) -> bool:
+        """Return whether joint token-reward OPD + RLVR needs the untouched student reward."""
+        if validate:
+            return False
+        distillation_config = getattr(self, "distillation_config", None)
+        if distillation_config is None or bool(getattr(distillation_config, "use_actor_loss", True)):
+            return False
+        loss_config = getattr(distillation_config, "distillation_loss", None)
+        if loss_config is None or not bool(getattr(loss_config, "use_task_rewards", False)):
+            return False
+        config = getattr(self, "config", None)
+        adv_estimator = getattr(getattr(config, "algorithm", None), "adv_estimator", "")
+        adv_estimator = getattr(adv_estimator, "value", adv_estimator)
+        return str(adv_estimator) == "token_reward_direct"
+
     def _collect_intervention_boundary_metrics(self, *, validate: bool) -> bool:
         """Return whether zero-extra-forward repair-boundary diagnostics are active."""
         if validate:
@@ -2454,9 +2469,14 @@ class AgentLoopWorker:
                 self,
                 validate=bool(validate),
             )
+            needs_joint_rlvr_raw_outcome = AgentLoopWorker._needs_joint_rlvr_raw_outcome(
+                self,
+                validate=bool(validate),
+            )
             observe_outcome = bool(
                 skip_correct
                 or collect_training_outcomes
+                or needs_joint_rlvr_raw_outcome
                 or (outcome_aware_selection and not validate)
                 or repair_for_evaluation
             )

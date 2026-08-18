@@ -90,6 +90,65 @@ def validate_distillation_intervention_training_config(config: Any) -> None:
             "actor can recompute logprobs on repaired teacher tokens, while bypass mode requires rollout_log_probs."
         )
 
+    adv_estimator = _get_nested(config, "algorithm", "adv_estimator", default="")
+    adv_estimator = getattr(adv_estimator, "value", adv_estimator)
+    use_task_rewards = bool(_get_nested(distillation_config, "distillation_loss", "use_task_rewards", default=True))
+    use_actor_loss = bool(_get_nested(distillation_config, "use_actor_loss", default=True))
+    joint_token_reward_rlvr = str(adv_estimator) == "token_reward_direct" and use_task_rewards
+    if joint_token_reward_rlvr:
+        if use_actor_loss:
+            raise ValueError(
+                "Joint token-reward OPD + RLVR requires distillation.use_actor_loss=false. "
+                "OPD is optimized through [B,T,K] token rewards while RLVR is an independent [B,T] branch."
+            )
+        if bypass_mode:
+            raise ValueError(
+                "Joint token-reward OPD + RLVR requires algorithm.rollout_correction.bypass_mode=false so both "
+                "sampled-token and Student-TopK proximal logprobs can be recomputed."
+            )
+        if bool(_get_nested(config, "algorithm", "use_kl_in_reward", default=False)):
+            raise ValueError(
+                "Joint token-reward OPD + RLVR does not support algorithm.use_kl_in_reward=true. "
+                "Keep the OPD and task-reward branches independent."
+            )
+        if bool(_get_nested(config, "actor_rollout_ref", "actor", "use_kl_loss", default=False)):
+            raise ValueError(
+                "Joint token-reward OPD + RLVR initially requires actor_rollout_ref.actor.use_kl_loss=false."
+            )
+        entropy_coeff = float(_get_nested(config, "actor_rollout_ref", "actor", "entropy_coeff", default=0.0))
+        if entropy_coeff != 0.0:
+            raise ValueError(
+                "Joint token-reward OPD + RLVR requires actor_rollout_ref.actor.entropy_coeff=0 so the implemented "
+                "objective is exactly loss_opd + rlvr_loss_coef * loss_rlvr."
+            )
+        policy_loss_mode = _get_nested(
+            config, "actor_rollout_ref", "actor", "policy_loss", "loss_mode", default="vanilla"
+        )
+        if str(policy_loss_mode) != "vanilla":
+            raise ValueError(
+                "Joint token-reward OPD + RLVR initially supports only "
+                "actor_rollout_ref.actor.policy_loss.loss_mode='vanilla'."
+            )
+        loss_agg_mode = _get_nested(config, "actor_rollout_ref", "actor", "loss_agg_mode", default="token-mean")
+        if str(loss_agg_mode) != "token-mean":
+            raise ValueError(
+                "Joint token-reward OPD + RLVR initially supports only "
+                "actor_rollout_ref.actor.loss_agg_mode='token-mean'."
+            )
+        rlvr_adv_estimator = _get_nested(distillation_config, "distillation_loss", "rlvr_adv_estimator", default="grpo")
+        if str(rlvr_adv_estimator) != "grpo":
+            raise ValueError("Joint token-reward OPD + RLVR initially supports only rlvr_adv_estimator='grpo'.")
+        rlvr_credit_mode = _get_nested(
+            distillation_config,
+            "distillation_loss",
+            "rlvr_credit_mode",
+            default="no_intervention_only",
+        )
+        if str(rlvr_credit_mode) != "no_intervention_only":
+            raise ValueError(
+                "Joint token-reward OPD + RLVR initially supports only rlvr_credit_mode='no_intervention_only'."
+            )
+
     top_k_strategy = _get_nested(
         distillation_config,
         "distillation_loss",
@@ -97,15 +156,13 @@ def validate_distillation_intervention_training_config(config: Any) -> None:
         default="only_stu",
     )
     if top_k_strategy in {"only_stu_rethinking_style", "only_stu_teacher_topk"}:
-        adv_estimator = _get_nested(config, "algorithm", "adv_estimator", default="")
-        adv_estimator = getattr(adv_estimator, "value", adv_estimator)
         if str(adv_estimator) != "token_reward_direct":
             raise ValueError(
                 f"distillation_loss.top_k_strategy={top_k_strategy!r} requires "
                 "algorithm.adv_estimator='token_reward_direct'. This student-support strategy is consumed by "
                 "the paper-style token-reward update, not the legacy actor-side OPD loss."
             )
-        if bool(_get_nested(distillation_config, "use_actor_loss", default=True)):
+        if use_actor_loss:
             raise ValueError(
                 f"distillation_loss.top_k_strategy={top_k_strategy!r} requires "
                 "distillation.use_actor_loss=false so the student-support teacher signal is not mixed with the "

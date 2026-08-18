@@ -1353,6 +1353,105 @@ def compute_advantage(
     return data
 
 
+def build_joint_rlvr_training_tensors(
+    *,
+    task_reward_tensor: torch.Tensor,
+    response_mask: torch.Tensor,
+    intervention_outcomes: Optional[list[Any]] = None,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Build raw-reward RLVR inputs without crediting teacher-repaired trajectories.
+
+    When intervention outcomes are present, raw student rewards are used for
+    GRPO group statistics. Samples whose response was repaired remain in those
+    statistics but receive an all-zero RLVR response mask, because their raw
+    reward no longer aligns with the repaired token sequence optimized by the
+    actor.
+    """
+    if task_reward_tensor.ndim != 2 or response_mask.ndim != 2:
+        raise ValueError(
+            "Joint RLVR expects task_reward_tensor and response_mask with shape [B,T], "
+            f"got {tuple(task_reward_tensor.shape)} and {tuple(response_mask.shape)}."
+        )
+    if task_reward_tensor.shape != response_mask.shape:
+        raise ValueError(
+            "Joint RLVR task rewards must align with response_mask, "
+            f"got {tuple(task_reward_tensor.shape)} and {tuple(response_mask.shape)}."
+        )
+
+    response_mask_bool = response_mask.bool()
+    # Reward managers may place the scalar outcome on a teacher-generated
+    # terminal token, which is intentionally absent from response_mask.  The
+    # task-reward tensor is already response-aligned, so sum it without the
+    # policy mask when recovering the per-response outcome.
+    final_scores = task_reward_tensor.sum(dim=-1)
+    if intervention_outcomes is None:
+        active_samples = response_mask_bool.any(dim=-1)
+        metrics = {
+            "distillation/joint_rlvr/raw_reward_mean": final_scores.float().mean().item(),
+            "distillation/joint_rlvr/final_reward_mean": final_scores.float().mean().item(),
+            "distillation/joint_rlvr/repair_reward_delta_mean": 0.0,
+            "distillation/joint_rlvr/active_sample_fraction": active_samples.float().mean().item(),
+            "distillation/joint_rlvr/intervention_excluded_fraction": 0.0,
+        }
+        return task_reward_tensor, response_mask, metrics
+
+    if len(intervention_outcomes) != response_mask.shape[0]:
+        raise RuntimeError(
+            "Joint RLVR intervention metadata must contain one item per response, "
+            f"got {len(intervention_outcomes)} items for batch size {response_mask.shape[0]}."
+        )
+
+    raw_scores: list[float] = []
+    repaired: list[bool] = []
+    for sample_idx, outcome in enumerate(intervention_outcomes):
+        if not isinstance(outcome, dict) or "raw_reward_score" not in outcome:
+            raise RuntimeError(
+                "Joint token-reward OPD + RLVR requires teacher_intervention_outcome.raw_reward_score "
+                f"for every DMPD sample, but sample {sample_idx} is missing it."
+            )
+        raw_score = outcome["raw_reward_score"]
+        if raw_score is None or not math.isfinite(float(raw_score)):
+            raise RuntimeError(
+                "Joint token-reward OPD + RLVR requires finite raw_reward_score values, "
+                f"got {raw_score!r} for sample {sample_idx}."
+            )
+        raw_scores.append(float(raw_score))
+        repaired.append(bool(outcome.get("repair_executed", False)))
+
+    raw_scores_tensor = task_reward_tensor.new_tensor(raw_scores)
+    repaired_tensor = torch.tensor(repaired, dtype=torch.bool, device=response_mask.device)
+    has_trainable_response = response_mask_bool.any(dim=-1)
+    active_samples = ~repaired_tensor & has_trainable_response
+    rlvr_response_mask = response_mask * active_samples.unsqueeze(-1).to(response_mask.dtype)
+
+    # GRPO consumes only the per-response reward sum. Place the raw score on
+    # the final valid response position so the tensor remains response-aligned.
+    rlvr_token_rewards = torch.zeros_like(task_reward_tensor)
+    if response_mask.shape[1] == 0 and raw_scores_tensor.numel() > 0:
+        raise RuntimeError("Joint RLVR cannot represent response rewards when the response width is zero.")
+    if response_mask_bool.any():
+        positions = torch.arange(response_mask.shape[1], device=response_mask.device).unsqueeze(0)
+        last_positions = positions.masked_fill(~response_mask_bool, -1).max(dim=-1).values
+        valid_samples = last_positions >= 0
+        valid_rows = torch.arange(response_mask.shape[0], device=response_mask.device)[valid_samples]
+        rlvr_token_rewards[valid_rows, last_positions[valid_samples]] = raw_scores_tensor[valid_samples]
+        invalid_rows = torch.arange(response_mask.shape[0], device=response_mask.device)[~valid_samples]
+        rlvr_token_rewards[invalid_rows, -1] = raw_scores_tensor[~valid_samples]
+    elif raw_scores_tensor.numel() > 0:
+        # Keep empty responses in the GRPO group statistics while their zero
+        # policy mask prevents any token-level gradient.
+        rlvr_token_rewards[:, -1] = raw_scores_tensor
+
+    metrics = {
+        "distillation/joint_rlvr/raw_reward_mean": raw_scores_tensor.float().mean().item(),
+        "distillation/joint_rlvr/final_reward_mean": final_scores.float().mean().item(),
+        "distillation/joint_rlvr/repair_reward_delta_mean": (final_scores - raw_scores_tensor).float().mean().item(),
+        "distillation/joint_rlvr/active_sample_fraction": active_samples.float().mean().item(),
+        "distillation/joint_rlvr/intervention_excluded_fraction": repaired_tensor.float().mean().item(),
+    }
+    return rlvr_token_rewards, rlvr_response_mask, metrics
+
+
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -3280,6 +3379,7 @@ class RayPPOTrainer:
             calculate_entropy=calculate_entropy,
             distillation_use_topk=distillation_use_topk,
             token_reward_direct_topk=token_reward_direct_topk,
+            joint_token_reward_rlvr=self._uses_joint_token_reward_rlvr(),
             teacher_segment_sft_enabled=teacher_segment_sft_enabled,
             global_batch_size=ppo_mini_batch_size,
             mini_batch_size=ppo_mini_batch_size,
@@ -3311,6 +3411,11 @@ class RayPPOTrainer:
         adv_estimator = self.config.algorithm.adv_estimator
         adv_estimator = getattr(adv_estimator, "value", adv_estimator)
         return str(adv_estimator) == "token_reward_direct"
+
+    def _uses_joint_token_reward_rlvr(self) -> bool:
+        if not self._uses_token_reward_direct():
+            return False
+        return bool(self.distillation_config.distillation_loss.use_task_rewards)
 
     def _uses_horizon_policy_loss_normalization(self) -> bool:
         """Return whether this actor update is the supported TOPD/POPD policy-loss path."""
@@ -4793,14 +4898,35 @@ class RayPPOTrainer:
                             metrics.update(token_reward_metrics)
                             loss_config = self.distillation_config.distillation_loss
                             if loss_config.use_task_rewards:
-                                raise NotImplementedError(
-                                    "Combining task rewards with [B,T,K] token_reward_direct rewards is not "
-                                    "implemented. Set distillation.distillation_loss.use_task_rewards=False for "
-                                    "paper-style OPD."
+                                intervention_outcomes = None
+                                if bool(getattr(self.distillation_config.intervention, "enabled", False)):
+                                    if "teacher_intervention_outcome" not in batch.non_tensor_batch:
+                                        raise RuntimeError(
+                                            "Joint token-reward OPD + RLVR requires teacher_intervention_outcome "
+                                            "metadata when DMPD intervention is enabled."
+                                        )
+                                    intervention_outcomes = self._non_tensor_to_list(
+                                        batch.non_tensor_batch["teacher_intervention_outcome"]
+                                    )
+                                rlvr_token_rewards, rlvr_response_mask, rlvr_metrics = (
+                                    build_joint_rlvr_training_tensors(
+                                        task_reward_tensor=reward_tensor,
+                                        response_mask=batch.batch["response_mask"],
+                                        intervention_outcomes=intervention_outcomes,
+                                    )
                                 )
+                                batch.batch["rlvr_token_level_rewards"] = rlvr_token_rewards
+                                batch.batch["rlvr_response_mask"] = rlvr_response_mask
+                                metrics.update(rlvr_metrics)
+                                response_tokens = batch.batch["response_mask"].sum().item()
+                                active_rlvr_tokens = rlvr_response_mask.sum().item()
+                                metrics["distillation/joint_rlvr/active_token_fraction"] = (
+                                    float(active_rlvr_tokens) / float(response_tokens) if response_tokens > 0 else 0.0
+                                )
+                                metrics["distillation/token_reward_direct/combined_with_task_rewards"] = 1.0
                             else:
-                                reward_tensor = token_reward_tensor
                                 metrics["distillation/token_reward_direct/combined_with_task_rewards"] = 0.0
+                            reward_tensor = token_reward_tensor
                             batch.batch["rm_scores"] = reward_tensor
 
                         batch.batch["token_level_scores"] = reward_tensor
@@ -4854,6 +4980,8 @@ class RayPPOTrainer:
                                     "ADV_ESTIMATOR=token_reward_direct requires student top-k tensors through "
                                     f"actor update, but missing {sorted(missing_topk_training_keys)}."
                                 )
+                            if self._uses_joint_token_reward_rlvr():
+                                batch.batch["rlvr_old_log_probs"] = batch.batch["old_log_probs"].clone()
                             batch.batch["old_log_probs"] = batch.batch["student_topk_logprobs"]
 
                         # compute advantages, executed on the driver process
@@ -4870,6 +4998,30 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        if self._uses_joint_token_reward_rlvr():
+                            rlvr_advantages, rlvr_returns = core_algos.compute_grpo_outcome_advantage(
+                                token_level_rewards=batch.batch["rlvr_token_level_rewards"],
+                                response_mask=batch.batch["rlvr_response_mask"],
+                                index=batch.non_tensor_batch["uid"],
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            )
+                            batch.batch["rlvr_advantages"] = rlvr_advantages
+                            batch.batch["rlvr_returns"] = rlvr_returns
+                            rlvr_active = batch.batch["rlvr_response_mask"].bool()
+                            if rlvr_active.any():
+                                metrics["distillation/joint_rlvr/adv_abs_mean"] = (
+                                    rlvr_advantages[rlvr_active].abs().float().mean().item()
+                                )
+                            else:
+                                metrics["distillation/joint_rlvr/adv_abs_mean"] = 0.0
+                            opd_active = (
+                                batch.batch["response_mask"].bool().unsqueeze(-1).expand_as(batch.batch["advantages"])
+                            )
+                            metrics["distillation/joint_rlvr/opd_adv_abs_mean"] = (
+                                batch.batch["advantages"][opd_active].abs().float().mean().item()
+                                if opd_active.any()
+                                else 0.0
+                            )
 
                     # update critic
                     if self.use_critic:

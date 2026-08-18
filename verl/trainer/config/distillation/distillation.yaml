@@ -50,6 +50,18 @@ distillation_loss:
   # The coef of the distillation loss when use_task_rewards is true
   distillation_loss_coef: 1.0
 
+  # Coefficient of the independent RLVR policy-loss branch when using
+  # ADV_ESTIMATOR=token_reward_direct. The joint objective is
+  # loss_opd + rlvr_loss_coef * loss_rlvr.
+  rlvr_loss_coef: 1.0
+
+  # Advantage estimator for the independent RLVR branch.
+  rlvr_adv_estimator: grpo
+
+  # Teacher-intervention samples contribute to the raw GRPO baseline but do
+  # not receive RLVR gradients in the initial implementation.
+  rlvr_credit_mode: no_intervention_only
+
   # Optional max clamp value for distillation loss. If null, no clamping is applied.
   loss_max_clamp: null
 

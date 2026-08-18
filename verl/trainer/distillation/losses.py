@@ -57,6 +57,26 @@ def is_teacher_segment_sft_enabled(config: Optional[DistillationConfig]) -> bool
     )
 
 
+def is_joint_token_reward_rlvr_enabled(config: Optional[DistillationConfig]) -> bool:
+    """Return whether token-reward OPD composes an independent RLVR branch."""
+    if config is None or not getattr(config, "enabled", True):
+        return False
+    if bool(getattr(config, "use_actor_loss", True)):
+        return False
+    loss_config = getattr(config, "distillation_loss", None)
+    return bool(loss_config is not None and getattr(loss_config, "use_task_rewards", False))
+
+
+def _is_joint_token_reward_rlvr_batch(
+    config: Optional[DistillationConfig],
+    data: TensorDict,
+) -> bool:
+    """Require the driver-provided runtime marker in addition to static config."""
+    return is_joint_token_reward_rlvr_enabled(config) and bool(
+        tu.get_non_tensor_data(data, "joint_token_reward_rlvr", False)
+    )
+
+
 def _zero_from_model_output(model_output: dict[str, Any]) -> torch.Tensor:
     """Build a graph-connected zero scalar from response-token model output."""
     value = model_output.get("response_token_log_probs", model_output["log_probs"])
@@ -83,6 +103,80 @@ def _ppo_loss_or_zero(
         "actor/pg_loss": Metric(value=zero, aggregation=AggregationType.SUM),
         "actor/empty_action_mask": Metric(value=zero.detach() + 1.0, aggregation=AggregationType.MEAN),
     }
+
+
+def _joint_rlvr_policy_loss(
+    config: ActorConfig,
+    model_output: dict[str, Any],
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute the sampled-token RLVR policy branch without shared regularizers."""
+    required_data = {"rlvr_old_log_probs", "rlvr_advantages", "rlvr_response_mask"}
+    missing_data = required_data.difference(data.keys())
+    if missing_data:
+        raise RuntimeError(f"Joint RLVR actor batch is missing required tensors: {sorted(missing_data)}.")
+    if "response_token_log_probs" not in model_output:
+        raise RuntimeError(
+            "Joint RLVR requires model_output['response_token_log_probs']; configure the FSDP actor to return "
+            "both sampled-token and Student-TopK current logprobs."
+        )
+
+    log_prob = no_padding_2_padding(model_output["response_token_log_probs"], data)
+    fields = ["rlvr_old_log_probs", "rlvr_advantages", "rlvr_response_mask"]
+    if "rollout_is_weights" in data:
+        fields.append("rollout_is_weights")
+    rlvr_data = data.select(*fields).to_padded_tensor()
+    old_log_prob = rlvr_data["rlvr_old_log_probs"]
+    advantages = rlvr_data["rlvr_advantages"]
+    response_mask = rlvr_data["rlvr_response_mask"].bool()
+    rollout_is_weights = rlvr_data.get("rollout_is_weights", None)
+
+    if not (old_log_prob.shape == advantages.shape == response_mask.shape == log_prob.shape):
+        raise ValueError(
+            "Joint RLVR expects sampled-token tensors with identical [B,T] shapes, got "
+            f"old={tuple(old_log_prob.shape)}, current={tuple(log_prob.shape)}, "
+            f"advantages={tuple(advantages.shape)}, mask={tuple(response_mask.shape)}."
+        )
+
+    batch_num_rlvr_tokens = tu.get_non_tensor_data(data, "batch_num_rlvr_tokens", None)
+    if batch_num_rlvr_tokens is None:
+        raise RuntimeError("Joint RLVR requires the distributed batch_num_rlvr_tokens denominator.")
+    batch_num_rlvr_tokens = int(batch_num_rlvr_tokens)
+    if batch_num_rlvr_tokens < 0:
+        raise ValueError(f"batch_num_rlvr_tokens must be non-negative, got {batch_num_rlvr_tokens}.")
+    if batch_num_rlvr_tokens == 0 or not response_mask.any().item():
+        zero = log_prob.sum() * 0.0
+        return zero, {
+            "distillation/joint_rlvr/pg_loss": Metric(value=zero, aggregation=AggregationType.SUM),
+            "distillation/joint_rlvr/empty_mask": Metric(value=zero.detach() + 1.0, aggregation=AggregationType.MEAN),
+        }
+
+    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+    policy_loss_fn = get_policy_loss_fn(loss_mode)
+    full_batch_num_tokens = config.global_batch_info.get("batch_num_tokens", None)
+    config.global_batch_info["batch_num_tokens"] = batch_num_rlvr_tokens
+    try:
+        rlvr_loss, rlvr_metrics = policy_loss_fn(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            loss_agg_mode=config.loss_agg_mode,
+            config=config,
+            rollout_is_weights=rollout_is_weights,
+        )
+    finally:
+        config.global_batch_info["batch_num_tokens"] = full_batch_num_tokens
+
+    metrics = {
+        f"distillation/joint_rlvr/{key.removeprefix('actor/')}": Metric(value=value, aggregation=AggregationType.MEAN)
+        for key, value in rlvr_metrics.items()
+    }
+    metrics["distillation/joint_rlvr/pg_loss"] = Metric(value=rlvr_loss, aggregation=AggregationType.SUM)
+    metrics["distillation/joint_rlvr/empty_mask"] = Metric(
+        value=rlvr_loss.detach() * 0.0, aggregation=AggregationType.MEAN
+    )
+    return rlvr_loss, metrics
 
 
 def teacher_segment_sft_loss(
@@ -331,10 +425,26 @@ def distillation_ppo_loss(
         return compute_topk_loss(config, distillation_config, data, student_logits, data_format)
 
     # Called as final policy loss. Actor-side OPD and token-reward OPD share this
-    # wrapper only when teacher-segment SFT needs to be composed with the base loss.
+    # wrapper when an auxiliary branch needs to be composed with the base loss.
     distillation_loss_config = distillation_config.distillation_loss
     use_actor_loss = getattr(distillation_config, "use_actor_loss", True)
     policy_loss, policy_metrics = _ppo_loss_or_zero(config, model_output, data, dp_group)
+
+    if _is_joint_token_reward_rlvr_batch(distillation_config, data):
+        rlvr_loss, rlvr_metrics = _joint_rlvr_policy_loss(config, model_output, data)
+        rlvr_loss_coef = float(distillation_loss_config.rlvr_loss_coef)
+        policy_metrics.update(rlvr_metrics)
+        policy_metrics["distillation/joint_rlvr/opd_loss"] = Metric(value=policy_loss, aggregation=AggregationType.SUM)
+        policy_metrics["distillation/joint_rlvr/weighted_loss"] = Metric(
+            value=rlvr_loss * rlvr_loss_coef, aggregation=AggregationType.SUM
+        )
+        policy_metrics["distillation/joint_rlvr/loss_coef"] = Metric(
+            value=rlvr_loss.detach().new_tensor(rlvr_loss_coef), aggregation=AggregationType.MEAN
+        )
+        policy_loss = policy_loss + rlvr_loss * rlvr_loss_coef
+        policy_metrics["distillation/joint_rlvr/total_loss"] = Metric(
+            value=policy_loss, aggregation=AggregationType.SUM
+        )
 
     if use_actor_loss:
         distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)

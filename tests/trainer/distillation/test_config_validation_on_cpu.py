@@ -49,6 +49,63 @@ def test_teacher_segment_loss_config_defaults_to_legacy_opd_on_cpu():
     assert config.repair_for_evaluation is False
 
 
+def test_joint_rlvr_loss_config_defaults_and_validation_on_cpu():
+    config = DistillationLossConfig()
+
+    assert config.rlvr_loss_coef == 1.0
+    assert config.rlvr_adv_estimator == "grpo"
+    assert config.rlvr_credit_mode == "no_intervention_only"
+
+    with pytest.raises(ValueError, match="rlvr_loss_coef"):
+        DistillationLossConfig(rlvr_loss_coef=-1.0)
+    with pytest.raises(ValueError, match="rlvr_loss_coef"):
+        DistillationLossConfig(rlvr_loss_coef=float("nan"))
+    with pytest.raises(NotImplementedError, match="rlvr_adv_estimator"):
+        DistillationLossConfig(rlvr_adv_estimator="gae")
+    with pytest.raises(NotImplementedError, match="rlvr_credit_mode"):
+        DistillationLossConfig(rlvr_credit_mode="final_hybrid")
+
+
+def test_joint_token_reward_rlvr_cross_feature_validation_on_cpu():
+    config = OmegaConf.create(
+        {
+            "distillation": {
+                "enabled": True,
+                "use_actor_loss": False,
+                "distillation_loss": {
+                    "use_task_rewards": True,
+                    "rlvr_adv_estimator": "grpo",
+                    "rlvr_credit_mode": "no_intervention_only",
+                },
+                "intervention": {"enabled": True},
+            },
+            "algorithm": {
+                "adv_estimator": "token_reward_direct",
+                "use_kl_in_reward": False,
+                "rollout_correction": {"bypass_mode": False},
+            },
+            "actor_rollout_ref": {
+                "actor": {
+                    "use_kl_loss": False,
+                    "loss_agg_mode": "token-mean",
+                    "policy_loss": {"loss_mode": "vanilla"},
+                }
+            },
+        }
+    )
+
+    validate_distillation_intervention_training_config(config)
+
+    config.distillation.use_actor_loss = True
+    with pytest.raises(ValueError, match="use_actor_loss=false"):
+        validate_distillation_intervention_training_config(config)
+
+    config.distillation.use_actor_loss = False
+    config.actor_rollout_ref.actor.entropy_coeff = 0.01
+    with pytest.raises(ValueError, match="entropy_coeff=0"):
+        validate_distillation_intervention_training_config(config)
+
+
 def test_future_gap_and_skip_correct_config_validation_on_cpu():
     config = DistillationInterventionConfig(
         enabled=True,
