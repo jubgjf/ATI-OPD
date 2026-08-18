@@ -21,6 +21,8 @@ from tensordict import TensorDict
 from verl.trainer.distillation import losses as distillation_losses
 from verl.trainer.ppo.ray_trainer import build_joint_rlvr_training_tensors
 from verl.utils import tensordict_utils as tu
+from verl.utils.metric import Metric
+from verl.utils.py_functional import append_to_dict
 from verl.workers.config import ActorConfig
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 
@@ -186,6 +188,64 @@ def test_joint_rlvr_policy_loss_uses_sampled_token_shape_and_independent_denomin
         current_log_probs.grad,
         torch.tensor([0.0, -1.0 / 3.0, 1.0 / 3.0, 0.0, -2.0 / 3.0, 0.0]),
     )
+
+
+def test_joint_rlvr_empty_local_mask_keeps_dp_metric_schema_on_cpu():
+    def compute_metrics(response_mask: torch.Tensor):
+        data = TensorDict(
+            {
+                "prompts": torch.tensor([[10, 11]], dtype=torch.long),
+                "responses": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+                "attention_mask": torch.ones(1, 6, dtype=torch.long),
+                "rlvr_old_log_probs": torch.zeros(1, 4),
+                "rlvr_advantages": torch.tensor([[1.0, -1.0, 0.0, 2.0]]),
+                "rlvr_response_mask": response_mask,
+            },
+            batch_size=[1],
+        )
+        # Simulate a DP batch where another rank still has three active RLVR tokens.
+        tu.assign_non_tensor(data, batch_num_rlvr_tokens=3)
+        config = ActorConfig(strategy="fsdp", rollout_n=1, use_dynamic_bsz=True)
+        config.global_batch_info.update(
+            dp_size=2,
+            batch_num_tokens=99,
+            global_batch_size=2,
+            loss_scale_factor=None,
+        )
+        current_log_probs = torch.zeros(6, requires_grad=True)
+        loss, metrics = distillation_losses._joint_rlvr_policy_loss(
+            config,
+            {"response_token_log_probs": current_log_probs},
+            data,
+        )
+        return loss, metrics, current_log_probs
+
+    active_loss, active_metrics, _ = compute_metrics(torch.tensor([[1, 1, 0, 1]], dtype=torch.long))
+    empty_loss, empty_metrics, empty_log_probs = compute_metrics(torch.zeros(1, 4, dtype=torch.long))
+
+    assert set(empty_metrics) == set(active_metrics)
+    assert empty_loss.item() == 0.0
+    assert empty_metrics["distillation/joint_rlvr/empty_mask"].aggregate() == 1.0
+    assert empty_metrics["distillation/joint_rlvr/pg_clipfrac"].aggregate() == 0.0
+    assert empty_metrics["distillation/joint_rlvr/ppo_kl"].aggregate() == 0.0
+    assert empty_metrics["distillation/joint_rlvr/pg_clipfrac_lower"].aggregate() == 0.0
+
+    # Reproduce the engine's micro-batch and DP aggregation shape contract: every
+    # metric must receive one value from every micro-batch on every rank.
+    rank_with_empty = {}
+    append_to_dict(rank_with_empty, active_metrics)
+    append_to_dict(rank_with_empty, empty_metrics)
+    rank_without_empty = {}
+    append_to_dict(rank_without_empty, active_metrics)
+    append_to_dict(rank_without_empty, active_metrics)
+    for key in active_metrics:
+        assert len(rank_with_empty[key].values) == 2
+        assert len(rank_without_empty[key].values) == 2
+        Metric.aggregate_dp([rank_with_empty[key], rank_without_empty[key]])
+
+    empty_loss.backward()
+    torch.testing.assert_close(empty_log_probs.grad, torch.zeros_like(empty_log_probs))
+    assert active_loss.item() != 0.0
 
 
 def test_fsdp_token_reward_direct_preserves_scalar_log_probs_for_joint_rlvr_on_cpu():

@@ -144,9 +144,13 @@ def _joint_rlvr_policy_loss(
     batch_num_rlvr_tokens = int(batch_num_rlvr_tokens)
     if batch_num_rlvr_tokens < 0:
         raise ValueError(f"batch_num_rlvr_tokens must be non-negative, got {batch_num_rlvr_tokens}.")
-    if batch_num_rlvr_tokens == 0 or not response_mask.any().item():
+    local_empty_mask = not response_mask.any().item()
+    if batch_num_rlvr_tokens == 0:
         zero = log_prob.sum() * 0.0
         return zero, {
+            "distillation/joint_rlvr/pg_clipfrac": Metric(value=zero, aggregation=AggregationType.MEAN),
+            "distillation/joint_rlvr/ppo_kl": Metric(value=zero, aggregation=AggregationType.MEAN),
+            "distillation/joint_rlvr/pg_clipfrac_lower": Metric(value=zero, aggregation=AggregationType.MEAN),
             "distillation/joint_rlvr/pg_loss": Metric(value=zero, aggregation=AggregationType.SUM),
             "distillation/joint_rlvr/empty_mask": Metric(value=zero.detach() + 1.0, aggregation=AggregationType.MEAN),
         }
@@ -174,7 +178,7 @@ def _joint_rlvr_policy_loss(
     }
     metrics["distillation/joint_rlvr/pg_loss"] = Metric(value=rlvr_loss, aggregation=AggregationType.SUM)
     metrics["distillation/joint_rlvr/empty_mask"] = Metric(
-        value=rlvr_loss.detach() * 0.0, aggregation=AggregationType.MEAN
+        value=rlvr_loss.detach().new_tensor(float(local_empty_mask)), aggregation=AggregationType.MEAN
     )
     return rlvr_loss, metrics
 
