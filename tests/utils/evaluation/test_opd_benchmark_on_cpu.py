@@ -14,6 +14,7 @@
 
 import asyncio
 import json
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -25,6 +26,130 @@ from omegaconf import OmegaConf
 from verl.utils.evaluation import opd_benchmark as benchmark
 from verl.utils.evaluation import opd_result_status, teacher_intervention
 from verl.utils.evaluation.checkpoint_evaluation import write_evaluation_spec, write_evaluation_state
+
+
+def _generation_preparation(
+    *,
+    weight_mtime_ns: int = 20,
+    weight_size: int = 10,
+    temperature: float = 0.7,
+) -> tuple[benchmark.GenerationPreparation, dict]:
+    request = {
+        "experiment": "exp",
+        "global_step": 20,
+        "benchmark": "math-ai/aime24",
+        "dataset_root": "/datasets",
+        "student_model_path": "/models/step-20",
+        "student_tokenizer_model": "/models/step-20",
+        "chat_template_model": "/models/teacher",
+        "rollout_n": 16,
+        "temperature": temperature,
+    }
+    tokenizer_info = {
+        "model_path": "/models/step-20",
+        "vocab_size": 2,
+        "fingerprint_sha256": "tokenizer",
+        "chat_template_sha256": "template",
+        "special_token_ids": {},
+    }
+    legacy_manifest = {
+        "dataset": [],
+        "student_model_metadata": [],
+        "student_model_weights": [
+            {
+                "path": "/models/step-20/model.safetensors",
+                "size": 10,
+                "mode": "stat",
+                "mtime_ns": 10,
+            }
+        ],
+        "student_tokenizer": [],
+        "chat_template": [],
+    }
+    legacy_manifest["fingerprint"] = benchmark.payload_fingerprint(legacy_manifest)
+    stable_manifest = {
+        "schema_version": benchmark.INPUT_MANIFEST_SCHEMA_VERSION,
+        "student_model_identity": {"kind": "committed_checkpoint", "fingerprint": "source-step-20"},
+        "dataset": [],
+        "student_model_metadata": [],
+        "student_model_weights": [
+            {
+                "path": "/models/step-20/model.safetensors",
+                "logical_path": "model.safetensors",
+                "size": weight_size,
+                "mode": "stat",
+                "mtime_ns": weight_mtime_ns,
+            }
+        ],
+        "student_tokenizer": [],
+        "chat_template": [],
+    }
+    stable_manifest["fingerprint"] = benchmark.stable_input_manifest_fingerprint(stable_manifest)
+    current_fingerprint = benchmark.generation_fingerprint(
+        request=request,
+        input_manifest=stable_manifest,
+        dataset_fingerprint="dataset",
+        tokenizer_info=tokenizer_info,
+    )
+    preparation = benchmark.GenerationPreparation(
+        tokenizer=None,
+        problems=[],
+        tasks=[],
+        dataset_fingerprint="dataset",
+        input_manifest=stable_manifest,
+        tokenizer_info=tokenizer_info,
+        request=request,
+        analysis={},
+        fingerprint=current_fingerprint,
+    )
+    existing = {
+        "schema_version": benchmark.SCHEMA_VERSION,
+        "generation_schema_version": 2,
+        "generation_complete": False,
+        "generation_fingerprint": benchmark.payload_fingerprint(
+            {
+                "generation_schema_version": 2,
+                "request": request,
+                "input_manifest_fingerprint": legacy_manifest["fingerprint"],
+                "dataset_fingerprint": "dataset",
+                "tokenizer": tokenizer_info,
+            }
+        ),
+        "request": request,
+        "benchmark": {"dataset_fingerprint": "dataset"},
+        "student_tokenizer": tokenizer_info,
+        "input_manifest": legacy_manifest,
+    }
+    return preparation, existing
+
+
+def _preflight_args(result_root: Path):
+    return benchmark.build_parser().parse_args(
+        [
+            "generate",
+            "--served-model-name",
+            "student",
+            "--result-root",
+            str(result_root),
+            "--benchmark",
+            "math-ai/aime24",
+            "--global-step",
+            "20",
+            "--experiment",
+            "exp",
+            "--dataset-root",
+            "/datasets",
+            "--student-model-path",
+            "/models/step-20",
+            "--student-model-identity",
+            "source-step-20",
+            "--student-tokenizer-model",
+            "/models/step-20",
+            "--chat-template-model",
+            "/models/teacher",
+            "--preflight-only",
+        ]
+    )
 
 
 def test_benchmark_id_uses_full_path_and_rejects_traversal_on_cpu():
@@ -126,6 +251,124 @@ def test_validate_hf_checkpoint_requires_every_indexed_shard_and_tokenizer_on_cp
 
     (model_dir / "model-00002-of-00002.safetensors").write_bytes(b"second")
     assert benchmark.validate_hf_checkpoint(model_dir) == (True, "ready")
+
+
+def test_stable_input_manifest_ignores_weight_mtime_but_detects_size_change_on_cpu(tmp_path):
+    weight = tmp_path / "model.safetensors"
+    weight.write_bytes(b"0123456789")
+    descriptor = benchmark._file_descriptor(weight, content_hash=False, logical_path=weight.name)
+    manifest = {
+        "schema_version": benchmark.INPUT_MANIFEST_SCHEMA_VERSION,
+        "student_model_identity": {"kind": "committed_checkpoint", "fingerprint": "source-step-20"},
+        "dataset": [],
+        "student_model_metadata": [],
+        "student_model_weights": [descriptor],
+        "student_tokenizer": [],
+        "chat_template": [],
+    }
+    manifest["fingerprint"] = benchmark.stable_input_manifest_fingerprint(manifest)
+
+    original_mtime = weight.stat().st_mtime_ns
+    os.utime(weight, ns=(original_mtime + 1_000_000_000, original_mtime + 1_000_000_000))
+    assert benchmark.validate_input_manifest(manifest) == (True, "valid")
+
+    weight.write_bytes(b"changed-size")
+    valid, reason = benchmark.validate_input_manifest(manifest)
+    assert valid is False
+    assert "fingerprint changed" in reason
+
+
+def test_direct_generation_weight_identity_hashes_content_on_cpu(tmp_path):
+    weight = tmp_path / "model.safetensors"
+    weight.write_bytes(b"first")
+    first = benchmark._weight_content_identity([weight], tmp_path)
+
+    weight.write_bytes(b"other")
+    second = benchmark._weight_content_identity([weight], tmp_path)
+
+    assert first["kind"] == "weight_content_sha256"
+    assert first["fingerprint"] != second["fingerprint"]
+
+
+def test_generation_fingerprint_is_independent_of_deployment_paths_on_cpu():
+    preparation, _ = _generation_preparation()
+    relocated_request = dict(preparation.request)
+    relocated_request.update(
+        {
+            "dataset_root": "/alternate/datasets",
+            "student_model_path": "/alternate/model",
+            "student_tokenizer_model": "/alternate/model",
+            "chat_template_model": "/alternate/teacher",
+        }
+    )
+    relocated_tokenizer = dict(preparation.tokenizer_info)
+    relocated_tokenizer["model_path"] = "/alternate/model"
+
+    assert (
+        benchmark.generation_fingerprint(
+            request=relocated_request,
+            input_manifest=preparation.input_manifest,
+            dataset_fingerprint=preparation.dataset_fingerprint,
+            tokenizer_info=relocated_tokenizer,
+        )
+        == preparation.fingerprint
+    )
+
+
+def test_legacy_generation_accepts_only_mtime_change_and_preserves_canonical_fingerprint_on_cpu(tmp_path):
+    preparation, existing = _generation_preparation()
+    assessment = benchmark.assess_generation_compatibility(existing, preparation)
+
+    assert assessment["status"] == "legacy_mtime_only"
+    assert assessment["effective_fingerprint"] == existing["generation_fingerprint"]
+    assert assessment["mtime_changes"] == [
+        {
+            "path": "/models/step-20/model.safetensors",
+            "size": 10,
+            "existing_mtime_ns": 10,
+            "current_mtime_ns": 20,
+        }
+    ]
+
+    output_dir = tmp_path / "unit"
+    output_dir.mkdir()
+    benchmark.write_json_atomic(output_dir / benchmark.METADATA_FILENAME, existing)
+    migrated = benchmark._apply_generation_compatibility_migration(
+        output_dir,
+        existing,
+        preparation,
+        assessment,
+    )
+    reloaded = json.loads((output_dir / benchmark.METADATA_FILENAME).read_text(encoding="utf-8"))
+    assert migrated == reloaded
+    assert reloaded["generation_fingerprint"] == existing["generation_fingerprint"]
+    assert preparation.fingerprint in reloaded["generation_compatibility"]["compatible_fingerprints"]
+    assert reloaded["input_manifest"]["fingerprint"] == preparation.input_manifest["fingerprint"]
+
+
+def test_legacy_generation_rejects_real_weight_or_sampling_change_with_structured_diff_on_cpu():
+    preparation, existing = _generation_preparation(weight_size=11)
+    assessment = benchmark.assess_generation_compatibility(existing, preparation)
+    assert assessment["status"] == "incompatible"
+    weight_diff = assessment["differences"]["input_manifest_groups"]["student_model_weights"]
+    assert weight_diff["changed"]["/models/step-20/model.safetensors"]["size"] == {
+        "existing": 10,
+        "current": 11,
+    }
+
+    sampling_preparation, sampling_existing = _generation_preparation()
+    changed_request = dict(sampling_preparation.request)
+    changed_request["temperature"] = 1.0
+    changed_preparation = benchmark.GenerationPreparation(
+        **{
+            **sampling_preparation.__dict__,
+            "request": changed_request,
+            "fingerprint": "different",
+        }
+    )
+    assessment = benchmark.assess_generation_compatibility(sampling_existing, changed_preparation)
+    assert assessment["status"] == "incompatible"
+    assert assessment["differences"]["request"]["temperature"] == {"existing": 0.7, "current": 1.0}
 
 
 def test_evaluate_one_prefers_exact_vllm_token_ids_on_cpu():
@@ -382,6 +625,52 @@ def test_status_parser_supports_teacher_completion_requirement_on_cpu():
     )
 
     assert args.require_teacher is True
+
+
+def test_generate_preflight_only_does_not_contact_model_server_on_cpu(tmp_path, monkeypatch, capsys):
+    preparation, _ = _generation_preparation()
+    monkeypatch.setattr(benchmark, "prepare_generation", lambda args: preparation)
+    result_root = tmp_path / "results"
+    args = _preflight_args(result_root)
+
+    assert asyncio.run(benchmark.generate_main(args)) == 0
+    output = capsys.readouterr().out
+    assert '"event":"generation_preflight"' in output
+    assert '"status":"new"' in output
+    assert not (benchmark.unit_output_dir(result_root, "math-ai/aime24", 20) / "metadata.json").exists()
+
+
+def test_generate_preflight_migrates_legacy_mtime_without_changing_canonical_fingerprint_on_cpu(
+    tmp_path,
+    monkeypatch,
+):
+    preparation, existing = _generation_preparation()
+    result_root = tmp_path / "results"
+    output_dir = benchmark.unit_output_dir(result_root, "math-ai/aime24", 20)
+    output_dir.mkdir(parents=True)
+    benchmark.write_json_atomic(output_dir / benchmark.METADATA_FILENAME, existing)
+    monkeypatch.setattr(benchmark, "prepare_generation", lambda args: preparation)
+
+    assert asyncio.run(benchmark.generate_main(_preflight_args(result_root))) == 0
+
+    migrated = json.loads((output_dir / benchmark.METADATA_FILENAME).read_text(encoding="utf-8"))
+    assert migrated["generation_fingerprint"] == existing["generation_fingerprint"]
+    assert preparation.fingerprint in migrated["generation_compatibility"]["compatible_fingerprints"]
+
+
+def test_generate_preflight_reports_real_input_difference_before_model_server_on_cpu(tmp_path, monkeypatch):
+    preparation, existing = _generation_preparation(weight_size=11)
+    result_root = tmp_path / "results"
+    output_dir = benchmark.unit_output_dir(result_root, "math-ai/aime24", 20)
+    output_dir.mkdir(parents=True)
+    benchmark.write_json_atomic(output_dir / benchmark.METADATA_FILENAME, existing)
+    monkeypatch.setattr(benchmark, "prepare_generation", lambda args: preparation)
+
+    with pytest.raises(RuntimeError, match='"student_model_weights"') as exc_info:
+        asyncio.run(benchmark.generate_main(_preflight_args(result_root)))
+
+    assert '"existing": 10' in str(exc_info.value)
+    assert '"current": 11' in str(exc_info.value)
 
 
 def test_migrate_legacy_splits_benchmarks_without_deleting_source_on_cpu(tmp_path):

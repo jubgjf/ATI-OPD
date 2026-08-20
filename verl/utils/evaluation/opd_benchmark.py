@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import copy
 import csv
 import fcntl
 import gzip
@@ -61,7 +62,9 @@ if TYPE_CHECKING:
     from openai import AsyncOpenAI
 
 SCHEMA_VERSION = 2
-GENERATION_SCHEMA_VERSION = 2
+GENERATION_SCHEMA_VERSION = 3
+INPUT_MANIFEST_SCHEMA_VERSION = 2
+GENERATION_COMPATIBILITY_SCHEMA_VERSION = 1
 DEFAULT_BENCHMARKS = [
     "math-ai/aime24",
     "math-ai/aime25",
@@ -149,6 +152,19 @@ class RolloutTask:
     question_id: int | str | None = None
     answer_type: str | None = None
     grader: str | None = None
+
+
+@dataclass(frozen=True)
+class GenerationPreparation:
+    tokenizer: Any
+    problems: list[Problem]
+    tasks: list[RolloutTask]
+    dataset_fingerprint: str
+    input_manifest: dict[str, Any]
+    tokenizer_info: dict[str, Any]
+    request: dict[str, Any]
+    analysis: dict[str, Any]
+    fingerprint: str
 
 
 def json_default(value: Any) -> Any:
@@ -372,7 +388,12 @@ def validate_hf_checkpoint(model_dir: str | Path) -> tuple[bool, str]:
     return True, "ready"
 
 
-def _file_descriptor(path: Path, *, content_hash: bool) -> dict[str, Any]:
+def _file_descriptor(
+    path: Path,
+    *,
+    content_hash: bool,
+    logical_path: str | None = None,
+) -> dict[str, Any]:
     resolved = path.expanduser().resolve()
     stat = resolved.stat()
     descriptor: dict[str, Any] = {
@@ -380,6 +401,8 @@ def _file_descriptor(path: Path, *, content_hash: bool) -> dict[str, Any]:
         "size": stat.st_size,
         "mode": "sha256" if content_hash else "stat",
     }
+    if logical_path is not None:
+        descriptor["logical_path"] = str(logical_path)
     if content_hash:
         descriptor["sha256"] = sha256_file(resolved)
     else:
@@ -410,6 +433,68 @@ def _tokenizer_files(model_dir: str | Path) -> list[Path]:
     return [directory / name for name in names if (directory / name).is_file()]
 
 
+def _relative_file_descriptor(path: Path, root: Path, *, content_hash: bool) -> dict[str, Any]:
+    return _file_descriptor(
+        path,
+        content_hash=content_hash,
+        logical_path=path.expanduser().resolve().relative_to(root.expanduser().resolve()).as_posix(),
+    )
+
+
+def _semantic_file_descriptor(entry: Mapping[str, Any]) -> dict[str, Any]:
+    descriptor = {
+        "logical_path": str(entry["logical_path"]),
+        "size": int(entry["size"]),
+        "mode": str(entry["mode"]),
+    }
+    if entry.get("mode") == "sha256":
+        descriptor["sha256"] = str(entry["sha256"])
+    return descriptor
+
+
+def _stable_input_manifest_payload(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    groups = (
+        "dataset",
+        "student_model_metadata",
+        "student_model_weights",
+        "student_tokenizer",
+        "chat_template",
+    )
+    return {
+        "schema_version": INPUT_MANIFEST_SCHEMA_VERSION,
+        "student_model_identity": manifest["student_model_identity"],
+        **{
+            group: sorted(
+                (_semantic_file_descriptor(entry) for entry in manifest.get(group, [])),
+                key=lambda entry: entry["logical_path"],
+            )
+            for group in groups
+        },
+    }
+
+
+def stable_input_manifest_fingerprint(manifest: Mapping[str, Any]) -> str:
+    """Fingerprint semantic inputs without deployment paths or merged-file mtimes."""
+
+    return payload_fingerprint(_stable_input_manifest_payload(manifest))
+
+
+def _weight_content_identity(weight_files: list[Path], model_dir: Path) -> dict[str, Any]:
+    files = [
+        {
+            "logical_path": path.resolve().relative_to(model_dir.resolve()).as_posix(),
+            "size": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        for path in weight_files
+    ]
+    return {
+        "kind": "weight_content_sha256",
+        "fingerprint": payload_fingerprint(files),
+        "files": files,
+    }
+
+
 def capture_input_manifest(
     *,
     dataset_root: str | Path,
@@ -417,6 +502,7 @@ def capture_input_manifest(
     student_model_path: str | Path,
     student_tokenizer_model: str | Path,
     chat_template_model: str | Path,
+    student_model_identity: str | None = None,
 ) -> dict[str, Any]:
     model_dir = Path(student_model_path).expanduser().resolve()
     ready, reason = validate_hf_checkpoint(model_dir)
@@ -433,18 +519,40 @@ def capture_input_manifest(
         )
         if (path := model_dir / name).is_file()
     ]
+    dataset_dir = Path(dataset_root).expanduser().resolve()
+    student_tokenizer_dir = Path(student_tokenizer_model).expanduser().resolve()
+    chat_template_dir = Path(chat_template_model).expanduser().resolve()
+    weight_files = _weight_files(model_dir)
+    if student_model_identity:
+        model_identity = {
+            "kind": "committed_checkpoint",
+            "fingerprint": str(student_model_identity),
+        }
+    else:
+        model_identity = _weight_content_identity(weight_files, model_dir)
     manifest = {
+        "schema_version": INPUT_MANIFEST_SCHEMA_VERSION,
+        "student_model_identity": model_identity,
         "dataset": [
-            _file_descriptor(path, content_hash=True) for path in _dataset_files(dataset_root, raw_benchmark_path)
+            _relative_file_descriptor(path, dataset_dir, content_hash=True)
+            for path in _dataset_files(dataset_root, raw_benchmark_path)
         ],
-        "student_model_metadata": [_file_descriptor(path, content_hash=True) for path in model_small_files],
-        "student_model_weights": [_file_descriptor(path, content_hash=False) for path in _weight_files(model_dir)],
+        "student_model_metadata": [
+            _relative_file_descriptor(path, model_dir, content_hash=True) for path in model_small_files
+        ],
+        "student_model_weights": [
+            _relative_file_descriptor(path, model_dir, content_hash=False) for path in weight_files
+        ],
         "student_tokenizer": [
-            _file_descriptor(path, content_hash=True) for path in _tokenizer_files(student_tokenizer_model)
+            _relative_file_descriptor(path, student_tokenizer_dir, content_hash=True)
+            for path in _tokenizer_files(student_tokenizer_model)
         ],
-        "chat_template": [_file_descriptor(path, content_hash=True) for path in _tokenizer_files(chat_template_model)],
+        "chat_template": [
+            _relative_file_descriptor(path, chat_template_dir, content_hash=True)
+            for path in _tokenizer_files(chat_template_model)
+        ],
     }
-    manifest["fingerprint"] = payload_fingerprint(manifest)
+    manifest["fingerprint"] = stable_input_manifest_fingerprint(manifest)
     return manifest
 
 
@@ -474,6 +582,50 @@ def capture_model_manifest(model_dir: str | Path) -> dict[str, Any]:
 
 def validate_input_manifest(manifest: dict[str, Any]) -> tuple[bool, str]:
     expected_fingerprint = manifest.get("fingerprint")
+    if manifest.get("schema_version") == INPUT_MANIFEST_SCHEMA_VERSION:
+        refreshed: dict[str, Any] = {
+            "schema_version": INPUT_MANIFEST_SCHEMA_VERSION,
+            "student_model_identity": dict(manifest.get("student_model_identity") or {}),
+        }
+        try:
+            for group_name in (
+                "dataset",
+                "student_model_metadata",
+                "student_model_weights",
+                "student_tokenizer",
+                "chat_template",
+            ):
+                refreshed[group_name] = [
+                    _file_descriptor(
+                        Path(entry["path"]),
+                        content_hash=entry.get("mode") == "sha256",
+                        logical_path=str(entry["logical_path"]),
+                    )
+                    for entry in manifest.get(group_name, [])
+                ]
+            identity = refreshed["student_model_identity"]
+            if identity.get("kind") == "weight_content_sha256":
+                weight_entries = refreshed["student_model_weights"]
+                files = [
+                    {
+                        "logical_path": str(entry["logical_path"]),
+                        "size": int(entry["size"]),
+                        "sha256": sha256_file(Path(entry["path"])),
+                    }
+                    for entry in weight_entries
+                ]
+                refreshed["student_model_identity"] = {
+                    "kind": "weight_content_sha256",
+                    "fingerprint": payload_fingerprint(files),
+                    "files": files,
+                }
+        except (KeyError, OSError, ValueError) as exc:
+            return False, f"input file is missing or unreadable: {exc}"
+        actual_fingerprint = stable_input_manifest_fingerprint(refreshed)
+        if actual_fingerprint != expected_fingerprint:
+            return False, "input dataset/model/tokenizer fingerprint changed"
+        return True, "valid"
+
     refreshed: dict[str, Any] = {}
     try:
         for group_name, entries in manifest.items():
@@ -698,6 +850,16 @@ def analysis_request(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def generation_request_identity(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Return sampling semantics without host-specific deployment paths."""
+
+    return {str(key): value for key, value in request.items() if key not in REQUEST_PATH_KEYS}
+
+
+def tokenizer_identity(tokenizer_info: Mapping[str, Any]) -> dict[str, Any]:
+    return {str(key): value for key, value in tokenizer_info.items() if key != "model_path"}
+
+
 def generation_fingerprint(
     *,
     request: dict[str, Any],
@@ -708,10 +870,10 @@ def generation_fingerprint(
     return payload_fingerprint(
         {
             "generation_schema_version": GENERATION_SCHEMA_VERSION,
-            "request": request,
+            "request": generation_request_identity(request),
             "input_manifest_fingerprint": input_manifest["fingerprint"],
             "dataset_fingerprint": dataset_fingerprint,
-            "tokenizer": tokenizer_info,
+            "tokenizer": tokenizer_identity(tokenizer_info),
         }
     )
 
@@ -1910,6 +2072,39 @@ def validate_generate_args(args: argparse.Namespace) -> None:
         raise ValueError("--high-gap-threshold must be finite and non-negative")
 
 
+def prepare_generation(args: argparse.Namespace) -> GenerationPreparation:
+    tokenizer = load_eval_tokenizer(args)
+    problems, tasks, dataset_fingerprint = prepare_tasks(args, tokenizer)
+    input_manifest = capture_input_manifest(
+        dataset_root=args.dataset_root,
+        raw_benchmark_path=args.benchmark,
+        student_model_path=args.student_model_path,
+        student_tokenizer_model=args.student_tokenizer_model,
+        chat_template_model=args.chat_template_model,
+        student_model_identity=getattr(args, "student_model_identity", None),
+    )
+    tokenizer_info = tokenizer_metadata(tokenizer, args.student_tokenizer_model)
+    request = generation_request(args)
+    analysis = analysis_request(args)
+    fingerprint = generation_fingerprint(
+        request=request,
+        input_manifest=input_manifest,
+        dataset_fingerprint=dataset_fingerprint,
+        tokenizer_info=tokenizer_info,
+    )
+    return GenerationPreparation(
+        tokenizer=tokenizer,
+        problems=problems,
+        tasks=tasks,
+        dataset_fingerprint=dataset_fingerprint,
+        input_manifest=input_manifest,
+        tokenizer_info=tokenizer_info,
+        request=request,
+        analysis=analysis,
+        fingerprint=fingerprint,
+    )
+
+
 def _metadata_for_generation(
     *,
     args: argparse.Namespace,
@@ -1919,12 +2114,14 @@ def _metadata_for_generation(
     tokenizer_info: dict[str, Any],
     input_manifest: dict[str, Any],
     fingerprint: str,
+    generation_schema_version: int = GENERATION_SCHEMA_VERSION,
+    generation_compatibility: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     prompt_lengths = [len(problem.prompt_token_ids) for problem in problems]
     normalized = normalize_benchmark_path(args.benchmark)
-    return {
+    metadata = {
         "schema_version": SCHEMA_VERSION,
-        "generation_schema_version": GENERATION_SCHEMA_VERSION,
+        "generation_schema_version": int(generation_schema_version),
         "experiment": args.experiment,
         "global_step": args.global_step,
         "benchmark": {
@@ -1948,6 +2145,9 @@ def _metadata_for_generation(
         "prompt_tokens_max": max(prompt_lengths),
         "source": source_metadata(),
     }
+    if generation_compatibility:
+        metadata["generation_compatibility"] = dict(generation_compatibility)
+    return metadata
 
 
 def _read_metadata(output_dir: Path) -> dict[str, Any] | None:
@@ -1959,6 +2159,255 @@ def _read_metadata(output_dir: Path) -> dict[str, Any] | None:
     except Exception:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _mapping_differences(existing: Mapping[str, Any], current: Mapping[str, Any]) -> dict[str, Any]:
+    differences: dict[str, Any] = {}
+    for key in sorted(set(existing) | set(current)):
+        if existing.get(key) != current.get(key):
+            differences[str(key)] = {"existing": existing.get(key), "current": current.get(key)}
+    return differences
+
+
+def _operational_descriptor(entry: Mapping[str, Any]) -> dict[str, Any]:
+    return {str(key): value for key, value in entry.items() if key != "logical_path"}
+
+
+def _descriptor_map(entries: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {str(entry.get("path") or entry.get("logical_path")): _operational_descriptor(entry) for entry in entries}
+
+
+def _manifest_group_difference(
+    existing_entries: Iterable[Mapping[str, Any]],
+    current_entries: Iterable[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    existing = _descriptor_map(existing_entries)
+    current = _descriptor_map(current_entries)
+    added = sorted(set(current) - set(existing))
+    removed = sorted(set(existing) - set(current))
+    changed = {
+        path: _mapping_differences(existing[path], current[path])
+        for path in sorted(set(existing) & set(current))
+        if existing[path] != current[path]
+    }
+    if not added and not removed and not changed:
+        return None
+    return {"added": added, "removed": removed, "changed": changed}
+
+
+def generation_compatibility_differences(
+    existing: Mapping[str, Any],
+    preparation: GenerationPreparation,
+) -> dict[str, Any]:
+    existing_manifest = existing.get("input_manifest") or {}
+    current_manifest = preparation.input_manifest
+    manifest_groups: dict[str, Any] = {}
+    for group in (
+        "dataset",
+        "student_model_metadata",
+        "student_model_weights",
+        "student_tokenizer",
+        "chat_template",
+    ):
+        difference = _manifest_group_difference(
+            existing_manifest.get(group, []),
+            current_manifest.get(group, []),
+        )
+        if difference is not None:
+            manifest_groups[group] = difference
+    differences: dict[str, Any] = {
+        "generation_fingerprint": {
+            "existing": existing.get("generation_fingerprint"),
+            "current": preparation.fingerprint,
+        },
+        "generation_schema_version": {
+            "existing": existing.get("generation_schema_version"),
+            "current": GENERATION_SCHEMA_VERSION,
+        },
+    }
+    request_difference = _mapping_differences(existing.get("request") or {}, preparation.request)
+    if request_difference:
+        differences["request"] = request_difference
+    existing_dataset_fingerprint = (existing.get("benchmark") or {}).get("dataset_fingerprint")
+    if existing_dataset_fingerprint != preparation.dataset_fingerprint:
+        differences["dataset_fingerprint"] = {
+            "existing": existing_dataset_fingerprint,
+            "current": preparation.dataset_fingerprint,
+        }
+    tokenizer_difference = _mapping_differences(
+        existing.get("student_tokenizer") or {},
+        preparation.tokenizer_info,
+    )
+    if tokenizer_difference:
+        differences["student_tokenizer"] = tokenizer_difference
+    existing_model_identity = existing_manifest.get("student_model_identity")
+    current_model_identity = current_manifest.get("student_model_identity")
+    if existing_model_identity != current_model_identity:
+        differences["student_model_identity"] = {
+            "existing": existing_model_identity,
+            "current": current_model_identity,
+        }
+    if manifest_groups:
+        differences["input_manifest_groups"] = manifest_groups
+    return differences
+
+
+def _legacy_generation_fingerprint(existing: Mapping[str, Any]) -> str | None:
+    try:
+        return payload_fingerprint(
+            {
+                "generation_schema_version": int(existing["generation_schema_version"]),
+                "request": existing["request"],
+                "input_manifest_fingerprint": existing["input_manifest"]["fingerprint"],
+                "dataset_fingerprint": existing["benchmark"]["dataset_fingerprint"],
+                "tokenizer": existing["student_tokenizer"],
+            }
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _legacy_manifest_is_self_consistent(manifest: Mapping[str, Any]) -> bool:
+    if manifest.get("schema_version") == INPUT_MANIFEST_SCHEMA_VERSION:
+        return False
+    payload = {str(key): value for key, value in manifest.items() if key != "fingerprint"}
+    return manifest.get("fingerprint") == payload_fingerprint(payload)
+
+
+def _legacy_mtime_only_compatibility(
+    existing: Mapping[str, Any],
+    preparation: GenerationPreparation,
+) -> tuple[bool, list[dict[str, Any]]]:
+    if existing.get("generation_schema_version") != 2:
+        return False, []
+    model_identity = preparation.input_manifest.get("student_model_identity") or {}
+    if model_identity.get("kind") != "committed_checkpoint" or not model_identity.get("fingerprint"):
+        return False, []
+    if existing.get("generation_fingerprint") != _legacy_generation_fingerprint(existing):
+        return False, []
+    existing_manifest = existing.get("input_manifest") or {}
+    if not _legacy_manifest_is_self_consistent(existing_manifest):
+        return False, []
+    if existing.get("request") != preparation.request:
+        return False, []
+    if (existing.get("benchmark") or {}).get("dataset_fingerprint") != preparation.dataset_fingerprint:
+        return False, []
+    if existing.get("student_tokenizer") != preparation.tokenizer_info:
+        return False, []
+
+    current_manifest = preparation.input_manifest
+    for group in ("dataset", "student_model_metadata", "student_tokenizer", "chat_template"):
+        if _descriptor_map(existing_manifest.get(group, [])) != _descriptor_map(current_manifest.get(group, [])):
+            return False, []
+
+    existing_weights = _descriptor_map(existing_manifest.get("student_model_weights", []))
+    current_weights = _descriptor_map(current_manifest.get("student_model_weights", []))
+    if set(existing_weights) != set(current_weights) or not existing_weights:
+        return False, []
+    changes: list[dict[str, Any]] = []
+    for path in sorted(existing_weights):
+        previous = existing_weights[path]
+        current = current_weights[path]
+        previous_without_mtime = {key: value for key, value in previous.items() if key != "mtime_ns"}
+        current_without_mtime = {key: value for key, value in current.items() if key != "mtime_ns"}
+        if previous_without_mtime != current_without_mtime:
+            return False, []
+        if previous.get("mtime_ns") != current.get("mtime_ns"):
+            changes.append(
+                {
+                    "path": path,
+                    "size": current.get("size"),
+                    "existing_mtime_ns": previous.get("mtime_ns"),
+                    "current_mtime_ns": current.get("mtime_ns"),
+                }
+            )
+    return True, changes
+
+
+def assess_generation_compatibility(
+    existing: Mapping[str, Any] | None,
+    preparation: GenerationPreparation,
+) -> dict[str, Any]:
+    if existing is None:
+        return {
+            "status": "new",
+            "compatible": True,
+            "effective_fingerprint": preparation.fingerprint,
+            "differences": {},
+        }
+    existing_fingerprint = str(existing.get("generation_fingerprint") or "")
+    if existing_fingerprint == preparation.fingerprint:
+        return {
+            "status": "exact",
+            "compatible": True,
+            "effective_fingerprint": preparation.fingerprint,
+            "differences": {},
+        }
+    compatibility = existing.get("generation_compatibility") or {}
+    compatible_fingerprints = compatibility.get("compatible_fingerprints") or []
+    if preparation.fingerprint in compatible_fingerprints:
+        return {
+            "status": "compatible_alias",
+            "compatible": True,
+            "effective_fingerprint": existing_fingerprint,
+            "differences": {},
+        }
+    legacy_compatible, mtime_changes = _legacy_mtime_only_compatibility(existing, preparation)
+    if legacy_compatible:
+        return {
+            "status": "legacy_mtime_only",
+            "compatible": True,
+            "effective_fingerprint": existing_fingerprint,
+            "differences": generation_compatibility_differences(existing, preparation),
+            "mtime_changes": mtime_changes,
+        }
+    return {
+        "status": "incompatible",
+        "compatible": False,
+        "effective_fingerprint": None,
+        "differences": generation_compatibility_differences(existing, preparation),
+    }
+
+
+def _apply_generation_compatibility_migration(
+    output_dir: Path,
+    existing: dict[str, Any],
+    preparation: GenerationPreparation,
+    assessment: Mapping[str, Any],
+) -> dict[str, Any]:
+    if assessment.get("status") != "legacy_mtime_only":
+        return existing
+    migrated = copy.deepcopy(existing)
+    compatibility = dict(migrated.get("generation_compatibility") or {})
+    aliases = [str(value) for value in compatibility.get("compatible_fingerprints") or []]
+    if preparation.fingerprint not in aliases:
+        aliases.append(preparation.fingerprint)
+    migrations = list(compatibility.get("migrations") or [])
+    migrations.append(
+        {
+            "migrated_at_unix": time.time(),
+            "reason": "legacy model manifest upgrade; merged-weight differences were limited to mtime",
+            "legacy_generation_fingerprint": migrated.get("generation_fingerprint"),
+            "compatible_generation_fingerprint": preparation.fingerprint,
+            "legacy_input_manifest_fingerprint": (migrated.get("input_manifest") or {}).get("fingerprint"),
+            "stable_input_manifest_fingerprint": preparation.input_manifest.get("fingerprint"),
+            "student_model_identity": preparation.input_manifest.get("student_model_identity"),
+            "mtime_changes": list(assessment.get("mtime_changes") or []),
+        }
+    )
+    compatibility.update(
+        {
+            "schema_version": GENERATION_COMPATIBILITY_SCHEMA_VERSION,
+            "compatible_fingerprints": aliases,
+            "migrations": migrations,
+        }
+    )
+    migrated["generation_compatibility"] = compatibility
+    migrated["input_manifest"] = preparation.input_manifest
+    write_json_atomic(output_dir / METADATA_FILENAME, migrated)
+    if migrated.get("generation_complete") and all((output_dir / name).is_file() for name in REQUIRED_RESULT_FILES):
+        write_completion_marker(output_dir, migrated)
+    return migrated
 
 
 def _reanalyze_completed_unit(output_dir: Path, metadata: dict[str, Any], analysis: dict[str, Any]) -> dict[str, Any]:
@@ -1977,55 +2426,87 @@ async def generate_main(args: argparse.Namespace) -> int:
     output_dir = unit_output_dir(result_root, args.benchmark, args.global_step)
     with unit_lock(output_dir):
         _write_layout_metadata(result_root, args)
-        tokenizer = load_eval_tokenizer(args)
-        problems, tasks, dataset_fingerprint = prepare_tasks(args, tokenizer)
-        input_manifest = capture_input_manifest(
-            dataset_root=args.dataset_root,
-            raw_benchmark_path=args.benchmark,
-            student_model_path=args.student_model_path,
-            student_tokenizer_model=args.student_tokenizer_model,
-            chat_template_model=args.chat_template_model,
-        )
-        tokenizer_info = tokenizer_metadata(tokenizer, args.student_tokenizer_model)
-        request = generation_request(args)
-        analysis = analysis_request(args)
-        fingerprint = generation_fingerprint(
-            request=request,
-            input_manifest=input_manifest,
-            dataset_fingerprint=dataset_fingerprint,
-            tokenizer_info=tokenizer_info,
-        )
+        preparation = prepare_generation(args)
         existing = _read_metadata(output_dir)
+
+        if args.overwrite:
+            assessment = {
+                "status": "overwrite",
+                "compatible": True,
+                "effective_fingerprint": preparation.fingerprint,
+                "differences": generation_compatibility_differences(existing, preparation) if existing else {},
+            }
+        else:
+            assessment = assess_generation_compatibility(existing, preparation)
+        if not assessment["compatible"]:
+            raise RuntimeError(
+                "Generation preflight rejected an existing evaluation. No model server is required to diagnose this "
+                "conflict:\n"
+                + json.dumps(
+                    {
+                        "event": "generation_preflight",
+                        "status": assessment["status"],
+                        "output_dir": str(output_dir),
+                        "differences": assessment["differences"],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=json_default,
+                )
+            )
+        if existing is not None and assessment["status"] == "legacy_mtime_only":
+            existing = _apply_generation_compatibility_migration(output_dir, existing, preparation, assessment)
+        print(
+            canonical_json(
+                {
+                    "event": "generation_preflight",
+                    "status": assessment["status"],
+                    "output_dir": output_dir,
+                    "existing_generation_fingerprint": None
+                    if existing is None
+                    else existing.get("generation_fingerprint"),
+                    "current_generation_fingerprint": preparation.fingerprint,
+                    "effective_generation_fingerprint": assessment["effective_fingerprint"],
+                    "mtime_change_count": len(assessment.get("mtime_changes") or []),
+                }
+            ),
+            flush=True,
+        )
+        if getattr(args, "preflight_only", False):
+            return 0
 
         if args.overwrite:
             _clean_unit_for_overwrite(output_dir)
             existing = None
-        elif existing and existing.get("generation_fingerprint") != fingerprint:
-            raise RuntimeError(
-                f"Existing evaluation under {output_dir} was created with different inputs or generation settings. "
-                "Use --overwrite only if replacing it is intentional."
-            )
-        elif existing and existing.get("generation_complete") and (output_dir / ROLLOUTS_FILENAME).is_file():
-            if existing.get("analysis") != analysis or not (output_dir / COMPLETION_FILENAME).is_file():
-                _reanalyze_completed_unit(output_dir, existing, analysis)
+        fingerprint = str(assessment["effective_fingerprint"])
+        if existing and existing.get("generation_complete") and (output_dir / ROLLOUTS_FILENAME).is_file():
+            if existing.get("analysis") != preparation.analysis or not (output_dir / COMPLETION_FILENAME).is_file():
+                _reanalyze_completed_unit(output_dir, existing, preparation.analysis)
+                return 0
             else:
                 valid, reason = validate_completed_unit(output_dir, validate_inputs=True)
                 if valid:
                     print(f"[generate] already complete: {output_dir}")
                     return 0
                 if "result file" in reason or "completion marker" in reason:
-                    _reanalyze_completed_unit(output_dir, existing, analysis)
+                    _reanalyze_completed_unit(output_dir, existing, preparation.analysis)
                     return 0
                 raise RuntimeError(f"Existing evaluation is no longer compatible: {reason}")
 
         metadata = _metadata_for_generation(
             args=args,
-            problems=problems,
-            tasks=tasks,
-            dataset_fingerprint=dataset_fingerprint,
-            tokenizer_info=tokenizer_info,
-            input_manifest=input_manifest,
+            problems=preparation.problems,
+            tasks=preparation.tasks,
+            dataset_fingerprint=preparation.dataset_fingerprint,
+            tokenizer_info=preparation.tokenizer_info,
+            input_manifest=preparation.input_manifest,
             fingerprint=fingerprint,
+            generation_schema_version=(
+                int(existing.get("generation_schema_version", GENERATION_SCHEMA_VERSION))
+                if existing is not None
+                else GENERATION_SCHEMA_VERSION
+            ),
+            generation_compatibility=(existing or {}).get("generation_compatibility"),
         )
         work_dir = output_dir / WORK_DIRNAME
         parts_dir = work_dir / "generation"
@@ -2035,7 +2516,7 @@ async def generate_main(args: argparse.Namespace) -> int:
 
         completed_records: dict[str, dict[str, Any]] = {}
         pending_tasks: list[RolloutTask] = []
-        for task in tasks:
+        for task in preparation.tasks:
             record = _load_completed_part(_part_path(parts_dir, task), task, fingerprint)
             if record is None:
                 pending_tasks.append(task)
@@ -2050,7 +2531,7 @@ async def generate_main(args: argparse.Namespace) -> int:
                     "event": "generation_start",
                     "output_dir": output_dir,
                     "benchmark": metadata["benchmark"],
-                    "rollout_count": len(tasks),
+                    "rollout_count": len(preparation.tasks),
                     "resumed": len(completed_records),
                     "pending": len(pending_tasks),
                 }
@@ -2082,7 +2563,7 @@ async def generate_main(args: argparse.Namespace) -> int:
                     generation_semaphore=generation_semaphore,
                     scoring_semaphore=scoring_semaphore,
                     args=args,
-                    tokenizer=tokenizer,
+                    tokenizer=preparation.tokenizer,
                     task=task,
                     fingerprint=fingerprint,
                 )
@@ -2092,7 +2573,7 @@ async def generate_main(args: argparse.Namespace) -> int:
             try:
                 await check_served_model(client, args.served_model_name)
                 async for record in bounded_results(pending_tasks, worker, max_pending=max_pending):
-                    task = tasks[int(record["flat_index"])]
+                    task = preparation.tasks[int(record["flat_index"])]
                     if record.get("error"):
                         failures.append(record)
                         write_json_atomic(failures_dir / f"{task.task_id}.json", record)
@@ -2108,7 +2589,7 @@ async def generate_main(args: argparse.Namespace) -> int:
                         completed_now % args.print_every == 0 or completed_now == len(pending_tasks)
                     ):
                         print(
-                            f"progress={total_done}/{len(tasks)} current_failures={len(failures)} "
+                            f"progress={total_done}/{len(preparation.tasks)} current_failures={len(failures)} "
                             f"elapsed_seconds={time.perf_counter() - started_at:.1f}",
                             flush=True,
                         )
@@ -2133,7 +2614,7 @@ async def generate_main(args: argparse.Namespace) -> int:
             return 1
 
         ordered_records: list[dict[str, Any]] = []
-        for task in tasks:
+        for task in preparation.tasks:
             record = completed_records.get(task.task_id) or _load_completed_part(
                 _part_path(parts_dir, task), task, fingerprint
             )
@@ -3438,6 +3919,14 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--experiment", required=True)
     generate.add_argument("--dataset-root", required=True)
     generate.add_argument("--student-model-path", required=True)
+    generate.add_argument(
+        "--student-model-identity",
+        default=None,
+        help=(
+            "Stable identity of the immutable source checkpoint. When omitted, the evaluator hashes model weights "
+            "to avoid relying on merged-file mtimes."
+        ),
+    )
     generate.add_argument("--student-tokenizer-model", required=True)
     generate.add_argument("--chat-template-model", required=True)
     generate.add_argument("--trust-remote-code", action="store_true")
@@ -3470,6 +3959,11 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--verifier", choices=["math_dapo", "math_verify", "hybrid"], default="math_verify")
     add_analysis_arguments(generate)
     generate.add_argument("--overwrite", action="store_true")
+    generate.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Validate or migrate result compatibility without contacting the model server.",
+    )
 
     teacher = subparsers.add_parser("teacher-score", help="Attach teacher logprobs to one completed unit")
     add_server_arguments(teacher)

@@ -302,6 +302,8 @@ load_experiment_context() {
     local candidate_json=$1
     CKPT_ROOT=$(python -c 'import json,sys; print(json.loads(sys.argv[1])["checkpoint_root"])' "$candidate_json")
     EVALUATION_SPEC=$(python -c 'import json,sys; print(json.loads(sys.argv[1])["evaluation_spec"])' "$candidate_json")
+    source_checkpoint_identity=$(python -c \
+        'import json,sys; print(json.loads(sys.argv[1])["source_checkpoint_identity"])' "$candidate_json")
     spec_fingerprint=$(json_value spec_fingerprint)
     experiment_name=$(json_value semantic_config.experiment_name)
     training_project=$(json_value semantic_config.training_project)
@@ -939,6 +941,7 @@ run_raw_unit() {
     local served_model=$4
     local base_url=$5
     local tokenizer_model=$6
+    local preflight_only=${7:-0}
     local effective_chat_template_model=${chat_template_model:-$tokenizer_model}
     local -a flags=(
         generate
@@ -951,6 +954,7 @@ run_raw_unit() {
         --experiment "$experiment_name"
         --dataset-root "$dataset_root"
         --student-model-path "$checkpoint"
+        --student-model-identity "$source_checkpoint_identity"
         --student-tokenizer-model "$tokenizer_model"
         --chat-template-model "$effective_chat_template_model"
         --rollout-n "$rollout_n"
@@ -978,6 +982,9 @@ run_raw_unit() {
     fi
     if [[ "$OVERWRITE_RESULTS" == "1" ]]; then
         flags+=(--overwrite)
+    fi
+    if [[ "$preflight_only" == "1" ]]; then
+        flags+=(--preflight-only)
     fi
     python -m verl.utils.evaluation.opd_benchmark "${flags[@]}"
 }
@@ -1120,10 +1127,6 @@ evaluate_checkpoint() {
     step=$(python -c 'import json,sys; print(json.loads(sys.argv[1])["step"])' "$candidate_json")
     actor_dir=$(python -c 'import json,sys; print(json.loads(sys.argv[1])["actor_dir"])' "$candidate_json")
     direct_hf=$(python -c 'import json,sys; print(json.loads(sys.argv[1]).get("hf_checkpoint") or "")' "$candidate_json")
-    update_active_claim_phase "teacher:request"
-    if ! request_teacher_endpoint; then
-        return 1
-    fi
     local attempt_count
     attempt_count=$(register_checkpoint_attempt "$step")
     local checkpoint_started=$SECONDS
@@ -1135,6 +1138,19 @@ evaluate_checkpoint() {
     local tokenizer_model=${STUDENT_TOKENIZER_MODEL:-$checkpoint}
     local served_model="dmpd-student-step-$step"
     local student_base_url="http://127.0.0.1:$STUDENT_PORT/v1"
+    local benchmark
+    for benchmark in "${benchmarks[@]}"; do
+        update_active_claim_phase "preflight:$benchmark"
+        if ! run_raw_unit "$step" "$checkpoint" "$benchmark" "$served_model" "$student_base_url" \
+            "$tokenizer_model" 1
+        then
+            return 1
+        fi
+    done
+    update_active_claim_phase "teacher:request"
+    if ! request_teacher_endpoint; then
+        return 1
+    fi
     update_active_claim_phase "load_student"
     if ! start_vllm "student-step-$step" "$checkpoint" "$tokenizer_model" "$served_model" \
         "$STUDENT_BIND_HOST" "$STUDENT_PORT" "$STUDENT_TP_SIZE" "$STUDENT_DP_SIZE" \
@@ -1147,7 +1163,6 @@ evaluate_checkpoint() {
         return 1
     fi
     local load_seconds=$((SECONDS - load_started))
-    local benchmark
     for benchmark in "${benchmarks[@]}"; do
         update_active_claim_phase "raw:$benchmark"
         if ! run_raw_unit "$step" "$checkpoint" "$benchmark" "$served_model" "$student_base_url" \

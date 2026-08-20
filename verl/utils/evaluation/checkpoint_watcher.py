@@ -48,6 +48,7 @@ CLAIMS_DIRNAME = "claims"
 CLAIM_OWNER_FILENAME = "owner.json"
 CLAIM_HEARTBEAT_FILENAME = "heartbeat.json"
 CLAIM_TYPES = ("checkpoint", "role", "wandb")
+SOURCE_CHECKPOINT_IDENTITY_SCHEMA_VERSION = 1
 SCHEDULER_METADATA_ENV = (
     "MA_VJ_NAME",
     "MA_TASK_NAME",
@@ -82,6 +83,7 @@ class SearchCheckpointCandidate:
     training_project: str
     training_run_id: str | None
     spec_fingerprint: str
+    source_checkpoint_identity: str
     checkpoint_mtime_ns: int
 
 
@@ -592,6 +594,42 @@ def discover_search_root_checkpoints(search_root: str | Path) -> list[SearchChec
         result_identities[result_identity] = (checkpoint_root, spec_fingerprint)
         for checkpoint in discover_committed_checkpoints(checkpoint_root):
             checkpoint_path = Path(checkpoint.checkpoint_dir)
+            state = _read_json(Path(checkpoint.evaluation_state))
+            if state is None:
+                continue
+            if checkpoint.needs_merge:
+                source_model_files = sorted(Path(checkpoint.actor_dir).glob("model_world_size_*_rank_*.pt"))
+                source_model_root = Path(checkpoint.actor_dir)
+            else:
+                source_model_root = Path(str(checkpoint.hf_checkpoint))
+                source_model_files = sorted(
+                    {
+                        path
+                        for pattern in ("*.safetensors", "pytorch_model*.bin", "model*.bin")
+                        for path in source_model_root.glob(pattern)
+                        if path.is_file()
+                    }
+                )
+            source_model_descriptors = [
+                {
+                    "logical_path": path.relative_to(source_model_root).as_posix(),
+                    "size": path.stat().st_size,
+                    "mtime_ns": path.stat().st_mtime_ns,
+                }
+                for path in source_model_files
+            ]
+            source_checkpoint_identity = payload_fingerprint(
+                {
+                    "schema_version": SOURCE_CHECKPOINT_IDENTITY_SCHEMA_VERSION,
+                    "training_project": training_project,
+                    "experiment_name": experiment_name,
+                    "training_run_id": None if training_run_id is None else str(training_run_id),
+                    "spec_fingerprint": spec_fingerprint,
+                    "global_step": checkpoint.step,
+                    "evaluation_state_fingerprint": state.get("state_fingerprint"),
+                    "source_model_files": source_model_descriptors,
+                }
+            )
             candidates.append(
                 SearchCheckpointCandidate(
                     **asdict(checkpoint),
@@ -601,6 +639,7 @@ def discover_search_root_checkpoints(search_root: str | Path) -> list[SearchChec
                     training_project=training_project,
                     training_run_id=None if training_run_id is None else str(training_run_id),
                     spec_fingerprint=spec_fingerprint,
+                    source_checkpoint_identity=source_checkpoint_identity,
                     checkpoint_mtime_ns=checkpoint_path.stat().st_mtime_ns,
                 )
             )

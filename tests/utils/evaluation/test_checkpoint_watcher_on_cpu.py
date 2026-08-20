@@ -136,6 +136,22 @@ def test_search_root_watcher_discovers_checkpoints_across_experiments(tmp_path):
     assert by_experiment["experiment-a"].checkpoint_dir == str(checkpoint_a.resolve())
     assert by_experiment["experiment-b"].checkpoint_root == str(run_b.resolve())
     assert by_experiment["experiment-b"].checkpoint_dir == str(checkpoint_b.resolve())
+    assert len(by_experiment["experiment-a"].source_checkpoint_identity) == 64
+    assert (
+        by_experiment["experiment-a"].source_checkpoint_identity
+        != by_experiment["experiment-b"].source_checkpoint_identity
+    )
+
+    original_identity = by_experiment["experiment-a"].source_checkpoint_identity
+    os.utime(checkpoint_a, None)
+    rediscovered = {candidate.experiment_name: candidate for candidate in discover_search_root_checkpoints(outputs)}
+    assert rediscovered["experiment-a"].source_checkpoint_identity == original_identity
+
+    source_shard = checkpoint_a / "actor" / "model_world_size_2_rank_0.pt"
+    source_mtime = source_shard.stat().st_mtime_ns
+    os.utime(source_shard, ns=(source_mtime + 1_000_000_000, source_mtime + 1_000_000_000))
+    changed_source = {candidate.experiment_name: candidate for candidate in discover_search_root_checkpoints(outputs)}
+    assert changed_source["experiment-a"].source_checkpoint_identity != original_identity
 
 
 def test_balanced_watcher_requires_checkpoint_local_metric_commit(tmp_path):

@@ -92,10 +92,21 @@ def test_checkpoint_eval_launcher_uses_distributed_claims_and_instance_scoped_co
     assert "sync_wandb_serialized" in source
     assert "OPD_RESULT_STATUS" in source
     assert "load_queue_context" in source
+    assert 'json.loads(sys.argv[1])["source_checkpoint_identity"]' in source
+    assert '--student-model-identity "$source_checkpoint_identity"' in source
+    assert "--preflight-only" in source
     assert "discovered ${#candidates[@]} committed checkpoint(s); checking result state" in source
     assert "EVAL_CLAIM_STALE_SECONDS=${EVAL_CLAIM_STALE_SECONDS:-300}" in source
     assert 'if checkpoint_complete "$step" && checkpoint_wandb_is_staged "$step"; then' in source
     assert 'elif checkpoint_complete "$step"; then' in source
+
+    evaluate_body = source[source.index("evaluate_checkpoint() {") : source.index("array_contains() {")]
+    assert evaluate_body.index('update_active_claim_phase "preflight:$benchmark"') < evaluate_body.index(
+        'update_active_claim_phase "teacher:request"'
+    )
+    assert evaluate_body.index('update_active_claim_phase "teacher:request"') < evaluate_body.index(
+        'update_active_claim_phase "load_student"'
+    )
 
 
 def test_checkpoint_eval_launcher_validates_direct_merge_before_starting_vllm_on_cpu():
