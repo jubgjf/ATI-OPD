@@ -23,7 +23,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from verl.utils.evaluation import opd_benchmark as benchmark
-from verl.utils.evaluation import teacher_intervention
+from verl.utils.evaluation import opd_result_status, teacher_intervention
 from verl.utils.evaluation.checkpoint_evaluation import write_evaluation_spec, write_evaluation_state
 
 
@@ -302,6 +302,29 @@ def test_completed_unit_checks_expectations_and_result_sizes_on_cpu(tmp_path):
     valid, reason = benchmark.validate_completed_unit(output_dir)
     assert valid is False
     assert "size changed" in reason
+
+
+def test_lightweight_watcher_status_matches_unit_layout_and_checks_repair_and_checksum_on_cpu(tmp_path):
+    output_dir = benchmark.unit_output_dir(tmp_path, "math-ai/aime24", 20)
+    metadata = _write_complete_unit(output_dir)
+
+    assert opd_result_status.unit_output_dir(tmp_path, "math-ai/aime24", 20) == output_dir
+    assert opd_result_status.validate_completed_unit(output_dir, require_repair=False) == (True, "complete")
+    valid, reason = opd_result_status.validate_completed_unit(output_dir)
+    assert valid is False
+    assert reason == "paired repair is incomplete"
+
+    metadata["repair_complete"] = True
+    benchmark.write_json_atomic(output_dir / benchmark.METADATA_FILENAME, metadata)
+    benchmark.write_completion_marker(output_dir, metadata)
+    assert opd_result_status.validate_completed_unit(output_dir) == (True, "complete")
+
+    summary_path = output_dir / benchmark.SUMMARY_FILENAME
+    assert summary_path.read_text(encoding="utf-8") == "{}\n"
+    summary_path.write_text("[]\n", encoding="utf-8")
+    valid, reason = opd_result_status.validate_completed_unit(output_dir)
+    assert valid is False
+    assert reason == "result file checksum changed: summary.json"
 
 
 def test_completed_unit_normalizes_expected_paths_on_cpu(tmp_path, monkeypatch):

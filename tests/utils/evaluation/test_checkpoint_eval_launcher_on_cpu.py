@@ -90,6 +90,9 @@ def test_checkpoint_eval_launcher_uses_distributed_claims_and_instance_scoped_co
     assert "release-claim" in source
     assert "render-queue" in source
     assert "sync_wandb_serialized" in source
+    assert "OPD_RESULT_STATUS" in source
+    assert "load_queue_context" in source
+    assert "discovered ${#candidates[@]} committed checkpoint(s); checking result state" in source
     assert "EVAL_CLAIM_STALE_SECONDS=${EVAL_CLAIM_STALE_SECONDS:-300}" in source
     assert 'if checkpoint_complete "$step" && checkpoint_wandb_is_staged "$step"; then' in source
     assert 'elif checkpoint_complete "$step"; then' in source

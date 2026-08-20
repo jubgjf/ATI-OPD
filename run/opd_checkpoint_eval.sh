@@ -8,6 +8,7 @@ fi
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+OPD_RESULT_STATUS=$REPO_ROOT/verl/utils/evaluation/opd_result_status.py
 DATASET_DIR=/opt/huawei/dataset/jnguan
 if command -v npu-smi >/dev/null 2>&1 && [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
     npu_environment_available=1
@@ -406,6 +407,44 @@ print(str(bool((student.get("apply_chat_template_kwargs") or {}).get("enable_thi
     EVAL_LOG_ROOT="$eval_log_base/$experiment_name"
     CURRENT_WANDB_ROOT="$EVAL_WANDB_ROOT/$training_project/$experiment_name"
     mkdir -p "$RESULT_ROOT" "$EVAL_CACHE_ROOT" "$EVAL_LOG_ROOT" "$CURRENT_WANDB_ROOT"
+}
+
+load_queue_context() {
+    local candidate_json=$1
+    local context_output
+    if ! context_output=$(python -c '
+import json, sys
+candidate = json.loads(sys.argv[1])
+with open(candidate["evaluation_spec"], encoding="utf-8") as handle:
+    spec = json.load(handle)
+semantic = spec["semantic_config"]
+benchmarks = sys.argv[2].split() or [str(value) for value in semantic["benchmarks"]["names"]]
+fields = [
+    candidate["checkpoint_root"],
+    candidate["evaluation_spec"],
+    candidate["spec_fingerprint"],
+    candidate["experiment_name"],
+    candidate["training_project"],
+]
+if any("\t" in str(value) or "\n" in str(value) for value in [*fields, *benchmarks]):
+    raise ValueError("Queue metadata may not contain tabs or newlines")
+print("\t".join(str(value) for value in fields))
+print("\n".join(benchmarks))
+' "$candidate_json" "${EVAL_BENCHMARKS_TEXT:-}")
+    then
+        return 2
+    fi
+
+    local -a context_lines=()
+    mapfile -t context_lines <<< "$context_output"
+    IFS=$'\t' read -r CKPT_ROOT EVALUATION_SPEC spec_fingerprint experiment_name training_project <<< \
+        "${context_lines[0]}"
+    benchmarks=("${context_lines[@]:1}")
+    if ((${#benchmarks[@]} == 0)); then
+        echo "Experiment $experiment_name contains no benchmark names." >&2
+        return 2
+    fi
+    RESULT_ROOT="$EVAL_RESULTS_ROOT/$training_project/$experiment_name"
 }
 
 VLLM_PID=""
@@ -838,19 +877,14 @@ ensure_hf_checkpoint() {
 checkpoint_complete() {
     local step=$1
     local benchmark
+    local -a status_args=(
+        --result-root "$RESULT_ROOT"
+        --global-step "$step"
+    )
     for benchmark in "${benchmarks[@]}"; do
-        if ! python -m verl.utils.evaluation.opd_benchmark status \
-            --result-root "$RESULT_ROOT" \
-            --benchmark "$benchmark" \
-            --global-step "$step" \
-            --no-validate-inputs \
-            --verify-checksums \
-            --require-repair >/dev/null 2>&1
-        then
-            return 1
-        fi
+        status_args+=(--benchmark "$benchmark")
     done
-    return 0
+    python "$OPD_RESULT_STATUS" "${status_args[@]}" >/dev/null 2>&1
 }
 
 checkpoint_wandb_is_staged() {
@@ -1293,6 +1327,7 @@ controller_role_main() {
     rm -f -- "$teacher_stop_file" "$teacher_request_file"
     while true; do
         local candidate_output
+        echo "[watcher] discovering committed checkpoints under $CHECKPOINT_SEARCH_ROOT"
         if ! candidate_output=$(python -m verl.utils.evaluation.checkpoint_watcher discover-tree \
             --search-root "$CHECKPOINT_SEARCH_ROOT"); then
             return 1
@@ -1301,11 +1336,13 @@ controller_role_main() {
         if [[ -n "$candidate_output" ]]; then
             mapfile -t candidates <<< "$candidate_output"
         fi
+        echo "[watcher] discovered ${#candidates[@]} committed checkpoint(s); checking result state"
 
         local -a pending_candidates=()
-        local candidate
+        local candidate scan_index=0
         for candidate in "${candidates[@]}"; do
             local step candidate_experiment key
+            scan_index=$((scan_index + 1))
             step=$(python -c 'import json,sys; print(json.loads(sys.argv[1])["step"])' "$candidate")
             candidate_experiment=$(python -c \
                 'import json,sys; print(json.loads(sys.argv[1])["experiment_name"])' "$candidate")
@@ -1316,8 +1353,9 @@ controller_role_main() {
             if [[ "$WATCH_ONCE" == "1" ]] && array_contains "$key" "${WATCH_ONCE_ATTEMPTED_KEYS[@]}"; then
                 continue
             fi
-            if ! load_experiment_context "$candidate"; then
-                echo "[watcher] failed to load evaluation context for $candidate_experiment/global_step_$step" >&2
+            echo "[watcher] scan $scan_index/${#candidates[@]}: $candidate_experiment/global_step_$step"
+            if ! load_queue_context "$candidate"; then
+                echo "[watcher] failed to load queue context for $candidate_experiment/global_step_$step" >&2
                 if [[ "$CONTINUE_ON_EVAL_ERROR" != "1" ]]; then
                     return 1
                 fi
@@ -1328,6 +1366,7 @@ controller_role_main() {
             fi
             pending_candidates+=("$candidate")
         done
+        echo "[watcher] result-state scan complete: ${#pending_candidates[@]} checkpoint(s) remain"
         QUEUE_CANDIDATES=("${pending_candidates[@]}")
 
         local selected_candidate=""
