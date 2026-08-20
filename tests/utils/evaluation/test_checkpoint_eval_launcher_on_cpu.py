@@ -27,8 +27,9 @@ def test_checkpoint_eval_launcher_is_valid_and_replaces_legacy_launcher_on_cpu()
     assert LAUNCHER.is_file()
     assert not (REPO_ROOT / "run" / "opd_benchmark_eval.sh").exists()
     source = LAUNCHER.read_text(encoding="utf-8")
-    assert "set -euo pipefail" in source
+    assert "set -euo pipefail" not in source
     assert "EVAL_SHELL_TRACE:-0" in source
+    assert 'if [[ "${EVAL_SHELL_TRACE:-0}" == "1" ]]' in source
 
 
 def test_checkpoint_eval_launcher_is_device_agnostic_and_keeps_prefix_caching_on_cpu():
@@ -54,7 +55,7 @@ def test_checkpoint_eval_launcher_supports_offline_shared_storage_and_manual_fil
     assert "EVAL_BENCHMARKS_TEXT" in source
     assert "POLL_SECONDS=${POLL_SECONDS:-600}" in source
     assert source.count('sleep "$POLL_SECONDS"') == 1
-    assert "processed $processed checkpoint(s); rescanning immediately" in source
+    assert "released $candidate_experiment/global_step_$step; rescanning immediately" in source
     assert "wandb-sync.json" in source
 
 
@@ -77,6 +78,23 @@ def test_checkpoint_eval_launcher_scans_all_experiments_and_bootstraps_npu_envir
     assert "EVAL_SETUP_MODE" in source
 
 
+def test_checkpoint_eval_launcher_uses_distributed_claims_and_instance_scoped_control_on_cpu():
+    source = LAUNCHER.read_text(encoding="utf-8")
+
+    assert "controller.lock" not in source
+    assert "flock -n" not in source
+    assert "EVAL_INSTANCE_ID" in source
+    assert "instance_runtime_root" in source
+    assert "acquire-claim" in source
+    assert "heartbeat-claim" in source
+    assert "release-claim" in source
+    assert "render-queue" in source
+    assert "sync_wandb_serialized" in source
+    assert "EVAL_CLAIM_STALE_SECONDS=${EVAL_CLAIM_STALE_SECONDS:-300}" in source
+    assert 'if checkpoint_complete "$step" && checkpoint_wandb_is_staged "$step"; then' in source
+    assert 'elif checkpoint_complete "$step"; then' in source
+
+
 def test_checkpoint_eval_launcher_validates_direct_merge_before_starting_vllm_on_cpu():
     source = LAUNCHER.read_text(encoding="utf-8")
 
@@ -89,21 +107,17 @@ def test_checkpoint_eval_launcher_validates_direct_merge_before_starting_vllm_on
 def test_checkpoint_eval_launcher_uses_default_local_dir_parent_as_search_root_on_cpu(tmp_path):
     workspace = tmp_path / "shared-workspace"
     expected_search_root = workspace / "outputs"
-    test_bin = tmp_path / "bin"
-    test_bin.mkdir()
-    flock = test_bin / "flock"
-    flock.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-    flock.chmod(0o755)
     env = os.environ.copy()
     env.update(
         {
             "ALLOW_DEBUG_OVERRIDES": "1",
             "DEFAULT_LOCAL_DIR": "outputs/experiment-a",
             "EVAL_RESULTS_ROOT": "eval-results",
+            "EVAL_INSTANCE_ID": "launcher-test",
             "EVAL_ROLE": "controller",
             "EVAL_SETUP_MODE": "skip",
             "EVAL_WANDB_ROOT": "wandb_logs/DMPD-eval",
-            "PATH": os.pathsep.join((str(test_bin), str(Path(sys.executable).parent), env.get("PATH", ""))),
+            "PATH": os.pathsep.join((str(Path(sys.executable).parent), env.get("PATH", ""))),
             "WANDB_MODE": "disabled",
             "WATCH_ONCE": "1",
             "WORKSPACE": str(workspace),
@@ -122,3 +136,25 @@ def test_checkpoint_eval_launcher_uses_default_local_dir_parent_as_search_root_o
     assert expected_search_root.is_dir()
     assert (workspace / "eval-results").is_dir()
     assert (workspace / "wandb_logs" / "DMPD-eval").is_dir()
+    assert "instance:         launcher-test" in completed.stdout
+    assert not list((expected_search_root / ".standalone-eval" / "claims").rglob("*.claim"))
+
+
+def test_checkpoint_eval_launcher_requires_a_shared_instance_identity_on_cpu(tmp_path):
+    env = os.environ.copy()
+    for name in ("EVAL_INSTANCE_ID", "MA_VJ_NAME", "MA_TASK_NAME"):
+        env.pop(name, None)
+    env.update(
+        {
+            "EVAL_ROLE": "controller",
+            "EVAL_SETUP_MODE": "skip",
+            "WANDB_MODE": "disabled",
+            "WATCH_ONCE": "1",
+            "WORKSPACE": str(tmp_path),
+        }
+    )
+
+    completed = subprocess.run(["bash", str(LAUNCHER)], capture_output=True, env=env, text=True)
+
+    assert completed.returncode == 2
+    assert "EVAL_INSTANCE_ID is required" in completed.stderr

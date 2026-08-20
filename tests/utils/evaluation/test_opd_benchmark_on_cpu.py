@@ -15,6 +15,7 @@
 import asyncio
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,6 +35,25 @@ def test_benchmark_id_uses_full_path_and_rejects_traversal_on_cpu():
     assert first.startswith("math-ai__aime24--")
     with pytest.raises(ValueError, match="relative"):
         benchmark.benchmark_id("../aime24")
+
+
+def test_atomic_result_writers_use_unique_temporary_files_on_cpu(tmp_path):
+    json_path = tmp_path / "metadata.json"
+    csv_path = tmp_path / "summary.csv"
+    gzip_path = tmp_path / "rollouts.jsonl.gz"
+
+    def write(index: int) -> None:
+        benchmark.write_json_atomic(json_path, {"index": index})
+        benchmark.write_csv_atomic(csv_path, [{"index": index}], ["index"])
+        benchmark.write_jsonl_gz_atomic(gzip_path, [{"index": index}])
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(write, range(32)))
+
+    assert json.loads(json_path.read_text(encoding="utf-8"))["index"] in range(32)
+    assert csv_path.read_text(encoding="utf-8").startswith("index\n")
+    assert benchmark.read_single_json_gz(gzip_path)["index"] in range(32)
+    assert list(tmp_path.glob(".*.tmp")) == []
 
 
 def test_prepare_tasks_uses_order_independent_seed_on_cpu(monkeypatch):

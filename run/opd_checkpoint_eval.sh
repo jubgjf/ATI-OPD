@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Persistent two-role checkpoint evaluation for every DMPD/OPD experiment below one output root.
+# Independent two-node jobs coordinate through atomic directory claims on shared storage.
 
-set -x
+if [[ "${EVAL_SHELL_TRACE:-0}" == "1" ]]; then
+    set -x
+fi
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
@@ -184,19 +187,53 @@ configure_eval_wandb_storage() {
 }
 configure_eval_wandb_storage
 
+if [[ -n "${EVAL_INSTANCE_ID:-}" ]]; then
+    EVAL_INSTANCE_ID=$EVAL_INSTANCE_ID
+elif [[ -n "${MA_VJ_NAME:-}" && -n "${MA_TASK_NAME:-}" ]]; then
+    EVAL_INSTANCE_ID=${MA_VJ_NAME}--${MA_TASK_NAME}
+else
+    echo "EVAL_INSTANCE_ID is required when MA_VJ_NAME and MA_TASK_NAME are unavailable." >&2
+    echo "Set the same EVAL_INSTANCE_ID on the controller and teacher nodes of one evaluation task." >&2
+    exit 2
+fi
+eval_instance_dirname=$(python -c '
+import hashlib, re, sys
+raw = sys.argv[1]
+slug = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-.")[:64] or "instance"
+print(f"{slug}--{hashlib.sha256(raw.encode()).hexdigest()[:12]}")
+' "$EVAL_INSTANCE_ID")
+
 shared_runtime_root=$CHECKPOINT_SEARCH_ROOT/.standalone-eval
-mkdir -p "$shared_runtime_root"
-teacher_request_file=$shared_runtime_root/teacher-request.json
-teacher_endpoint_file=$shared_runtime_root/teacher-endpoint.json
-teacher_stop_file=$shared_runtime_root/STOP_TEACHER
+instance_runtime_root=$shared_runtime_root/instances/$eval_instance_dirname
+mkdir -p "$shared_runtime_root" "$instance_runtime_root"
+teacher_request_file=$instance_runtime_root/teacher-request.json
+teacher_endpoint_file=$instance_runtime_root/teacher-endpoint.json
+teacher_stop_file=$instance_runtime_root/STOP_TEACHER
 eval_cache_base=$shared_runtime_root/merged-checkpoints
-eval_log_base=$shared_runtime_root/logs
+eval_log_base=$instance_runtime_root/logs
 mkdir -p "$eval_cache_base" "$eval_log_base"
 
 POLL_SECONDS=${POLL_SECONDS:-600}
 TEACHER_REQUEST_POLL_SECONDS=${TEACHER_REQUEST_POLL_SECONDS:-2}
 RETRY_SECONDS=${RETRY_SECONDS:-300}
 WATCH_ONCE=${WATCH_ONCE:-0}
+EVAL_CLAIM_HEARTBEAT_SECONDS=${EVAL_CLAIM_HEARTBEAT_SECONDS:-30}
+EVAL_CLAIM_STALE_SECONDS=${EVAL_CLAIM_STALE_SECONDS:-300}
+EVAL_CLAIM_POLL_SECONDS=${EVAL_CLAIM_POLL_SECONDS:-30}
+EVAL_WANDB_LOCK_WAIT_SECONDS=${EVAL_WANDB_LOCK_WAIT_SECONDS:-3600}
+EVAL_QUEUE_MAX_ROWS=${EVAL_QUEUE_MAX_ROWS:-0}
+if ! python -c '
+import sys
+heartbeat, stale, poll, wandb_wait = map(float, sys.argv[1:5])
+queue_max_rows = int(sys.argv[5])
+if heartbeat <= 0 or stale <= heartbeat or poll <= 0 or wandb_wait <= 0 or queue_max_rows < 0:
+    raise SystemExit(1)
+' "$EVAL_CLAIM_HEARTBEAT_SECONDS" "$EVAL_CLAIM_STALE_SECONDS" "$EVAL_CLAIM_POLL_SECONDS" \
+    "$EVAL_WANDB_LOCK_WAIT_SECONDS" "$EVAL_QUEUE_MAX_ROWS"
+then
+    echo "Invalid claim settings: require heartbeat>0, stale>heartbeat, poll>0, W&B wait>0, queue rows>=0." >&2
+    exit 2
+fi
 EVAL_STEPS_TEXT=${EVAL_STEPS_TEXT:-}
 EVAL_EXPERIMENTS_TEXT=${EVAL_EXPERIMENTS_TEXT:-}
 KEEP_MERGED_CHECKPOINTS=${KEEP_MERGED_CHECKPOINTS:-0}
@@ -374,6 +411,124 @@ print(str(bool((student.get("apply_chat_template_kwargs") or {}).get("enable_thi
 VLLM_PID=""
 VLLM_PGID=""
 VLLM_LOG=""
+ROLE_CLAIM_PATH=""
+ROLE_CLAIM_TOKEN=""
+ROLE_CLAIM_HEARTBEAT_PID=""
+ACTIVE_CLAIM_PATH=""
+ACTIVE_CLAIM_TOKEN=""
+ACTIVE_CLAIM_HEARTBEAT_PID=""
+ACTIVE_CLAIM_LABEL=""
+WANDB_CLAIM_PATH=""
+WANDB_CLAIM_TOKEN=""
+WANDB_CLAIM_HEARTBEAT_PID=""
+STARTED_HEARTBEAT_PID=""
+QUEUE_CANDIDATES=()
+WATCH_ONCE_ATTEMPTED_KEYS=()
+REPORTED_STALE_CLAIM_PATHS=()
+LAST_QUEUE_SIGNATURE=""
+
+claim_json_value() {
+    local payload=$1
+    local key=$2
+    python -c 'import json,sys; print(json.loads(sys.argv[1])[sys.argv[2]])' "$payload" "$key"
+}
+
+start_claim_heartbeat() {
+    local claim_path=$1
+    local claim_token=$2
+    python -m verl.utils.evaluation.checkpoint_watcher heartbeat-claim \
+        --claim-path "$claim_path" \
+        --claim-token "$claim_token" \
+        --loop-seconds "$EVAL_CLAIM_HEARTBEAT_SECONDS" >/dev/null &
+    STARTED_HEARTBEAT_PID=$!
+}
+
+stop_claim_heartbeat() {
+    local heartbeat_pid=${1:-}
+    if [[ -z "$heartbeat_pid" ]]; then
+        return 0
+    fi
+    kill "$heartbeat_pid" 2>/dev/null || true
+    wait "$heartbeat_pid" 2>/dev/null || true
+}
+
+release_claim_safely() {
+    local claim_path=${1:-}
+    local claim_token=${2:-}
+    if [[ -z "$claim_path" || -z "$claim_token" ]]; then
+        return 0
+    fi
+    if ! python -m verl.utils.evaluation.checkpoint_watcher release-claim \
+        --claim-path "$claim_path" \
+        --claim-token "$claim_token" >/dev/null
+    then
+        echo "[claim] failed to release $claim_path; inspect it with:" >&2
+        echo "  python -m verl.utils.evaluation.checkpoint_watcher list-claims --runtime-root $shared_runtime_root" >&2
+        return 1
+    fi
+}
+
+register_role_claim() {
+    local claim_output claim_status
+    claim_output=$(python -m verl.utils.evaluation.checkpoint_watcher acquire-claim \
+        --runtime-root "$shared_runtime_root" \
+        --claim-type role \
+        --instance-id "$EVAL_INSTANCE_ID" \
+        --owner-pid "$$" \
+        --phase "$EVAL_ROLE" \
+        --role "$EVAL_ROLE" \
+        --stale-after-seconds "$EVAL_CLAIM_STALE_SECONDS")
+    claim_status=$?
+    if [[ "$claim_status" != "0" ]]; then
+        echo "[claim] another $EVAL_ROLE already uses EVAL_INSTANCE_ID=$EVAL_INSTANCE_ID" >&2
+        echo "$claim_output" >&2
+        local claim_state=UNKNOWN
+        if [[ "$claim_status" == "3" ]]; then
+            claim_state=$(python -c 'import json,sys; print(json.loads(sys.argv[1]).get("state", "UNKNOWN"))' \
+                "$claim_output")
+        fi
+        if [[ "$claim_state" == "STALE" ]]; then
+            print_stale_claim_recovery "$claim_output"
+        else
+            echo "Inspect claims with:" >&2
+            echo "  python -m verl.utils.evaluation.checkpoint_watcher list-claims --runtime-root $shared_runtime_root" >&2
+        fi
+        return 2
+    fi
+    ROLE_CLAIM_PATH=$(claim_json_value "$claim_output" claim_path)
+    ROLE_CLAIM_TOKEN=$(claim_json_value "$claim_output" claim_token)
+    start_claim_heartbeat "$ROLE_CLAIM_PATH" "$ROLE_CLAIM_TOKEN"
+    ROLE_CLAIM_HEARTBEAT_PID=$STARTED_HEARTBEAT_PID
+}
+
+update_active_claim_phase() {
+    local phase=$1
+    if [[ -z "$ACTIVE_CLAIM_PATH" || -z "$ACTIVE_CLAIM_TOKEN" ]]; then
+        return 0
+    fi
+    python -m verl.utils.evaluation.checkpoint_watcher heartbeat-claim \
+        --claim-path "$ACTIVE_CLAIM_PATH" \
+        --claim-token "$ACTIVE_CLAIM_TOKEN" \
+        --phase "$phase" >/dev/null
+    echo "[current] instance=$EVAL_INSTANCE_ID checkpoint=${ACTIVE_CLAIM_LABEL:-unknown} phase=$phase"
+}
+
+release_active_claim() {
+    stop_claim_heartbeat "$ACTIVE_CLAIM_HEARTBEAT_PID"
+    ACTIVE_CLAIM_HEARTBEAT_PID=""
+    release_claim_safely "$ACTIVE_CLAIM_PATH" "$ACTIVE_CLAIM_TOKEN" || true
+    ACTIVE_CLAIM_PATH=""
+    ACTIVE_CLAIM_TOKEN=""
+    ACTIVE_CLAIM_LABEL=""
+}
+
+release_wandb_claim() {
+    stop_claim_heartbeat "$WANDB_CLAIM_HEARTBEAT_PID"
+    WANDB_CLAIM_HEARTBEAT_PID=""
+    release_claim_safely "$WANDB_CLAIM_PATH" "$WANDB_CLAIM_TOKEN" || true
+    WANDB_CLAIM_PATH=""
+    WANDB_CLAIM_TOKEN=""
+}
 
 port_is_open() {
     local host=$1
@@ -499,9 +654,16 @@ cleanup() {
     trap - EXIT
     set +e
     stop_vllm
-    if [[ "$EVAL_ROLE" == "controller" ]]; then
+    release_wandb_claim
+    release_active_claim
+    if [[ "$EVAL_ROLE" == "controller" && -n "$ROLE_CLAIM_TOKEN" ]]; then
         touch "$teacher_stop_file"
     fi
+    stop_claim_heartbeat "$ROLE_CLAIM_HEARTBEAT_PID"
+    ROLE_CLAIM_HEARTBEAT_PID=""
+    release_claim_safely "$ROLE_CLAIM_PATH" "$ROLE_CLAIM_TOKEN" || true
+    ROLE_CLAIM_PATH=""
+    ROLE_CLAIM_TOKEN=""
     exit "$status"
 }
 trap cleanup EXIT
@@ -653,7 +815,7 @@ ensure_hf_checkpoint() {
     # Match the proven legacy standalone evaluator's direct-merge behavior:
     # some NPU shared filesystems reject renaming a populated directory even
     # within the same parent. Keep the output in an independent cache rather
-    # than mutating actor/huggingface; the controller lock guarantees one writer.
+    # than mutating actor/huggingface; the checkpoint claim guarantees one writer.
     if ! mkdir -p "$cache_step" || ! rm -rf -- "$target" "$cache_step"/.huggingface.tmp.*; then
         echo "Failed to prepare merged-checkpoint cache: $target" >&2
         return 1
@@ -842,6 +1004,62 @@ sync_wandb() {
     python "$SCRIPT_DIR/upload_opd_benchmark_wandb.py" "${flags[@]}"
 }
 
+sync_wandb_serialized() {
+    local step=$1
+    if [[ "$WANDB_MODE" == "disabled" ]] || checkpoint_wandb_is_staged "$step"; then
+        return 0
+    fi
+    update_active_claim_phase "wandb:publish"
+    local deadline=$((SECONDS + EVAL_WANDB_LOCK_WAIT_SECONDS))
+    local reported_stale=""
+    while ((SECONDS < deadline)); do
+        local claim_output claim_status
+        claim_output=$(python -m verl.utils.evaluation.checkpoint_watcher acquire-claim \
+            --runtime-root "$shared_runtime_root" \
+            --claim-type wandb \
+            --instance-id "$EVAL_INSTANCE_ID" \
+            --owner-pid "$$" \
+            --phase "wandb:publish" \
+            --result-root "$RESULT_ROOT" \
+            --experiment-name "$experiment_name" \
+            --training-project "$training_project" \
+            --spec-fingerprint "$spec_fingerprint" \
+            --stale-after-seconds "$EVAL_CLAIM_STALE_SECONDS")
+        claim_status=$?
+        if [[ "$claim_status" == "0" ]]; then
+            WANDB_CLAIM_PATH=$(claim_json_value "$claim_output" claim_path)
+            WANDB_CLAIM_TOKEN=$(claim_json_value "$claim_output" claim_token)
+            start_claim_heartbeat "$WANDB_CLAIM_PATH" "$WANDB_CLAIM_TOKEN"
+            WANDB_CLAIM_HEARTBEAT_PID=$STARTED_HEARTBEAT_PID
+            if checkpoint_wandb_is_staged "$step"; then
+                release_wandb_claim
+                return 0
+            fi
+            if ! sync_wandb; then
+                release_wandb_claim
+                return 1
+            fi
+            release_wandb_claim
+            return 0
+        fi
+        if [[ "$claim_status" != "3" ]]; then
+            echo "[wandb] could not acquire publish claim: $claim_output" >&2
+            return 1
+        fi
+        local claim_state
+        claim_state=$(python -c 'import json,sys; print(json.loads(sys.argv[1]).get("state", "UNKNOWN"))' \
+            "$claim_output")
+        if [[ "$claim_state" == "STALE" && "$reported_stale" != "1" ]]; then
+            reported_stale=1
+            echo "[wandb] stale publish claim blocks $training_project/$experiment_name:" >&2
+            print_stale_claim_recovery "$claim_output"
+        fi
+        sleep "$EVAL_CLAIM_POLL_SECONDS"
+    done
+    echo "[wandb] timed out waiting ${EVAL_WANDB_LOCK_WAIT_SECONDS}s for $training_project/$experiment_name" >&2
+    return 1
+}
+
 register_checkpoint_attempt() {
     local step=$1
     python -c '
@@ -868,6 +1086,7 @@ evaluate_checkpoint() {
     step=$(python -c 'import json,sys; print(json.loads(sys.argv[1])["step"])' "$candidate_json")
     actor_dir=$(python -c 'import json,sys; print(json.loads(sys.argv[1])["actor_dir"])' "$candidate_json")
     direct_hf=$(python -c 'import json,sys; print(json.loads(sys.argv[1]).get("hf_checkpoint") or "")' "$candidate_json")
+    update_active_claim_phase "teacher:request"
     if ! request_teacher_endpoint; then
         return 1
     fi
@@ -875,12 +1094,14 @@ evaluate_checkpoint() {
     attempt_count=$(register_checkpoint_attempt "$step")
     local checkpoint_started=$SECONDS
     local load_started=$SECONDS
+    update_active_claim_phase "merge"
     if ! checkpoint=$(ensure_hf_checkpoint "$step" "$actor_dir" "$direct_hf"); then
         return 1
     fi
     local tokenizer_model=${STUDENT_TOKENIZER_MODEL:-$checkpoint}
     local served_model="dmpd-student-step-$step"
     local student_base_url="http://127.0.0.1:$STUDENT_PORT/v1"
+    update_active_claim_phase "load_student"
     if ! start_vllm "student-step-$step" "$checkpoint" "$tokenizer_model" "$served_model" \
         "$STUDENT_BIND_HOST" "$STUDENT_PORT" "$STUDENT_TP_SIZE" "$STUDENT_DP_SIZE" \
         "$STUDENT_MAX_NUM_SEQS" "$STUDENT_GPU_MEMORY_UTILIZATION" "$STUDENT_DP_RPC_PORT" \
@@ -894,11 +1115,13 @@ evaluate_checkpoint() {
     local load_seconds=$((SECONDS - load_started))
     local benchmark
     for benchmark in "${benchmarks[@]}"; do
+        update_active_claim_phase "raw:$benchmark"
         if ! run_raw_unit "$step" "$checkpoint" "$benchmark" "$served_model" "$student_base_url" \
             "$tokenizer_model"
         then
             return 1
         fi
+        update_active_claim_phase "repair:$benchmark"
         if ! run_repair_unit "$step" "$benchmark" "$served_model" "$student_base_url" "$tokenizer_model"; then
             return 1
         fi
@@ -928,7 +1151,7 @@ os.replace(tmp, path)
     then
         return 1
     fi
-    if ! sync_wandb; then
+    if ! sync_wandb_serialized "$step"; then
         return 1
     fi
     if [[ "$KEEP_MERGED_CHECKPOINTS" != "1" && -z "$direct_hf" ]]; then
@@ -937,16 +1160,136 @@ os.replace(tmp, path)
     echo "[watcher] completed global_step_$step"
 }
 
-controller_role_main() {
-    command -v flock >/dev/null 2>&1 || {
-        echo "The controller requires flock for the checkpoint-root consumer lock." >&2
-        return 2
-    }
-    exec 9>"$shared_runtime_root/controller.lock"
-    if ! flock -n 9; then
-        echo "Another checkpoint evaluator already owns $shared_runtime_root/controller.lock." >&2
-        return 2
+array_contains() {
+    local expected=$1
+    shift
+    local value
+    for value in "$@"; do
+        if [[ "$value" == "$expected" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+candidate_key() {
+    local candidate_json=$1
+    python -c '
+import json, sys
+candidate = json.loads(sys.argv[1])
+print("{}\x1f{}".format(candidate["checkpoint_root"], candidate["step"]))
+' "$candidate_json"
+}
+
+print_queue_snapshot() {
+    local force=${1:-0}
+    local -a flags=(
+        --runtime-root "$shared_runtime_root"
+        --instance-id "$EVAL_INSTANCE_ID"
+        --stale-after-seconds "$EVAL_CLAIM_STALE_SECONDS"
+        --max-rows "$EVAL_QUEUE_MAX_ROWS"
+        --include-signature
+    )
+    if [[ -n "$ACTIVE_CLAIM_PATH" ]]; then
+        flags+=(--current-claim-path "$ACTIVE_CLAIM_PATH")
     fi
+    local snapshot signature table
+    if ! snapshot=$(printf '%s\n' "${QUEUE_CANDIDATES[@]}" | \
+        python -m verl.utils.evaluation.checkpoint_watcher render-queue "${flags[@]}")
+    then
+        echo "[queue] failed to render checkpoint queue" >&2
+        return 1
+    fi
+    signature=${snapshot%%$'\n'*}
+    signature=${signature#__QUEUE_SIGNATURE__=}
+    table=${snapshot#*$'\n'}
+    if [[ "$force" == "1" || "$signature" != "$LAST_QUEUE_SIGNATURE" ]]; then
+        echo "$table"
+        LAST_QUEUE_SIGNATURE=$signature
+    fi
+}
+
+print_stale_claim_recovery() {
+    local claim_output=$1
+    local claim_path claim_token owner_missing runtime_root_quoted claim_path_quoted claim_token_quoted
+    claim_path=$(python -c 'import json,sys; print(json.loads(sys.argv[1])["claim_path"])' "$claim_output")
+    if array_contains "$claim_path" "${REPORTED_STALE_CLAIM_PATHS[@]}"; then
+        return 0
+    fi
+    REPORTED_STALE_CLAIM_PATHS+=("$claim_path")
+    claim_token=$(python -c '
+import json, sys
+owner = json.loads(sys.argv[1]).get("owner") or {}
+print(owner.get("claim_token") or "")
+' "$claim_output")
+    owner_missing=$(python -c '
+import json, sys
+print(str(json.loads(sys.argv[1]).get("owner") is None).lower())
+' "$claim_output")
+    printf -v runtime_root_quoted '%q' "$shared_runtime_root"
+    printf -v claim_path_quoted '%q' "$claim_path"
+    printf -v claim_token_quoted '%q' "$claim_token"
+    echo "[claim] stale claim blocks a managed resource: $claim_path" >&2
+    echo "Confirm its scheduler task has exited, then release it explicitly:" >&2
+    if [[ "$owner_missing" == "true" ]]; then
+        echo "  python -m verl.utils.evaluation.checkpoint_watcher release-stale-claim \
+--runtime-root $runtime_root_quoted --claim-path $claim_path_quoted \
+--stale-after-seconds $EVAL_CLAIM_STALE_SECONDS --allow-ownerless" >&2
+    else
+        echo "  python -m verl.utils.evaluation.checkpoint_watcher release-stale-claim \
+--runtime-root $runtime_root_quoted --claim-path $claim_path_quoted --claim-token $claim_token_quoted \
+--stale-after-seconds $EVAL_CLAIM_STALE_SECONDS" >&2
+    fi
+}
+
+try_acquire_checkpoint_claim() {
+    local candidate_json=$1
+    local checkpoint_root step candidate_experiment candidate_project candidate_fingerprint
+    checkpoint_root=$(python -c 'import json,sys; print(json.loads(sys.argv[1])["checkpoint_root"])' "$candidate_json")
+    step=$(python -c 'import json,sys; print(json.loads(sys.argv[1])["step"])' "$candidate_json")
+    candidate_experiment=$(python -c \
+        'import json,sys; print(json.loads(sys.argv[1])["experiment_name"])' "$candidate_json")
+    candidate_project=$(python -c \
+        'import json,sys; print(json.loads(sys.argv[1])["training_project"])' "$candidate_json")
+    candidate_fingerprint=$(python -c \
+        'import json,sys; print(json.loads(sys.argv[1])["spec_fingerprint"])' "$candidate_json")
+
+    local claim_output claim_status
+    claim_output=$(python -m verl.utils.evaluation.checkpoint_watcher acquire-claim \
+        --runtime-root "$shared_runtime_root" \
+        --claim-type checkpoint \
+        --instance-id "$EVAL_INSTANCE_ID" \
+        --owner-pid "$$" \
+        --phase "claimed" \
+        --checkpoint-root "$checkpoint_root" \
+        --global-step "$step" \
+        --experiment-name "$candidate_experiment" \
+        --training-project "$candidate_project" \
+        --spec-fingerprint "$candidate_fingerprint" \
+        --stale-after-seconds "$EVAL_CLAIM_STALE_SECONDS")
+    claim_status=$?
+    if [[ "$claim_status" == "0" ]]; then
+        ACTIVE_CLAIM_PATH=$(claim_json_value "$claim_output" claim_path)
+        ACTIVE_CLAIM_TOKEN=$(claim_json_value "$claim_output" claim_token)
+        ACTIVE_CLAIM_LABEL=$candidate_experiment/global_step_$step
+        start_claim_heartbeat "$ACTIVE_CLAIM_PATH" "$ACTIVE_CLAIM_TOKEN"
+        ACTIVE_CLAIM_HEARTBEAT_PID=$STARTED_HEARTBEAT_PID
+        return 0
+    fi
+    if [[ "$claim_status" == "3" ]]; then
+        local claim_state
+        claim_state=$(python -c 'import json,sys; print(json.loads(sys.argv[1]).get("state", "UNKNOWN"))' \
+            "$claim_output")
+        if [[ "$claim_state" == "STALE" ]]; then
+            print_stale_claim_recovery "$claim_output"
+        fi
+        return 3
+    fi
+    echo "[claim] failed to acquire $candidate_experiment/global_step_$step: $claim_output" >&2
+    return 1
+}
+
+controller_role_main() {
     rm -f -- "$teacher_stop_file" "$teacher_request_file"
     while true; do
         local candidate_output
@@ -958,17 +1301,19 @@ controller_role_main() {
         if [[ -n "$candidate_output" ]]; then
             mapfile -t candidates <<< "$candidate_output"
         fi
-        local processed=0
+
+        local -a pending_candidates=()
         local candidate
         for candidate in "${candidates[@]}"; do
-            local step candidate_experiment
+            local step candidate_experiment key
             step=$(python -c 'import json,sys; print(json.loads(sys.argv[1])["step"])' "$candidate")
             candidate_experiment=$(python -c \
                 'import json,sys; print(json.loads(sys.argv[1])["experiment_name"])' "$candidate")
-            if ! step_is_selected "$step"; then
+            if ! step_is_selected "$step" || ! experiment_is_selected "$candidate_experiment"; then
                 continue
             fi
-            if ! experiment_is_selected "$candidate_experiment"; then
+            key=$(candidate_key "$candidate")
+            if [[ "$WATCH_ONCE" == "1" ]] && array_contains "$key" "${WATCH_ONCE_ATTEMPTED_KEYS[@]}"; then
                 continue
             fi
             if ! load_experiment_context "$candidate"; then
@@ -978,40 +1323,81 @@ controller_role_main() {
                 fi
                 continue
             fi
-            if checkpoint_complete "$step"; then
-                if ! checkpoint_wandb_is_staged "$step"; then
-                    processed=$((processed + 1))
-                    echo "[watcher] staging recovered W&B results for $experiment_name/global_step_$step"
-                    if ! sync_wandb; then
-                        echo "[watcher] W&B staging failed for $experiment_name/global_step_$step" >&2
-                        if [[ "$CONTINUE_ON_EVAL_ERROR" != "1" ]]; then
-                            return 1
-                        fi
-                        sleep "$RETRY_SECONDS"
-                    fi
-                fi
+            if checkpoint_complete "$step" && checkpoint_wandb_is_staged "$step"; then
                 continue
             fi
-            processed=$((processed + 1))
-            echo "[watcher] evaluating experiment=$experiment_name step=$step root=$CKPT_ROOT"
-            if ! evaluate_checkpoint "$candidate"; then
-                stop_vllm || true
-                echo "[watcher] $experiment_name/global_step_$step failed; resumable shards were retained." >&2
-                if [[ "$CONTINUE_ON_EVAL_ERROR" != "1" ]]; then
-                    return 1
+            pending_candidates+=("$candidate")
+        done
+        QUEUE_CANDIDATES=("${pending_candidates[@]}")
+
+        local selected_candidate=""
+        for candidate in "${pending_candidates[@]}"; do
+            try_acquire_checkpoint_claim "$candidate"
+            local claim_status=$?
+            if [[ "$claim_status" == "0" ]]; then
+                selected_candidate=$candidate
+                if [[ "$WATCH_ONCE" == "1" ]]; then
+                    WATCH_ONCE_ATTEMPTED_KEYS+=("$(candidate_key "$candidate")")
                 fi
-                sleep "$RETRY_SECONDS"
+                break
+            fi
+            if [[ "$claim_status" != "3" && "$CONTINUE_ON_EVAL_ERROR" != "1" ]]; then
+                return 1
             fi
         done
-        if [[ "$WATCH_ONCE" == "1" ]]; then
-            break
+        print_queue_snapshot 0
+
+        if [[ -z "$selected_candidate" ]]; then
+            if [[ "$WATCH_ONCE" == "1" ]]; then
+                echo "[watcher] no unclaimed checkpoint remains for this WATCH_ONCE worker"
+                break
+            fi
+            if ((${#pending_candidates[@]} == 0)); then
+                echo "[watcher] no pending committed checkpoint; sleeping ${POLL_SECONDS}s"
+                sleep "$POLL_SECONDS"
+            else
+                echo "[watcher] all pending checkpoints are claimed or stale; sleeping ${EVAL_CLAIM_POLL_SECONDS}s"
+                sleep "$EVAL_CLAIM_POLL_SECONDS"
+            fi
+            continue
         fi
-        if ((processed == 0)); then
-            echo "[watcher] no pending committed checkpoint; sleeping ${POLL_SECONDS}s"
-            sleep "$POLL_SECONDS"
+
+        local step candidate_experiment work_failed=0
+        step=$(python -c 'import json,sys; print(json.loads(sys.argv[1])["step"])' "$selected_candidate")
+        candidate_experiment=$(python -c \
+            'import json,sys; print(json.loads(sys.argv[1])["experiment_name"])' "$selected_candidate")
+        if ! load_experiment_context "$selected_candidate"; then
+            echo "[watcher] failed to reload evaluation context for $candidate_experiment/global_step_$step" >&2
+            work_failed=1
+        elif checkpoint_complete "$step"; then
+            if checkpoint_wandb_is_staged "$step"; then
+                echo "[watcher] $experiment_name/global_step_$step was completed by another worker before recheck"
+            else
+                echo "[watcher] staging recovered W&B results for $experiment_name/global_step_$step"
+                if ! sync_wandb_serialized "$step"; then
+                    echo "[watcher] W&B staging failed for $experiment_name/global_step_$step" >&2
+                    work_failed=1
+                fi
+            fi
         else
-            echo "[watcher] processed $processed checkpoint(s); rescanning immediately"
+            echo "[watcher] evaluating experiment=$experiment_name step=$step root=$CKPT_ROOT"
+            if ! evaluate_checkpoint "$selected_candidate"; then
+                stop_vllm || true
+                echo "[watcher] $experiment_name/global_step_$step failed; resumable shards were retained." >&2
+                work_failed=1
+            fi
         fi
+
+        if [[ "$work_failed" == "1" ]]; then
+            if [[ "$CONTINUE_ON_EVAL_ERROR" != "1" ]]; then
+                release_active_claim
+                return 1
+            fi
+            echo "[watcher] retaining the checkpoint claim during the ${RETRY_SECONDS}s retry backoff"
+            sleep "$RETRY_SECONDS"
+        fi
+        release_active_claim
+        echo "[watcher] released $candidate_experiment/global_step_$step; rescanning immediately"
     done
     touch "$teacher_stop_file"
 }
@@ -1019,6 +1405,8 @@ controller_role_main() {
 echo "================================================================================"
 echo "Standalone checkpoint evaluation"
 echo "  role:             $EVAL_ROLE"
+echo "  instance:         $EVAL_INSTANCE_ID"
+echo "  instance runtime: $instance_runtime_root"
 echo "  checkpoint search: $CHECKPOINT_SEARCH_ROOT"
 echo "  result root:       $EVAL_RESULTS_ROOT"
 echo "  W&B root:          $EVAL_WANDB_ROOT"
@@ -1028,9 +1416,14 @@ if [[ "$WANDB_MODE" == "offline" ]]; then
 fi
 echo "  experiment filter: ${EVAL_EXPERIMENTS_TEXT:-all}"
 echo "  step filter:       ${EVAL_STEPS_TEXT:-all}"
+echo "  claim heartbeat:   ${EVAL_CLAIM_HEARTBEAT_SECONDS}s"
+echo "  claim stale after: ${EVAL_CLAIM_STALE_SECONDS}s (manual release only)"
 echo "================================================================================"
 
 cd "$REPO_ROOT"
+if ! register_role_claim; then
+    exit 2
+fi
 if [[ "$EVAL_ROLE" == "teacher" ]]; then
     teacher_role_main
 else

@@ -13,16 +13,32 @@
 # limitations under the License.
 
 import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
 
+import pytest
 from omegaconf import OmegaConf
 
-from verl.utils.evaluation.checkpoint_evaluation import write_evaluation_spec, write_evaluation_state
+from verl.utils.evaluation.checkpoint_evaluation import write_evaluation_spec, write_evaluation_state, write_json_atomic
 from verl.utils.evaluation.checkpoint_watcher import (
+    acquire_claim,
+    checkpoint_claim_path,
     discover_committed_checkpoints,
     discover_experiment_roots,
     discover_search_root_checkpoints,
+    heartbeat_claim,
+    inspect_claim,
+    list_claims,
     load_endpoint_descriptor,
     pending_checkpoints,
+    release_claim,
+    release_stale_claim,
+    render_queue_snapshot,
+    role_claim_path,
+    wandb_claim_path,
     write_endpoint_descriptor,
 )
 
@@ -186,3 +202,273 @@ def test_endpoint_descriptor_round_trip(tmp_path):
         model_path=model,
     )
     assert changed["model_fingerprint"] != written["model_fingerprint"]
+
+
+def test_atomic_checkpoint_claim_has_one_winner_across_processes_on_cpu(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    checkpoint_root = tmp_path / "outputs" / "experiment"
+    command = [
+        sys.executable,
+        "-m",
+        "verl.utils.evaluation.checkpoint_watcher",
+        "acquire-claim",
+        "--runtime-root",
+        str(runtime_root),
+        "--claim-type",
+        "checkpoint",
+        "--instance-id",
+        "worker",
+        "--owner-pid",
+        str(os.getpid()),
+        "--checkpoint-root",
+        str(checkpoint_root),
+        "--global-step",
+        "20",
+        "--experiment-name",
+        "experiment",
+    ]
+    processes = [subprocess.Popen(command, stdout=subprocess.PIPE, text=True) for _ in range(8)]
+    results = [(process.wait(), json.loads(process.stdout.read())) for process in processes]
+
+    winners = [payload for return_code, payload in results if return_code == 0]
+    assert len(winners) == 1
+    assert sum(return_code == 3 for return_code, _ in results) == 7
+    winner = winners[0]
+    release_claim(winner["claim_path"], winner["claim_token"])
+
+
+def test_different_checkpoint_claims_can_be_owned_together_on_cpu(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    root = tmp_path / "outputs" / "experiment"
+    first = acquire_claim(
+        checkpoint_claim_path(runtime_root, root, 20),
+        claim_type="checkpoint",
+        instance_id="worker-a",
+        owner_pid=1,
+    )
+    second = acquire_claim(
+        checkpoint_claim_path(runtime_root, root, 40),
+        claim_type="checkpoint",
+        instance_id="worker-b",
+        owner_pid=2,
+    )
+
+    assert first["acquired"] is True
+    assert second["acquired"] is True
+    assert first["claim_path"] != second["claim_path"]
+    release_claim(first["claim_path"], first["claim_token"])
+    release_claim(second["claim_path"], second["claim_token"])
+
+
+def test_claim_heartbeat_token_and_manual_stale_release_on_cpu(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    path = wandb_claim_path(runtime_root, tmp_path / "results" / "experiment")
+    claim = acquire_claim(
+        path,
+        claim_type="wandb",
+        instance_id="worker-a",
+        owner_pid=1,
+        phase="wandb:publish",
+    )
+    heartbeat = heartbeat_claim(path, claim["claim_token"], phase="wandb:artifact")
+    assert heartbeat["phase"] == "wandb:artifact"
+    heartbeat_claim(path, claim["claim_token"])
+    assert inspect_claim(path, stale_after_seconds=300)["owner"]["phase"] == "wandb:artifact"
+    with pytest.raises(RuntimeError, match="token does not match"):
+        heartbeat_claim(path, "wrong-token")
+    with pytest.raises(RuntimeError, match="token does not match"):
+        release_claim(path, "wrong-token")
+
+    heartbeat["updated_at_unix"] = time.time() - 600
+    write_json_atomic(path / "heartbeat.json", heartbeat)
+    assert inspect_claim(path, stale_after_seconds=300)["state"] == "STALE"
+    with pytest.raises(RuntimeError, match="token does not match"):
+        release_stale_claim(
+            runtime_root,
+            path,
+            claim_token="wrong-token",
+            stale_after_seconds=300,
+            allow_ownerless=False,
+        )
+    released = release_stale_claim(
+        runtime_root,
+        path,
+        claim_token=claim["claim_token"],
+        stale_after_seconds=300,
+        allow_ownerless=False,
+    )
+    assert released["state"] == "STALE"
+    assert not path.exists()
+
+
+def test_ownerless_claim_requires_explicit_stale_release_on_cpu(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    path = checkpoint_claim_path(runtime_root, tmp_path / "experiment", 20)
+    path.mkdir(parents=True)
+    old = time.time() - 600
+    os.utime(path, (old, old))
+
+    state = inspect_claim(path, stale_after_seconds=300)
+    assert state["state"] == "STALE"
+    assert state["owner"] is None
+    with pytest.raises(RuntimeError, match="--allow-ownerless"):
+        release_stale_claim(
+            runtime_root,
+            path,
+            claim_token=None,
+            stale_after_seconds=300,
+            allow_ownerless=False,
+        )
+    release_stale_claim(
+        runtime_root,
+        path,
+        claim_token=None,
+        stale_after_seconds=300,
+        allow_ownerless=True,
+    )
+    assert list_claims(runtime_root, stale_after_seconds=300) == []
+
+    outside = tmp_path / "outside.claim"
+    outside.mkdir()
+    os.utime(outside, (old, old))
+    with pytest.raises(ValueError, match="outside managed claim root"):
+        release_stale_claim(
+            runtime_root,
+            outside,
+            claim_token=None,
+            stale_after_seconds=300,
+            allow_ownerless=True,
+        )
+
+
+def test_role_and_wandb_claim_paths_are_resource_scoped_on_cpu(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    controller_path = role_claim_path(runtime_root, "job-a", "controller")
+    teacher_path = role_claim_path(runtime_root, "job-a", "teacher")
+    assert controller_path != role_claim_path(runtime_root, "job-b", "controller")
+    assert controller_path != teacher_path
+    first_wandb_path = wandb_claim_path(runtime_root, tmp_path / "results-a")
+    second_wandb_path = wandb_claim_path(runtime_root, tmp_path / "results-b")
+    assert first_wandb_path != second_wandb_path
+    controller = acquire_claim(
+        controller_path,
+        claim_type="role",
+        instance_id="job-a",
+        owner_pid=1,
+        metadata={"role": "controller"},
+    )
+    duplicate = acquire_claim(
+        controller_path,
+        claim_type="role",
+        instance_id="job-a",
+        owner_pid=2,
+        metadata={"role": "controller"},
+    )
+    teacher = acquire_claim(
+        teacher_path,
+        claim_type="role",
+        instance_id="job-a",
+        owner_pid=3,
+        metadata={"role": "teacher"},
+    )
+    assert controller["acquired"] is True
+    assert duplicate["acquired"] is False
+    assert teacher["acquired"] is True
+    first_wandb = acquire_claim(
+        first_wandb_path,
+        claim_type="wandb",
+        instance_id="job-a",
+        owner_pid=1,
+    )
+    duplicate_wandb = acquire_claim(
+        first_wandb_path,
+        claim_type="wandb",
+        instance_id="job-b",
+        owner_pid=2,
+    )
+    second_wandb = acquire_claim(
+        second_wandb_path,
+        claim_type="wandb",
+        instance_id="job-b",
+        owner_pid=2,
+    )
+    assert first_wandb["acquired"] is True
+    assert duplicate_wandb["acquired"] is False
+    assert second_wandb["acquired"] is True
+    release_claim(controller["claim_path"], controller["claim_token"])
+    release_claim(teacher["claim_path"], teacher["claim_token"])
+    release_claim(first_wandb["claim_path"], first_wandb["claim_token"])
+    release_claim(second_wandb["claim_path"], second_wandb["claim_token"])
+
+
+def test_queue_snapshot_reports_current_queued_claimed_and_stale_on_cpu(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    roots = [tmp_path / f"experiment-{index}" for index in range(4)]
+    candidates = [
+        {"checkpoint_root": str(root), "experiment_name": root.name, "step": index * 20}
+        for index, root in enumerate(roots, start=1)
+    ]
+    current = acquire_claim(
+        checkpoint_claim_path(runtime_root, roots[0], 20),
+        claim_type="checkpoint",
+        instance_id="worker-a",
+        owner_pid=1,
+        phase="raw:aime24",
+    )
+    claimed = acquire_claim(
+        checkpoint_claim_path(runtime_root, roots[2], 60),
+        claim_type="checkpoint",
+        instance_id="worker-b",
+        owner_pid=2,
+        phase="load_student",
+    )
+    stale = acquire_claim(
+        checkpoint_claim_path(runtime_root, roots[3], 80),
+        claim_type="checkpoint",
+        instance_id="worker-c",
+        owner_pid=3,
+        phase="repair:amc23",
+    )
+    stale_heartbeat = json.loads((Path(stale["claim_path"]) / "heartbeat.json").read_text(encoding="utf-8"))
+    stale_heartbeat["updated_at_unix"] = time.time() - 600
+    write_json_atomic(Path(stale["claim_path"]) / "heartbeat.json", stale_heartbeat)
+
+    table, signature = render_queue_snapshot(
+        candidates,
+        runtime_root=runtime_root,
+        instance_id="worker-a",
+        stale_after_seconds=300,
+        current_claim_path=current["claim_path"],
+    )
+
+    assert "current=experiment-0/global_step_20" in table
+    assert "CURRENT" in table
+    assert "QUEUED" in table
+    assert "CLAIMED" in table
+    assert "STALE" in table
+    assert "worker-b" in table
+    assert len(signature) == 64
+    limited_table, repeated_signature = render_queue_snapshot(
+        candidates,
+        runtime_root=runtime_root,
+        instance_id="worker-a",
+        stale_after_seconds=300,
+        current_claim_path=current["claim_path"],
+        max_rows=2,
+    )
+    assert "2 additional row(s) hidden" in limited_table
+    assert repeated_signature == signature
+    release_claim(current["claim_path"], current["claim_token"])
+    release_claim(claimed["claim_path"], claimed["claim_token"])
+    release_claim(stale["claim_path"], stale["claim_token"])
+
+
+def test_search_root_rejects_duplicate_result_identity_on_cpu(tmp_path):
+    outputs = tmp_path / "outputs"
+    first = outputs / "first-root"
+    second = outputs / "second-root"
+    write_evaluation_spec(first, _config(experiment_name="duplicate"), training_run_id="first")
+    write_evaluation_spec(second, _config(experiment_name="duplicate"), training_run_id="second")
+
+    with pytest.raises(RuntimeError, match="same standalone result identity"):
+        discover_search_root_checkpoints(outputs)

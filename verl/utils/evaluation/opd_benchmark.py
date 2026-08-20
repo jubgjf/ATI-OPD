@@ -39,6 +39,7 @@ import statistics
 import subprocess
 import sys
 import time
+import uuid
 import zlib
 from array import array
 from collections import defaultdict
@@ -179,28 +180,38 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _atomic_temporary_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+
+
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2, default=json_default)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    temporary.replace(path)
+    temporary = _atomic_temporary_path(path)
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, default=json_default)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def write_csv_atomic(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: "" if value is None else value for key, value in row.items()})
-        handle.flush()
-        os.fsync(handle.fileno())
-    temporary.replace(path)
+    temporary = _atomic_temporary_path(path)
+    try:
+        with temporary.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: "" if value is None else value for key, value in row.items()})
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _write_jsonl_gzip(path: Path, records: Iterable[dict[str, Any]]) -> None:
@@ -216,9 +227,12 @@ def _write_jsonl_gzip(path: Path, records: Iterable[dict[str, Any]]) -> None:
 
 def write_jsonl_gz_atomic(path: Path, records: Iterable[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    _write_jsonl_gzip(temporary, records)
-    temporary.replace(path)
+    temporary = _atomic_temporary_path(path)
+    try:
+        _write_jsonl_gzip(temporary, records)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def write_json_gz_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -300,6 +314,8 @@ def unit_output_dir(result_root: str | Path, raw_path: str, global_step: int) ->
 
 @contextlib.contextmanager
 def unit_lock(output_dir: Path) -> Iterator[None]:
+    # The standalone launcher uses atomic checkpoint claims for cross-host exclusion.
+    # This flock remains a local safeguard for direct module invocations only.
     output_dir.mkdir(parents=True, exist_ok=True)
     lock_path = output_dir / ".lock"
     with lock_path.open("a+", encoding="utf-8") as handle:
