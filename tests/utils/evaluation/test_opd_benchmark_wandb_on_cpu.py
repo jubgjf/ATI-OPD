@@ -226,17 +226,19 @@ def test_standalone_uploader_discovers_completed_units_on_cpu(tmp_path):
     assert uploader.discover_units(result_root) == {("math-ai/aime24", 100): unit_dir}
     assert uploader.discover_units(result_root, global_steps={100}) == {("math-ai/aime24", 100): unit_dir}
     assert uploader.discover_units(result_root, global_steps={20}) == {}
+    assert uploader.discover_units(result_root, benchmarks={"math-ai/aime24"}) == {("math-ai/aime24", 100): unit_dir}
+    assert uploader.discover_units(result_root, benchmarks={"math-ai/amc23"}) == {}
 
 
 def test_sync_experiment_applies_requested_step_filter_before_conflict_checks_on_cpu(tmp_path, monkeypatch):
     result_root = tmp_path / "experiment"
     step_20 = _write_completed_unit(result_root, step=20)
     step_100 = _write_completed_unit(result_root, step=100)
-    discovered: list[set[int] | None] = []
+    discovered: list[tuple[set[int] | None, set[str] | None]] = []
 
-    def discover_filtered(root, *, global_steps=None):
+    def discover_filtered(root, *, global_steps=None, benchmarks=None):
         assert root == result_root
-        discovered.append(global_steps)
+        discovered.append((global_steps, benchmarks))
         return (
             {("math-ai/aime24", 100): step_100}
             if global_steps == {100}
@@ -249,6 +251,7 @@ def test_sync_experiment_applies_requested_step_filter_before_conflict_checks_on
     monkeypatch.setattr(uploader, "discover_units", discover_filtered)
     args = SimpleNamespace(
         global_step=[100],
+        benchmark=["math-ai/aime24"],
         entity="jubgjf",
         project="DMPD-eval",
         run_id=None,
@@ -263,7 +266,7 @@ def test_sync_experiment_applies_requested_step_filter_before_conflict_checks_on
     )
 
     assert uploader.sync_experiment(args, result_root) == 0
-    assert discovered == [{100}]
+    assert discovered == [({100}, {"math-ai/aime24"})]
 
 
 def test_offline_paths_preserve_jump_host_visible_symlink_spelling_on_cpu(tmp_path):

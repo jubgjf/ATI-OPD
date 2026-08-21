@@ -237,10 +237,17 @@ then
 fi
 EVAL_STEPS_TEXT=${EVAL_STEPS_TEXT:-}
 EVAL_EXPERIMENTS_TEXT=${EVAL_EXPERIMENTS_TEXT:-}
+EVAL_PRIORITY_EXPERIMENTS_TEXT=${EVAL_PRIORITY_EXPERIMENTS_TEXT:-}
+EVAL_SKIP_BENCHMARKS_TEXT=${EVAL_SKIP_BENCHMARKS_TEXT:-}
+EVAL_ENABLE_REPAIR=${EVAL_ENABLE_REPAIR:-1}
 KEEP_MERGED_CHECKPOINTS=${KEEP_MERGED_CHECKPOINTS:-0}
 OVERWRITE_RESULTS=${OVERWRITE_RESULTS:-0}
 CONTINUE_ON_EVAL_ERROR=${CONTINUE_ON_EVAL_ERROR:-1}
 ALLOW_DEBUG_OVERRIDES=${ALLOW_DEBUG_OVERRIDES:-0}
+if [[ "$EVAL_ENABLE_REPAIR" != "0" && "$EVAL_ENABLE_REPAIR" != "1" ]]; then
+    echo "EVAL_ENABLE_REPAIR must be 0 or 1; got $EVAL_ENABLE_REPAIR." >&2
+    exit 2
+fi
 
 SERVER_READY_TIMEOUT=${SERVER_READY_TIMEOUT:-3600}
 SERVER_STOP_TIMEOUT=${SERVER_STOP_TIMEOUT:-180}
@@ -298,6 +305,34 @@ print(payload.get(sys.argv[2], sys.argv[3]))
 ' "$sampling_json" "$key" "$fallback"
 }
 
+text_list_contains() {
+    local expected=$1
+    local values=$2
+    local value
+    for value in $values; do
+        if [[ "$value" == "$expected" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+apply_benchmark_filters() {
+    if [[ -n "${EVAL_BENCHMARKS_TEXT:-}" ]]; then
+        read -r -a benchmarks <<< "$EVAL_BENCHMARKS_TEXT"
+    fi
+    if [[ -n "$EVAL_SKIP_BENCHMARKS_TEXT" ]]; then
+        local -a filtered_benchmarks=()
+        local benchmark
+        for benchmark in "${benchmarks[@]}"; do
+            if ! text_list_contains "$benchmark" "$EVAL_SKIP_BENCHMARKS_TEXT"; then
+                filtered_benchmarks+=("$benchmark")
+            fi
+        done
+        benchmarks=("${filtered_benchmarks[@]}")
+    fi
+}
+
 load_experiment_context() {
     local candidate_json=$1
     CKPT_ROOT=$(python -c 'import json,sys; print(json.loads(sys.argv[1])["checkpoint_root"])' "$candidate_json")
@@ -341,7 +376,7 @@ print(value.get("model_path") or value.get("path") or "")
     TEACHER_TOKENIZER_MODEL=$TEACHER_MODEL
     STUDENT_TOKENIZER_MODEL=$student_tokenizer_from_spec
 
-    if [[ -z "$TEACHER_MODEL" || ! -d "$TEACHER_MODEL" ]]; then
+    if [[ "$EVAL_ENABLE_REPAIR" == "1" && ( -z "$TEACHER_MODEL" || ! -d "$TEACHER_MODEL" ) ]]; then
         echo "Teacher model directory is unavailable for $experiment_name: $TEACHER_MODEL" >&2
         return 2
     fi
@@ -361,9 +396,7 @@ print(value.get("model_path") or value.get("path") or "")
     readarray -t benchmarks < <(
         python -c 'import json,sys; print("\n".join(str(x) for x in json.loads(sys.argv[1])))' "$benchmark_json"
     )
-    if [[ -n "${EVAL_BENCHMARKS_TEXT:-}" ]]; then
-        read -r -a benchmarks <<< "$EVAL_BENCHMARKS_TEXT"
-    fi
+    apply_benchmark_filters
     if ((${#benchmarks[@]} == 0)); then
         echo "Experiment $experiment_name contains no benchmark names." >&2
         return 2
@@ -421,6 +454,8 @@ with open(candidate["evaluation_spec"], encoding="utf-8") as handle:
     spec = json.load(handle)
 semantic = spec["semantic_config"]
 benchmarks = sys.argv[2].split() or [str(value) for value in semantic["benchmarks"]["names"]]
+excluded = set(sys.argv[3].split())
+benchmarks = [benchmark for benchmark in benchmarks if benchmark not in excluded]
 fields = [
     candidate["checkpoint_root"],
     candidate["evaluation_spec"],
@@ -432,7 +467,7 @@ if any("\t" in str(value) or "\n" in str(value) for value in [*fields, *benchmar
     raise ValueError("Queue metadata may not contain tabs or newlines")
 print("\t".join(str(value) for value in fields))
 print("\n".join(benchmarks))
-' "$candidate_json" "${EVAL_BENCHMARKS_TEXT:-}")
+' "$candidate_json" "${EVAL_BENCHMARKS_TEXT:-}" "$EVAL_SKIP_BENCHMARKS_TEXT")
     then
         return 2
     fi
@@ -886,12 +921,15 @@ checkpoint_complete() {
     for benchmark in "${benchmarks[@]}"; do
         status_args+=(--benchmark "$benchmark")
     done
+    if [[ "$EVAL_ENABLE_REPAIR" == "0" ]]; then
+        status_args+=(--no-require-repair)
+    fi
     python "$OPD_RESULT_STATUS" "${status_args[@]}" >/dev/null 2>&1
 }
 
 checkpoint_wandb_is_staged() {
     local step=$1
-    if [[ "$WANDB_MODE" == "disabled" ]]; then
+    if [[ "$WANDB_MODE" == "disabled" || "$EVAL_ENABLE_REPAIR" == "0" ]]; then
         return 0
     fi
     python -c '
@@ -925,13 +963,26 @@ experiment_is_selected() {
     if [[ -z "$EVAL_EXPERIMENTS_TEXT" ]]; then
         return 0
     fi
-    local selected
-    for selected in $EVAL_EXPERIMENTS_TEXT; do
-        if [[ "$candidate" == "$selected" ]]; then
-            return 0
+    text_list_contains "$candidate" "$EVAL_EXPERIMENTS_TEXT"
+}
+
+prioritize_pending_candidates() {
+    if [[ -z "$EVAL_PRIORITY_EXPERIMENTS_TEXT" || ${#pending_candidates[@]} -eq 0 ]]; then
+        return 0
+    fi
+    local -a prioritized_candidates=()
+    local -a regular_candidates=()
+    local candidate candidate_experiment
+    for candidate in "${pending_candidates[@]}"; do
+        candidate_experiment=$(python -c \
+            'import json,sys; print(json.loads(sys.argv[1])["experiment_name"])' "$candidate")
+        if text_list_contains "$candidate_experiment" "$EVAL_PRIORITY_EXPERIMENTS_TEXT"; then
+            prioritized_candidates+=("$candidate")
+        else
+            regular_candidates+=("$candidate")
         fi
     done
-    return 1
+    pending_candidates=("${prioritized_candidates[@]}" "${regular_candidates[@]}")
 }
 
 run_raw_unit() {
@@ -1044,6 +1095,10 @@ sync_wandb() {
         --source-training-run-id "$training_run_id"
         --global-step "$step"
     )
+    local benchmark
+    for benchmark in "${benchmarks[@]}"; do
+        flags+=(--benchmark "$benchmark")
+    done
     python "$SCRIPT_DIR/upload_opd_benchmark_wandb.py" "${flags[@]}"
 }
 
@@ -1149,9 +1204,12 @@ evaluate_checkpoint() {
             return 1
         fi
     done
-    update_active_claim_phase "teacher:request"
-    if ! request_teacher_endpoint; then
-        return 1
+    teacher_model_load_seconds=0
+    if [[ "$EVAL_ENABLE_REPAIR" == "1" ]]; then
+        update_active_claim_phase "teacher:request"
+        if ! request_teacher_endpoint; then
+            return 1
+        fi
     fi
     update_active_claim_phase "load_student"
     if ! start_vllm "student-step-$step" "$checkpoint" "$tokenizer_model" "$served_model" \
@@ -1172,9 +1230,11 @@ evaluate_checkpoint() {
         then
             return 1
         fi
-        update_active_claim_phase "repair:$benchmark"
-        if ! run_repair_unit "$step" "$benchmark" "$served_model" "$student_base_url" "$tokenizer_model"; then
-            return 1
+        if [[ "$EVAL_ENABLE_REPAIR" == "1" ]]; then
+            update_active_claim_phase "repair:$benchmark"
+            if ! run_repair_unit "$step" "$benchmark" "$served_model" "$student_base_url" "$tokenizer_model"; then
+                return 1
+            fi
         fi
     done
     if ! stop_vllm; then
@@ -1189,6 +1249,7 @@ payload = {
     "checkpoint_total_seconds": float(sys.argv[4]),
     "failure_retry_count": max(int(sys.argv[5]) - 1, 0),
     "teacher_model_load_seconds": float(sys.argv[6]),
+    "repair_enabled": sys.argv[7] == "1",
     "completed_at_unix": time.time(),
 }
 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1198,17 +1259,25 @@ with open(tmp, "w", encoding="utf-8") as handle:
     handle.write("\n")
 os.replace(tmp, path)
 ' "$RESULT_ROOT/checkpoint_timings/global_step_$step.json" "$step" "$load_seconds" \
-        "$((SECONDS - checkpoint_started))" "$attempt_count" "${teacher_model_load_seconds:-0}"
+        "$((SECONDS - checkpoint_started))" "$attempt_count" "${teacher_model_load_seconds:-0}" "$EVAL_ENABLE_REPAIR"
     then
         return 1
     fi
-    if ! sync_wandb_serialized "$step"; then
-        return 1
+    if [[ "$EVAL_ENABLE_REPAIR" == "1" ]]; then
+        if ! sync_wandb_serialized "$step"; then
+            return 1
+        fi
+    else
+        echo "[wandb] deferred for raw-only global_step_$step; enable repair before publishing final results"
     fi
     if [[ "$KEEP_MERGED_CHECKPOINTS" != "1" && -z "$direct_hf" ]]; then
         rm -rf -- "$EVAL_CACHE_ROOT/global_step_$step"
     fi
-    echo "[watcher] completed global_step_$step"
+    if [[ "$EVAL_ENABLE_REPAIR" == "1" ]]; then
+        echo "[watcher] completed global_step_$step"
+    else
+        echo "[watcher] completed raw-only global_step_$step"
+    fi
 }
 
 array_contains() {
@@ -1383,6 +1452,7 @@ controller_role_main() {
             fi
             pending_candidates+=("$candidate")
         done
+        prioritize_pending_candidates
         echo "[watcher] result-state scan complete: ${#pending_candidates[@]} checkpoint(s) remain"
         QUEUE_CANDIDATES=("${pending_candidates[@]}")
 
@@ -1471,7 +1541,15 @@ if [[ "$WANDB_MODE" == "offline" ]]; then
     echo "  offline sync:      run the wandb-offline-sync.sh files below $EVAL_RESULTS_ROOT"
 fi
 echo "  experiment filter: ${EVAL_EXPERIMENTS_TEXT:-all}"
+echo "  priority experiments: ${EVAL_PRIORITY_EXPERIMENTS_TEXT:-none}"
 echo "  step filter:       ${EVAL_STEPS_TEXT:-all}"
+echo "  benchmark include: ${EVAL_BENCHMARKS_TEXT:-all from each experiment spec}"
+echo "  benchmark skip:    ${EVAL_SKIP_BENCHMARKS_TEXT:-none}"
+if [[ "$EVAL_ENABLE_REPAIR" == "1" ]]; then
+    echo "  evaluation phase:  raw + repair + W&B publish"
+else
+    echo "  evaluation phase:  raw only (repair and W&B publish deferred)"
+fi
 echo "  claim heartbeat:   ${EVAL_CLAIM_HEARTBEAT_SECONDS}s"
 echo "  claim stale after: ${EVAL_CLAIM_STALE_SECONDS}s (manual release only)"
 echo "================================================================================"

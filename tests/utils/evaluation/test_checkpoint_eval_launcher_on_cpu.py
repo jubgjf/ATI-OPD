@@ -52,7 +52,10 @@ def test_checkpoint_eval_launcher_supports_offline_shared_storage_and_manual_fil
     assert "wandb-offline-sync.sh" in source
     assert "EVAL_STEPS_TEXT" in source
     assert "EVAL_EXPERIMENTS_TEXT" in source
+    assert "EVAL_PRIORITY_EXPERIMENTS_TEXT" in source
     assert "EVAL_BENCHMARKS_TEXT" in source
+    assert "EVAL_SKIP_BENCHMARKS_TEXT" in source
+    assert "EVAL_ENABLE_REPAIR" in source
     assert "POLL_SECONDS=${POLL_SECONDS:-600}" in source
     assert source.count('sleep "$POLL_SECONDS"') == 1
     assert "released $candidate_experiment/global_step_$step; rescanning immediately" in source
@@ -109,6 +112,21 @@ def test_checkpoint_eval_launcher_uses_distributed_claims_and_instance_scoped_co
     assert evaluate_body.index('update_active_claim_phase "teacher:request"') < evaluate_body.index(
         'update_active_claim_phase "load_student"'
     )
+
+
+def test_checkpoint_eval_launcher_supports_priority_raw_only_and_incremental_benchmark_backfill_on_cpu():
+    source = LAUNCHER.read_text(encoding="utf-8")
+
+    assert "prioritize_pending_candidates" in source
+    assert source.index("prioritize_pending_candidates\n") < source.index(
+        'QUEUE_CANDIDATES=("${pending_candidates[@]}")'
+    )
+    assert 'if [[ "$EVAL_ENABLE_REPAIR" == "1" ]]' in source
+    assert "status_args+=(--no-require-repair)" in source
+    assert "[wandb] deferred for raw-only global_step_$step" in source
+    assert 'flags+=(--benchmark "$benchmark")' in source
+    assert "excluded = set(sys.argv[3].split())" in source
+    assert 'if ! text_list_contains "$benchmark" "$EVAL_SKIP_BENCHMARKS_TEXT"' in source
 
 
 def test_checkpoint_eval_launcher_validates_direct_merge_before_starting_vllm_on_cpu():

@@ -153,6 +153,7 @@ def discover_units(
     result_root: str | Path,
     *,
     global_steps: set[int] | None = None,
+    benchmarks: set[str] | None = None,
 ) -> dict[tuple[str, int], Path]:
     root = absolute_path(result_root)
     units: dict[tuple[str, int], Path] = {}
@@ -167,6 +168,8 @@ def discover_units(
             benchmark_metadata = json.loads(benchmark_metadata_path.read_text(encoding="utf-8"))
             normalized = normalize_benchmark_path(str(benchmark_metadata["path"]))
         except Exception:
+            continue
+        if benchmarks is not None and normalized not in benchmarks:
             continue
         for step_dir in sorted(directory.glob("global_step_*")):
             match = re.fullmatch(r"global_step_(\d+)", step_dir.name)
@@ -763,7 +766,13 @@ def _wandb_settings(wandb_module: Any) -> Any | None:
 def sync_experiment(args: argparse.Namespace, result_root: Path) -> int:
     requested_steps = getattr(args, "global_step", None)
     global_steps = None if not requested_steps else {int(step) for step in requested_steps}
-    units = discover_units(result_root, global_steps=global_steps)
+    requested_benchmarks = getattr(args, "benchmark", None)
+    benchmarks = (
+        None
+        if not requested_benchmarks
+        else {normalize_benchmark_path(str(benchmark)) for benchmark in requested_benchmarks}
+    )
+    units = discover_units(result_root, global_steps=global_steps, benchmarks=benchmarks)
     if not units:
         if global_steps is not None:
             requested = ", ".join(str(step) for step in sorted(global_steps))
@@ -1076,6 +1085,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Only publish units at this checkpoint step; repeat to select multiple steps.",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="append",
+        default=None,
+        help="Only publish this benchmark path; repeat to select multiple benchmarks.",
     )
     parser.add_argument("--include-rollouts", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
