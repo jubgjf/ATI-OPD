@@ -22,6 +22,7 @@ Execute this file by path instead of importing the ``verl`` package.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -52,6 +53,14 @@ SYNC_FILENAME = "wandb-sync.json"
 OFFLINE_SYNC_COMMANDS_FILENAME = "wandb-offline-sync.sh"
 SYNC_UNIT_KEY = "sync/unit_key"
 SYNC_FINGERPRINT_KEY = "sync/result_fingerprint"
+LEGACY_MTIME_MIGRATION_REASON = "legacy model manifest upgrade; merged-weight differences were limited to mtime"
+INPUT_MANIFEST_GROUPS = (
+    "dataset",
+    "student_model_metadata",
+    "student_model_weights",
+    "student_tokenizer",
+    "chat_template",
+)
 
 
 def _json_default(value: Any) -> Any:
@@ -67,6 +76,14 @@ def _json_default(value: Any) -> Any:
 
 def canonical_json(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=_json_default)
+
+
+def payload_fingerprint(payload: Any) -> str:
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def serialized_json_bytes(payload: Any) -> bytes:
+    return (json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default) + "\n").encode("utf-8")
 
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -473,6 +490,7 @@ def _empty_sync_manifest(
         "experiment": experiment,
         "source_training_run_id": source_training_run_id,
         "units": {},
+        "compatible_units": {},
         "artifacts": {},
         "offline_segments": [],
     }
@@ -511,6 +529,11 @@ def _load_local_sync_manifest(
             f"stored={stored_source!r}, requested={source_training_run_id!r}."
         )
     expected["units"] = {str(key): str(value) for key, value in dict(payload.get("units") or {}).items()}
+    expected["compatible_units"] = {
+        str(key): dict(value)
+        for key, value in dict(payload.get("compatible_units") or {}).items()
+        if isinstance(value, dict)
+    }
     expected["artifacts"] = {str(key): str(value) for key, value in dict(payload.get("artifacts") or {}).items()}
     expected["offline_segments"] = [str(value) for value in list(payload.get("offline_segments") or [])]
     return expected
@@ -564,16 +587,155 @@ def _offline_sync_target(run_directory: Path) -> Path:
     return absolute_path(candidates[-1])
 
 
-def _check_remote_conflict(remote_state: dict[str, str], key: str, fingerprint: str) -> bool:
+def _legacy_manifest_before_mtime_migration(
+    metadata: dict[str, Any],
+    migration: dict[str, Any],
+) -> dict[str, Any] | None:
+    compatibility = metadata.get("generation_compatibility") or {}
+    current_manifest = metadata.get("input_manifest") or {}
+    if (
+        metadata.get("generation_schema_version") != 2
+        or compatibility.get("schema_version") != 1
+        or current_manifest.get("schema_version") != 2
+        or migration.get("reason") != LEGACY_MTIME_MIGRATION_REASON
+        or migration.get("legacy_generation_fingerprint") != metadata.get("generation_fingerprint")
+        or migration.get("stable_input_manifest_fingerprint") != current_manifest.get("fingerprint")
+        or migration.get("student_model_identity") != current_manifest.get("student_model_identity")
+        or migration.get("compatible_generation_fingerprint")
+        not in set(compatibility.get("compatible_fingerprints") or [])
+    ):
+        return None
+
+    changes: dict[str, dict[str, Any]] = {}
+    for raw_change in migration.get("mtime_changes") or []:
+        if not isinstance(raw_change, dict) or not raw_change.get("path"):
+            return None
+        path = str(raw_change["path"])
+        if path in changes:
+            return None
+        changes[path] = raw_change
+
+    restored: dict[str, Any] = {}
+    consumed_changes: set[str] = set()
+    for group in INPUT_MANIFEST_GROUPS:
+        restored_entries: list[dict[str, Any]] = []
+        for raw_entry in current_manifest.get(group) or []:
+            if not isinstance(raw_entry, dict):
+                return None
+            entry = {str(key): value for key, value in raw_entry.items() if key != "logical_path"}
+            if group == "student_model_weights":
+                path = str(entry.get("path") or "")
+                change = changes.get(path)
+                if change is not None:
+                    if (
+                        entry.get("size") != change.get("size")
+                        or entry.get("mtime_ns") != change.get("current_mtime_ns")
+                        or change.get("existing_mtime_ns") is None
+                    ):
+                        return None
+                    entry["mtime_ns"] = change["existing_mtime_ns"]
+                    consumed_changes.add(path)
+            restored_entries.append(entry)
+        restored[group] = restored_entries
+    if consumed_changes != set(changes):
+        return None
+
+    restored["fingerprint"] = payload_fingerprint(restored)
+    if restored["fingerprint"] != migration.get("legacy_input_manifest_fingerprint"):
+        return None
+    return restored
+
+
+def compatible_legacy_result_fingerprints(
+    unit_dir: Path,
+    marker: dict[str, Any],
+    metadata: dict[str, Any],
+) -> set[str]:
+    """Recover result fingerprints changed only by the v2-to-v3 manifest migration.
+
+    A short-lived evaluator version persisted a compatibility-only manifest
+    upgrade into completed results. Since ``metadata.json`` participates in the
+    immutable result fingerprint, those units no longer matched an identical
+    result already published by an older evaluator. Reconstruct the exact old
+    metadata only for this narrowly validated migration so the publisher can
+    recognize the remote unit without uploading a revision.
+    """
+
+    if not metadata.get("generation_complete") or not metadata.get("repair_complete"):
+        return set()
+    files = marker.get("files") or {}
+    metadata_entry = files.get(METADATA_FILENAME)
+    if not isinstance(metadata_entry, dict):
+        return set()
+    try:
+        current_metadata_bytes = (unit_dir / METADATA_FILENAME).read_bytes()
+    except OSError:
+        return set()
+    if (
+        len(current_metadata_bytes) != metadata_entry.get("size")
+        or hashlib.sha256(current_metadata_bytes).hexdigest() != metadata_entry.get("sha256")
+        or marker.get("result_fingerprint") != payload_fingerprint(files)
+    ):
+        return set()
+
+    compatibility = metadata.get("generation_compatibility") or {}
+    migrations = compatibility.get("migrations") or []
+    if not migrations or any(
+        not isinstance(migration, dict) or migration.get("reason") != LEGACY_MTIME_MIGRATION_REASON
+        for migration in migrations
+    ):
+        return set()
+
+    result: set[str] = set()
+    for migration in migrations:
+        legacy_manifest = _legacy_manifest_before_mtime_migration(metadata, migration)
+        if legacy_manifest is None:
+            continue
+        legacy_metadata = copy.deepcopy(metadata)
+        legacy_metadata.pop("generation_compatibility", None)
+        legacy_metadata["input_manifest"] = legacy_manifest
+        legacy_metadata_bytes = serialized_json_bytes(legacy_metadata)
+        legacy_files = copy.deepcopy(files)
+        legacy_files[METADATA_FILENAME] = {
+            "size": len(legacy_metadata_bytes),
+            "sha256": hashlib.sha256(legacy_metadata_bytes).hexdigest(),
+        }
+        result.add(payload_fingerprint(legacy_files))
+    return result
+
+
+def _check_remote_conflict(
+    remote_state: dict[str, str],
+    key: str,
+    fingerprint: str,
+    *,
+    compatible_fingerprints: set[str] | None = None,
+) -> str | None:
     existing = remote_state.get(key)
     if existing is None:
-        return False
+        return None
     if existing != fingerprint:
+        if existing in (compatible_fingerprints or set()):
+            return existing
         raise RuntimeError(
             f"W&B already contains {key} with fingerprint {existing}, but local results have {fingerprint}. "
             "Completed evaluation units are immutable; use a new --run-id for a deliberate revision."
         )
-    return True
+    return existing
+
+
+def _record_compatible_unit(
+    manifest: dict[str, Any],
+    *,
+    key: str,
+    remote_fingerprint: str,
+    local_fingerprint: str,
+) -> None:
+    manifest.setdefault("compatible_units", {})[key] = {
+        "reason": "completed result changed only by the legacy merged-weight mtime manifest migration",
+        "remote_result_fingerprint": remote_fingerprint,
+        "local_result_fingerprint": local_fingerprint,
+    }
 
 
 def _wandb_settings(wandb_module: Any) -> Any | None:
@@ -646,17 +808,38 @@ def sync_experiment(args: argparse.Namespace, result_root: Path) -> int:
     )
     if mode == "offline":
         pending = False
+        manifest_changed = False
         for (benchmark_path, global_step), unit_dir in units.items():
-            marker, summary, _ = _load_unit(unit_dir)
+            marker, summary, metadata = _load_unit(unit_dir)
             fingerprint = str(marker["result_fingerprint"])
             key = unit_sync_key(benchmark_path, global_step)
-            metrics_done = _check_remote_conflict(local_manifest["units"], key, fingerprint)
+            compatible_fingerprints = compatible_legacy_result_fingerprints(unit_dir, marker, metadata)
+            staged_fingerprint = _check_remote_conflict(
+                local_manifest["units"],
+                key,
+                fingerprint,
+                compatible_fingerprints=compatible_fingerprints,
+            )
+            metrics_done = staged_fingerprint is not None
+            compatibility_only = staged_fingerprint is not None and staged_fingerprint != fingerprint
+            if compatibility_only:
+                _record_compatible_unit(
+                    local_manifest,
+                    key=key,
+                    remote_fingerprint=staged_fingerprint,
+                    local_fingerprint=fingerprint,
+                )
+                manifest_changed = True
             benchmark = summary.get("benchmark") or {}
             name = artifact_name(experiment, str(benchmark["id"]), global_step)
-            content_fingerprint = artifact_fingerprint(unit_dir, include_rollouts=args.include_rollouts)
-            artifact_done = local_manifest["artifacts"].get(name) == content_fingerprint
+            artifact_done = compatibility_only
+            if not artifact_done:
+                content_fingerprint = artifact_fingerprint(unit_dir, include_rollouts=args.include_rollouts)
+                artifact_done = local_manifest["artifacts"].get(name) == content_fingerprint
             pending = pending or not (metrics_done and artifact_done)
         if not pending:
+            if manifest_changed:
+                write_json_atomic(result_root / SYNC_FILENAME, local_manifest)
             print(f"[wandb] all offline units already staged: experiment={experiment} run_id={run_id}")
             _write_offline_sync_commands(result_root, local_manifest)
             return 0
@@ -733,17 +916,28 @@ def sync_experiment(args: argparse.Namespace, result_root: Path) -> int:
             marker, summary, metadata = _load_unit(unit_dir)
             fingerprint = str(marker["result_fingerprint"])
             key = unit_sync_key(benchmark_path, global_step)
-            metrics_already_synced = _check_remote_conflict(remote_state, key, fingerprint)
+            compatible_fingerprints = compatible_legacy_result_fingerprints(unit_dir, marker, metadata)
+            synced_fingerprint = _check_remote_conflict(
+                remote_state,
+                key,
+                fingerprint,
+                compatible_fingerprints=compatible_fingerprints,
+            )
+            metrics_already_synced = synced_fingerprint is not None
+            compatibility_only = synced_fingerprint is not None and synced_fingerprint != fingerprint
             benchmark = summary.get("benchmark") or {}
             name = artifact_name(experiment, str(benchmark["id"]), global_step)
-            content_fingerprint = artifact_fingerprint(unit_dir, include_rollouts=args.include_rollouts)
-            if mode == "online":
-                assert api is not None
-                artifact_already_synced = _remote_artifact_matches(
-                    api, args.entity, args.project, name, content_fingerprint
-                )
+            if compatibility_only:
+                artifact_already_synced = True
             else:
-                artifact_already_synced = artifact_manifest.get(name) == content_fingerprint
+                content_fingerprint = artifact_fingerprint(unit_dir, include_rollouts=args.include_rollouts)
+                if mode == "online":
+                    assert api is not None
+                    artifact_already_synced = _remote_artifact_matches(
+                        api, args.entity, args.project, name, content_fingerprint
+                    )
+                else:
+                    artifact_already_synced = artifact_manifest.get(name) == content_fingerprint
             if not artifact_already_synced:
                 artifact = wandb.Artifact(
                     name=name,
@@ -768,16 +962,31 @@ def sync_experiment(args: argparse.Namespace, result_root: Path) -> int:
                 artifacts_updated += 1
                 print(f"[wandb] artifact {'uploaded' if mode == 'online' else 'staged'}: {key}")
             if metrics_already_synced:
-                sync_manifest[key] = fingerprint
+                assert synced_fingerprint is not None
+                sync_manifest[key] = synced_fingerprint
                 run.summary["benchmark_sync_manifest"] = sync_manifest
                 local_manifest["units"] = sync_manifest
                 local_manifest["artifacts"] = artifact_manifest
+                if compatibility_only:
+                    _record_compatible_unit(
+                        local_manifest,
+                        key=key,
+                        remote_fingerprint=synced_fingerprint,
+                        local_fingerprint=fingerprint,
+                    )
                 write_json_atomic(
                     result_root / SYNC_FILENAME,
                     local_manifest,
                 )
                 skipped += 1
-                print(f"[wandb] metrics already {'synced' if mode == 'online' else 'staged'}: {key}")
+                if compatibility_only:
+                    print(
+                        f"[wandb] compatible legacy result already "
+                        f"{'synced' if mode == 'online' else 'staged'}: {key} "
+                        f"remote={synced_fingerprint} local={fingerprint}"
+                    )
+                else:
+                    print(f"[wandb] metrics already {'synced' if mode == 'online' else 'staged'}: {key}")
                 continue
             run.log(
                 unit_metric_payload(

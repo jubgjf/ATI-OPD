@@ -2377,6 +2377,11 @@ def _apply_generation_compatibility_migration(
 ) -> dict[str, Any]:
     if assessment.get("status") != "legacy_mtime_only":
         return existing
+    if existing.get("generation_complete"):
+        # Completed units are immutable: metadata.json participates in the
+        # result fingerprint published to W&B. Persisting a compatibility alias
+        # here would turn a read-only manifest upgrade into a new result revision.
+        return existing
     migrated = copy.deepcopy(existing)
     compatibility = dict(migrated.get("generation_compatibility") or {})
     aliases = [str(value) for value in compatibility.get("compatible_fingerprints") or []]
@@ -2405,8 +2410,6 @@ def _apply_generation_compatibility_migration(
     migrated["generation_compatibility"] = compatibility
     migrated["input_manifest"] = preparation.input_manifest
     write_json_atomic(output_dir / METADATA_FILENAME, migrated)
-    if migrated.get("generation_complete") and all((output_dir / name).is_file() for name in REQUIRED_RESULT_FILES):
-        write_completion_marker(output_dir, migrated)
     return migrated
 
 
@@ -2454,8 +2457,6 @@ async def generate_main(args: argparse.Namespace) -> int:
                     default=json_default,
                 )
             )
-        if existing is not None and assessment["status"] == "legacy_mtime_only":
-            existing = _apply_generation_compatibility_migration(output_dir, existing, preparation, assessment)
         print(
             canonical_json(
                 {
@@ -2480,18 +2481,33 @@ async def generate_main(args: argparse.Namespace) -> int:
             existing = None
         fingerprint = str(assessment["effective_fingerprint"])
         if existing and existing.get("generation_complete") and (output_dir / ROLLOUTS_FILENAME).is_file():
-            if existing.get("analysis") != preparation.analysis or not (output_dir / COMPLETION_FILENAME).is_file():
+            if not (output_dir / COMPLETION_FILENAME).is_file():
                 _reanalyze_completed_unit(output_dir, existing, preparation.analysis)
                 return 0
             else:
-                valid, reason = validate_completed_unit(output_dir, validate_inputs=True)
+                # ``prepare_generation`` and the compatibility assessment have
+                # already validated the current inputs. Revalidating the paths
+                # stored by an older result would reintroduce merged-file mtime
+                # and mount-path sensitivity. Keep the completed result package
+                # byte-for-byte immutable and reuse it as-is.
+                valid, reason = validate_completed_unit(output_dir, validate_inputs=False)
                 if valid:
+                    if existing.get("analysis") != preparation.analysis:
+                        print(
+                            f"[analysis] completed result is immutable; keeping its existing analysis settings: "
+                            f"{output_dir}"
+                        )
                     print(f"[generate] already complete: {output_dir}")
                     return 0
                 if "result file" in reason or "completion marker" in reason:
                     _reanalyze_completed_unit(output_dir, existing, preparation.analysis)
                     return 0
                 raise RuntimeError(f"Existing evaluation is no longer compatible: {reason}")
+
+        if existing is not None and assessment["status"] == "legacy_mtime_only":
+            # Partial units are not published immutable results yet, so they
+            # may persist the stable manifest before resuming their shards.
+            existing = _apply_generation_compatibility_migration(output_dir, existing, preparation, assessment)
 
         metadata = _metadata_for_generation(
             args=args,

@@ -278,6 +278,242 @@ def _write_completed_unit(result_root: Path, *, step: int, benchmark_path: str =
     return unit_dir
 
 
+def _write_mtime_migrated_completed_unit(result_root: Path, *, step: int = 20) -> tuple[Path, str, str]:
+    benchmark_path = "math-ai/aime24"
+    benchmark_root = result_root / "benchmarks" / "aime24--abc"
+    unit_dir = benchmark_root / f"global_step_{step}"
+    unit_dir.mkdir(parents=True)
+    uploader.write_json_atomic(result_root / "experiment.json", {"experiment": result_root.name})
+    uploader.write_json_atomic(benchmark_root / "benchmark.json", {"path": benchmark_path})
+
+    legacy_manifest = {
+        "dataset": [],
+        "student_model_metadata": [],
+        "student_model_weights": [
+            {
+                "path": "/models/step-20/model.safetensors",
+                "size": 10,
+                "mode": "stat",
+                "mtime_ns": 10,
+            }
+        ],
+        "student_tokenizer": [],
+        "chat_template": [],
+    }
+    legacy_manifest["fingerprint"] = uploader.payload_fingerprint(legacy_manifest)
+    legacy_metadata = {
+        "schema_version": uploader.SCHEMA_VERSION,
+        "generation_schema_version": 2,
+        "experiment": result_root.name,
+        "global_step": step,
+        "generation_complete": True,
+        "repair_complete": True,
+        "generation_fingerprint": "legacy-generation-fingerprint",
+        "input_manifest": legacy_manifest,
+    }
+    summary = {
+        "global_step": step,
+        "rollout_n": 16,
+        "benchmark": {"id": "aime24--abc", "name": "aime24", "path": benchmark_path},
+        "metrics": {"acc": 0.5, "response_tokens": {"mean": 10}},
+        "accuracy_at_n": {"mean": 0.5, "maj": 0.5, "best": 0.5},
+    }
+    payloads = {
+        uploader.METADATA_FILENAME: legacy_metadata,
+        uploader.SUMMARY_FILENAME: summary,
+        uploader.PER_PROBLEM_FILENAME: {},
+        uploader.LENGTH_BINS_FILENAME: {},
+        uploader.ROLLOUTS_FILENAME: {},
+    }
+    for name, payload in payloads.items():
+        uploader.write_json_atomic(unit_dir / name, payload)
+
+    def result_files() -> dict[str, dict[str, object]]:
+        return {
+            name: {
+                "size": (unit_dir / name).stat().st_size,
+                "sha256": uploader._sha256_file(unit_dir / name),
+            }
+            for name in uploader.REQUIRED_RESULT_FILES
+        }
+
+    legacy_files = result_files()
+    legacy_result_fingerprint = uploader.payload_fingerprint(legacy_files)
+
+    stable_manifest = {
+        "schema_version": 2,
+        "student_model_identity": {"kind": "committed_checkpoint", "fingerprint": "source-step-20"},
+        "dataset": [],
+        "student_model_metadata": [],
+        "student_model_weights": [
+            {
+                "path": "/models/step-20/model.safetensors",
+                "size": 10,
+                "mode": "stat",
+                "logical_path": "model.safetensors",
+                "mtime_ns": 20,
+            }
+        ],
+        "student_tokenizer": [],
+        "chat_template": [],
+        "fingerprint": "stable-manifest-fingerprint",
+    }
+    migrated_metadata = dict(legacy_metadata)
+    migrated_metadata["input_manifest"] = stable_manifest
+    migrated_metadata["generation_compatibility"] = {
+        "schema_version": 1,
+        "compatible_fingerprints": ["stable-generation-fingerprint"],
+        "migrations": [
+            {
+                "reason": uploader.LEGACY_MTIME_MIGRATION_REASON,
+                "legacy_generation_fingerprint": legacy_metadata["generation_fingerprint"],
+                "compatible_generation_fingerprint": "stable-generation-fingerprint",
+                "legacy_input_manifest_fingerprint": legacy_manifest["fingerprint"],
+                "stable_input_manifest_fingerprint": stable_manifest["fingerprint"],
+                "student_model_identity": stable_manifest["student_model_identity"],
+                "mtime_changes": [
+                    {
+                        "path": "/models/step-20/model.safetensors",
+                        "size": 10,
+                        "existing_mtime_ns": 10,
+                        "current_mtime_ns": 20,
+                    }
+                ],
+            }
+        ],
+    }
+    uploader.write_json_atomic(unit_dir / uploader.METADATA_FILENAME, migrated_metadata)
+    migrated_files = result_files()
+    migrated_result_fingerprint = uploader.payload_fingerprint(migrated_files)
+    uploader.write_json_atomic(
+        unit_dir / uploader.COMPLETION_FILENAME,
+        {
+            "schema_version": uploader.SCHEMA_VERSION,
+            "generation_fingerprint": migrated_metadata["generation_fingerprint"],
+            "result_fingerprint": migrated_result_fingerprint,
+            "files": migrated_files,
+        },
+    )
+    return unit_dir, legacy_result_fingerprint, migrated_result_fingerprint
+
+
+def test_wandb_recognizes_completed_result_changed_only_by_mtime_manifest_migration_on_cpu(tmp_path):
+    unit_dir, legacy_fingerprint, migrated_fingerprint = _write_mtime_migrated_completed_unit(tmp_path / "experiment")
+    marker, _, metadata = uploader._load_unit(unit_dir)
+
+    compatible = uploader.compatible_legacy_result_fingerprints(unit_dir, marker, metadata)
+
+    assert migrated_fingerprint != legacy_fingerprint
+    assert compatible == {legacy_fingerprint}
+    assert (
+        uploader._check_remote_conflict(
+            {"math-ai/aime24@global_step_20": legacy_fingerprint},
+            "math-ai/aime24@global_step_20",
+            migrated_fingerprint,
+            compatible_fingerprints=compatible,
+        )
+        == legacy_fingerprint
+    )
+    with pytest.raises(RuntimeError, match="Completed evaluation units are immutable"):
+        uploader._check_remote_conflict(
+            {"math-ai/aime24@global_step_20": "unrelated-result"},
+            "math-ai/aime24@global_step_20",
+            migrated_fingerprint,
+            compatible_fingerprints=compatible,
+        )
+
+
+def test_online_sync_skips_compatible_legacy_result_and_records_local_alias_on_cpu(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    result_root = tmp_path / "experiment"
+    _, legacy_fingerprint, migrated_fingerprint = _write_mtime_migrated_completed_unit(result_root)
+    key = "math-ai/aime24@global_step_20"
+    run_id = stable_run_id("jubgjf", "DMPD-eval", "experiment")
+
+    class FakeRemoteRun:
+        id = run_id
+
+        @staticmethod
+        def scan_history(**kwargs):
+            del kwargs
+            return [{uploader.SYNC_UNIT_KEY: key, uploader.SYNC_FINGERPRINT_KEY: legacy_fingerprint}]
+
+    class FakeApi:
+        @staticmethod
+        def run(path):
+            assert path == f"jubgjf/DMPD-eval/{run_id}"
+            return FakeRemoteRun()
+
+        @staticmethod
+        def artifact(path):
+            raise AssertionError(f"compatible legacy result must not query or replace its artifact: {path}")
+
+    class FakeRun:
+        resumed = True
+        dir = str(tmp_path / "wandb" / "files")
+
+        def __init__(self):
+            self.summary = {"benchmark_sync_manifest": {key: legacy_fingerprint}}
+
+        @staticmethod
+        def define_metric(*args, **kwargs):
+            del args, kwargs
+
+        @staticmethod
+        def log_artifact(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError("compatible legacy result must not upload a new artifact")
+
+        @staticmethod
+        def log(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError("compatible legacy result must not append duplicate metrics")
+
+        @staticmethod
+        def finish():
+            return None
+
+    fake_run = FakeRun()
+
+    class FakeWandb:
+        @staticmethod
+        def Api():
+            return FakeApi()
+
+        @staticmethod
+        def init(**kwargs):
+            assert kwargs["id"] == run_id
+            return fake_run
+
+    monkeypatch.setitem(sys.modules, "wandb", FakeWandb)
+    args = SimpleNamespace(
+        entity="jubgjf",
+        project="DMPD-eval",
+        run_id=None,
+        mode="online",
+        dry_run=False,
+        adopt_existing_name=True,
+        include_rollouts=True,
+        wandb_dir=None,
+        wandb_data_dir=None,
+        wandb_cache_dir=None,
+        source_training_run_id="training-id",
+    )
+
+    assert uploader.sync_experiment(args, result_root) == 0
+    assert "[wandb] compatible legacy result already synced:" in capsys.readouterr().out
+    manifest = json.loads((result_root / uploader.SYNC_FILENAME).read_text(encoding="utf-8"))
+    assert manifest["units"] == {key: legacy_fingerprint}
+    assert manifest["compatible_units"][key] == {
+        "reason": "completed result changed only by the legacy merged-weight mtime manifest migration",
+        "remote_result_fingerprint": legacy_fingerprint,
+        "local_result_fingerprint": migrated_fingerprint,
+    }
+
+
 def test_offline_sync_never_uses_public_api_and_is_locally_idempotent_on_cpu(tmp_path, monkeypatch):
     result_root = tmp_path / "experiment"
     _write_completed_unit(result_root, step=20)

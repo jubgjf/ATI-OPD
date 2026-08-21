@@ -346,6 +346,26 @@ def test_legacy_generation_accepts_only_mtime_change_and_preserves_canonical_fin
     assert reloaded["input_manifest"]["fingerprint"] == preparation.input_manifest["fingerprint"]
 
 
+def test_legacy_manifest_migration_never_mutates_completed_result_on_cpu(tmp_path):
+    preparation, existing = _generation_preparation()
+    existing["generation_complete"] = True
+    assessment = benchmark.assess_generation_compatibility(existing, preparation)
+    output_dir = tmp_path / "unit"
+    output_dir.mkdir()
+    benchmark.write_json_atomic(output_dir / benchmark.METADATA_FILENAME, existing)
+    original_metadata = (output_dir / benchmark.METADATA_FILENAME).read_bytes()
+
+    result = benchmark._apply_generation_compatibility_migration(
+        output_dir,
+        existing,
+        preparation,
+        assessment,
+    )
+
+    assert result is existing
+    assert (output_dir / benchmark.METADATA_FILENAME).read_bytes() == original_metadata
+
+
 def test_legacy_generation_rejects_real_weight_or_sampling_change_with_structured_diff_on_cpu():
     preparation, existing = _generation_preparation(weight_size=11)
     assessment = benchmark.assess_generation_compatibility(existing, preparation)
@@ -640,7 +660,7 @@ def test_generate_preflight_only_does_not_contact_model_server_on_cpu(tmp_path, 
     assert not (benchmark.unit_output_dir(result_root, "math-ai/aime24", 20) / "metadata.json").exists()
 
 
-def test_generate_preflight_migrates_legacy_mtime_without_changing_canonical_fingerprint_on_cpu(
+def test_generate_preflight_keeps_legacy_metadata_read_only_on_cpu(
     tmp_path,
     monkeypatch,
 ):
@@ -649,13 +669,44 @@ def test_generate_preflight_migrates_legacy_mtime_without_changing_canonical_fin
     output_dir = benchmark.unit_output_dir(result_root, "math-ai/aime24", 20)
     output_dir.mkdir(parents=True)
     benchmark.write_json_atomic(output_dir / benchmark.METADATA_FILENAME, existing)
+    original_metadata = (output_dir / benchmark.METADATA_FILENAME).read_bytes()
     monkeypatch.setattr(benchmark, "prepare_generation", lambda args: preparation)
 
     assert asyncio.run(benchmark.generate_main(_preflight_args(result_root))) == 0
+    assert (output_dir / benchmark.METADATA_FILENAME).read_bytes() == original_metadata
 
-    migrated = json.loads((output_dir / benchmark.METADATA_FILENAME).read_text(encoding="utf-8"))
-    assert migrated["generation_fingerprint"] == existing["generation_fingerprint"]
-    assert preparation.fingerprint in migrated["generation_compatibility"]["compatible_fingerprints"]
+
+def test_generate_reuses_completed_legacy_mtime_result_without_mutation_on_cpu(tmp_path, monkeypatch, capsys):
+    preparation, existing = _generation_preparation()
+    existing.update(
+        {
+            "experiment": "exp",
+            "global_step": 20,
+            "generation_complete": True,
+            "repair_complete": True,
+            "rollout_count": 0,
+            "analysis": {},
+        }
+    )
+    result_root = tmp_path / "results"
+    output_dir = benchmark.unit_output_dir(result_root, "math-ai/aime24", 20)
+    output_dir.mkdir(parents=True)
+    benchmark.write_json_atomic(output_dir / benchmark.METADATA_FILENAME, existing)
+    for name in benchmark.REQUIRED_RESULT_FILES:
+        path = output_dir / name
+        if not path.exists():
+            path.write_text("{}\n", encoding="utf-8")
+    benchmark.write_completion_marker(output_dir, existing)
+    original_metadata = (output_dir / benchmark.METADATA_FILENAME).read_bytes()
+    original_marker = (output_dir / benchmark.COMPLETION_FILENAME).read_bytes()
+    monkeypatch.setattr(benchmark, "prepare_generation", lambda args: preparation)
+    args = _preflight_args(result_root)
+    args.preflight_only = False
+
+    assert asyncio.run(benchmark.generate_main(args)) == 0
+    assert "[generate] already complete:" in capsys.readouterr().out
+    assert (output_dir / benchmark.METADATA_FILENAME).read_bytes() == original_metadata
+    assert (output_dir / benchmark.COMPLETION_FILENAME).read_bytes() == original_marker
 
 
 def test_generate_preflight_reports_real_input_difference_before_model_server_on_cpu(tmp_path, monkeypatch):
