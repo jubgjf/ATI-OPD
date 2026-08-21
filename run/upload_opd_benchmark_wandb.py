@@ -149,7 +149,11 @@ def _validate_completed_unit(output_dir: Path) -> tuple[bool, str]:
     return True, "complete"
 
 
-def discover_units(result_root: str | Path) -> dict[tuple[str, int], Path]:
+def discover_units(
+    result_root: str | Path,
+    *,
+    global_steps: set[int] | None = None,
+) -> dict[tuple[str, int], Path]:
     root = absolute_path(result_root)
     units: dict[tuple[str, int], Path] = {}
     benchmarks_root = root / BENCHMARKS_DIRNAME
@@ -168,9 +172,12 @@ def discover_units(result_root: str | Path) -> dict[tuple[str, int], Path]:
             match = re.fullmatch(r"global_step_(\d+)", step_dir.name)
             if not match:
                 continue
+            global_step = int(match.group(1))
+            if global_steps is not None and global_step not in global_steps:
+                continue
             valid, _ = _validate_completed_unit(step_dir)
             if valid:
-                units[(normalized, int(match.group(1)))] = step_dir
+                units[(normalized, global_step)] = step_dir
     return dict(sorted(units.items()))
 
 
@@ -710,6 +717,7 @@ def _check_remote_conflict(
     fingerprint: str,
     *,
     compatible_fingerprints: set[str] | None = None,
+    state_label: str = "W&B",
 ) -> str | None:
     existing = remote_state.get(key)
     if existing is None:
@@ -718,7 +726,8 @@ def _check_remote_conflict(
         if existing in (compatible_fingerprints or set()):
             return existing
         raise RuntimeError(
-            f"W&B already contains {key} with fingerprint {existing}, but local results have {fingerprint}. "
+            f"{state_label} already contains {key} with fingerprint {existing}, "
+            f"but local results have {fingerprint}. "
             "Completed evaluation units are immutable; use a new --run-id for a deliberate revision."
         )
     return existing
@@ -752,8 +761,15 @@ def _wandb_settings(wandb_module: Any) -> Any | None:
 
 
 def sync_experiment(args: argparse.Namespace, result_root: Path) -> int:
-    units = discover_units(result_root)
+    requested_steps = getattr(args, "global_step", None)
+    global_steps = None if not requested_steps else {int(step) for step in requested_steps}
+    units = discover_units(result_root, global_steps=global_steps)
     if not units:
+        if global_steps is not None:
+            requested = ", ".join(str(step) for step in sorted(global_steps))
+            raise RuntimeError(
+                f"No completed benchmark units for requested global step(s) {requested} under {result_root}"
+            )
         print(f"[wandb] no completed benchmark units under {result_root}; skipping")
         return 0
     experiment = _load_experiment_name(result_root)
@@ -819,6 +835,7 @@ def sync_experiment(args: argparse.Namespace, result_root: Path) -> int:
                 key,
                 fingerprint,
                 compatible_fingerprints=compatible_fingerprints,
+                state_label="Local W&B staging manifest",
             )
             metrics_done = staged_fingerprint is not None
             compatibility_only = staged_fingerprint is not None and staged_fingerprint != fingerprint
@@ -922,6 +939,7 @@ def sync_experiment(args: argparse.Namespace, result_root: Path) -> int:
                 key,
                 fingerprint,
                 compatible_fingerprints=compatible_fingerprints,
+                state_label="W&B" if mode == "online" else "Local W&B staging manifest",
             )
             metrics_already_synced = synced_fingerprint is not None
             compatibility_only = synced_fingerprint is not None and synced_fingerprint != fingerprint
@@ -1051,6 +1069,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--run-id",
         default=None,
         help="Optional explicit run ID. Only valid when syncing exactly one experiment.",
+    )
+    parser.add_argument(
+        "--global-step",
+        action="append",
+        type=int,
+        default=None,
+        help="Only publish units at this checkpoint step; repeat to select multiple steps.",
     )
     parser.add_argument("--include-rollouts", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(

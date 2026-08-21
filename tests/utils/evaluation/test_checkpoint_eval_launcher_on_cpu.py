@@ -90,6 +90,8 @@ def test_checkpoint_eval_launcher_uses_distributed_claims_and_instance_scoped_co
     assert "release-claim" in source
     assert "render-queue" in source
     assert "sync_wandb_serialized" in source
+    assert '--global-step "$step"' in source
+    assert 'sync_wandb "$step"' in source
     assert "OPD_RESULT_STATUS" in source
     assert "load_queue_context" in source
     assert 'json.loads(sys.argv[1])["source_checkpoint_identity"]' in source

@@ -1027,6 +1027,7 @@ run_repair_unit() {
 }
 
 sync_wandb() {
+    local step=$1
     local wandb_dir="$CURRENT_WANDB_ROOT/wandb"
     local wandb_data_dir="$CURRENT_WANDB_ROOT/wandb-data"
     local wandb_cache_dir="$CURRENT_WANDB_ROOT/wandb-cache"
@@ -1041,6 +1042,7 @@ sync_wandb() {
         --wandb-data-dir "$wandb_data_dir"
         --wandb-cache-dir "$wandb_cache_dir"
         --source-training-run-id "$training_run_id"
+        --global-step "$step"
     )
     python "$SCRIPT_DIR/upload_opd_benchmark_wandb.py" "${flags[@]}"
 }
@@ -1076,7 +1078,7 @@ sync_wandb_serialized() {
                 release_wandb_claim
                 return 0
             fi
-            if ! sync_wandb; then
+            if ! sync_wandb "$step"; then
                 release_wandb_claim
                 return 1
             fi
