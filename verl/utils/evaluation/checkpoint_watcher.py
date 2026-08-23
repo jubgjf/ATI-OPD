@@ -37,12 +37,19 @@ from verl.utils.evaluation.checkpoint_evaluation import (
     payload_fingerprint,
     write_json_atomic,
 )
+from verl.utils.evaluation.model_identity import (
+    capture_stable_model_manifest,
+    legacy_stat_model_fingerprint,
+    model_manifest_cache_path,
+    register_model_fingerprint_aliases,
+    validate_stable_model_manifest,
+)
 
 CHECKPOINT_PATTERN = re.compile(r"global_step_(\d+)")
 FSDP_SHARD_PATTERN = re.compile(r"model_world_size_(\d+)_rank_(\d+)\.pt")
 TRACKER_FILENAME = "latest_checkpointed_iteration.txt"
 METRIC_COMMIT_FILENAME = "metrics_commit.json"
-ENDPOINT_SCHEMA_VERSION = 1
+ENDPOINT_SCHEMA_VERSION = 2
 CLAIM_SCHEMA_VERSION = 1
 CLAIMS_DIRNAME = "claims"
 CLAIM_OWNER_FILENAME = "owner.json"
@@ -657,41 +664,24 @@ def write_endpoint_descriptor(
     model_path: str | Path,
     request_id: str | None = None,
     model_load_seconds: float | None = None,
+    manifest_cache_root: str | Path | None = None,
+    force_model_rehash: bool = False,
 ) -> dict[str, Any]:
     model_path = Path(model_path).expanduser().resolve()
-    metadata_names = (
-        "config.json",
-        "generation_config.json",
-        "tokenizer_config.json",
-        "tokenizer.json",
-        "special_tokens_map.json",
+    cache_path = None if manifest_cache_root is None else model_manifest_cache_path(manifest_cache_root, model_path)
+    model_manifest = capture_stable_model_manifest(
+        model_path,
+        cache_path=cache_path,
+        force_rehash=force_model_rehash,
     )
-    metadata = {
-        name: (model_path / name).read_text(encoding="utf-8")
-        for name in metadata_names
-        if (model_path / name).is_file()
-    }
-    weight_files = sorted(
-        {path for pattern in ("*.safetensors", "*.bin", "*.pt") for path in model_path.glob(pattern) if path.is_file()}
-    )
-    model_identity = {
-        "path": str(model_path),
-        "metadata": metadata,
-        "weights": [
-            {
-                "name": path.name,
-                "size": path.stat().st_size,
-                "mtime_ns": path.stat().st_mtime_ns,
-            }
-            for path in weight_files
-        ],
-    }
     payload = {
         "schema_version": ENDPOINT_SCHEMA_VERSION,
         "base_url": str(base_url).rstrip("/"),
         "served_model_name": str(served_model_name),
         "model_path": str(model_path),
-        "model_fingerprint": payload_fingerprint(model_identity),
+        "model_fingerprint": model_manifest["fingerprint"],
+        "model_manifest": model_manifest,
+        "legacy_stat_model_fingerprint": legacy_stat_model_fingerprint(model_path),
     }
     if request_id is not None:
         payload["request_id"] = str(request_id)
@@ -706,10 +696,20 @@ def load_endpoint_descriptor(path: str | Path) -> dict[str, Any]:
     payload = _read_json(descriptor_path)
     if payload is None or payload.get("schema_version") != ENDPOINT_SCHEMA_VERSION:
         raise RuntimeError(f"Teacher endpoint descriptor is missing or invalid: {descriptor_path}.")
-    required = {"base_url", "served_model_name", "model_path", "model_fingerprint"}
+    required = {
+        "base_url",
+        "served_model_name",
+        "model_path",
+        "model_fingerprint",
+        "model_manifest",
+        "legacy_stat_model_fingerprint",
+    }
     missing = sorted(required - set(payload))
     if missing:
         raise RuntimeError(f"Teacher endpoint descriptor is missing fields {missing}: {descriptor_path}.")
+    valid, reason = validate_stable_model_manifest(payload["model_manifest"])
+    if not valid or payload["model_fingerprint"] != payload["model_manifest"].get("fingerprint"):
+        raise RuntimeError(f"Teacher endpoint model manifest is invalid at {descriptor_path}: {reason}.")
     return payload
 
 
@@ -889,6 +889,22 @@ def build_parser() -> argparse.ArgumentParser:
     endpoint.add_argument("--model-path", required=True)
     endpoint.add_argument("--request-id")
     endpoint.add_argument("--model-load-seconds", type=float)
+    endpoint.add_argument("--manifest-cache-root")
+    endpoint.add_argument("--force-model-rehash", action="store_true")
+
+    model_manifest = subparsers.add_parser("model-manifest")
+    model_manifest.add_argument("--model-path", required=True)
+    model_manifest.add_argument("--manifest-cache-root")
+    model_manifest.add_argument("--force-model-rehash", action="store_true")
+
+    register_alias = subparsers.add_parser("register-model-alias")
+    register_alias.add_argument("--alias-file", required=True)
+    register_alias.add_argument("--model-path", required=True)
+    register_alias.add_argument("--legacy-fingerprint", action="append", required=True)
+    register_alias.add_argument("--expected-stable-fingerprint", required=True)
+    register_alias.add_argument("--manifest-cache-root")
+    register_alias.add_argument("--force-model-rehash", action="store_true")
+    register_alias.add_argument("--note")
 
     acquire = subparsers.add_parser("acquire-claim")
     acquire.add_argument("--runtime-root", required=True)
@@ -963,6 +979,38 @@ def main() -> int:
             model_path=args.model_path,
             request_id=args.request_id,
             model_load_seconds=args.model_load_seconds,
+            manifest_cache_root=args.manifest_cache_root,
+            force_model_rehash=args.force_model_rehash,
+        )
+        print(json.dumps(payload, sort_keys=True))
+        return 0
+    if args.command == "model-manifest":
+        cache_path = (
+            None
+            if args.manifest_cache_root is None
+            else model_manifest_cache_path(args.manifest_cache_root, args.model_path)
+        )
+        payload = capture_stable_model_manifest(
+            args.model_path,
+            cache_path=cache_path,
+            force_rehash=args.force_model_rehash,
+        )
+        print(json.dumps(payload, sort_keys=True))
+        return 0
+    if args.command == "register-model-alias":
+        cache_path = (
+            None
+            if args.manifest_cache_root is None
+            else model_manifest_cache_path(args.manifest_cache_root, args.model_path)
+        )
+        payload = register_model_fingerprint_aliases(
+            args.alias_file,
+            legacy_fingerprints=args.legacy_fingerprint,
+            model_path=args.model_path,
+            expected_stable_fingerprint=args.expected_stable_fingerprint,
+            cache_path=cache_path,
+            force_rehash=args.force_model_rehash,
+            note=args.note,
         )
         print(json.dumps(payload, sort_keys=True))
         return 0

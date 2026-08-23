@@ -907,6 +907,43 @@ def _expand_segment_to_token_patterns(
     return adjusted_start, min(adjusted_end, len(token_ids))
 
 
+def _expand_segment_to_delimited_blocks(
+    token_ids: list[int],
+    start: int,
+    end: int,
+    *,
+    start_pattern: list[int],
+    end_pattern: list[int],
+) -> tuple[int, int]:
+    """Move boundaries outside complete (or trailing open) tagged blocks."""
+    if not start_pattern or not end_pattern:
+        return start, end
+    adjusted_start, adjusted_end = start, end
+    position = 0
+    open_start: Optional[int] = None
+    blocks: list[tuple[int, int]] = []
+    while position < len(token_ids):
+        if open_start is None and _match_token_pattern(token_ids, start_pattern, position):
+            open_start = position
+            position += len(start_pattern)
+            continue
+        if open_start is not None and _match_token_pattern(token_ids, end_pattern, position):
+            blocks.append((open_start, position + len(end_pattern)))
+            open_start = None
+            position += len(end_pattern)
+            continue
+        position += 1
+    if open_start is not None:
+        blocks.append((open_start, len(token_ids)))
+
+    for block_start, block_end in blocks:
+        if block_start < adjusted_start < block_end:
+            adjusted_start = block_start
+        if block_start < adjusted_end < block_end:
+            adjusted_end = block_end
+    return adjusted_start, min(adjusted_end, len(token_ids))
+
+
 def _generation_is_terminal(
     *,
     token_ids: list[int],
@@ -1673,6 +1710,8 @@ class AgentLoopBase(ABC):
         data_config (DictConfigWrap): Dataset config.
     """
 
+    supports_intervention_resume = False
+
     def __init__(
         self,
         trainer_config: DictConfigWrap,
@@ -1816,6 +1855,25 @@ class AgentLoopBase(ABC):
         """
         raise NotImplementedError
 
+    async def resume_after_teacher_intervention(self, **kwargs) -> AgentLoopOutput:
+        """Resume an environment-aware rollout after a teacher rewrites its suffix.
+
+        Stateful agent loops override this hook.  The default deliberately
+        fails so single-turn loops keep using the cheaper raw-token suffix
+        generation path in :class:`AgentLoopWorker`.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support environment-aware intervention resume.")
+
+    async def validate_teacher_intervention_segment(
+        self,
+        token_ids: list[int],
+        *,
+        sample_kwargs: Optional[dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Return a stable skip reason when a teacher segment is unsafe to apply."""
+        del sample_kwargs
+        return None
+
 
 """Agent loop registry: key is agent_name, value is a dict of agent loop config
 used by hydra.utils.instantiate to initialize agent loop instance.
@@ -1951,26 +2009,29 @@ class AgentLoopWorker:
 
     def _init_teacher_intervention_token_patterns(self) -> None:
         config = self.teacher_intervention_config
-        if config is None or not getattr(config, "protect_thinking_blocks", True):
-            self._teacher_intervention_thinking_start_pattern = []
-            self._teacher_intervention_thinking_end_pattern = []
-            return
         tokenizer = getattr(self, "tokenizer", None)
         if tokenizer is None:
             self._teacher_intervention_thinking_start_pattern = []
             self._teacher_intervention_thinking_end_pattern = []
+            self._teacher_intervention_tool_call_start_pattern = []
+            self._teacher_intervention_tool_call_end_pattern = []
             return
-        self._teacher_intervention_thinking_start_pattern = _encode_token_pattern(
-            tokenizer,
-            getattr(config, "thinking_start_text", "<think>"),
+        protect_thinking = config is not None and getattr(config, "protect_thinking_blocks", True)
+        self._teacher_intervention_thinking_start_pattern = (
+            _encode_token_pattern(tokenizer, getattr(config, "thinking_start_text", "<think>"))
+            if protect_thinking
+            else []
         )
-        self._teacher_intervention_thinking_end_pattern = _encode_token_pattern(
-            tokenizer,
-            getattr(config, "thinking_end_text", "</think>"),
+        self._teacher_intervention_thinking_end_pattern = (
+            _encode_token_pattern(tokenizer, getattr(config, "thinking_end_text", "</think>"))
+            if protect_thinking
+            else []
         )
+        self._teacher_intervention_tool_call_start_pattern = _encode_token_pattern(tokenizer, "<tool_call>")
+        self._teacher_intervention_tool_call_end_pattern = _encode_token_pattern(tokenizer, "</tool_call>")
 
     def _ensure_teacher_intervention_token_patterns(self) -> None:
-        if not hasattr(self, "_teacher_intervention_thinking_start_pattern"):
+        if not hasattr(self, "_teacher_intervention_tool_call_start_pattern"):
             AgentLoopWorker._init_teacher_intervention_token_patterns(self)
 
     def _teacher_intervention_thinking_state(
@@ -1991,15 +2052,35 @@ class AgentLoopWorker:
 
     def _expand_teacher_intervention_segment_for_token_patterns(self, response_ids: list[int], start: int, end: int):
         AgentLoopWorker._ensure_teacher_intervention_token_patterns(self)
-        return _expand_segment_to_token_patterns(
+        adjusted_start, adjusted_end = _expand_segment_to_token_patterns(
             response_ids,
             start,
             end,
             patterns=[
                 getattr(self, "_teacher_intervention_thinking_start_pattern", []),
                 getattr(self, "_teacher_intervention_thinking_end_pattern", []),
+                getattr(self, "_teacher_intervention_tool_call_start_pattern", []),
+                getattr(self, "_teacher_intervention_tool_call_end_pattern", []),
             ],
         )
+        for start_pattern, end_pattern in (
+            (
+                getattr(self, "_teacher_intervention_thinking_start_pattern", []),
+                getattr(self, "_teacher_intervention_thinking_end_pattern", []),
+            ),
+            (
+                getattr(self, "_teacher_intervention_tool_call_start_pattern", []),
+                getattr(self, "_teacher_intervention_tool_call_end_pattern", []),
+            ),
+        ):
+            adjusted_start, adjusted_end = _expand_segment_to_delimited_blocks(
+                response_ids,
+                adjusted_start,
+                adjusted_end,
+                start_pattern=start_pattern,
+                end_pattern=end_pattern,
+            )
+        return adjusted_start, adjusted_end
 
     def _teacher_prompt_logprobs(self) -> int:
         distillation_config = getattr(self, "distillation_config", None)
@@ -2442,6 +2523,7 @@ class AgentLoopWorker:
             return await self._agent_loop_postprocess(
                 output,
                 trajectory["validate"],
+                agent_loop=agent_loop,
                 sampling_params=sampling_params,
                 repair_for_evaluation=repair_for_evaluation,
                 **kwargs,
@@ -2451,6 +2533,7 @@ class AgentLoopWorker:
         self,
         output,
         validate,
+        agent_loop: Optional[AgentLoopBase] = None,
         sampling_params: Optional[dict[str, Any]] = None,
         repair_for_evaluation: bool = False,
         **kwargs,
@@ -2529,6 +2612,7 @@ class AgentLoopWorker:
                 ),
                 sampling_params=sampling_params,
                 sample_kwargs=kwargs,
+                agent_loop=agent_loop,
             )
             if repair_for_evaluation and self.teacher_intervention_config.confirmation_mode == "future_gap":
                 await self._score_rejected_future_gap_candidate(output, kwargs=kwargs)
@@ -2933,7 +3017,14 @@ class AgentLoopWorker:
                 all_prompts, all_responses, all_input_ids, all_attention_mask, all_position_ids = [], [], [], [], []
                 for output in outputs:
                     prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
-                    responses = torch.tensor(output.response_ids, dtype=torch.int64)
+                    reward_response_ids = output.extra_fields.get("reward_response_ids")
+                    if reward_response_ids == []:
+                        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+                        reward_response_ids = [0 if eos_token_id is None else int(eos_token_id)]
+                    responses = torch.tensor(
+                        output.response_ids if reward_response_ids is None else reward_response_ids,
+                        dtype=torch.int64,
+                    )
                     input_ids = torch.cat([prompts, responses], dim=0)
                     attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
                     multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
@@ -3622,6 +3713,7 @@ class AgentLoopWorker:
         retain_rejected_candidate_for_outcome: bool = False,
         sampling_params: Optional[dict[str, Any]],
         sample_kwargs: Optional[dict[str, Any]],
+        agent_loop: Optional[AgentLoopBase] = None,
     ) -> None:
         """Repair high-gap response segments with teacher generation before padding/training."""
         if not self.teacher_intervention_enabled or (validate and not repair_for_evaluation):
@@ -3638,6 +3730,14 @@ class AgentLoopWorker:
         interventions: list[dict[str, Any]] = output.extra_fields["teacher_interventions"]
         skipped_interventions: list[dict[str, Any]] = output.extra_fields["teacher_intervention_skipped"]
         gap_diagnostics: list[dict[str, Any]] = output.extra_fields["teacher_intervention_gap_diagnostics"]
+        environment_aware_resume = bool(
+            agent_loop is not None and getattr(agent_loop, "supports_intervention_resume", False)
+        )
+        if environment_aware_resume:
+            output.extra_fields["tool_call/dmpd_repair_count"] = 0
+            output.extra_fields["tool_call/dmpd_safe_boundary_expansion_count"] = 0
+            output.extra_fields["tool_call/dmpd_repair_rejection_count"] = 0
+            output.extra_fields["tool_call/dmpd_repair_rejection_counts"] = {}
 
         intervention_config: DistillationInterventionConfig = self.teacher_intervention_config
         future_gap_confirmation = intervention_config.confirmation_mode == "future_gap"
@@ -3707,7 +3807,7 @@ class AgentLoopWorker:
         response_mask = list(output.response_mask[: len(response_ids)])
         if not response_ids:
             return
-        if any(mask != 1 for mask in response_mask):
+        if any(mask != 1 for mask in response_mask) and not environment_aware_resume:
             first_zero = next(idx for idx, mask in enumerate(response_mask) if mask != 1)
             raise NotImplementedError(
                 "Teacher intervention currently supports only pure single-turn student-generated responses. "
@@ -3724,7 +3824,20 @@ class AgentLoopWorker:
             )
 
         response_logprobs = list(output.response_logprobs[: len(response_ids)])
+        # Only student assistant tokens may trigger a repair. Tool
+        # observations/role prefixes already have response_mask=0; teacher
+        # assistant spans can have response_mask=1 in OPD mode and must be
+        # removed explicitly after each intervention.
         gap_mask = list(response_mask)
+        for span in output.extra_fields.get("trajectory_spans", []):
+            if span.get("kind") != "assistant" or span.get("source") != "teacher":
+                continue
+            span_start = max(int(span.get("start", 0)), 0)
+            span_end = min(int(span.get("end", span_start)), len(gap_mask))
+            gap_mask[span_start:span_end] = [0] * max(span_end - span_start, 0)
+        for token_index, logprob in enumerate(response_logprobs):
+            if not math.isfinite(float(logprob)):
+                gap_mask[token_index] = 0
         if len(response_logprobs) < len(response_ids):
             raise RuntimeError(
                 "Teacher intervention requires one student logprob per response token, but got "
@@ -3800,6 +3913,9 @@ class AgentLoopWorker:
                 prompt_len=len(prompt_ids),
                 response_len=len(response_ids),
             )
+            for token_index in teacher_nonfinite_positions:
+                if 0 <= token_index < len(gap_mask):
+                    gap_mask[token_index] = 0
             if pending_local_effect is not None:
                 pending_metadata, after_intervention_start = pending_local_effect
                 _finalize_local_effect_metadata(
@@ -4055,7 +4171,11 @@ class AgentLoopWorker:
             if bad_segment is None or len(interventions) >= intervention_config.max_interventions_per_sample:
                 break
 
-            start, end, score = bad_segment
+            trigger_start, trigger_end, score = bad_segment
+            eligible_positions = [position for position in range(trigger_start, trigger_end) if gap_mask[position] == 1]
+            if not eligible_positions:
+                raise RuntimeError("Teacher intervention selected a segment without any eligible student tokens.")
+            start, end = eligible_positions[0], eligible_positions[-1] + 1
             if isinstance(outcome_metadata, dict):
                 outcome_metadata["trigger_detected"] = True
                 outcome_metadata["trigger_count"] = int(outcome_metadata.get("trigger_count", 0)) + 1
@@ -4064,7 +4184,7 @@ class AgentLoopWorker:
                 persistence_score, persistence_tokens = _compute_teacher_rejection_persistence(
                     gaps=gaps,
                     response_mask=gap_mask,
-                    candidate_end=end,
+                    candidate_end=trigger_end,
                     intervention_config=intervention_config,
                 )
                 if persistence_score is None:
@@ -4081,12 +4201,21 @@ class AgentLoopWorker:
                         intervention_config
                     ),
                 }
+            unexpanded_start, unexpanded_end = start, end
             start, end = AgentLoopWorker._expand_teacher_intervention_segment_for_token_patterns(
                 self,
                 response_ids,
                 start,
                 end,
             )
+            safe_boundary_expanded = start != unexpanded_start or end != unexpanded_end
+            trigger_boundary_metadata = {
+                "trigger_start": int(trigger_start),
+                "trigger_end": int(trigger_end),
+                "applied_start": int(start),
+                "applied_end": int(end),
+                "safe_boundary_expanded": bool(safe_boundary_expanded),
+            }
             future_gap_proposal: Optional[dict[str, Any]] = None
             future_gap_baseline_values: list[float] = []
             if future_gap_confirmation:
@@ -4107,6 +4236,7 @@ class AgentLoopWorker:
                     "attempt": attempt,
                     "start": start,
                     "end": end,
+                    **trigger_boundary_metadata,
                     "start_fraction": start / max(len(response_ids), 1),
                     "trigger_gap_metric": str(intervention_config.gap_metric).lower(),
                     "trigger_gap_aggregation": str(intervention_config.gap_aggregation),
@@ -4295,6 +4425,24 @@ class AgentLoopWorker:
                     skipped_interventions[-1]["invalid_token_ids"] = invalid_teacher_token_ids[:8]
                     skipped_interventions[-1]["tokenizer_vocab_size"] = _tokenizer_vocab_size(self.tokenizer)
                     break
+            if environment_aware_resume and agent_loop is not None:
+                tool_segment_skip_reason = await agent_loop.validate_teacher_intervention_segment(
+                    teacher_segment_ids,
+                    sample_kwargs=sample_kwargs,
+                )
+                if tool_segment_skip_reason is not None:
+                    _record_skipped_intervention(
+                        skipped_interventions,
+                        reason=f"teacher_tool_repair_{tool_segment_skip_reason}",
+                        attempt=attempt,
+                        start=start,
+                        end=end,
+                        candidate_response_ids=response_ids,
+                        candidate_response_mask=response_mask,
+                        teacher_tokens=len(teacher_segment_ids),
+                    )
+                    skipped_interventions[-1].update(trigger_boundary_metadata)
+                    break
             rewrite_overlap_metrics = compute_rewrite_overlap_metrics(original_student_segment_ids, teacher_segment_ids)
             if future_gap_proposal is not None:
                 future_gap_proposal.update(
@@ -4333,7 +4481,64 @@ class AgentLoopWorker:
                 )
             student_suffix_result = _StudentSuffixGenerationResult(token_ids=[], logprobs=[])
             student_suffix_requested_tokens = 0
-            if not teacher_terminal:
+            candidate_tool_extra_fields: Optional[dict[str, Any]] = None
+            candidate_num_turns = output.num_turns
+            candidate_multi_modal_data = output.multi_modal_data
+            if environment_aware_resume and agent_loop is not None:
+                student_suffix_requested_tokens = student_suffix_max_tokens
+                resumed_output = await agent_loop.resume_after_teacher_intervention(
+                    output=output,
+                    prefix_response_ids=prefix_response_ids,
+                    prefix_response_mask=prefix_response_mask,
+                    prefix_response_logprobs=prefix_response_logprobs,
+                    prefix_teacher_segment_mask=prefix_teacher_segment_mask,
+                    teacher_segment_ids=teacher_segment_ids,
+                    teacher_response_mask=teacher_response_mask,
+                    teacher_segment_logprobs=teacher_segment_logprobs,
+                    teacher_segment_sft_mask=(
+                        [1] * len(teacher_segment_ids) if prefix_teacher_segment_mask is not None else None
+                    ),
+                    teacher_terminal=teacher_terminal,
+                    sampling_params=dict(sampling_params or {}),
+                    sample_kwargs=sample_kwargs or {},
+                    request_id=f"{base_request_id}:tool-resume:{attempt}",
+                )
+                candidate_response_ids = list(resumed_output.response_ids)
+                candidate_response_mask = list(resumed_output.response_mask)
+                candidate_response_logprobs = list(resumed_output.response_logprobs or [])
+                candidate_teacher_segment_mask = (
+                    list(resumed_output.teacher_segment_mask)
+                    if resumed_output.teacher_segment_mask is not None
+                    else None
+                )
+                candidate_tool_extra_fields = dict(resumed_output.extra_fields)
+                candidate_num_turns = resumed_output.num_turns
+                candidate_multi_modal_data = resumed_output.multi_modal_data
+                suffix_start = len(prefix_response_ids) + len(teacher_segment_ids)
+                suffix_token_ids = candidate_response_ids[suffix_start:]
+                suffix_logprobs = candidate_response_logprobs[suffix_start:]
+                nonfinite_offsets = tuple(
+                    index for index, logprob in enumerate(suffix_logprobs) if not math.isfinite(float(logprob))
+                )
+                student_suffix_result = _StudentSuffixGenerationResult(
+                    token_ids=suffix_token_ids,
+                    logprobs=suffix_logprobs,
+                    stop_reason=candidate_tool_extra_fields.get("stop_reason"),
+                    finish_reason=candidate_tool_extra_fields.get("finish_reason"),
+                    terminal=True,
+                    nonfinite_logprob_offsets=nonfinite_offsets,
+                )
+                candidate_gap_mask = list(candidate_response_mask)
+                for span in candidate_tool_extra_fields.get("trajectory_spans", []):
+                    if span.get("kind") != "assistant" or span.get("source") != "teacher":
+                        continue
+                    span_start = max(int(span.get("start", 0)), 0)
+                    span_end = min(int(span.get("end", span_start)), len(candidate_gap_mask))
+                    candidate_gap_mask[span_start:span_end] = [0] * max(span_end - span_start, 0)
+                for token_index, logprob in enumerate(candidate_response_logprobs):
+                    if not math.isfinite(float(logprob)):
+                        candidate_gap_mask[token_index] = 0
+            elif not teacher_terminal:
                 student_suffix_requested_tokens = student_suffix_max_tokens
                 student_suffix_result = await self._generate_student_suffix(
                     request_id=(
@@ -4346,28 +4551,29 @@ class AgentLoopWorker:
                     sampling_params=sampling_params,
                     output=output,
                 )
-            candidate_response_ids = prefix_response_ids + teacher_segment_ids + student_suffix_result.token_ids
-            candidate_response_mask = (
-                prefix_response_mask + teacher_response_mask + [1] * len(student_suffix_result.token_ids)
-            )
-            candidate_response_logprobs = (
-                prefix_response_logprobs + teacher_segment_logprobs + student_suffix_result.logprobs
-            )
-            suffix_gap_mask = [1] * len(student_suffix_result.token_ids)
-            for suffix_offset in student_suffix_result.nonfinite_logprob_offsets:
-                suffix_gap_mask[suffix_offset] = 0
-            candidate_gap_mask = prefix_gap_mask + [0] * len(teacher_segment_ids) + suffix_gap_mask
+            if not environment_aware_resume:
+                candidate_response_ids = prefix_response_ids + teacher_segment_ids + student_suffix_result.token_ids
+                candidate_response_mask = (
+                    prefix_response_mask + teacher_response_mask + [1] * len(student_suffix_result.token_ids)
+                )
+                candidate_response_logprobs = (
+                    prefix_response_logprobs + teacher_segment_logprobs + student_suffix_result.logprobs
+                )
+                suffix_gap_mask = [1] * len(student_suffix_result.token_ids)
+                for suffix_offset in student_suffix_result.nonfinite_logprob_offsets:
+                    suffix_gap_mask[suffix_offset] = 0
+                candidate_gap_mask = prefix_gap_mask + [0] * len(teacher_segment_ids) + suffix_gap_mask
+                candidate_teacher_segment_mask = None
+                if prefix_teacher_segment_mask is not None:
+                    candidate_teacher_segment_mask = (
+                        prefix_teacher_segment_mask
+                        + [1] * len(teacher_segment_ids)
+                        + [0] * len(student_suffix_result.token_ids)
+                    )
             student_suffix_logprob_metadata = _student_suffix_logprob_metadata(
                 student_suffix_result,
                 response_start=len(prefix_response_ids) + len(teacher_segment_ids),
             )
-            candidate_teacher_segment_mask = None
-            if prefix_teacher_segment_mask is not None:
-                candidate_teacher_segment_mask = (
-                    prefix_teacher_segment_mask
-                    + [1] * len(teacher_segment_ids)
-                    + [0] * len(student_suffix_result.token_ids)
-                )
             _validate_intervention_state(
                 context=f"after repair attempt {attempt}",
                 response_ids=candidate_response_ids,
@@ -4484,6 +4690,26 @@ class AgentLoopWorker:
             gap_mask = candidate_gap_mask
             teacher_segment_mask = candidate_teacher_segment_mask
             cached_teacher_result = None
+            if candidate_tool_extra_fields is not None:
+                tool_extra_keys = {
+                    "trajectory_spans",
+                    "tool_events",
+                    "reward_response_ids",
+                    "tool_call_counts",
+                    "tool_call_attempts",
+                    "turn_scores",
+                    "tool_rewards",
+                    "finish_reason",
+                    "stop_reason",
+                    "min_global_steps",
+                    "max_global_steps",
+                    "extras",
+                }
+                for key, value in candidate_tool_extra_fields.items():
+                    if key in tool_extra_keys or key.startswith("tool_call/"):
+                        output.extra_fields[key] = value
+                output.num_turns = candidate_num_turns
+                output.multi_modal_data = candidate_multi_modal_data
             boundary_metadata: dict[str, Any] = {}
             if collect_boundary_metrics:
                 teacher_segment_sha256 = _token_ids_sha256(teacher_segment_ids)
@@ -4522,6 +4748,7 @@ class AgentLoopWorker:
                 "attempt": attempt,
                 "start": start,
                 "end": end,
+                **trigger_boundary_metadata,
                 "score": score,
                 "teacher_tokens": len(teacher_segment_ids),
                 "student_suffix_tokens": len(student_suffix_result.token_ids),
@@ -4567,7 +4794,7 @@ class AgentLoopWorker:
                 interventions.append(intervention_item)
                 if isinstance(outcome_metadata, dict):
                     outcome_metadata["repair_executed"] = True
-                if candidate_terminal:
+                if candidate_terminal and not environment_aware_resume:
                     _mark_local_effect_unavailable(intervention_item, "terminal_response")
                     break
                 pending_local_effect = (intervention_item, start + len(teacher_segment_ids))
@@ -4637,6 +4864,19 @@ class AgentLoopWorker:
         output.extra_fields["teacher_interventions"] = interventions
         output.extra_fields["teacher_intervention_skipped"] = skipped_interventions
         output.extra_fields["teacher_intervention_gap_diagnostics"] = gap_diagnostics
+        if environment_aware_resume:
+            repair_rejection_counts: dict[str, int] = {}
+            for skipped in skipped_interventions:
+                reason = str(skipped.get("reason", "unknown"))
+                if not reason.startswith("teacher_tool_repair_"):
+                    continue
+                repair_rejection_counts[reason] = repair_rejection_counts.get(reason, 0) + 1
+            output.extra_fields["tool_call/dmpd_repair_count"] = len(interventions)
+            output.extra_fields["tool_call/dmpd_safe_boundary_expansion_count"] = sum(
+                bool(intervention.get("safe_boundary_expanded")) for intervention in interventions
+            )
+            output.extra_fields["tool_call/dmpd_repair_rejection_count"] = sum(repair_rejection_counts.values())
+            output.extra_fields["tool_call/dmpd_repair_rejection_counts"] = repair_rejection_counts
         if future_gap_confirmation:
             output.extra_fields["teacher_intervention_proposals"] = proposals
         if cached_teacher_result is not None:

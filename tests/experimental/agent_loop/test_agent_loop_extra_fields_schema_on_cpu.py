@@ -552,7 +552,10 @@ class _FakeInterventionTeacherManager:
             ids=teacher_ids,
             logprobs=teacher_logprobs,
             nonfinite_count=1,
-            nonfinite_sequence_positions=[3 if call_idx == 0 else 5],
+            # Keep the synthetic non-finite diagnostic outside the initial
+            # high-gap segment. Non-finite positions are now intentionally
+            # excluded from DMPD triggering.
+            nonfinite_sequence_positions=[6 if call_idx == 0 else 5],
             replacement_value=-10.0,
         )
 

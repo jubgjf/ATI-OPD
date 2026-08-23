@@ -124,6 +124,16 @@ class RLHFDataset(Dataset):
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
         self.mm_processor_kwargs = config.get("mm_processor_kwargs", {})
+        self.system_prompt_path = config.get("system_prompt_path", None)
+        self.system_prompt = None
+        if self.system_prompt_path:
+            expanded_prompt_path = os.path.abspath(os.path.expanduser(self.system_prompt_path))
+            if not os.path.isfile(expanded_prompt_path):
+                raise FileNotFoundError(f"data.system_prompt_path does not exist: {self.system_prompt_path}")
+            with open(expanded_prompt_path, encoding="utf-8") as prompt_file:
+                self.system_prompt = prompt_file.read().strip()
+            if not self.system_prompt:
+                raise ValueError(f"data.system_prompt_path is empty: {self.system_prompt_path}")
 
         # Mirror AgentLoopWorker's tool loading so length filtering sees the
         # same schemas the rollout will.
@@ -142,13 +152,12 @@ class RLHFDataset(Dataset):
                     tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list
                 ]
             except Exception as e:
-                logger.warning(
-                    "Failed to initialize tools (tool_config_path=%s, function_tool_path=%s): %s",
-                    self.tool_config_path,
-                    self.function_tool_path,
-                    e,
-                )
-                self.tool_schemas = None
+                raise RuntimeError(
+                    "Failed to initialize tools while constructing the dataset prompt-length filter "
+                    f"(tool_config_path={self.tool_config_path!r}, "
+                    f"function_tool_path={self.function_tool_path!r}). The filter must include the exact "
+                    "tool schema used by rollout."
+                ) from e
 
         self.num_workers = config.get("filter_overlong_prompts_workers", max(1, os.cpu_count() // 4))
         self.num_workers = min(self.num_workers, os.cpu_count()) if self.num_workers is not None else None
@@ -261,8 +270,9 @@ class RLHFDataset(Dataset):
                         apply_kwargs.pop("return_dict", None)
                         apply_kwargs.pop("return_tensors", None)
 
+                        messages = self._build_messages(doc, key=prompt_key)
                         tokenized_prompt = tokenizer.apply_chat_template(
-                            doc[prompt_key], add_generation_prompt=True, tokenize=True, **apply_kwargs
+                            messages, add_generation_prompt=True, tokenize=True, **apply_kwargs
                         )
                         return len(normalize_token_ids(tokenized_prompt))
                     except Exception:
@@ -315,7 +325,17 @@ class RLHFDataset(Dataset):
         Returns:
             messages: List of messages with replaced placeholder.
         """
-        messages: list = example[key]
+        # Hugging Face rows can reuse nested objects across filtering and
+        # __getitem__.  Never mutate the source prompt while adding a system
+        # message or replacing multimodal placeholders.
+        messages: list = copy.deepcopy(example[key])
+        if self.system_prompt:
+            system_message = {"role": "system", "content": self.system_prompt}
+            if messages and messages[0].get("role") == "system" and isinstance(messages[0].get("content"), str):
+                existing = messages[0]["content"].strip()
+                messages[0]["content"] = f"{self.system_prompt}\n\n{existing}" if existing else self.system_prompt
+            else:
+                messages.insert(0, system_message)
         # When concatenating multimodal datasets, get will return None for samples without a modality column.
         images = example.get(self.image_key, None) or []
         videos = example.get(self.video_key, None) or []

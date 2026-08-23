@@ -64,6 +64,18 @@ def test_wandb_metric_payload_uses_global_step_axis_and_unit_fingerprint_on_cpu(
             "rollout_count": 480,
             "response_tokens": {"mean": 1000, "p50": 900, "p90": 2000, "p99": 3000},
             "gap_regions": {"last_window": {"abs_mean_token_weighted": 0.3}},
+            "tool_call": {
+                "attempt_rate": 0.75,
+                "parse_success_rate": 0.9,
+                "execution_success_rate": 0.8,
+                "markdown_extraction_rate": 0.25,
+                "calls_per_trajectory": {"mean": 1.2},
+                "observation_tokens": {"mean": 80},
+                "final_answer_after_tool_rate": 0.95,
+                "ended_after_observation_rate": 0.01,
+                "total_attempts": 360,
+                "total_parsed_calls": 324,
+            },
         },
         "rollout_n": 16,
         "accuracy_at_n": {"mean": 0.5, "maj": 0.6, "best": 0.8},
@@ -97,6 +109,9 @@ def test_wandb_metric_payload_uses_global_step_axis_and_unit_fingerprint_on_cpu(
     assert payload["test-core/aime24/acc/mean@16"] == 0.5
     assert payload["test-repair-core/aime24/acc/paired_delta@16"] == 0.05
     assert payload["test-repair-core/aime24/transition/pre_wrong_post_correct"] == 0.1
+    assert payload["test-core/aime24/tool_call/attempt_rate"] == 0.75
+    assert payload["test-core/aime24/tool_call/execution_success_rate"] == 0.8
+    assert payload["test-core/aime24/tool_call/observation_tokens_mean"] == 80
     assert payload["eval/timing/checkpoint_total_seconds"] == 40
 
 

@@ -33,10 +33,21 @@ RUN_PREFLIGHT=${RUN_PREFLIGHT:-1}
 REMOTE_PYTHON=${REMOTE_PYTHON:-python3}
 
 DEBUG_MODE=${DEBUG_MODE:-topd}
+ENABLE_TOOL_CALL=${ENABLE_TOOL_CALL:-False}
+case "$ENABLE_TOOL_CALL" in
+    True | true | 1) ENABLE_TOOL_CALL=True ;;
+    False | false | 0) ENABLE_TOOL_CALL=False ;;
+    *) echo "ENABLE_TOOL_CALL must be True or False, got: $ENABLE_TOOL_CALL" >&2; exit 2 ;;
+esac
 MODEL_ROOT=${MODEL_ROOT:-/share/home/jnguan/share/models}
 DATASET_ROOT=${DATASET_ROOT:-/share/home/jnguan/share/datasets}
-DEFAULT_STUDENT_MODEL="$MODEL_ROOT/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-DEFAULT_TEACHER_MODEL="$MODEL_ROOT/hbx/JustRL-DeepSeek-1.5B"
+if [[ "$ENABLE_TOOL_CALL" == "True" ]]; then
+    DEFAULT_STUDENT_MODEL="$MODEL_ROOT/Qwen3-1.7B"
+    DEFAULT_TEACHER_MODEL="$MODEL_ROOT/Qwen3-8B"
+else
+    DEFAULT_STUDENT_MODEL="$MODEL_ROOT/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+    DEFAULT_TEACHER_MODEL="$MODEL_ROOT/hbx/JustRL-DeepSeek-1.5B"
+fi
 if [[ ! -d "$DEFAULT_STUDENT_MODEL" && -d "$MODEL_ROOT/DeepSeek-R1-Distill-Qwen-1.5B" ]]; then
     DEFAULT_STUDENT_MODEL="$MODEL_ROOT/DeepSeek-R1-Distill-Qwen-1.5B"
 fi
@@ -72,10 +83,21 @@ TEACHER_NNODES=${TEACHER_NNODES:-1}
 STUDENT_TP=${STUDENT_TP:-$STUDENT_GPUS}
 TEACHER_TP=${TEACHER_TP:-$TEACHER_GPUS}
 TEACHER_REPLICAS=${TEACHER_REPLICAS:-1}
-SP_SIZE=${SP_SIZE:-1}
+if [[ "$ENABLE_TOOL_CALL" == "True" ]]; then
+    # A full 23K response does not reliably fit in one A100 backward pass.
+    # Match the NPU launcher and shard long sequences over the four student GPUs.
+    SP_SIZE=${SP_SIZE:-4}
+else
+    SP_SIZE=${SP_SIZE:-1}
+fi
 
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-15360}
+if [[ "$ENABLE_TOOL_CALL" == "True" ]]; then
+    MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
+    MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-23552}
+else
+    MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
+    MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-15360}
+fi
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 1))}
 ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-1024}
 TEACHER_MAX_NUM_BATCHED_TOKENS=${TEACHER_MAX_NUM_BATCHED_TOKENS:-1024}
@@ -103,6 +125,12 @@ TEACHER_ENFORCE_EAGER=${TEACHER_ENFORCE_EAGER:-False}
 SKIP_TOKENIZER_INIT=${SKIP_TOKENIZER_INIT:-True}
 ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-flash_attention_2}
 REMOTE_DISABLE_LD_PRELOAD=${REMOTE_DISABLE_LD_PRELOAD:-0}
+PYTHON_SANDBOX_URL=${PYTHON_SANDBOX_URL:-http://127.0.0.1:18080}
+PYTHON_SANDBOX_TIMEOUT=${PYTHON_SANDBOX_TIMEOUT:-10}
+PYTHON_SANDBOX_PORT=${PYTHON_SANDBOX_PORT:-18080}
+AUTO_START_PYTHON_SANDBOX=${AUTO_START_PYTHON_SANDBOX:-1}
+TOOL_SYSTEM_PROMPT_PATH=${TOOL_SYSTEM_PROMPT_PATH:-run/prompts/qwen3_math_tool_optional.txt}
+FUNCTION_TOOL_PATH=${FUNCTION_TOOL_PATH:-verl/tools/code_interpreter_tool.py}
 
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$TRAIN_BATCH_SIZE}
@@ -143,7 +171,7 @@ if [[ ! "$METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 ACTOR_LR=${ACTOR_LR:-1e-6}
-PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-$(( (MAX_MODEL_LEN + 127) / 128 * 128 ))}
+PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-$(( ((MAX_MODEL_LEN + SP_SIZE - 1) / SP_SIZE + 127) / 128 * 128 ))}
 
 ADV_ESTIMATOR=${ADV_ESTIMATOR:-token_reward_direct}
 if [[ "$ADV_ESTIMATOR" == "token_reward_direct" ]]; then
@@ -199,6 +227,9 @@ TEACHER_INTERVENTION_GAP_DISTRIBUTION_TOPK=${TEACHER_INTERVENTION_GAP_DISTRIBUTI
 TEACHER_INTERVENTION_GAP_THRESHOLD=${TEACHER_INTERVENTION_GAP_THRESHOLD:-0.3}
 TEACHER_INTERVENTION_MAX_COUNT=${TEACHER_INTERVENTION_MAX_COUNT:-2}
 TEACHER_INTERVENTION_TRAIN_TEACHER=${TEACHER_INTERVENTION_TRAIN_TEACHER:-False}
+TEACHER_INTERVENTION_LOSS_MODE=${TEACHER_INTERVENTION_LOSS_MODE:-opd}
+TEACHER_INTERVENTION_SFT_COEF=${TEACHER_INTERVENTION_SFT_COEF:-1.0}
+TEACHER_INTERVENTION_SKIP_CORRECT=${TEACHER_INTERVENTION_SKIP_CORRECT:-False}
 TEACHER_INTERVENTION_MIN_TRAINABLE_TOKENS=${TEACHER_INTERVENTION_MIN_TRAINABLE_TOKENS:-1}
 TEACHER_INTERVENTION_TEMPERATURE=${TEACHER_INTERVENTION_TEMPERATURE:-0.6}
 TEACHER_INTERVENTION_TOP_P=${TEACHER_INTERVENTION_TOP_P:-0.95}
@@ -273,7 +304,11 @@ esac
 EXPERIMENT_TIMESTAMP=${EXPERIMENT_TIMESTAMP:-$(date +"%Y%m%d-%H%M%S")}
 EXPERIMENT_BASE_NAME=${EXPERIMENT_NAME:-"debug-${DEBUG_MODE}"}
 EXPERIMENT_FULL_NAME=${EXPERIMENT_FULL_NAME:-"${EXPERIMENT_BASE_NAME}-${EXPERIMENT_TIMESTAMP}"}
-DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-"/tmp/verl_debug/${EXPERIMENT_FULL_NAME}"}
+if [[ "$ENABLE_TOOL_CALL" == "True" ]]; then
+    DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-"/tmp/verl_debug/tool-call/${EXPERIMENT_FULL_NAME}"}
+else
+    DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-"/tmp/verl_debug/${EXPERIMENT_FULL_NAME}"}
+fi
 if [[ -z "$WANDB_DATA_DIR" && -n "$WANDB_DIR" ]]; then
     WANDB_DATA_DIR="${WANDB_DIR%/}/wandb-data/${EXPERIMENT_FULL_NAME}"
 fi
@@ -320,10 +355,17 @@ case "$DEBUG_MODE" in
             "distillation.intervention.gap_threshold=${TEACHER_INTERVENTION_GAP_THRESHOLD}"
             "distillation.intervention.max_interventions_per_sample=${TEACHER_INTERVENTION_MAX_COUNT}"
             "distillation.intervention.train_on_teacher_segments=${TEACHER_INTERVENTION_TRAIN_TEACHER}"
+            "distillation.intervention.teacher_segment_loss_mode=${TEACHER_INTERVENTION_LOSS_MODE}"
+            "distillation.intervention.teacher_segment_sft_loss_coef=${TEACHER_INTERVENTION_SFT_COEF}"
+            "distillation.intervention.skip_correct=${TEACHER_INTERVENTION_SKIP_CORRECT}"
             "distillation.intervention.min_trainable_tokens_after_repair=${TEACHER_INTERVENTION_MIN_TRAINABLE_TOKENS}"
             "distillation.intervention.teacher_temperature=${TEACHER_INTERVENTION_TEMPERATURE}"
             "distillation.intervention.teacher_top_p=${TEACHER_INTERVENTION_TOP_P}"
             "distillation.intervention.teacher_top_k=${TEACHER_INTERVENTION_TOP_K}"
+            "distillation.intervention.confirmation_mode=none"
+            "distillation.intervention.outcome_aware_candidate_selection_enabled=False"
+            "distillation.intervention.repair_for_evaluation=False"
+            "distillation.diagnostics.collect_intervention_outcome_transitions=False"
         )
         ;;
     outcome-nll-rank | dmpd-outcome)
@@ -511,6 +553,22 @@ COMMON_OVERRIDES=(
     "distillation.diagnostics.bad_tail_entropy_threshold=${OPD_DIAGNOSTICS_BAD_TAIL_ENTROPY_THRESHOLD}"
 )
 
+if [[ "$ENABLE_TOOL_CALL" == "True" ]]; then
+    COMMON_OVERRIDES+=(
+        "data.system_prompt_path=${TOOL_SYSTEM_PROMPT_PATH}"
+        "+data.apply_chat_template_kwargs.enable_thinking=True"
+        "actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent"
+        "actor_rollout_ref.rollout.multi_turn.enable=True"
+        "actor_rollout_ref.rollout.multi_turn.function_tool_path=${FUNCTION_TOOL_PATH}"
+        "actor_rollout_ref.rollout.multi_turn.format=hermes"
+        "actor_rollout_ref.rollout.multi_turn.max_assistant_turns=null"
+        "actor_rollout_ref.rollout.multi_turn.max_user_turns=null"
+        "actor_rollout_ref.rollout.multi_turn.max_parallel_calls=1"
+        "actor_rollout_ref.rollout.multi_turn.max_tool_response_length=4096"
+        "actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=disable"
+    )
+fi
+
 OVERRIDES=("${COMMON_OVERRIDES[@]}" "${MODE_OVERRIDES[@]}")
 
 PREFLIGHT_CODE='import numpy as np, numba, torch, flash_attn, vllm
@@ -561,6 +619,42 @@ test -d '"$(printf "%q" "$TEACHER_MODEL")"' || { echo "Missing TEACHER_MODEL='"$
 test -d '"$(printf "%q" "$CHAT_TEMPLATE_MODEL")"' || { echo "Missing CHAT_TEMPLATE_MODEL='"$CHAT_TEMPLATE_MODEL"'" >&2; exit 2; }
 '
 
+if [[ "$ENABLE_TOOL_CALL" == "True" ]]; then
+    SANDBOX_HEALTH_CODE='import sys, time, urllib.request
+url = sys.argv[1].rstrip("/") + "/health"
+for _ in range(60):
+    try:
+        if urllib.request.urlopen(url, timeout=2).read().decode().strip() == "OK":
+            print(f"[debug] sandbox healthy: {url}", flush=True)
+            break
+    except Exception:
+        time.sleep(1)
+else:
+    raise SystemExit(f"sandbox health check timed out: {url}")'
+    REMOTE_CMD+="export PYTHON_SANDBOX_URL=$(printf "%q" "$PYTHON_SANDBOX_URL")
+export PYTHON_SANDBOX_TIMEOUT=$(printf "%q" "$PYTHON_SANDBOX_TIMEOUT")
+mkdir -p $(printf "%q" "$DEFAULT_LOCAL_DIR")
+test -f $(printf "%q" "$TOOL_SYSTEM_PROMPT_PATH") || { echo 'Missing tool system prompt' >&2; exit 2; }
+test -f $(printf "%q" "$FUNCTION_TOOL_PATH") || { echo 'Missing function tool file' >&2; exit 2; }
+"
+    if [[ "$AUTO_START_PYTHON_SANDBOX" == "1" ]]; then
+        REMOTE_CMD+="SANDBOX_PID=''
+cleanup_sandbox() {
+    if [[ -n \"\${SANDBOX_PID:-}\" ]]; then
+        kill \"\$SANDBOX_PID\" 2>/dev/null || true
+        wait \"\$SANDBOX_PID\" 2>/dev/null || true
+    fi
+}
+trap cleanup_sandbox EXIT
+$(printf "%q" "$REMOTE_PYTHON") -m verl.tools.python_sandbox --host 127.0.0.1 --port $(printf "%q" "$PYTHON_SANDBOX_PORT") --max-concurrency 32 --max-timeout $(printf "%q" "$PYTHON_SANDBOX_TIMEOUT") >$(printf "%q" "$DEFAULT_LOCAL_DIR/sandbox.log") 2>&1 &
+SANDBOX_PID=\$!
+echo \"[debug] sandbox pid=\$SANDBOX_PID\"
+"
+    fi
+    REMOTE_CMD+="$(printf "%q" "$REMOTE_PYTHON") -c $(printf "%q" "$SANDBOX_HEALTH_CODE") $(printf "%q" "$PYTHON_SANDBOX_URL")
+"
+fi
+
 if [[ -n "$WANDB_DIR" ]]; then
     REMOTE_CMD+="export WANDB_DIR=$(printf "%q" "$WANDB_DIR")
 mkdir -p $(printf "%q" "$WANDB_DIR")
@@ -600,8 +694,8 @@ for override in "${OVERRIDES[@]}"; do
     REMOTE_CMD+="TRAIN_CMD+=($(printf "%q" "$override"))
 "
 done
-REMOTE_CMD+='echo "[debug] train command overrides=\$(( \${#TRAIN_CMD[@]} - 3 ))"
-"\${TRAIN_CMD[@]}"
+REMOTE_CMD+='echo "[debug] train command overrides=$((${#TRAIN_CMD[@]} - 3))"
+"${TRAIN_CMD[@]}"
 '
 
 cat <<EOF
@@ -640,4 +734,11 @@ if [[ "$RAY_NO_WAIT" == "1" ]]; then
 fi
 
 cd "$REPO_ROOT"
-RAY_API_SERVER_ADDRESS="$RAY_API_SERVER_ADDRESS" "$RAY_BIN" "${RAY_JOB_ARGS[@]}" -- bash -lc "$REMOTE_CMD"
+# Ray serializes argv back into a shell entrypoint. Passing REMOTE_CMD as the
+# literal `bash -lc` argument would therefore expand `$TRAIN_CMD`, `$!`, and
+# similar variables once in Ray's outer shell before the intended remote bash
+# sees them. Encode the script so the Ray entrypoint itself contains no remote
+# shell variables.
+REMOTE_CMD_B64=$(printf "%s" "$REMOTE_CMD" | base64 | tr -d '\n')
+RAY_REMOTE_ENTRYPOINT="printf '%s' '$REMOTE_CMD_B64' | base64 -d | bash"
+RAY_API_SERVER_ADDRESS="$RAY_API_SERVER_ADDRESS" "$RAY_BIN" "${RAY_JOB_ARGS[@]}" -- bash -lc "$RAY_REMOTE_ENTRYPOINT"

@@ -69,6 +69,9 @@ class NaiveRewardManager(AbstractRewardManager):
             response_ids = data_item.batch["responses"]
             valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
             valid_response_ids = response_ids[:valid_response_length]
+            reward_response_ids = data_item.non_tensor_batch.get("reward_response_ids")
+            if reward_response_ids is not None:
+                valid_response_ids = torch.as_tensor(reward_response_ids, dtype=torch.long)
 
             # decode
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)

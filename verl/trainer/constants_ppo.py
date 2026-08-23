@@ -69,6 +69,14 @@ WANDB_RAY_ENV_PASSTHROUGH = [
     "WANDB__SERVICE_WAIT",
 ]
 
+# Tool calls execute inside AgentLoop workers rather than in the Ray job entrypoint.
+# The debug launcher starts the sandbox and exports these variables from that
+# entrypoint, so explicitly propagate them into ray.init's runtime environment.
+TOOL_RAY_ENV_PASSTHROUGH = [
+    "PYTHON_SANDBOX_URL",
+    "PYTHON_SANDBOX_TIMEOUT",
+]
+
 
 def get_ppo_ray_runtime_env():
     """
@@ -88,5 +96,8 @@ def get_ppo_ray_runtime_env():
             runtime_env["env_vars"].pop(key, None)
     for key in WANDB_RAY_ENV_PASSTHROUGH:
         if key not in job_env_vars and (value := os.environ.get(key)) is not None:
+            runtime_env["env_vars"][key] = value
+    for key in TOOL_RAY_ENV_PASSTHROUGH:
+        if (value := os.environ.get(key)) is not None:
             runtime_env["env_vars"][key] = value
     return runtime_env

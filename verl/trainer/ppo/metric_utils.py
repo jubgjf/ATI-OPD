@@ -683,6 +683,49 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    tool_metric_keys = (
+        "tool_call/attempt_rate",
+        "tool_call/parse_success_rate",
+        "tool_call/parse_failure_rate",
+        "tool_call/execution_success_rate",
+        "tool_call/protocol_error_rate",
+        "tool_call/timeout_rate",
+        "tool_call/runtime_error_rate",
+        "tool_call/http_error_rate",
+        "tool_call/syntax_error_rate",
+        "tool_call/markdown_extraction_rate",
+        "tool_call/student_call_rate",
+        "tool_call/teacher_call_rate",
+        "tool_call/student_calls",
+        "tool_call/teacher_calls",
+        "tool_call/calls_per_trajectory",
+        "tool_call/observation_tokens",
+        "tool_call/final_answer_after_tool",
+        "tool_call/ended_after_observation",
+        "tool_call/dmpd_repair_count",
+        "tool_call/dmpd_safe_boundary_expansion_count",
+        "tool_call/dmpd_repair_rejection_count",
+    )
+    for metric_key in tool_metric_keys:
+        if metric_key not in batch.non_tensor_batch:
+            continue
+        values = np.asarray(
+            [value for value in batch.non_tensor_batch[metric_key] if value is not None],
+            dtype=np.float64,
+        )
+        if values.size:
+            metrics[metric_key] = float(values.mean())
+
+    rejection_counts = batch.non_tensor_batch.get("tool_call/dmpd_repair_rejection_counts")
+    if rejection_counts is not None:
+        totals: dict[str, int] = {}
+        for sample_counts in rejection_counts:
+            for reason, count in (sample_counts or {}).items():
+                totals[str(reason)] = totals.get(str(reason), 0) + int(count)
+        denominator = max(len(rejection_counts), 1)
+        for reason, total in totals.items():
+            metrics[f"tool_call/dmpd_rejection/{reason}"] = float(total / denominator)
+
     return metrics
 
 

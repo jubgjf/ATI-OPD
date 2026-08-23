@@ -49,6 +49,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
+from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 
 from verl.utils.evaluation.math_benchmark import (
@@ -57,14 +58,21 @@ from verl.utils.evaluation.math_benchmark import (
     load_benchmark_samples,
     score_completion,
 )
+from verl.utils.evaluation.model_identity import (
+    load_model_fingerprint_aliases,
+    validate_stable_model_manifest,
+)
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
 
 SCHEMA_VERSION = 2
 GENERATION_SCHEMA_VERSION = 3
+TOOL_GENERATION_SCHEMA_VERSION = 4
 INPUT_MANIFEST_SCHEMA_VERSION = 2
 GENERATION_COMPATIBILITY_SCHEMA_VERSION = 1
+REPAIR_SCHEMA_VERSION = 2
+REPAIR_COMPATIBILITY_SCHEMA_VERSION = 1
 DEFAULT_BENCHMARKS = [
     "math-ai/aime24",
     "math-ai/aime25",
@@ -152,6 +160,7 @@ class RolloutTask:
     question_id: int | str | None = None
     answer_type: str | None = None
     grader: str | None = None
+    raw_prompt: list[dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +174,8 @@ class GenerationPreparation:
     request: dict[str, Any]
     analysis: dict[str, Any]
     fingerprint: str
+    generation_schema_version: int = GENERATION_SCHEMA_VERSION
+    tool_contract: dict[str, Any] | None = None
 
 
 def json_default(value: Any) -> Any:
@@ -703,12 +714,179 @@ def load_eval_tokenizer(args: argparse.Namespace) -> Any:
     return student_tokenizer
 
 
-def apply_chat_template(tokenizer: Any, messages: list[dict[str, str]], enable_thinking: bool) -> list[int]:
+def _resolve_runtime_file(path_value: str, *, field_name: str) -> Path:
+    from verl.experimental.agent_loop.utils import resolve_config_path
+
+    try:
+        return Path(resolve_config_path(path_value)).expanduser().resolve()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"{field_name} is unavailable: {path_value}") from exc
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def resolve_tool_call_contract(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Resolve the effective standalone rollout mode without guessing from experiment names."""
+
+    mode = str(getattr(args, "tool_call_mode", "auto")).lower()
+    if mode not in {"auto", "on", "off"}:
+        raise ValueError(f"Unsupported tool-call mode: {mode!r}.")
+    spec: dict[str, Any] | None = None
+    spec_contract: dict[str, Any] = {}
+    evaluation_spec = getattr(args, "evaluation_spec", None)
+    if evaluation_spec:
+        from verl.utils.evaluation.checkpoint_evaluation import load_evaluation_spec
+
+        spec_path = Path(evaluation_spec).expanduser().resolve()
+        spec = load_evaluation_spec(spec_path.parent if spec_path.is_file() else spec_path)
+        if int(spec.get("schema_version", 1)) >= 2:
+            spec_contract = dict((spec.get("semantic_config") or {}).get("tool_call") or {})
+
+    spec_enabled = bool(spec_contract.get("enabled"))
+    enabled = spec_enabled if mode == "auto" else mode == "on"
+    if not enabled:
+        return None
+
+    forced_legacy = not spec_enabled
+    system_prompt_override = getattr(args, "tool_system_prompt_path", None)
+    function_tool_override = getattr(args, "function_tool_path", None)
+    tool_config_override = getattr(args, "tool_config_path", None)
+    if forced_legacy and (not system_prompt_override or not function_tool_override):
+        raise ValueError(
+            "EVAL_TOOL_CALL_MODE=on for a v1/non-tool evaluation spec requires both "
+            "--tool-system-prompt-path and --function-tool-path. Standalone evaluation never infers tool use "
+            "from an experiment name."
+        )
+
+    if system_prompt_override:
+        system_prompt_path = _resolve_runtime_file(
+            str(system_prompt_override),
+            field_name="tool system prompt",
+        )
+        system_prompt = system_prompt_path.read_text(encoding="utf-8").strip()
+        if not system_prompt:
+            raise ValueError(f"Tool system prompt is empty: {system_prompt_path}")
+        expected_prompt_hash = (spec_contract.get("system_prompt") or {}).get("sha256")
+        actual_prompt_hash = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+        if spec_enabled and expected_prompt_hash != actual_prompt_hash:
+            raise ValueError(
+                "Explicit tool system prompt differs from the checkpoint evaluation contract: "
+                f"expected={expected_prompt_hash}, actual={actual_prompt_hash}."
+            )
+    else:
+        prompt_descriptor = spec_contract.get("system_prompt") or {}
+        system_prompt = str(prompt_descriptor.get("content") or "").strip()
+        if not system_prompt:
+            raise ValueError("Tool-enabled evaluation spec does not contain a system prompt snapshot.")
+        actual_prompt_hash = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+
+    function_descriptor = spec_contract.get("function_tool") or {}
+    tool_config_descriptor = spec_contract.get("tool_config") or {}
+    function_tool_value = function_tool_override or function_descriptor.get("configured_path")
+    tool_config_value = tool_config_override or tool_config_descriptor.get("configured_path")
+    if not function_tool_value and not tool_config_value:
+        raise ValueError("Tool-call evaluation requires a function-tool or native tool configuration path.")
+    function_tool_path = (
+        _resolve_runtime_file(str(function_tool_value), field_name="function tool") if function_tool_value else None
+    )
+    tool_config_path = (
+        _resolve_runtime_file(str(tool_config_value), field_name="tool config") if tool_config_value else None
+    )
+    if spec_enabled:
+        for descriptor, path, label in (
+            (function_descriptor, function_tool_path, "function tool"),
+            (tool_config_descriptor, tool_config_path, "tool config"),
+        ):
+            if descriptor and (path is None or descriptor.get("sha256") != _file_sha256(path)):
+                raise ValueError(
+                    f"Runtime {label} differs from the checkpoint evaluation contract: "
+                    f"expected={descriptor.get('sha256')}, "
+                    f"actual={None if path is None else _file_sha256(path)}."
+                )
+
+    from verl.tools.tool_registry import load_all_tools
+
+    tools = load_all_tools(
+        tool_config_path=str(tool_config_path) if tool_config_path is not None else None,
+        function_tool_path=str(function_tool_path) if function_tool_path is not None else None,
+    )
+    schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tools]
+    if not schemas:
+        raise ValueError("Tool-call evaluation resolved no tools.")
+    if spec_enabled and schemas != list(spec_contract.get("tool_schemas") or []):
+        raise ValueError("Runtime tool schemas differ from the checkpoint evaluation contract.")
+
+    semantic_contract = {
+        "agent_loop": str(spec_contract.get("agent_loop", "tool_agent")),
+        "format": str(spec_contract.get("format", "hermes")),
+        "system_prompt_sha256": actual_prompt_hash,
+        "tool_schemas": schemas,
+        "function_tool_sha256": _file_sha256(function_tool_path) if function_tool_path is not None else None,
+        "tool_config_sha256": _file_sha256(tool_config_path) if tool_config_path is not None else None,
+        "max_assistant_turns": spec_contract.get("max_assistant_turns"),
+        "max_user_turns": spec_contract.get("max_user_turns"),
+        "max_parallel_calls": int(spec_contract.get("max_parallel_calls", 1)),
+        "max_tool_response_length": int(spec_contract.get("max_tool_response_length", 4096)),
+        "tool_response_truncate_side": str(spec_contract.get("tool_response_truncate_side", "middle")),
+        "apply_chat_template_kwargs": dict(
+            spec_contract.get("apply_chat_template_kwargs")
+            or {"enable_thinking": bool(getattr(args, "enable_thinking", True))}
+        ),
+        "logprob_floor": float(
+            (((spec or {}).get("semantic_config") or {}).get("distillation") or {}).get("log_prob_min_clamp", -10.0)
+        ),
+    }
+    if semantic_contract["agent_loop"] != "tool_agent":
+        raise ValueError(
+            f"Standalone tool evaluation supports only tool_agent, got {semantic_contract['agent_loop']!r}."
+        )
+    if semantic_contract["format"] != "hermes":
+        raise ValueError(
+            f"Standalone tool evaluation supports only Hermes format, got {semantic_contract['format']!r}."
+        )
+    return {
+        **semantic_contract,
+        "enabled": True,
+        "system_prompt": system_prompt,
+        "function_tool_path": str(function_tool_path) if function_tool_path is not None else None,
+        "tool_config_path": str(tool_config_path) if tool_config_path is not None else None,
+        "contract_fingerprint": str(
+            spec_contract.get("contract_fingerprint") or payload_fingerprint(semantic_contract)
+        ),
+        "tools": tools,
+    }
+
+
+def _merge_system_prompt(messages: list[dict[str, Any]], system_prompt: str) -> list[dict[str, Any]]:
+    merged = copy.deepcopy(messages)
+    system_message = {"role": "system", "content": system_prompt}
+    if merged and merged[0].get("role") == "system" and isinstance(merged[0].get("content"), str):
+        existing = str(merged[0]["content"]).strip()
+        merged[0]["content"] = f"{system_prompt}\n\n{existing}" if existing else system_prompt
+    else:
+        merged.insert(0, system_message)
+    return merged
+
+
+def apply_chat_template(
+    tokenizer: Any,
+    messages: list[dict[str, Any]],
+    enable_thinking: bool,
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    apply_chat_template_kwargs: Mapping[str, Any] | None = None,
+) -> list[int]:
     kwargs: dict[str, Any] = {
         "tokenize": True,
         "add_generation_prompt": True,
         "enable_thinking": enable_thinking,
     }
+    if apply_chat_template_kwargs is not None:
+        kwargs.update(dict(apply_chat_template_kwargs))
+    if tools is not None:
+        kwargs["tools"] = tools
     try:
         token_ids = tokenizer.apply_chat_template(messages, **kwargs)
     except TypeError:
@@ -730,7 +908,11 @@ def apply_chat_template(tokenizer: Any, messages: list[dict[str, str]], enable_t
     return normalized
 
 
-def prepare_tasks(args: argparse.Namespace, tokenizer: Any) -> tuple[list[Problem], list[RolloutTask], str]:
+def prepare_tasks(
+    args: argparse.Namespace,
+    tokenizer: Any,
+    tool_contract: Mapping[str, Any] | None = None,
+) -> tuple[list[Problem], list[RolloutTask], str]:
     normalized_path = normalize_benchmark_path(args.benchmark)
     identity = benchmark_id(normalized_path)
     name = Path(normalized_path).name
@@ -752,7 +934,17 @@ def prepare_tasks(args: argparse.Namespace, tokenizer: Any) -> tuple[list[Proble
             idx=question_index,
             use_raw_prompt=bool(getattr(sample, "use_raw_prompt", False)),
         )
-        prompt_token_ids = apply_chat_template(tokenizer, messages, args.enable_thinking)
+        if tool_contract is not None:
+            messages = _merge_system_prompt(messages, str(tool_contract["system_prompt"]))
+        prompt_token_ids = apply_chat_template(
+            tokenizer,
+            messages,
+            args.enable_thinking,
+            tools=list(tool_contract["tool_schemas"]) if tool_contract is not None else None,
+            apply_chat_template_kwargs=(
+                tool_contract.get("apply_chat_template_kwargs") if tool_contract is not None else None
+            ),
+        )
         if len(prompt_token_ids) > args.max_prompt_tokens:
             raise ValueError(
                 f"{normalized_path}/{sample.sample_id} has {len(prompt_token_ids)} prompt tokens, "
@@ -808,13 +1000,14 @@ def prepare_tasks(args: argparse.Namespace, tokenizer: Any) -> tuple[list[Proble
                     question_id=problem.question_id,
                     answer_type=problem.answer_type,
                     grader=problem.grader,
+                    raw_prompt=copy.deepcopy(messages) if tool_contract is not None else None,
                 )
             )
     return problems, tasks, payload_fingerprint(dataset_records)
 
 
 def generation_request(args: argparse.Namespace) -> dict[str, Any]:
-    return {
+    request = {
         "experiment": args.experiment,
         "global_step": args.global_step,
         "benchmark": normalize_benchmark_path(args.benchmark),
@@ -835,6 +1028,15 @@ def generation_request(args: argparse.Namespace) -> dict[str, Any]:
         "require_exact_token_ids": args.require_exact_token_ids,
         "max_samples_per_benchmark": args.max_samples_per_benchmark,
     }
+    tool_contract = getattr(args, "_tool_contract", None)
+    if tool_contract is not None:
+        request.update(
+            {
+                "rollout_mode": "tool_agent",
+                "tool_contract_fingerprint": str(tool_contract["contract_fingerprint"]),
+            }
+        )
+    return request
 
 
 def analysis_request(args: argparse.Namespace) -> dict[str, Any]:
@@ -866,10 +1068,11 @@ def generation_fingerprint(
     input_manifest: dict[str, Any],
     dataset_fingerprint: str,
     tokenizer_info: dict[str, Any],
+    generation_schema_version: int = GENERATION_SCHEMA_VERSION,
 ) -> str:
     return payload_fingerprint(
         {
-            "generation_schema_version": GENERATION_SCHEMA_VERSION,
+            "generation_schema_version": int(generation_schema_version),
             "request": generation_request_identity(request),
             "input_manifest_fingerprint": input_manifest["fingerprint"],
             "dataset_fingerprint": dataset_fingerprint,
@@ -988,6 +1191,7 @@ def gap_region(
     start: int,
     end: int,
     high_gap_threshold: float,
+    valid_mask: list[bool] | None = None,
 ) -> dict[str, Any]:
     start = max(0, start)
     end = max(start, min(end, len(student_logprobs), len(teacher_logprobs)))
@@ -996,8 +1200,12 @@ def gap_region(
     student_probs: list[float] = []
     teacher_probs: list[float] = []
     invalid_count = 0
+    eligible_count = 0
     high_gap_count = 0
     for position in range(start, end):
+        if valid_mask is not None and not valid_mask[position]:
+            continue
+        eligible_count += 1
         student = student_logprobs[position]
         teacher = teacher_logprobs[position]
         if not is_valid_logprob(student) or not is_valid_logprob(teacher):
@@ -1013,7 +1221,7 @@ def gap_region(
         teacher_probs.append(math.exp(max(teacher_value, -100.0)))
         high_gap_count += int(absolute > high_gap_threshold)
     token_count = len(signed_gaps)
-    return {
+    result = {
         "requested_token_count": end - start,
         "valid_token_count": token_count,
         "invalid_token_count": invalid_count,
@@ -1024,6 +1232,9 @@ def gap_region(
         "student_sampled_prob_mean": statistics.fmean(student_probs) if student_probs else None,
         "teacher_sampled_prob_mean": statistics.fmean(teacher_probs) if teacher_probs else None,
     }
+    if valid_mask is not None:
+        result["eligible_token_count"] = eligible_count
+    return result
 
 
 def compute_gap_metrics(
@@ -1031,10 +1242,15 @@ def compute_gap_metrics(
     teacher_logprobs: list[Any],
     high_gap_threshold: float,
     tail_token_window: int,
+    valid_mask: list[bool] | None = None,
 ) -> dict[str, Any]:
     if len(student_logprobs) != len(teacher_logprobs):
         raise ValueError(
             f"Student and teacher response logprobs do not align: {len(student_logprobs)} != {len(teacher_logprobs)}"
+        )
+    if valid_mask is not None and len(valid_mask) != len(student_logprobs):
+        raise ValueError(
+            f"Gap valid mask does not align with response logprobs: {len(valid_mask)} != {len(student_logprobs)}"
         )
     length = len(student_logprobs)
     regions = {
@@ -1047,7 +1263,14 @@ def compute_gap_metrics(
         "last_window": (max(0, length - tail_token_window), length),
     }
     return {
-        name: gap_region(student_logprobs, teacher_logprobs, start, end, high_gap_threshold)
+        name: gap_region(
+            student_logprobs,
+            teacher_logprobs,
+            start,
+            end,
+            high_gap_threshold,
+            valid_mask=valid_mask,
+        )
         for name, (start, end) in regions.items()
     }
 
@@ -1158,18 +1381,8 @@ async def _request_completion(
         return await request(fallback_body), True
 
 
-async def evaluate_one(
-    *,
-    client: AsyncOpenAI,
-    generation_semaphore: asyncio.Semaphore,
-    scoring_semaphore: asyncio.Semaphore,
-    args: argparse.Namespace,
-    tokenizer: Any,
-    task: RolloutTask,
-    fingerprint: str,
-) -> dict[str, Any]:
-    started_at = time.perf_counter()
-    base_record: dict[str, Any] = {
+def _base_rollout_record(task: RolloutTask, fingerprint: str) -> dict[str, Any]:
+    return {
         "schema_version": SCHEMA_VERSION,
         "generation_fingerprint": fingerprint,
         "task_id": task.task_id,
@@ -1198,6 +1411,20 @@ async def evaluate_one(
         ),
         "prompt_token_ids": task.prompt_token_ids,
     }
+
+
+async def evaluate_one(
+    *,
+    client: AsyncOpenAI,
+    generation_semaphore: asyncio.Semaphore,
+    scoring_semaphore: asyncio.Semaphore,
+    args: argparse.Namespace,
+    tokenizer: Any,
+    task: RolloutTask,
+    fingerprint: str,
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    base_record = _base_rollout_record(task, fingerprint)
     try:
         response, request_fallback = await _request_completion(
             client=client,
@@ -1323,6 +1550,266 @@ async def evaluate_one(
         }
 
 
+def build_standalone_tool_agent_loop(
+    *,
+    args: argparse.Namespace,
+    tokenizer: Any,
+    client: AsyncOpenAI,
+    semaphore: asyncio.Semaphore,
+    tool_contract: Mapping[str, Any],
+) -> Any:
+    from verl.experimental.agent_loop.agent_loop import DictConfigWrap, ToolListWrap
+    from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
+    from verl.utils.dataset.rl_dataset import RLHFDataset
+    from verl.utils.evaluation.teacher_intervention import OpenAICompletionAdapter, OpenAICompletionAdapterConfig
+
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {
+                    "prompt_length": int(args.max_prompt_tokens),
+                    "response_length": int(args.max_tokens),
+                    "multi_turn": {
+                        "max_user_turns": tool_contract.get("max_user_turns"),
+                        "max_assistant_turns": tool_contract.get("max_assistant_turns"),
+                        "max_parallel_calls": int(tool_contract.get("max_parallel_calls", 1)),
+                        "max_tool_response_length": int(tool_contract.get("max_tool_response_length", 4096)),
+                        "tool_response_truncate_side": str(tool_contract.get("tool_response_truncate_side", "middle")),
+                        "format": str(tool_contract.get("format", "hermes")),
+                    },
+                }
+            },
+            "data": {
+                "apply_chat_template_kwargs": dict(tool_contract.get("apply_chat_template_kwargs") or {}),
+                "mm_processor_kwargs": {},
+            },
+        }
+    )
+    adapter = OpenAICompletionAdapter(
+        client=client,
+        config=OpenAICompletionAdapterConfig(
+            served_model_name=args.served_model_name,
+            logprob_floor=float(tool_contract.get("logprob_floor", -10.0)),
+            request_timeout_seconds=float(args.request_timeout_seconds),
+        ),
+        semaphore=semaphore,
+    )
+    return ToolAgentLoop(
+        trainer_config=DictConfigWrap(config),
+        server_manager=adapter,
+        tokenizer=tokenizer,
+        processor=None,
+        dataset_cls=RLHFDataset,
+        data_config=DictConfigWrap(config.data),
+        tools=ToolListWrap(list(tool_contract["tools"])),
+    )
+
+
+def _span_token_ids(
+    response_ids: list[int],
+    spans: Iterable[Mapping[str, Any]],
+    *,
+    kind: str,
+    source: str | None = None,
+) -> list[int]:
+    selected: list[int] = []
+    for span in spans:
+        if span.get("kind") != kind or (source is not None and span.get("source") != source):
+            continue
+        start = max(int(span.get("start", 0)), 0)
+        end = min(int(span.get("end", start)), len(response_ids))
+        if end > start:
+            selected.extend(response_ids[start:end])
+    return selected
+
+
+def _validate_tool_trajectory(
+    response_ids: list[int],
+    response_mask: list[int],
+    spans: list[Mapping[str, Any]],
+    reward_response_ids: list[int],
+) -> None:
+    if any(value not in {0, 1} for value in response_mask):
+        raise RuntimeError("Tool response_mask must contain only 0/1 values.")
+    covered = [False] * len(response_ids)
+    student_assistant_spans: list[tuple[int, int]] = []
+    for span in spans:
+        kind = span.get("kind")
+        start = int(span.get("start", -1))
+        end = int(span.get("end", -1))
+        if start < 0 or end < start or end > len(response_ids):
+            raise RuntimeError(f"Tool trajectory span is out of bounds: {dict(span)}")
+        if any(covered[start:end]):
+            raise RuntimeError(f"Tool trajectory spans overlap: {dict(span)}")
+        covered[start:end] = [True] * (end - start)
+        if kind == "assistant":
+            if span.get("source") != "student":
+                raise RuntimeError("Standalone raw tool rollout unexpectedly contains a non-student assistant span.")
+            if any(value != 1 for value in response_mask[start:end]):
+                raise RuntimeError("Student assistant tokens must have response_mask=1.")
+            student_assistant_spans.append((start, end))
+        elif kind == "tool_observation":
+            if any(value != 0 for value in response_mask[start:end]):
+                raise RuntimeError("Tool observation and inserted role-prefix tokens must have response_mask=0.")
+        else:
+            raise RuntimeError(f"Unsupported standalone tool trajectory span kind: {kind!r}.")
+    if response_ids and not all(covered):
+        raise RuntimeError("Tool trajectory spans do not cover the serialized response exactly.")
+    if reward_response_ids:
+        if not student_assistant_spans:
+            raise RuntimeError("reward_response_ids exist without a student assistant span.")
+        final_start, final_end = student_assistant_spans[-1]
+        if reward_response_ids != response_ids[final_start:final_end]:
+            raise RuntimeError("reward_response_ids do not match the final student assistant answer.")
+
+
+async def evaluate_tool_one(
+    *,
+    agent_loop: Any,
+    args: argparse.Namespace,
+    tokenizer: Any,
+    task: RolloutTask,
+    fingerprint: str,
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    base_record = _base_rollout_record(task, fingerprint)
+    try:
+        if task.raw_prompt is None:
+            raise RuntimeError("Tool rollout task does not contain raw_prompt messages.")
+        sampling_params: dict[str, Any] = {
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "max_tokens": args.max_tokens,
+            "logprobs": bool(args.score_student_logprobs),
+        }
+        if task.seed is not None:
+            sampling_params["seed"] = task.seed
+        output = await agent_loop.run(
+            sampling_params,
+            raw_prompt=copy.deepcopy(task.raw_prompt),
+            extra_info={},
+            tools_kwargs={},
+        )
+        prompt_ids = [int(value) for value in output.prompt_ids]
+        if prompt_ids != task.prompt_token_ids:
+            raise RuntimeError(
+                "Standalone ToolAgentLoop rendered a different initial prompt than preflight: "
+                f"prepared={len(task.prompt_token_ids)}, rollout={len(prompt_ids)}."
+            )
+        response_ids = [int(value) for value in output.response_ids]
+        response_mask = [int(value) for value in output.response_mask]
+        if len(response_mask) != len(response_ids):
+            raise RuntimeError(f"Tool response mask is misaligned: ids={len(response_ids)}, mask={len(response_mask)}.")
+        student_logprobs = None
+        if args.score_student_logprobs:
+            student_logprobs = [float(value) for value in (output.response_logprobs or [])]
+            if len(student_logprobs) != len(response_ids):
+                raise RuntimeError(
+                    "Tool rollout requires one student logprob per serialized response token: "
+                    f"ids={len(response_ids)}, logprobs={len(student_logprobs)}."
+                )
+
+        extra_fields = dict(output.extra_fields or {})
+        spans = [dict(span) for span in extra_fields.get("trajectory_spans", [])]
+        tool_events = [dict(event) for event in extra_fields.get("tool_events", [])]
+        reward_response_ids = [int(value) for value in extra_fields.get("reward_response_ids", [])]
+        _validate_tool_trajectory(response_ids, response_mask, spans, reward_response_ids)
+        student_assistant_ids = _span_token_ids(response_ids, spans, kind="assistant", source="student")
+        observation_ids = _span_token_ids(response_ids, spans, kind="tool_observation")
+        trajectory_text = tokenizer.decode(response_ids, skip_special_tokens=False)
+        assistant_text = tokenizer.decode(student_assistant_ids, skip_special_tokens=True)
+        final_answer_text = tokenizer.decode(reward_response_ids, skip_special_tokens=True)
+        finish_reason_raw = extra_fields.get("finish_reason")
+        finish_reason = str(finish_reason_raw).lower() if finish_reason_raw is not None else None
+        stop_reason = extra_fields.get("stop_reason")
+        ended_after_observation = bool(extra_fields.get("tool_call/ended_after_observation", 0.0))
+        scored = score_completion(
+            final_answer_text,
+            task.ground_truth,
+            finish_reason=finish_reason,
+            response_token_count=len(response_ids),
+            verifier=args.verifier,
+            extra_info={
+                "benchmark": task.benchmark_name,
+                "benchmark_path": task.benchmark_path,
+                "question_id": task.question_id,
+                "answer_type": task.answer_type,
+                "grader": task.grader,
+            },
+        )
+        repetition = text_repetition_metrics(
+            assistant_text,
+            tail_chars=args.repetition_tail_chars,
+            threshold=args.repetition_threshold,
+        )
+        repetition.update(
+            token_repetition_metrics(
+                student_assistant_ids,
+                tail_token_window=args.repetition_tail_token_window,
+                threshold=args.repetition_threshold,
+                ngram_size=args.ngram_size,
+            )
+        )
+        tool_metrics = {
+            key: value
+            for key, value in extra_fields.items()
+            if key.startswith("tool_call/") or key in {"tool_call_counts", "tool_call_attempts"}
+        }
+        eos_success = bool(reward_response_ids) and finish_reason in {"stop", "eos"}
+        return {
+            **base_record,
+            "rollout_mode": "tool_agent",
+            "text": trajectory_text,
+            "assistant_text": assistant_text,
+            "final_answer_text": final_answer_text,
+            "response_token_ids": response_ids,
+            "response_token_ids_source": "tool_agent_vllm",
+            "response_mask": response_mask,
+            "student_logprobs": student_logprobs,
+            "student_logprobs_source": "tool_agent_generation_response" if student_logprobs is not None else None,
+            "teacher_logprobs": None,
+            "gap_metrics": None,
+            "finish_reason": finish_reason,
+            "stop_reason": stop_reason,
+            "usage_completion_tokens": None,
+            "response_tokens": len(response_ids),
+            "response_token_id_count": len(response_ids),
+            "token_id_count_minus_usage_tokens": None,
+            "assistant_token_count": len(student_assistant_ids),
+            "observation_token_count": len(observation_ids),
+            "reward_response_ids": reward_response_ids,
+            "trajectory_spans": spans,
+            "tool_events": tool_events,
+            "tool_metrics": tool_metrics,
+            "ended_after_observation": ended_after_observation,
+            "eos_success": eos_success,
+            "truncated": finish_reason == "length" or len(response_ids) >= args.max_tokens,
+            "acc": bool(scored.acc),
+            "pred": str(scored.pred),
+            "final_content": str(scored.final_content),
+            "invalid_pred": bool(scored.invalid_pred),
+            "answer_extractable": not bool(scored.invalid_pred),
+            "has_answer_pattern": bool(scored.has_answer_pattern),
+            "has_boxed_pattern": bool(scored.has_boxed_pattern),
+            "accepted_answer_format": bool(scored.has_accepted_answer_format),
+            "verified_by": str(scored.verified_by),
+            "math_verify_score": scored.math_verify_score,
+            "repetition": repetition,
+            "generation_return_token_ids_fallback": False,
+            "student_scoring_return_token_ids_fallback": False if student_logprobs is not None else None,
+            "elapsed_seconds": time.perf_counter() - started_at,
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            **base_record,
+            "rollout_mode": "tool_agent",
+            "elapsed_seconds": time.perf_counter() - started_at,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 async def bounded_results(tasks: Iterable[RolloutTask], worker: Any, max_pending: int) -> Any:
     iterator = iter(tasks)
     pending: set[asyncio.Task[Any]] = set()
@@ -1384,6 +1871,28 @@ def lightweight_record(record: dict[str, Any]) -> dict[str, Any]:
         light[f"{prefix}_high_gap_rate"] = region.get("high_gap_rate")
         light[f"{prefix}_student_sampled_prob_mean"] = region.get("student_sampled_prob_mean")
         light[f"{prefix}_teacher_sampled_prob_mean"] = region.get("teacher_sampled_prob_mean")
+    if record.get("rollout_mode") == "tool_agent":
+        events = list(record.get("tool_events") or [])
+        parsed = [event for event in events if event.get("parse_status") == "success"]
+        light.update(
+            {
+                "tool_rollout": 1.0,
+                "tool_call_attempted": float(bool(events)),
+                "tool_call_attempts": len(events),
+                "tool_call_parsed": len(parsed),
+                "tool_call_parse_errors": len(events) - len(parsed),
+                "tool_call_executed": sum(event.get("execution_status") == "success" for event in parsed),
+                "tool_call_protocol_errors": sum(event.get("execution_status") == "protocol_error" for event in parsed),
+                "tool_call_timeouts": sum(event.get("execution_status") == "timeout" for event in parsed),
+                "tool_call_runtime_errors": sum(event.get("execution_status") == "runtime_error" for event in parsed),
+                "tool_call_syntax_errors": sum(event.get("execution_status") == "syntax_error" for event in parsed),
+                "tool_call_http_errors": sum(event.get("execution_status") == "http_error" for event in parsed),
+                "tool_call_markdown_extracted": sum(bool(event.get("markdown_extracted")) for event in parsed),
+                "tool_call_observation_tokens": int(record.get("observation_token_count", 0)),
+                "tool_call_final_answer_after_tool": float(bool(events) and bool(record.get("reward_response_ids"))),
+                "tool_call_ended_after_observation": float(bool(record.get("ended_after_observation"))),
+            }
+        )
     return light
 
 
@@ -1608,6 +2117,42 @@ def aggregate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         if region is not None:
             gap_regions[region_name] = region
     result["gap_regions"] = gap_regions
+    tool_records = [record for record in successful if record.get("tool_rollout")]
+    if tool_records:
+        total_attempts = sum(int(record.get("tool_call_attempts", 0)) for record in tool_records)
+        total_parsed = sum(int(record.get("tool_call_parsed", 0)) for record in tool_records)
+
+        def rate(numerator_key: str, denominator: int) -> float | None:
+            if denominator <= 0:
+                return None
+            return sum(int(record.get(numerator_key, 0)) for record in tool_records) / denominator
+
+        result["tool_call"] = {
+            "trajectory_count": len(tool_records),
+            "attempt_rate": mean_present(record.get("tool_call_attempted") for record in tool_records),
+            "parse_success_rate": total_parsed / total_attempts if total_attempts else None,
+            "parse_failure_rate": (total_attempts - total_parsed) / total_attempts if total_attempts else None,
+            "execution_success_rate": rate("tool_call_executed", total_parsed),
+            "protocol_error_rate": rate("tool_call_protocol_errors", total_parsed),
+            "timeout_rate": rate("tool_call_timeouts", total_parsed),
+            "runtime_error_rate": rate("tool_call_runtime_errors", total_parsed),
+            "syntax_error_rate": rate("tool_call_syntax_errors", total_parsed),
+            "http_error_rate": rate("tool_call_http_errors", total_parsed),
+            "markdown_extraction_rate": rate("tool_call_markdown_extracted", total_parsed),
+            "calls_per_trajectory": distribution(record.get("tool_call_parsed") for record in tool_records),
+            "observation_tokens": distribution(record.get("tool_call_observation_tokens") for record in tool_records),
+            "final_answer_after_tool_rate": (
+                sum(float(record.get("tool_call_final_answer_after_tool", 0.0)) for record in tool_records)
+                / sum(float(record.get("tool_call_attempted", 0.0)) for record in tool_records)
+                if any(record.get("tool_call_attempted") for record in tool_records)
+                else None
+            ),
+            "ended_after_observation_rate": mean_present(
+                record.get("tool_call_ended_after_observation") for record in tool_records
+            ),
+            "total_attempts": total_attempts,
+            "total_parsed_calls": total_parsed,
+        }
     return result
 
 
@@ -1641,6 +2186,25 @@ def question_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "gap_extreme_tail_20000_plus_sampled_forward_kl",
         "gap_extreme_tail_20000_plus_abs_mean",
     ]
+    if any(record.get("tool_rollout") for record in records):
+        scalar_fields.extend(
+            [
+                "tool_call_attempted",
+                "tool_call_attempts",
+                "tool_call_parsed",
+                "tool_call_parse_errors",
+                "tool_call_executed",
+                "tool_call_protocol_errors",
+                "tool_call_timeouts",
+                "tool_call_runtime_errors",
+                "tool_call_syntax_errors",
+                "tool_call_http_errors",
+                "tool_call_markdown_extracted",
+                "tool_call_observation_tokens",
+                "tool_call_final_answer_after_tool",
+                "tool_call_ended_after_observation",
+            ]
+        )
     rows: list[dict[str, Any]] = []
     for sample_id, group in sorted(grouped.items()):
         problem_fingerprints = {
@@ -2039,6 +2603,38 @@ def _write_layout_metadata(result_root: Path, args: argparse.Namespace) -> None:
         write_json_atomic(benchmark_path, payload)
 
 
+def _validate_result_root_rollout_contract(result_root: Path, args: argparse.Namespace) -> None:
+    tool_contract = getattr(args, "_tool_contract", None)
+    expected_mode = "tool_agent" if tool_contract is not None else "single_turn"
+    expected_contract = str(tool_contract["contract_fingerprint"]) if tool_contract is not None else None
+    current_output_dir = unit_output_dir(result_root, args.benchmark, args.global_step)
+    conflicts: list[dict[str, Any]] = []
+    for metadata_path in sorted(result_root.glob(f"{BENCHMARKS_DIRNAME}/*/global_step_*/{METADATA_FILENAME}")):
+        if args.overwrite and metadata_path.parent == current_output_dir:
+            continue
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Cannot validate existing result rollout mode at {metadata_path}: {exc}") from exc
+        request = metadata.get("request") or {}
+        existing_mode = str(request.get("rollout_mode") or "single_turn")
+        existing_contract = request.get("tool_contract_fingerprint")
+        if existing_mode != expected_mode or existing_contract != expected_contract:
+            conflicts.append(
+                {
+                    "metadata": str(metadata_path),
+                    "rollout_mode": existing_mode,
+                    "tool_contract_fingerprint": existing_contract,
+                }
+            )
+    if conflicts:
+        raise RuntimeError(
+            "A standalone result root cannot mix tool-on/tool-off or different tool contracts across steps. "
+            "Use a different EVAL_RESULTS_ROOT; --overwrite is accepted only when the conflicting result is the "
+            "same benchmark/step unit. Conflicts:\n" + json.dumps(conflicts, ensure_ascii=False, indent=2)
+        )
+
+
 def validate_generate_args(args: argparse.Namespace) -> None:
     positive_names = [
         "rollout_n",
@@ -2073,8 +2669,12 @@ def validate_generate_args(args: argparse.Namespace) -> None:
 
 
 def prepare_generation(args: argparse.Namespace) -> GenerationPreparation:
+    tool_contract = resolve_tool_call_contract(args)
+    args._tool_contract = tool_contract
+    if tool_contract is not None and "enable_thinking" in tool_contract["apply_chat_template_kwargs"]:
+        args.enable_thinking = bool(tool_contract["apply_chat_template_kwargs"]["enable_thinking"])
     tokenizer = load_eval_tokenizer(args)
-    problems, tasks, dataset_fingerprint = prepare_tasks(args, tokenizer)
+    problems, tasks, dataset_fingerprint = prepare_tasks(args, tokenizer, tool_contract)
     input_manifest = capture_input_manifest(
         dataset_root=args.dataset_root,
         raw_benchmark_path=args.benchmark,
@@ -2086,11 +2686,15 @@ def prepare_generation(args: argparse.Namespace) -> GenerationPreparation:
     tokenizer_info = tokenizer_metadata(tokenizer, args.student_tokenizer_model)
     request = generation_request(args)
     analysis = analysis_request(args)
+    generation_schema_version = (
+        TOOL_GENERATION_SCHEMA_VERSION if tool_contract is not None else GENERATION_SCHEMA_VERSION
+    )
     fingerprint = generation_fingerprint(
         request=request,
         input_manifest=input_manifest,
         dataset_fingerprint=dataset_fingerprint,
         tokenizer_info=tokenizer_info,
+        generation_schema_version=generation_schema_version,
     )
     return GenerationPreparation(
         tokenizer=tokenizer,
@@ -2102,6 +2706,8 @@ def prepare_generation(args: argparse.Namespace) -> GenerationPreparation:
         request=request,
         analysis=analysis,
         fingerprint=fingerprint,
+        generation_schema_version=generation_schema_version,
+        tool_contract=tool_contract,
     )
 
 
@@ -2147,6 +2753,13 @@ def _metadata_for_generation(
     }
     if generation_compatibility:
         metadata["generation_compatibility"] = dict(generation_compatibility)
+    tool_contract = getattr(args, "_tool_contract", None)
+    if tool_contract is not None:
+        metadata["tool_call_contract"] = {
+            key: value
+            for key, value in tool_contract.items()
+            if key not in {"tools", "system_prompt", "function_tool_path", "tool_config_path"}
+        }
     return metadata
 
 
@@ -2222,7 +2835,7 @@ def generation_compatibility_differences(
         },
         "generation_schema_version": {
             "existing": existing.get("generation_schema_version"),
-            "current": GENERATION_SCHEMA_VERSION,
+            "current": preparation.generation_schema_version,
         },
     }
     request_difference = _mapping_differences(existing.get("request") or {}, preparation.request)
@@ -2428,8 +3041,9 @@ async def generate_main(args: argparse.Namespace) -> int:
     result_root = Path(args.result_root).expanduser().resolve()
     output_dir = unit_output_dir(result_root, args.benchmark, args.global_step)
     with unit_lock(output_dir):
-        _write_layout_metadata(result_root, args)
         preparation = prepare_generation(args)
+        _validate_result_root_rollout_contract(result_root, args)
+        _write_layout_metadata(result_root, args)
         existing = _read_metadata(output_dir)
 
         if args.overwrite:
@@ -2518,9 +3132,9 @@ async def generate_main(args: argparse.Namespace) -> int:
             input_manifest=preparation.input_manifest,
             fingerprint=fingerprint,
             generation_schema_version=(
-                int(existing.get("generation_schema_version", GENERATION_SCHEMA_VERSION))
+                int(existing.get("generation_schema_version", preparation.generation_schema_version))
                 if existing is not None
-                else GENERATION_SCHEMA_VERSION
+                else preparation.generation_schema_version
             ),
             generation_compatibility=(existing or {}).get("generation_compatibility"),
         )
@@ -2572,17 +3186,36 @@ async def generate_main(args: argparse.Namespace) -> int:
             )
             generation_semaphore = asyncio.Semaphore(args.dp_size * args.max_concurrency_per_dp)
             scoring_semaphore = asyncio.Semaphore(args.score_max_in_flight)
-
-            async def worker(task: RolloutTask) -> dict[str, Any]:
-                return await evaluate_one(
-                    client=client,
-                    generation_semaphore=generation_semaphore,
-                    scoring_semaphore=scoring_semaphore,
+            if preparation.tool_contract is not None:
+                tool_agent_loop = build_standalone_tool_agent_loop(
                     args=args,
                     tokenizer=preparation.tokenizer,
-                    task=task,
-                    fingerprint=fingerprint,
+                    client=client,
+                    semaphore=generation_semaphore,
+                    tool_contract=preparation.tool_contract,
                 )
+
+                async def worker(task: RolloutTask) -> dict[str, Any]:
+                    return await evaluate_tool_one(
+                        agent_loop=tool_agent_loop,
+                        args=args,
+                        tokenizer=preparation.tokenizer,
+                        task=task,
+                        fingerprint=fingerprint,
+                    )
+
+            else:
+
+                async def worker(task: RolloutTask) -> dict[str, Any]:
+                    return await evaluate_one(
+                        client=client,
+                        generation_semaphore=generation_semaphore,
+                        scoring_semaphore=scoring_semaphore,
+                        args=args,
+                        tokenizer=preparation.tokenizer,
+                        task=task,
+                        fingerprint=fingerprint,
+                    )
 
             completed_now = 0
             max_pending = args.max_pending or max(args.dp_size * args.max_concurrency_per_dp * 2, 1)
@@ -2672,6 +3305,17 @@ async def score_teacher_record(
             raise RuntimeError(
                 f"student/teacher logprob lengths differ: {len(student_logprobs)} != {len(teacher_logprobs)}"
             )
+        response_mask = record.get("response_mask")
+        valid_mask = None
+        if response_mask is not None:
+            if len(response_mask) != len(student_logprobs):
+                raise RuntimeError(
+                    f"response_mask/student logprob lengths differ: {len(response_mask)} != {len(student_logprobs)}"
+                )
+            # Tool observations and all non-student spans are context for the
+            # teacher forward pass, but are not policy tokens and therefore do
+            # not contribute to the student/teacher gap diagnostic.
+            valid_mask = [bool(value) for value in response_mask]
         result = dict(record)
         result["teacher_logprobs"] = teacher_logprobs
         result["gap_metrics"] = compute_gap_metrics(
@@ -2679,6 +3323,7 @@ async def score_teacher_record(
             teacher_logprobs,
             high_gap_threshold=args.high_gap_threshold,
             tail_token_window=args.repetition_tail_token_window,
+            valid_mask=valid_mask,
         )
         result["teacher_scoring_return_token_ids_fallback"] = fallback
         result["teacher_scoring_fingerprint"] = scoring_fingerprint
@@ -3159,6 +3804,232 @@ def _validate_repair_spec_against_unit(
         )
 
 
+def _load_teacher_endpoint_identity(args: argparse.Namespace) -> dict[str, Any]:
+    from verl.utils.evaluation.checkpoint_watcher import load_endpoint_descriptor
+
+    descriptor = load_endpoint_descriptor(args.teacher_endpoint_descriptor)
+    if descriptor["served_model_name"] != args.teacher_served_model_name:
+        raise RuntimeError(
+            "Teacher endpoint descriptor served-model name does not match the repair endpoint: "
+            f"descriptor={descriptor['served_model_name']!r}, repair={args.teacher_served_model_name!r}."
+        )
+    if normalize_base_url(descriptor["base_url"]) != normalize_base_url(args.teacher_base_url):
+        raise RuntimeError(
+            "Teacher endpoint descriptor URL does not match the repair endpoint: "
+            f"descriptor={descriptor['base_url']!r}, repair={args.teacher_base_url!r}."
+        )
+    manifest = descriptor["model_manifest"]
+    valid, reason = validate_stable_model_manifest(manifest)
+    if not valid or descriptor["model_fingerprint"] != manifest.get("fingerprint"):
+        raise RuntimeError(f"Teacher endpoint contains an invalid stable model manifest: {reason}.")
+    return descriptor
+
+
+def _repair_request_identity(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize a repair request to model/tokenizer semantics, excluding deployment details."""
+
+    operational_keys = {
+        "repair_schema_version",
+        "student_served_model_name",
+        "teacher_served_model_name",
+        "teacher_model_fingerprint",
+        "teacher_model",
+    }
+    identity = {str(key): value for key, value in request.items() if key not in operational_keys}
+    for key in ("student_tokenizer", "teacher_tokenizer"):
+        value = identity.get(key)
+        if isinstance(value, Mapping):
+            identity[key] = tokenizer_identity(value)
+    return identity
+
+
+def _stable_teacher_fingerprint(request: Mapping[str, Any]) -> str | None:
+    teacher_model = request.get("teacher_model")
+    if not isinstance(teacher_model, Mapping):
+        return None
+    manifest = teacher_model.get("manifest")
+    fingerprint = str(teacher_model.get("fingerprint") or "")
+    if not isinstance(manifest, Mapping):
+        return None
+    valid, _ = validate_stable_model_manifest(manifest)
+    if not valid or manifest.get("fingerprint") != fingerprint:
+        return None
+    return fingerprint
+
+
+def _repair_compatibility_differences(
+    existing_request: Mapping[str, Any],
+    current_request: Mapping[str, Any],
+    *,
+    endpoint_descriptor: Mapping[str, Any],
+) -> dict[str, Any]:
+    differences: dict[str, Any] = {}
+    existing_identity = _repair_request_identity(existing_request)
+    current_identity = _repair_request_identity(current_request)
+    if existing_identity != current_identity:
+        differences["repair_semantics"] = _mapping_differences(existing_identity, current_identity)
+    existing_stable = _stable_teacher_fingerprint(existing_request)
+    existing_legacy = existing_request.get("teacher_model_fingerprint")
+    current_stable = _stable_teacher_fingerprint(current_request)
+    if existing_stable != current_stable:
+        differences["teacher_model"] = {
+            "existing_stable_fingerprint": existing_stable,
+            "existing_legacy_fingerprint": existing_legacy,
+            "current_stable_fingerprint": current_stable,
+            "current_legacy_stat_fingerprint": endpoint_descriptor.get("legacy_stat_model_fingerprint"),
+        }
+    return differences
+
+
+def assess_repair_compatibility(
+    *,
+    existing_request: Mapping[str, Any] | None,
+    existing_fingerprint: str | None,
+    existing_compatibility: Mapping[str, Any] | None,
+    current_request: Mapping[str, Any],
+    endpoint_descriptor: Mapping[str, Any],
+    model_aliases: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Assess whether old repair shards/results can be reused without changing their canonical fingerprint."""
+
+    current_fingerprint = payload_fingerprint(current_request)
+    if existing_request is None and existing_fingerprint is None:
+        return {
+            "status": "new",
+            "compatible": True,
+            "effective_fingerprint": current_fingerprint,
+            "canonical_request": dict(current_request),
+            "differences": {},
+        }
+    if existing_request is None or not existing_fingerprint:
+        return {
+            "status": "invalid_existing",
+            "compatible": False,
+            "effective_fingerprint": None,
+            "canonical_request": None,
+            "differences": {"existing_contract": "repair request/fingerprint is incomplete"},
+        }
+    if payload_fingerprint(existing_request) != existing_fingerprint:
+        return {
+            "status": "invalid_existing",
+            "compatible": False,
+            "effective_fingerprint": None,
+            "canonical_request": None,
+            "differences": {"existing_contract": "repair fingerprint is not self-consistent"},
+        }
+    if existing_fingerprint == current_fingerprint:
+        return {
+            "status": "exact",
+            "compatible": True,
+            "effective_fingerprint": existing_fingerprint,
+            "canonical_request": dict(existing_request),
+            "differences": {},
+        }
+    compatible_fingerprints = (existing_compatibility or {}).get("compatible_fingerprints") or []
+    if current_fingerprint in compatible_fingerprints:
+        return {
+            "status": "compatible_alias",
+            "compatible": True,
+            "effective_fingerprint": existing_fingerprint,
+            "canonical_request": dict(existing_request),
+            "differences": {},
+        }
+
+    differences = _repair_compatibility_differences(
+        existing_request,
+        current_request,
+        endpoint_descriptor=endpoint_descriptor,
+    )
+    if _repair_request_identity(existing_request) != _repair_request_identity(current_request):
+        return {
+            "status": "incompatible",
+            "compatible": False,
+            "effective_fingerprint": None,
+            "canonical_request": None,
+            "differences": differences,
+        }
+
+    current_stable = _stable_teacher_fingerprint(current_request)
+    existing_stable = _stable_teacher_fingerprint(existing_request)
+    if current_stable is None:
+        return {
+            "status": "invalid_current",
+            "compatible": False,
+            "effective_fingerprint": None,
+            "canonical_request": None,
+            "differences": {"current_contract": "stable teacher model identity is invalid"},
+        }
+    if existing_stable == current_stable:
+        status = "stable_teacher_identity"
+    else:
+        existing_legacy = str(existing_request.get("teacher_model_fingerprint") or "")
+        current_legacy = str(endpoint_descriptor.get("legacy_stat_model_fingerprint") or "")
+        alias = model_aliases.get(existing_legacy)
+        if existing_legacy and existing_legacy == current_stable:
+            status = "legacy_value_matches_stable"
+        elif existing_legacy and existing_legacy == current_legacy:
+            status = "legacy_stat_exact"
+        elif alias is not None and alias.get("stable_model_fingerprint") == current_stable:
+            status = "legacy_teacher_alias"
+        else:
+            differences.setdefault("required_teacher_alias", {})
+            differences["required_teacher_alias"] = {
+                "legacy_fingerprint": existing_legacy or None,
+                "stable_model_fingerprint": current_stable,
+            }
+            return {
+                "status": "incompatible",
+                "compatible": False,
+                "effective_fingerprint": None,
+                "canonical_request": None,
+                "differences": differences,
+            }
+    return {
+        "status": status,
+        "compatible": True,
+        "effective_fingerprint": existing_fingerprint,
+        "canonical_request": dict(existing_request),
+        "differences": differences,
+    }
+
+
+def _updated_repair_compatibility(
+    existing: Mapping[str, Any] | None,
+    *,
+    assessment: Mapping[str, Any],
+    current_request: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    current_fingerprint = payload_fingerprint(current_request)
+    effective_fingerprint = str(assessment["effective_fingerprint"])
+    if current_fingerprint == effective_fingerprint:
+        return None if existing is None else dict(existing)
+    compatibility = dict(existing or {})
+    aliases = [str(value) for value in compatibility.get("compatible_fingerprints") or []]
+    if current_fingerprint not in aliases:
+        aliases.append(current_fingerprint)
+    migrations = list(compatibility.get("migrations") or [])
+    migration_key = (effective_fingerprint, current_fingerprint)
+    if not any(
+        (entry.get("canonical_repair_fingerprint"), entry.get("compatible_repair_fingerprint")) == migration_key
+        for entry in migrations
+        if isinstance(entry, Mapping)
+    ):
+        migrations.append(
+            {
+                "registered_at_unix": time.time(),
+                "reason": str(assessment["status"]),
+                "canonical_repair_fingerprint": effective_fingerprint,
+                "compatible_repair_fingerprint": current_fingerprint,
+                "stable_teacher_model_fingerprint": _stable_teacher_fingerprint(current_request),
+            }
+        )
+    return {
+        "schema_version": REPAIR_COMPATIBILITY_SCHEMA_VERSION,
+        "compatible_fingerprints": aliases,
+        "migrations": migrations,
+    }
+
+
 async def repair_main(args: argparse.Namespace) -> int:
     if args.max_in_flight <= 0 or args.max_pending <= 0:
         raise ValueError("--max-in-flight and --max-pending must be positive.")
@@ -3171,6 +4042,16 @@ async def repair_main(args: argparse.Namespace) -> int:
             or not (output_dir / ROLLOUTS_FILENAME).is_file()
         ):
             raise RuntimeError(f"Raw student generation is incomplete under {output_dir}.")
+        if (
+            metadata.get("request", {}).get("rollout_mode") == "tool_agent"
+            or bool((metadata.get("tool_call_contract") or {}).get("enabled"))
+            or int(metadata.get("generation_schema_version", GENERATION_SCHEMA_VERSION))
+            == TOOL_GENERATION_SCHEMA_VERSION
+        ):
+            raise RuntimeError(
+                "Standalone repair is not supported for tool-call generations. "
+                "Tool-aware raw benchmark output is the final evaluation result."
+            )
         if not metadata.get("request", {}).get("score_student_logprobs"):
             raise RuntimeError("Paired repair requires raw generation with --score-student-logprobs.")
 
@@ -3219,33 +4100,108 @@ async def repair_main(args: argparse.Namespace) -> int:
                 "Student and teacher tokenizer vocabularies/IDs differ; token-ID segment splicing would be invalid."
             )
 
+        endpoint_descriptor = _load_teacher_endpoint_identity(args)
+        model_aliases = load_model_fingerprint_aliases(args.teacher_model_aliases)
         repair_request = {
+            "repair_schema_version": REPAIR_SCHEMA_VERSION,
             "generation_fingerprint": metadata["generation_fingerprint"],
             "spec_fingerprint": spec["spec_fingerprint"],
             "state_fingerprint": state["state_fingerprint"],
-            "student_served_model_name": args.student_served_model_name,
-            "teacher_served_model_name": args.teacher_served_model_name,
-            "teacher_model_fingerprint": args.teacher_model_fingerprint,
-            "student_tokenizer": student_tokenizer_info,
-            "teacher_tokenizer": teacher_tokenizer_info,
+            "teacher_model": {
+                "fingerprint": endpoint_descriptor["model_fingerprint"],
+                "manifest": endpoint_descriptor["model_manifest"],
+            },
+            "student_tokenizer": tokenizer_identity(student_tokenizer_info),
+            "teacher_tokenizer": tokenizer_identity(teacher_tokenizer_info),
             "intervention": intervention_config,
             "logprob_floor": logprob_floor,
         }
-        repair_fingerprint = payload_fingerprint(repair_request)
-        existing_fingerprint = metadata.get("repair_fingerprint")
-        if metadata.get("repair_complete") and not args.overwrite:
-            if existing_fingerprint != repair_fingerprint:
-                raise RuntimeError(
-                    "Completed paired repair used a different configuration; pass --overwrite only if replacing it "
-                    "is intentional."
+        work_root = output_dir / WORK_DIRNAME / "repair"
+        repair_state_path = work_root / "repair-state.json"
+        try:
+            existing_state = (
+                json.loads(repair_state_path.read_text(encoding="utf-8")) if repair_state_path.is_file() else None
+            )
+        except (OSError, json.JSONDecodeError):
+            existing_state = None
+        if not isinstance(existing_state, dict):
+            existing_state = None
+        if metadata.get("repair_fingerprint") is not None or metadata.get("repair_request") is not None:
+            existing_request = metadata.get("repair_request")
+            existing_fingerprint = metadata.get("repair_fingerprint")
+            existing_compatibility = metadata.get("repair_compatibility")
+        elif existing_state is not None:
+            existing_request = existing_state.get("repair_request")
+            existing_fingerprint = existing_state.get("repair_fingerprint")
+            existing_compatibility = existing_state.get("repair_compatibility")
+        else:
+            existing_request = None
+            existing_fingerprint = None
+            existing_compatibility = None
+
+        if args.overwrite:
+            assessment = {
+                "status": "overwrite",
+                "compatible": True,
+                "effective_fingerprint": payload_fingerprint(repair_request),
+                "canonical_request": repair_request,
+                "differences": {},
+            }
+        else:
+            assessment = assess_repair_compatibility(
+                existing_request=existing_request,
+                existing_fingerprint=None if existing_fingerprint is None else str(existing_fingerprint),
+                existing_compatibility=existing_compatibility,
+                current_request=repair_request,
+                endpoint_descriptor=endpoint_descriptor,
+                model_aliases=model_aliases,
+            )
+        print(
+            canonical_json(
+                {
+                    "event": "repair_preflight",
+                    "status": assessment["status"],
+                    "output_dir": output_dir,
+                    "existing_repair_fingerprint": existing_fingerprint,
+                    "current_repair_fingerprint": payload_fingerprint(repair_request),
+                    "effective_repair_fingerprint": assessment["effective_fingerprint"],
+                    "teacher_model_fingerprint": endpoint_descriptor["model_fingerprint"],
+                }
+            ),
+            flush=True,
+        )
+        if not assessment["compatible"]:
+            alias_hint = ""
+            required_alias = assessment.get("differences", {}).get("required_teacher_alias")
+            if required_alias:
+                alias_hint = (
+                    "\nThe old teacher identity cannot be proven from its opaque fingerprint. After independently "
+                    "verifying that the teacher checkpoint content is unchanged, register an explicit alias with "
+                    "`python -m verl.utils.evaluation.checkpoint_watcher register-model-alias`."
                 )
+            raise RuntimeError(
+                "Completed or resumable paired repair used an incompatible configuration:\n"
+                + json.dumps(assessment["differences"], ensure_ascii=False, indent=2, default=json_default)
+                + alias_hint
+            )
+        repair_fingerprint = str(assessment["effective_fingerprint"])
+        canonical_repair_request = dict(assessment["canonical_request"])
+        repair_compatibility = (
+            None
+            if args.overwrite
+            else _updated_repair_compatibility(
+                existing_compatibility,
+                assessment=assessment,
+                current_request=repair_request,
+            )
+        )
+        if metadata.get("repair_complete") and not args.overwrite:
             valid, reason = validate_completed_unit(output_dir, validate_inputs=False)
             if valid:
-                print(f"[repair] already complete: {output_dir}")
+                print(f"[repair] already complete: {output_dir} compatibility={assessment['status']}")
                 return 0
             raise RuntimeError(f"Completed paired repair artifacts are invalid: {reason}")
 
-        work_root = output_dir / WORK_DIRNAME / "repair"
         if args.overwrite and work_root.is_dir():
             shutil.rmtree(work_root)
         parts_dir = work_root / "parts"
@@ -3253,8 +4209,12 @@ async def repair_main(args: argparse.Namespace) -> int:
         parts_dir.mkdir(parents=True, exist_ok=True)
         failures_dir.mkdir(parents=True, exist_ok=True)
         write_json_atomic(
-            work_root / "repair-state.json",
-            {"repair_fingerprint": repair_fingerprint, "repair_request": repair_request},
+            repair_state_path,
+            {
+                "repair_fingerprint": repair_fingerprint,
+                "repair_request": canonical_repair_request,
+                "repair_compatibility": repair_compatibility,
+            },
         )
 
         source_records = list(iter_jsonl_gz(output_dir / ROLLOUTS_FILENAME))
@@ -3392,16 +4352,21 @@ async def repair_main(args: argparse.Namespace) -> int:
         metadata.update(
             {
                 "repair_complete": True,
-                "repair_request": repair_request,
+                "repair_request": canonical_repair_request,
                 "repair_fingerprint": repair_fingerprint,
                 "repair_error_count": 0,
                 "repair_completed_rollout_count": len(ordered),
                 "repair_elapsed_seconds": time.perf_counter() - started_at,
                 "repair_student_served_model_name": args.student_served_model_name,
                 "repair_teacher_served_model_name": args.teacher_served_model_name,
+                "repair_teacher_model_fingerprint": endpoint_descriptor["model_fingerprint"],
                 "repair_teacher_tokenizer_matches_student": tokenizers_match,
             }
         )
+        if repair_compatibility is None:
+            metadata.pop("repair_compatibility", None)
+        else:
+            metadata["repair_compatibility"] = repair_compatibility
         write_json_atomic(output_dir / METADATA_FILENAME, metadata)
         write_summary_artifacts(output_dir, metadata)
         marker = write_completion_marker(output_dir, metadata)
@@ -3471,12 +4436,23 @@ def _comparison_compatibility(left: dict[str, Any], right: dict[str, Any]) -> li
         "enable_thinking",
         "verifier",
         "max_samples_per_benchmark",
+        "rollout_mode",
+        "tool_contract_fingerprint",
     )
     left_request = left.get("request") or {}
     right_request = right.get("request") or {}
     for field in comparable_fields:
-        if field in left_request and field in right_request and left_request[field] != right_request[field]:
-            issues.append(f"request field {field!r} differs: {left_request[field]!r} != {right_request[field]!r}")
+        if field in {"rollout_mode", "tool_contract_fingerprint"}:
+            differs = left_request.get(field) != right_request.get(field)
+        else:
+            # Retain compatibility with historical requests that predate an
+            # optional field: legacy comparisons only enforce fields present
+            # on both sides. Tool mode itself is always compared above.
+            differs = field in left_request and field in right_request and left_request[field] != right_request[field]
+        if differs:
+            issues.append(
+                f"request field {field!r} differs: {left_request.get(field)!r} != {right_request.get(field)!r}"
+            )
     left_tokenizer = left.get("student_tokenizer") or {}
     right_tokenizer = right.get("student_tokenizer") or {}
     if left_tokenizer.get("fingerprint_sha256") != right_tokenizer.get("fingerprint_sha256"):
@@ -3972,6 +4948,11 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--base-seed", type=int, default=42)
     generate.add_argument("--print-every", type=int, default=50)
     generate.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True)
+    generate.add_argument("--evaluation-spec", default=None)
+    generate.add_argument("--tool-call-mode", choices=["auto", "on", "off"], default="auto")
+    generate.add_argument("--tool-system-prompt-path", default=None)
+    generate.add_argument("--function-tool-path", default=None)
+    generate.add_argument("--tool-config-path", default=None)
     generate.add_argument("--verifier", choices=["math_dapo", "math_verify", "hybrid"], default="math_verify")
     add_analysis_arguments(generate)
     generate.add_argument("--overwrite", action="store_true")
@@ -4011,7 +4992,12 @@ def build_parser() -> argparse.ArgumentParser:
     repair.add_argument("--teacher-base-url", required=True)
     repair.add_argument("--teacher-api-key", default="EMPTY")
     repair.add_argument("--teacher-served-model-name", required=True)
-    repair.add_argument("--teacher-model-fingerprint", required=True)
+    repair.add_argument("--teacher-endpoint-descriptor", required=True)
+    repair.add_argument(
+        "--teacher-model-aliases",
+        default=None,
+        help="Explicit legacy-to-stable teacher fingerprint aliases created after content verification.",
+    )
     repair.add_argument("--student-tokenizer-model", required=True)
     repair.add_argument("--teacher-tokenizer-model", required=True)
     repair.add_argument("--trust-remote-code", action="store_true")

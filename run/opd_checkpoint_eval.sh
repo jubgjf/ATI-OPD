@@ -8,6 +8,8 @@ fi
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck source=run/python_sandbox_helper.sh
+. "$SCRIPT_DIR/python_sandbox_helper.sh"
 OPD_RESULT_STATUS=$REPO_ROOT/verl/utils/evaluation/opd_result_status.py
 DATASET_DIR=/opt/huawei/dataset/jnguan
 if command -v npu-smi >/dev/null 2>&1 && [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
@@ -207,6 +209,14 @@ print(f"{slug}--{hashlib.sha256(raw.encode()).hexdigest()[:12]}")
 shared_runtime_root=$CHECKPOINT_SEARCH_ROOT/.standalone-eval
 instance_runtime_root=$shared_runtime_root/instances/$eval_instance_dirname
 mkdir -p "$shared_runtime_root" "$instance_runtime_root"
+EVAL_TEACHER_MODEL_MANIFEST_CACHE_ROOT=${EVAL_TEACHER_MODEL_MANIFEST_CACHE_ROOT:-$shared_runtime_root/model-manifests}
+EVAL_TEACHER_MODEL_ALIASES_FILE=${EVAL_TEACHER_MODEL_ALIASES_FILE:-$shared_runtime_root/teacher-model-aliases.json}
+EVAL_TEACHER_MODEL_MANIFEST_REHASH=${EVAL_TEACHER_MODEL_MANIFEST_REHASH:-0}
+if [[ "$EVAL_TEACHER_MODEL_MANIFEST_REHASH" != "0" && "$EVAL_TEACHER_MODEL_MANIFEST_REHASH" != "1" ]]; then
+    echo "EVAL_TEACHER_MODEL_MANIFEST_REHASH must be 0 or 1; got $EVAL_TEACHER_MODEL_MANIFEST_REHASH." >&2
+    exit 2
+fi
+mkdir -p "$EVAL_TEACHER_MODEL_MANIFEST_CACHE_ROOT" "$(dirname -- "$EVAL_TEACHER_MODEL_ALIASES_FILE")"
 teacher_request_file=$instance_runtime_root/teacher-request.json
 teacher_endpoint_file=$instance_runtime_root/teacher-endpoint.json
 teacher_stop_file=$instance_runtime_root/STOP_TEACHER
@@ -239,13 +249,37 @@ EVAL_STEPS_TEXT=${EVAL_STEPS_TEXT:-}
 EVAL_EXPERIMENTS_TEXT=${EVAL_EXPERIMENTS_TEXT:-}
 EVAL_PRIORITY_EXPERIMENTS_TEXT=${EVAL_PRIORITY_EXPERIMENTS_TEXT:-}
 EVAL_SKIP_BENCHMARKS_TEXT=${EVAL_SKIP_BENCHMARKS_TEXT:-}
-EVAL_ENABLE_REPAIR=${EVAL_ENABLE_REPAIR:-1}
+# auto reads each checkpoint's immutable evaluation spec. A v1 tool run must
+# use `on` plus TOOL_SYSTEM_PROMPT_PATH and FUNCTION_TOOL_PATH explicitly.
+EVAL_TOOL_CALL_MODE=${EVAL_TOOL_CALL_MODE:-auto}
+if [[ -n "${EVAL_REPAIR_MODE+x}" && -n "${EVAL_ENABLE_REPAIR+x}" ]]; then
+    echo "EVAL_REPAIR_MODE and legacy EVAL_ENABLE_REPAIR cannot both be set." >&2
+    exit 2
+fi
+if [[ -n "${EVAL_REPAIR_MODE+x}" ]]; then
+    : # Keep the explicit new-style setting.
+elif [[ -n "${EVAL_ENABLE_REPAIR+x}" ]]; then
+    case "$EVAL_ENABLE_REPAIR" in
+        1) EVAL_REPAIR_MODE=on ;;
+        0) EVAL_REPAIR_MODE=off ;;
+        *)
+            echo "Legacy EVAL_ENABLE_REPAIR must be 0 or 1; got $EVAL_ENABLE_REPAIR." >&2
+            exit 2
+            ;;
+    esac
+else
+    EVAL_REPAIR_MODE=auto
+fi
 KEEP_MERGED_CHECKPOINTS=${KEEP_MERGED_CHECKPOINTS:-0}
 OVERWRITE_RESULTS=${OVERWRITE_RESULTS:-0}
 CONTINUE_ON_EVAL_ERROR=${CONTINUE_ON_EVAL_ERROR:-1}
 ALLOW_DEBUG_OVERRIDES=${ALLOW_DEBUG_OVERRIDES:-0}
-if [[ "$EVAL_ENABLE_REPAIR" != "0" && "$EVAL_ENABLE_REPAIR" != "1" ]]; then
-    echo "EVAL_ENABLE_REPAIR must be 0 or 1; got $EVAL_ENABLE_REPAIR." >&2
+if [[ "$EVAL_TOOL_CALL_MODE" != "auto" && "$EVAL_TOOL_CALL_MODE" != "on" && "$EVAL_TOOL_CALL_MODE" != "off" ]]; then
+    echo "EVAL_TOOL_CALL_MODE must be auto, on, or off; got $EVAL_TOOL_CALL_MODE." >&2
+    exit 2
+fi
+if [[ "$EVAL_REPAIR_MODE" != "auto" && "$EVAL_REPAIR_MODE" != "on" && "$EVAL_REPAIR_MODE" != "off" ]]; then
+    echo "EVAL_REPAIR_MODE must be auto, on, or off; got $EVAL_REPAIR_MODE." >&2
     exit 2
 fi
 
@@ -333,6 +367,71 @@ apply_benchmark_filters() {
     fi
 }
 
+resolve_evaluation_modes() {
+    local evaluation_spec_path=$1
+    EVALUATION_MODE_FATAL=0
+    local spec_mode
+    if ! spec_mode=$(python -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    spec = json.load(handle)
+contract = (spec.get("semantic_config") or {}).get("tool_call") or {}
+enabled = int(int(spec.get("schema_version", 1)) >= 2 and bool(contract.get("enabled")))
+print("%d\t%d" % (int(spec.get("schema_version", 1)), enabled))
+' "$evaluation_spec_path"); then
+        echo "Failed to resolve evaluation modes from $evaluation_spec_path." >&2
+        return 2
+    fi
+    local spec_schema_version spec_tool_enabled
+    IFS=$'\t' read -r spec_schema_version spec_tool_enabled <<< "$spec_mode"
+
+    case "$EVAL_TOOL_CALL_MODE" in
+        auto) EFFECTIVE_TOOL_CALL_ENABLED=$spec_tool_enabled ;;
+        on) EFFECTIVE_TOOL_CALL_ENABLED=1 ;;
+        off) EFFECTIVE_TOOL_CALL_ENABLED=0 ;;
+    esac
+    if [[ "$EFFECTIVE_TOOL_CALL_ENABLED" == "1" ]]; then
+        EFFECTIVE_TOOL_CALL_MODE=on
+        if [[ "$spec_tool_enabled" != "1" ]]; then
+            if [[ -z "${TOOL_SYSTEM_PROMPT_PATH:-}" || -z "${FUNCTION_TOOL_PATH:-}" ]]; then
+                echo "EVAL_TOOL_CALL_MODE=on for v${spec_schema_version}/non-tool spec requires " \
+                    "TOOL_SYSTEM_PROMPT_PATH and FUNCTION_TOOL_PATH." >&2
+                EVALUATION_MODE_FATAL=1
+                return 2
+            fi
+        fi
+    else
+        EFFECTIVE_TOOL_CALL_MODE=off
+    fi
+
+    case "$EVAL_REPAIR_MODE" in
+        auto)
+            if [[ "$EFFECTIVE_TOOL_CALL_ENABLED" == "1" ]]; then
+                EFFECTIVE_REPAIR_ENABLED=0
+            else
+                EFFECTIVE_REPAIR_ENABLED=1
+            fi
+            ;;
+        on)
+            if [[ "$EFFECTIVE_TOOL_CALL_ENABLED" == "1" ]]; then
+                echo "Standalone repair is unsupported for tool-call evaluation; set EVAL_REPAIR_MODE=auto or off." >&2
+                EVALUATION_MODE_FATAL=1
+                return 2
+            fi
+            EFFECTIVE_REPAIR_ENABLED=1
+            ;;
+        off) EFFECTIVE_REPAIR_ENABLED=0 ;;
+    esac
+
+    # Legacy raw-only evaluation intentionally keeps its historical deferred
+    # publication behavior. Tool-aware raw output is final and is publishable.
+    if [[ "$EFFECTIVE_REPAIR_ENABLED" == "1" || "$EFFECTIVE_TOOL_CALL_ENABLED" == "1" ]]; then
+        EFFECTIVE_WANDB_PUBLISH_ENABLED=1
+    else
+        EFFECTIVE_WANDB_PUBLISH_ENABLED=0
+    fi
+}
+
 load_experiment_context() {
     local candidate_json=$1
     CKPT_ROOT=$(python -c 'import json,sys; print(json.loads(sys.argv[1])["checkpoint_root"])' "$candidate_json")
@@ -356,6 +455,7 @@ load_experiment_context() {
     max_samples_per_benchmark=$(json_value semantic_config.benchmarks.max_samples_per_benchmark)
     verifier=$(json_value semantic_config.reward.benchmark_reward_data_source)
     intervention_json=$(json_value semantic_config.distillation.intervention)
+    resolve_evaluation_modes "$EVALUATION_SPEC" || return $?
     if [[ -z "$max_model_len" || "$max_model_len" == "None" || "$max_model_len" == "null" ]]; then
         max_model_len=$((max_prompt_tokens + max_completion_tokens + 1))
     fi
@@ -363,20 +463,22 @@ load_experiment_context() {
     local teacher_models teacher_count teacher_model_from_spec
     teacher_models=$(json_value semantic_config.teacher.models)
     teacher_count=$(python -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$teacher_models")
-    if [[ "$teacher_count" != "1" ]]; then
+    if [[ ( "$EFFECTIVE_REPAIR_ENABLED" == "1" || "$EFFECTIVE_TOOL_CALL_ENABLED" == "0" ) \
+        && "$teacher_count" != "1" ]]; then
         echo "Experiment $experiment_name requires exactly one Teacher model; found $teacher_count." >&2
         return 2
     fi
     teacher_model_from_spec=$(python -c '
 import json, sys
-value = next(iter(json.loads(sys.argv[1]).values()))
+models = json.loads(sys.argv[1])
+value = next(iter(models.values())) if models else {}
 print(value.get("model_path") or value.get("path") or "")
 ' "$teacher_models")
     TEACHER_MODEL=$teacher_model_from_spec
     TEACHER_TOKENIZER_MODEL=$TEACHER_MODEL
     STUDENT_TOKENIZER_MODEL=$student_tokenizer_from_spec
 
-    if [[ "$EVAL_ENABLE_REPAIR" == "1" && ( -z "$TEACHER_MODEL" || ! -d "$TEACHER_MODEL" ) ]]; then
+    if [[ "$EFFECTIVE_REPAIR_ENABLED" == "1" && ( -z "$TEACHER_MODEL" || ! -d "$TEACHER_MODEL" ) ]]; then
         echo "Teacher model directory is unavailable for $experiment_name: $TEACHER_MODEL" >&2
         return 2
     fi
@@ -482,6 +584,7 @@ print("\n".join(benchmarks))
         return 2
     fi
     RESULT_ROOT="$EVAL_RESULTS_ROOT/$training_project/$experiment_name"
+    resolve_evaluation_modes "$EVALUATION_SPEC"
 }
 
 VLLM_PID=""
@@ -502,6 +605,12 @@ QUEUE_CANDIDATES=()
 WATCH_ONCE_ATTEMPTED_KEYS=()
 REPORTED_STALE_CLAIM_PATHS=()
 LAST_QUEUE_SIGNATURE=""
+EFFECTIVE_TOOL_CALL_ENABLED=0
+EFFECTIVE_TOOL_CALL_MODE=off
+EFFECTIVE_REPAIR_ENABLED=1
+EFFECTIVE_WANDB_PUBLISH_ENABLED=1
+EVALUATION_MODE_FATAL=0
+verl_python_sandbox_pid=""
 
 claim_json_value() {
     local payload=$1
@@ -730,6 +839,7 @@ cleanup() {
     trap - EXIT
     set +e
     stop_vllm
+    _stop_verl_python_sandbox
     release_wandb_claim
     release_active_claim
     if [[ "$EVAL_ROLE" == "controller" && -n "$ROLE_CLAIM_TOKEN" ]]; then
@@ -789,13 +899,26 @@ for key in ("request_id", "model_path", "tokenizer_path", "served_model_name", "
                         continue
                     fi
                     local load_seconds=$((SECONDS - load_started))
-                    python -m verl.utils.evaluation.checkpoint_watcher write-endpoint \
-                        --path "$teacher_endpoint_file" \
-                        --base-url "$base_url" \
-                        --served-model-name "$requested_served_model" \
-                        --model-path "$requested_model" \
-                        --request-id "$requested_id" \
-                        --model-load-seconds "$load_seconds" >/dev/null
+                    local -a endpoint_flags=(
+                        write-endpoint
+                        --path "$teacher_endpoint_file"
+                        --base-url "$base_url"
+                        --served-model-name "$requested_served_model"
+                        --model-path "$requested_model"
+                        --request-id "$requested_id"
+                        --model-load-seconds "$load_seconds"
+                        --manifest-cache-root "$EVAL_TEACHER_MODEL_MANIFEST_CACHE_ROOT"
+                    )
+                    if [[ "$EVAL_TEACHER_MODEL_MANIFEST_REHASH" == "1" ]]; then
+                        endpoint_flags+=(--force-model-rehash)
+                    fi
+                    echo "[teacher] verifying stable model content fingerprint for $requested_model"
+                    if ! python -m verl.utils.evaluation.checkpoint_watcher "${endpoint_flags[@]}" >/dev/null; then
+                        echo "[teacher] stable model content verification failed: $requested_model" >&2
+                        stop_vllm
+                        sleep "$RETRY_SECONDS"
+                        continue
+                    fi
                     active_request_id=$requested_id
                     echo "[teacher] ready request=$active_request_id model=$requested_model"
                 fi
@@ -860,6 +983,7 @@ print(request_id)
                     'import json,sys; print(float(json.load(open(sys.argv[1])).get("model_load_seconds", 0.0)))' \
                     "$teacher_endpoint_file")
                 if model_is_ready "$teacher_base_url" "${TEACHER_API_KEY:-EMPTY}" "$teacher_served_model"; then
+                    echo "[teacher] endpoint ready stable_model_fingerprint=$teacher_model_fingerprint"
                     return 0
                 fi
             fi
@@ -921,7 +1045,7 @@ checkpoint_complete() {
     for benchmark in "${benchmarks[@]}"; do
         status_args+=(--benchmark "$benchmark")
     done
-    if [[ "$EVAL_ENABLE_REPAIR" == "0" ]]; then
+    if [[ "$EFFECTIVE_REPAIR_ENABLED" == "0" ]]; then
         status_args+=(--no-require-repair)
     fi
     python "$OPD_RESULT_STATUS" "${status_args[@]}" >/dev/null 2>&1
@@ -929,7 +1053,7 @@ checkpoint_complete() {
 
 checkpoint_wandb_is_staged() {
     local step=$1
-    if [[ "$WANDB_MODE" == "disabled" || "$EVAL_ENABLE_REPAIR" == "0" ]]; then
+    if [[ "$WANDB_MODE" == "disabled" || "$EFFECTIVE_WANDB_PUBLISH_ENABLED" == "0" ]]; then
         return 0
     fi
     python -c '
@@ -1003,6 +1127,8 @@ run_raw_unit() {
         --benchmark "$benchmark"
         --global-step "$step"
         --experiment "$experiment_name"
+        --evaluation-spec "$EVALUATION_SPEC"
+        --tool-call-mode "$EFFECTIVE_TOOL_CALL_MODE"
         --dataset-root "$dataset_root"
         --student-model-path "$checkpoint"
         --student-model-identity "$source_checkpoint_identity"
@@ -1023,6 +1149,15 @@ run_raw_unit() {
         --base-seed "$base_seed"
         --verifier "$verifier"
     )
+    if [[ -n "${TOOL_SYSTEM_PROMPT_PATH:-}" ]]; then
+        flags+=(--tool-system-prompt-path "$TOOL_SYSTEM_PROMPT_PATH")
+    fi
+    if [[ -n "${FUNCTION_TOOL_PATH:-}" ]]; then
+        flags+=(--function-tool-path "$FUNCTION_TOOL_PATH")
+    fi
+    if [[ -n "${TOOL_CONFIG_PATH:-}" ]]; then
+        flags+=(--tool-config-path "$TOOL_CONFIG_PATH")
+    fi
     if [[ "$enable_thinking" == "true" ]]; then
         flags+=(--enable-thinking)
     else
@@ -1059,7 +1194,8 @@ run_repair_unit() {
         --teacher-base-url "$teacher_base_url"
         --teacher-api-key "${TEACHER_API_KEY:-EMPTY}"
         --teacher-served-model-name "$teacher_served_model"
-        --teacher-model-fingerprint "$teacher_model_fingerprint"
+        --teacher-endpoint-descriptor "$teacher_endpoint_file"
+        --teacher-model-aliases "$EVAL_TEACHER_MODEL_ALIASES_FILE"
         --student-tokenizer-model "$tokenizer_model"
         --teacher-tokenizer-model "$TEACHER_TOKENIZER_MODEL"
         --max-in-flight "$REPAIR_MAX_IN_FLIGHT"
@@ -1178,6 +1314,60 @@ print(payload["attempt_count"])
 ' "$RESULT_ROOT/checkpoint_timings/global_step_$step.attempts.json"
 }
 
+ensure_evaluation_python_sandbox() {
+    if [[ "$EFFECTIVE_TOOL_CALL_ENABLED" != "1" ]]; then
+        return 0
+    fi
+
+    local sandbox_timeout=${PYTHON_SANDBOX_TIMEOUT:-10}
+    if [[ -n "${PYTHON_SANDBOX_URL:-}" && -z "${verl_python_sandbox_pid:-}" ]]; then
+        if ! _check_verl_python_sandbox_health "$PYTHON_SANDBOX_URL" 5 >/dev/null 2>&1; then
+            echo "External Python sandbox health check failed: ${PYTHON_SANDBOX_URL%/}/health" >&2
+            return 2
+        fi
+        export PYTHON_SANDBOX_TIMEOUT=$sandbox_timeout
+        echo "[sandbox] using external service: $PYTHON_SANDBOX_URL"
+        return 0
+    fi
+
+    if [[ -n "${verl_python_sandbox_pid:-}" ]]; then
+        if _check_verl_python_sandbox_health "$PYTHON_SANDBOX_URL" 5 >/dev/null 2>&1; then
+            return 0
+        fi
+        echo "Managed Python sandbox became unhealthy: $PYTHON_SANDBOX_URL" >&2
+        return 2
+    fi
+
+    local sandbox_bind_host=${PYTHON_SANDBOX_BIND_HOST:-127.0.0.1}
+    local sandbox_port=${PYTHON_SANDBOX_PORT:-8080}
+    local sandbox_max_concurrency=${PYTHON_SANDBOX_MAX_CONCURRENCY:-32}
+    local sandbox_startup_timeout=${PYTHON_SANDBOX_STARTUP_TIMEOUT:-60}
+    local setting_name setting_value
+    for setting_name in sandbox_port sandbox_max_concurrency sandbox_timeout sandbox_startup_timeout; do
+        setting_value=${!setting_name}
+        if [[ ! "$setting_value" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid Python sandbox setting $setting_name=$setting_value; expected a positive integer." >&2
+            return 2
+        fi
+    done
+    if ((sandbox_port > 65535)); then
+        echo "PYTHON_SANDBOX_PORT must be at most 65535; got $sandbox_port." >&2
+        return 2
+    fi
+
+    PYTHON_SANDBOX_URL="http://127.0.0.1:${sandbox_port}"
+    export PYTHON_SANDBOX_URL PYTHON_SANDBOX_TIMEOUT=$sandbox_timeout
+    local sandbox_log_path=${PYTHON_SANDBOX_LOG_PATH:-$eval_log_base/python-sandbox.log}
+    _start_verl_python_sandbox \
+        "$PYTHON_SANDBOX_URL" \
+        "$sandbox_bind_host" \
+        "$sandbox_port" \
+        "$sandbox_max_concurrency" \
+        "$sandbox_timeout" \
+        "$sandbox_startup_timeout" \
+        "$sandbox_log_path"
+}
+
 evaluate_checkpoint() {
     local candidate_json=$1
     local step actor_dir direct_hf checkpoint
@@ -1188,6 +1378,9 @@ evaluate_checkpoint() {
     attempt_count=$(register_checkpoint_attempt "$step")
     local checkpoint_started=$SECONDS
     local load_started=$SECONDS
+    if ! ensure_evaluation_python_sandbox; then
+        return 1
+    fi
     update_active_claim_phase "merge"
     if ! checkpoint=$(ensure_hf_checkpoint "$step" "$actor_dir" "$direct_hf"); then
         return 1
@@ -1205,7 +1398,7 @@ evaluate_checkpoint() {
         fi
     done
     teacher_model_load_seconds=0
-    if [[ "$EVAL_ENABLE_REPAIR" == "1" ]]; then
+    if [[ "$EFFECTIVE_REPAIR_ENABLED" == "1" ]]; then
         update_active_claim_phase "teacher:request"
         if ! request_teacher_endpoint; then
             return 1
@@ -1230,7 +1423,7 @@ evaluate_checkpoint() {
         then
             return 1
         fi
-        if [[ "$EVAL_ENABLE_REPAIR" == "1" ]]; then
+        if [[ "$EFFECTIVE_REPAIR_ENABLED" == "1" ]]; then
             update_active_claim_phase "repair:$benchmark"
             if ! run_repair_unit "$step" "$benchmark" "$served_model" "$student_base_url" "$tokenizer_model"; then
                 return 1
@@ -1250,6 +1443,7 @@ payload = {
     "failure_retry_count": max(int(sys.argv[5]) - 1, 0),
     "teacher_model_load_seconds": float(sys.argv[6]),
     "repair_enabled": sys.argv[7] == "1",
+    "tool_call_enabled": sys.argv[8] == "1",
     "completed_at_unix": time.time(),
 }
 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1259,11 +1453,12 @@ with open(tmp, "w", encoding="utf-8") as handle:
     handle.write("\n")
 os.replace(tmp, path)
 ' "$RESULT_ROOT/checkpoint_timings/global_step_$step.json" "$step" "$load_seconds" \
-        "$((SECONDS - checkpoint_started))" "$attempt_count" "${teacher_model_load_seconds:-0}" "$EVAL_ENABLE_REPAIR"
+        "$((SECONDS - checkpoint_started))" "$attempt_count" "${teacher_model_load_seconds:-0}" \
+        "$EFFECTIVE_REPAIR_ENABLED" "$EFFECTIVE_TOOL_CALL_ENABLED"
     then
         return 1
     fi
-    if [[ "$EVAL_ENABLE_REPAIR" == "1" ]]; then
+    if [[ "$EFFECTIVE_WANDB_PUBLISH_ENABLED" == "1" ]]; then
         if ! sync_wandb_serialized "$step"; then
             return 1
         fi
@@ -1273,8 +1468,10 @@ os.replace(tmp, path)
     if [[ "$KEEP_MERGED_CHECKPOINTS" != "1" && -z "$direct_hf" ]]; then
         rm -rf -- "$EVAL_CACHE_ROOT/global_step_$step"
     fi
-    if [[ "$EVAL_ENABLE_REPAIR" == "1" ]]; then
+    if [[ "$EFFECTIVE_REPAIR_ENABLED" == "1" ]]; then
         echo "[watcher] completed global_step_$step"
+    elif [[ "$EFFECTIVE_TOOL_CALL_ENABLED" == "1" ]]; then
+        echo "[watcher] completed tool-aware raw-final global_step_$step"
     else
         echo "[watcher] completed raw-only global_step_$step"
     fi
@@ -1442,6 +1639,9 @@ controller_role_main() {
             echo "[watcher] scan $scan_index/${#candidates[@]}: $candidate_experiment/global_step_$step"
             if ! load_queue_context "$candidate"; then
                 echo "[watcher] failed to load queue context for $candidate_experiment/global_step_$step" >&2
+                if [[ "$EVALUATION_MODE_FATAL" == "1" ]]; then
+                    return 2
+                fi
                 if [[ "$CONTINUE_ON_EVAL_ERROR" != "1" ]]; then
                     return 1
                 fi
@@ -1494,6 +1694,9 @@ controller_role_main() {
             'import json,sys; print(json.loads(sys.argv[1])["experiment_name"])' "$selected_candidate")
         if ! load_experiment_context "$selected_candidate"; then
             echo "[watcher] failed to reload evaluation context for $candidate_experiment/global_step_$step" >&2
+            if [[ "$EVALUATION_MODE_FATAL" == "1" ]]; then
+                return 2
+            fi
             work_failed=1
         elif checkpoint_complete "$step"; then
             if checkpoint_wandb_is_staged "$step"; then
@@ -1545,11 +1748,10 @@ echo "  priority experiments: ${EVAL_PRIORITY_EXPERIMENTS_TEXT:-none}"
 echo "  step filter:       ${EVAL_STEPS_TEXT:-all}"
 echo "  benchmark include: ${EVAL_BENCHMARKS_TEXT:-all from each experiment spec}"
 echo "  benchmark skip:    ${EVAL_SKIP_BENCHMARKS_TEXT:-none}"
-if [[ "$EVAL_ENABLE_REPAIR" == "1" ]]; then
-    echo "  evaluation phase:  raw + repair + W&B publish"
-else
-    echo "  evaluation phase:  raw only (repair and W&B publish deferred)"
-fi
+echo "  tool-call policy:  $EVAL_TOOL_CALL_MODE (resolved per experiment)"
+echo "  repair policy:     $EVAL_REPAIR_MODE (tool experiments always forbid repair)"
+echo "  teacher manifests: $EVAL_TEACHER_MODEL_MANIFEST_CACHE_ROOT"
+echo "  teacher aliases:   $EVAL_TEACHER_MODEL_ALIASES_FILE"
 echo "  claim heartbeat:   ${EVAL_CLAIM_HEARTBEAT_SECONDS}s"
 echo "  claim stale after: ${EVAL_CLAIM_STALE_SECONDS}s (manual release only)"
 echo "================================================================================"

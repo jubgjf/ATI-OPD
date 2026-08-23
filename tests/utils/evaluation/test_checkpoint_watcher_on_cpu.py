@@ -41,6 +41,11 @@ from verl.utils.evaluation.checkpoint_watcher import (
     wandb_claim_path,
     write_endpoint_descriptor,
 )
+from verl.utils.evaluation.model_identity import (
+    capture_stable_model_manifest,
+    load_model_fingerprint_aliases,
+    register_model_fingerprint_aliases,
+)
 
 
 def _config(*, metric_logging_mode: str = "full", experiment_name: str = "watcher-test"):
@@ -204,11 +209,14 @@ def test_endpoint_descriptor_round_trip(tmp_path):
         model_path=model,
         request_id="request-a",
         model_load_seconds=12.5,
+        manifest_cache_root=tmp_path / "manifest-cache",
     )
     assert load_endpoint_descriptor(endpoint_path) == written
     assert written["base_url"] == "http://teacher:8001/v1"
     assert written["request_id"] == "request-a"
     assert written["model_load_seconds"] == 12.5
+    assert written["model_fingerprint"] == written["model_manifest"]["fingerprint"]
+    assert "legacy_stat_model_fingerprint" in written
 
     (model / "model.safetensors").write_bytes(b"weights")
     changed = write_endpoint_descriptor(
@@ -216,8 +224,78 @@ def test_endpoint_descriptor_round_trip(tmp_path):
         base_url="http://teacher:8001/v1",
         served_model_name="teacher",
         model_path=model,
+        manifest_cache_root=tmp_path / "manifest-cache",
     )
     assert changed["model_fingerprint"] != written["model_fingerprint"]
+
+    previous_legacy = changed["legacy_stat_model_fingerprint"]
+    previous_mtime = (model / "model.safetensors").stat().st_mtime_ns
+    os.utime(
+        model / "model.safetensors",
+        ns=(previous_mtime + 1_000_000_000, previous_mtime + 1_000_000_000),
+    )
+    touched = write_endpoint_descriptor(
+        endpoint_path,
+        base_url="http://teacher:8001/v1",
+        served_model_name="teacher-relocated",
+        model_path=model,
+        manifest_cache_root=tmp_path / "manifest-cache",
+    )
+    assert touched["model_fingerprint"] == changed["model_fingerprint"]
+    assert touched["legacy_stat_model_fingerprint"] != previous_legacy
+
+
+def test_stable_model_manifest_is_path_and_mtime_independent_but_content_addressed(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    for root in (first, second):
+        (root / "config.json").write_text('{"model_type":"qwen2"}', encoding="utf-8")
+        (root / "model.safetensors").write_bytes(b"same-weight-content")
+
+    first_manifest = capture_stable_model_manifest(first, cache_path=tmp_path / "first-cache.json")
+    second_manifest = capture_stable_model_manifest(second, cache_path=tmp_path / "second-cache.json")
+    assert first_manifest == second_manifest
+
+    original_mtime = (first / "model.safetensors").stat().st_mtime_ns
+    os.utime(
+        first / "model.safetensors",
+        ns=(original_mtime + 2_000_000_000, original_mtime + 2_000_000_000),
+    )
+    assert capture_stable_model_manifest(first, cache_path=tmp_path / "first-cache.json") == first_manifest
+
+    (first / "model.safetensors").write_bytes(b"diff-weight-content")
+    assert capture_stable_model_manifest(first, cache_path=tmp_path / "first-cache.json") != first_manifest
+
+
+def test_register_model_fingerprint_alias_requires_expected_verified_content(tmp_path):
+    model = tmp_path / "teacher"
+    model.mkdir()
+    (model / "config.json").write_text('{"model_type":"qwen2"}', encoding="utf-8")
+    (model / "model.safetensors").write_bytes(b"weights")
+    manifest = capture_stable_model_manifest(model)
+    alias_file = tmp_path / "aliases.json"
+    legacy = "1" * 64
+
+    register_model_fingerprint_aliases(
+        alias_file,
+        legacy_fingerprints=[legacy],
+        model_path=model,
+        expected_stable_fingerprint=manifest["fingerprint"],
+        note="verified against archived checkpoint",
+    )
+    aliases = load_model_fingerprint_aliases(alias_file)
+    assert aliases[legacy]["stable_model_fingerprint"] == manifest["fingerprint"]
+    assert aliases[legacy]["model_manifest"] == manifest
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        register_model_fingerprint_aliases(
+            alias_file,
+            legacy_fingerprints=["2" * 64],
+            model_path=model,
+            expected_stable_fingerprint="3" * 64,
+        )
 
 
 def test_atomic_checkpoint_claim_has_one_winner_across_processes_on_cpu(tmp_path):

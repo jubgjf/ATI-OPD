@@ -74,6 +74,11 @@ tool_config_path: ${oc.select:actor_rollout_ref.rollout.multi_turn.tool_config_p
 # for @function_tool entries
 function_tool_path: ${oc.select:actor_rollout_ref.rollout.multi_turn.function_tool_path, null}
 
+# Optional UTF-8 text file prepended as a system message. If the sample
+# already starts with a text system message, the two messages are merged.
+# Prompt-length filtering includes this text and any configured tool schema.
+system_prompt_path: null
+
 # Whether to return the original input_ids without adding chat template.
 # This is used when the reward model's chat template differs from the policy.
 # If using a model-based RM with different templates, this should be True.

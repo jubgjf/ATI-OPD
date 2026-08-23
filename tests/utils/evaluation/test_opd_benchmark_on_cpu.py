@@ -26,6 +26,7 @@ from omegaconf import OmegaConf
 from verl.utils.evaluation import opd_benchmark as benchmark
 from verl.utils.evaluation import opd_result_status, teacher_intervention
 from verl.utils.evaluation.checkpoint_evaluation import write_evaluation_spec, write_evaluation_state
+from verl.utils.evaluation.checkpoint_watcher import write_endpoint_descriptor
 
 
 def _generation_preparation(
@@ -224,6 +225,147 @@ def test_apply_chat_template_accepts_transformers_mapping_result_on_cpu():
         [{"role": "user", "content": "question"}],
         enable_thinking=True,
     ) == [10, 11, 12]
+
+
+def test_legacy_generation_request_and_fingerprint_remain_schema_v3_on_cpu():
+    args = SimpleNamespace(
+        experiment="exp",
+        global_step=20,
+        benchmark="math-ai/aime24",
+        dataset_root="/datasets",
+        student_model_path="/models/step-20",
+        student_tokenizer_model="/models/student-tokenizer",
+        chat_template_model="/models/teacher",
+        rollout_n=16,
+        temperature=0.7,
+        top_p=0.95,
+        top_k=-1,
+        max_tokens=23552,
+        max_prompt_tokens=1024,
+        base_seed=42,
+        enable_thinking=True,
+        verifier="math_verify",
+        score_student_logprobs=True,
+        require_exact_token_ids=True,
+        max_samples_per_benchmark=-1,
+    )
+    request = benchmark.generation_request(args)
+
+    assert "rollout_mode" not in request
+    assert "tool_contract_fingerprint" not in request
+    assert benchmark.GENERATION_SCHEMA_VERSION == 3
+    assert (
+        benchmark.generation_fingerprint(
+            request=request,
+            input_manifest={"fingerprint": "manifest"},
+            dataset_fingerprint="dataset",
+            tokenizer_info={"model_path": "/models/student-tokenizer", "vocab_size": 3},
+        )
+        == "c3512d901dee9a0f870fce3c3ff9ceb65bceda95c0a15986ec6aa47e887d01a0"
+    )
+    legacy_rows = benchmark.question_rows(
+        [{"sample_id": "0", "problem_fingerprint": "problem", "acc": 1.0, "error": None}]
+    )
+    assert not any(key.startswith("tool_call_") for key in legacy_rows[0])
+
+
+def test_prepare_tasks_tool_mode_merges_system_prompt_and_schema_on_cpu(monkeypatch):
+    sample = SimpleNamespace(sample_id="a", problem="1+1?", ground_truth="2")
+    monkeypatch.setattr(benchmark, "load_benchmark_samples", lambda *args, **kwargs: [sample])
+    rendered: list[tuple[list[dict], dict]] = []
+
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            rendered.append((messages, kwargs))
+            return [1, 2, 3]
+
+    args = SimpleNamespace(
+        benchmark="math-ai/aime24",
+        dataset_root="unused",
+        max_samples_per_benchmark=-1,
+        max_prompt_tokens=16,
+        rollout_n=1,
+        base_seed=42,
+        enable_thinking=True,
+    )
+    schema = {"type": "function", "function": {"name": "code_interpreter", "parameters": {}}}
+    contract = {"system_prompt": "Use tools when useful.", "tool_schemas": [schema]}
+
+    _, tasks, _ = benchmark.prepare_tasks(args, FakeTokenizer(), contract)
+
+    assert rendered[0][0][0] == {"role": "system", "content": "Use tools when useful."}
+    assert rendered[0][1]["tools"] == [schema]
+    assert tasks[0].raw_prompt == rendered[0][0]
+
+
+def test_v1_tool_mode_requires_explicit_prompt_and_function_tool_on_cpu(tmp_path):
+    semantic = {"experiment_name": "legacy"}
+    spec = {
+        "schema_version": 1,
+        "spec_fingerprint": benchmark.payload_fingerprint(semantic),
+        "semantic_config": semantic,
+    }
+    spec_path = tmp_path / "evaluation_spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+
+    auto_args = SimpleNamespace(tool_call_mode="auto", evaluation_spec=str(spec_path))
+    assert benchmark.resolve_tool_call_contract(auto_args) is None
+    forced_args = SimpleNamespace(
+        tool_call_mode="on",
+        evaluation_spec=str(spec_path),
+        tool_system_prompt_path=None,
+        function_tool_path=None,
+        tool_config_path=None,
+    )
+    with pytest.raises(ValueError, match="requires both"):
+        benchmark.resolve_tool_call_contract(forced_args)
+
+    prompt_path = tmp_path / "tool-prompt.txt"
+    prompt_path.write_text("Use tools when useful.\n", encoding="utf-8")
+    function_tool_path = Path(__file__).resolve().parents[3] / "verl" / "tools" / "code_interpreter_tool.py"
+    forced_args.tool_system_prompt_path = str(prompt_path)
+    forced_args.function_tool_path = str(function_tool_path)
+    forced_args.enable_thinking = True
+    resolved = benchmark.resolve_tool_call_contract(forced_args)
+    assert resolved is not None
+    assert resolved["enabled"] is True
+    assert resolved["system_prompt"] == "Use tools when useful."
+    assert resolved["tool_schemas"][0]["function"]["name"] == "code_interpreter"
+
+
+def test_result_root_rejects_tool_on_off_coexistence_across_steps_on_cpu(tmp_path):
+    existing_dir = benchmark.unit_output_dir(tmp_path, "math-ai/aime24", 20)
+    existing_dir.mkdir(parents=True)
+    benchmark.write_json_atomic(
+        existing_dir / benchmark.METADATA_FILENAME,
+        {"request": {"rollout_n": 16}, "generation_complete": True},
+    )
+    args = SimpleNamespace(
+        benchmark="math-ai/aime24",
+        global_step=40,
+        overwrite=False,
+        _tool_contract={"contract_fingerprint": "tool-contract"},
+    )
+
+    with pytest.raises(RuntimeError, match="cannot mix tool-on/tool-off"):
+        benchmark._validate_result_root_rollout_contract(tmp_path, args)
+
+
+def test_result_root_allows_explicit_overwrite_of_same_conflicting_unit_on_cpu(tmp_path):
+    existing_dir = benchmark.unit_output_dir(tmp_path, "math-ai/aime24", 20)
+    existing_dir.mkdir(parents=True)
+    benchmark.write_json_atomic(
+        existing_dir / benchmark.METADATA_FILENAME,
+        {"request": {"rollout_n": 16}, "generation_complete": True},
+    )
+    args = SimpleNamespace(
+        benchmark="math-ai/aime24",
+        global_step=20,
+        overwrite=True,
+        _tool_contract={"contract_fingerprint": "tool-contract"},
+    )
+
+    benchmark._validate_result_root_rollout_contract(tmp_path, args)
 
 
 def test_validate_hf_checkpoint_requires_every_indexed_shard_and_tokenizer_on_cpu(tmp_path):
@@ -522,6 +664,197 @@ def test_evaluate_one_reuses_generation_logprobs_without_echo_forward_on_cpu():
     assert record["student_logprobs_source"] == "generation_response"
 
 
+def test_evaluate_tool_one_scores_only_final_assistant_and_excludes_observation_from_repetition_on_cpu(
+    monkeypatch,
+):
+    scored_texts: list[str] = []
+    repeated_ids: list[list[int]] = []
+
+    def fake_score_completion(text, *args, **kwargs):
+        del args, kwargs
+        scored_texts.append(text)
+        return SimpleNamespace(
+            acc=True,
+            pred="2",
+            final_content="2",
+            invalid_pred=False,
+            has_answer_pattern=True,
+            has_boxed_pattern=True,
+            has_accepted_answer_format=True,
+            verified_by="test",
+            math_verify_score=1.0,
+        )
+
+    def fake_token_repetition(token_ids, *args, **kwargs):
+        del args, kwargs
+        repeated_ids.append(list(token_ids))
+        return {
+            "repetition_token_zlib": False,
+            "repetition_token_zlib_eligible": False,
+            "repetition_token_zlib_ratio": None,
+            "tail_ngram_repeat_fraction": None,
+            "ngram_size": 4,
+        }
+
+    monkeypatch.setattr(benchmark, "score_completion", fake_score_completion)
+    monkeypatch.setattr(benchmark, "token_repetition_metrics", fake_token_repetition)
+
+    output = SimpleNamespace(
+        prompt_ids=[1, 2],
+        response_ids=[10, 11, 90, 91, 20, 21],
+        response_mask=[1, 1, 0, 0, 1, 1],
+        response_logprobs=[-0.1, -0.2, 0.0, 0.0, -0.3, -0.4],
+        extra_fields={
+            "finish_reason": "stop",
+            "stop_reason": "eos",
+            "reward_response_ids": [20, 21],
+            "trajectory_spans": [
+                {"kind": "assistant", "source": "student", "turn": 1, "start": 0, "end": 2},
+                {"kind": "tool_observation", "turn": 1, "start": 2, "end": 4},
+                {"kind": "assistant", "source": "student", "turn": 2, "start": 4, "end": 6},
+            ],
+            "tool_events": [
+                {
+                    "source": "student",
+                    "parse_status": "success",
+                    "execution_status": "success",
+                    "markdown_extracted": True,
+                }
+            ],
+            "tool_call/ended_after_observation": 0.0,
+        },
+    )
+
+    class FakeLoop:
+        async def run(self, *args, **kwargs):
+            del args, kwargs
+            return output
+
+    class FakeTokenizer:
+        def decode(self, token_ids, skip_special_tokens=True):
+            del skip_special_tokens
+            mapping = {
+                (20, 21): r"final answer is \boxed{2}",
+                (10, 11, 20, 21): "all assistant text",
+                (10, 11, 90, 91, 20, 21): "full trajectory with observation",
+            }
+            return mapping[tuple(token_ids)]
+
+    args = SimpleNamespace(
+        temperature=0.7,
+        top_p=0.95,
+        top_k=-1,
+        max_tokens=32,
+        score_student_logprobs=True,
+        verifier="math_verify",
+        repetition_tail_chars=100,
+        repetition_threshold=10.0,
+        repetition_tail_token_window=32,
+        ngram_size=4,
+    )
+    task = benchmark.RolloutTask(
+        flat_index=0,
+        task_id="tool-task",
+        benchmark_id="bench",
+        benchmark_name="aime24",
+        benchmark_path="math-ai/aime24",
+        question_index=0,
+        sample_id="0",
+        problem="1+1?",
+        ground_truth="2",
+        prompt_token_ids=[1, 2],
+        rollout_index=0,
+        seed=42,
+        raw_prompt=[{"role": "user", "content": "1+1?"}],
+    )
+
+    record = asyncio.run(
+        benchmark.evaluate_tool_one(
+            agent_loop=FakeLoop(),
+            args=args,
+            tokenizer=FakeTokenizer(),
+            task=task,
+            fingerprint="fingerprint",
+        )
+    )
+
+    assert record["error"] is None
+    assert scored_texts == [r"final answer is \boxed{2}"]
+    assert repeated_ids == [[10, 11, 20, 21]]
+    assert record["response_token_ids"] == [10, 11, 90, 91, 20, 21]
+    assert record["response_mask"] == [1, 1, 0, 0, 1, 1]
+    assert record["observation_token_count"] == 2
+    assert record["reward_response_ids"] == [20, 21]
+    tool_metrics = benchmark.aggregate_records([benchmark.lightweight_record(record)])["tool_call"]
+    assert tool_metrics["attempt_rate"] == 1.0
+    assert tool_metrics["parse_success_rate"] == 1.0
+    assert tool_metrics["execution_success_rate"] == 1.0
+    assert tool_metrics["markdown_extraction_rate"] == 1.0
+    assert tool_metrics["observation_tokens"]["mean"] == 2
+    assert tool_metrics["final_answer_after_tool_rate"] == 1.0
+
+
+def test_gap_metrics_valid_mask_excludes_tool_observations_on_cpu():
+    metrics = benchmark.compute_gap_metrics(
+        student_logprobs=[-0.2, 0.0, -0.3],
+        teacher_logprobs=[-0.1, -9.0, -0.5],
+        high_gap_threshold=0.15,
+        tail_token_window=3,
+        valid_mask=[True, False, True],
+    )["all"]
+
+    assert metrics["requested_token_count"] == 3
+    assert metrics["eligible_token_count"] == 2
+    assert metrics["valid_token_count"] == 2
+    assert metrics["invalid_token_count"] == 0
+    assert metrics["abs_mean"] == pytest.approx(0.15)
+    assert metrics["high_gap_rate"] == pytest.approx(0.5)
+    legacy_metrics = benchmark.compute_gap_metrics(
+        student_logprobs=[-0.2],
+        teacher_logprobs=[-0.1],
+        high_gap_threshold=0.15,
+        tail_token_window=1,
+    )["all"]
+    assert "eligible_token_count" not in legacy_metrics
+
+
+def test_teacher_scoring_keeps_observations_in_forward_but_masks_them_from_gap_on_cpu(monkeypatch):
+    scored_sequences: list[tuple[list[int], list[int]]] = []
+
+    async def fake_score_sequence_logprobs(**kwargs):
+        scored_sequences.append((kwargs["prompt_token_ids"], kwargs["response_token_ids"]))
+        return [-0.1, -9.0, -0.5], False
+
+    monkeypatch.setattr(benchmark, "score_sequence_logprobs", fake_score_sequence_logprobs)
+    record = {
+        "task_id": "tool-task",
+        "prompt_token_ids": [1, 2],
+        "response_token_ids": [10, 90, 20],
+        "response_mask": [1, 0, 1],
+        "student_logprobs": [-0.2, 0.0, -0.3],
+    }
+    args = SimpleNamespace(
+        served_model_name="teacher",
+        high_gap_threshold=0.15,
+        repetition_tail_token_window=3,
+    )
+
+    result = asyncio.run(
+        benchmark.score_teacher_record(
+            record=record,
+            client=SimpleNamespace(),
+            semaphore=asyncio.Semaphore(1),
+            args=args,
+            scoring_fingerprint="teacher-score",
+        )
+    )
+
+    assert scored_sequences == [([1, 2], [10, 90, 20])]
+    assert result["teacher_scoring_error"] is None
+    assert result["gap_metrics"]["all"]["eligible_token_count"] == 2
+    assert result["gap_metrics"]["all"]["invalid_token_count"] == 0
+
+
 def _write_complete_unit(output_dir: Path) -> dict:
     output_dir.mkdir(parents=True)
     empty_manifest = {"fingerprint": benchmark.payload_fingerprint({})}
@@ -549,6 +882,29 @@ def _write_complete_unit(output_dir: Path) -> dict:
     benchmark.write_csv_atomic(output_dir / benchmark.LENGTH_BINS_FILENAME, [], ["length_bin"])
     benchmark.write_completion_marker(output_dir, metadata)
     return metadata
+
+
+def test_repair_subcommand_rejects_tool_generation_before_model_loading_on_cpu(tmp_path):
+    output_dir = benchmark.unit_output_dir(tmp_path, "math-ai/aime24", 20)
+    output_dir.mkdir(parents=True)
+    benchmark.write_json_atomic(
+        output_dir / benchmark.METADATA_FILENAME,
+        {
+            "generation_complete": True,
+            "request": {"score_student_logprobs": True, "rollout_mode": "tool_agent"},
+        },
+    )
+    benchmark.write_jsonl_gz_atomic(output_dir / benchmark.ROLLOUTS_FILENAME, [])
+    args = SimpleNamespace(
+        max_in_flight=1,
+        max_pending=1,
+        result_root=str(tmp_path),
+        benchmark="math-ai/aime24",
+        global_step=20,
+    )
+
+    with pytest.raises(RuntimeError, match="not supported for tool-call"):
+        asyncio.run(benchmark.repair_main(args))
 
 
 def test_completed_unit_checks_expectations_and_result_sizes_on_cpu(tmp_path):
@@ -628,6 +984,27 @@ def test_paired_bootstrap_reports_randomization_p_value_on_cpu():
     assert result["difference_right_minus_left"] == pytest.approx(2 / 3)
     assert 0.0 < result["paired_randomization_p"] <= 1.0
     assert "two_sided_bootstrap_p" not in result
+
+
+def test_paired_comparison_rejects_tool_on_off_mixture_on_cpu():
+    common = {
+        "benchmark": {"path": "math-ai/aime24", "dataset_fingerprint": "dataset"},
+        "student_tokenizer": {"fingerprint_sha256": "tokenizer", "chat_template_sha256": "template"},
+    }
+    legacy = {**common, "request": {"rollout_n": 16}}
+    tool = {
+        **common,
+        "request": {
+            "rollout_n": 16,
+            "rollout_mode": "tool_agent",
+            "tool_contract_fingerprint": "contract",
+        },
+    }
+
+    issues = benchmark._comparison_compatibility(legacy, tool)
+
+    assert any("rollout_mode" in issue for issue in issues)
+    assert any("tool_contract_fingerprint" in issue for issue in issues)
 
 
 def test_status_parser_supports_teacher_completion_requirement_on_cpu():
@@ -722,6 +1099,121 @@ def test_generate_preflight_reports_real_input_difference_before_model_server_on
 
     assert '"existing": 10' in str(exc_info.value)
     assert '"current": 11' in str(exc_info.value)
+
+
+def test_repair_compatibility_requires_explicit_alias_after_legacy_teacher_mtime_change_on_cpu():
+    manifest = {
+        "schema_version": 1,
+        "metadata": [{"logical_path": "config.json", "size": 2, "sha256": "a" * 64}],
+        "weights": [{"logical_path": "model.safetensors", "size": 7, "sha256": "b" * 64}],
+    }
+    manifest["fingerprint"] = benchmark.payload_fingerprint(manifest)
+    current_request = {
+        "repair_schema_version": benchmark.REPAIR_SCHEMA_VERSION,
+        "generation_fingerprint": "generation",
+        "spec_fingerprint": "spec",
+        "state_fingerprint": "state",
+        "teacher_model": {"fingerprint": manifest["fingerprint"], "manifest": manifest},
+        "student_tokenizer": {"vocab_size": 4, "fingerprint_sha256": "tokens"},
+        "teacher_tokenizer": {"vocab_size": 4, "fingerprint_sha256": "tokens"},
+        "intervention": {"enabled": True},
+        "logprob_floor": -10.0,
+    }
+    legacy_fingerprint = "1" * 64
+    existing_request = {
+        "generation_fingerprint": "generation",
+        "spec_fingerprint": "spec",
+        "state_fingerprint": "state",
+        "student_served_model_name": "student-old-host",
+        "teacher_served_model_name": "teacher-old-host",
+        "teacher_model_fingerprint": legacy_fingerprint,
+        "student_tokenizer": {
+            "model_path": "/old/student",
+            "vocab_size": 4,
+            "fingerprint_sha256": "tokens",
+        },
+        "teacher_tokenizer": {
+            "model_path": "/old/teacher",
+            "vocab_size": 4,
+            "fingerprint_sha256": "tokens",
+        },
+        "intervention": {"enabled": True},
+        "logprob_floor": -10.0,
+    }
+    existing_repair_fingerprint = benchmark.payload_fingerprint(existing_request)
+    endpoint = {
+        "model_fingerprint": manifest["fingerprint"],
+        "model_manifest": manifest,
+        "legacy_stat_model_fingerprint": "2" * 64,
+    }
+
+    rejected = benchmark.assess_repair_compatibility(
+        existing_request=existing_request,
+        existing_fingerprint=existing_repair_fingerprint,
+        existing_compatibility=None,
+        current_request=current_request,
+        endpoint_descriptor=endpoint,
+        model_aliases={},
+    )
+    assert rejected["status"] == "incompatible"
+    assert rejected["differences"]["required_teacher_alias"] == {
+        "legacy_fingerprint": legacy_fingerprint,
+        "stable_model_fingerprint": manifest["fingerprint"],
+    }
+
+    accepted = benchmark.assess_repair_compatibility(
+        existing_request=existing_request,
+        existing_fingerprint=existing_repair_fingerprint,
+        existing_compatibility=None,
+        current_request=current_request,
+        endpoint_descriptor=endpoint,
+        model_aliases={legacy_fingerprint: {"stable_model_fingerprint": manifest["fingerprint"]}},
+    )
+    assert accepted["status"] == "legacy_teacher_alias"
+    assert accepted["effective_fingerprint"] == existing_repair_fingerprint
+
+
+def test_repair_compatibility_upgrades_exact_legacy_endpoint_identity_without_alias_on_cpu():
+    manifest = {"schema_version": 1, "metadata": [], "weights": []}
+    manifest["fingerprint"] = benchmark.payload_fingerprint(manifest)
+    legacy_fingerprint = "4" * 64
+    existing_request = {
+        "generation_fingerprint": "generation",
+        "spec_fingerprint": "spec",
+        "state_fingerprint": "state",
+        "student_served_model_name": "student",
+        "teacher_served_model_name": "teacher",
+        "teacher_model_fingerprint": legacy_fingerprint,
+        "student_tokenizer": {"model_path": "/student", "vocab_size": 4},
+        "teacher_tokenizer": {"model_path": "/teacher", "vocab_size": 4},
+        "intervention": {},
+        "logprob_floor": -10.0,
+    }
+    current_request = {
+        "repair_schema_version": benchmark.REPAIR_SCHEMA_VERSION,
+        "generation_fingerprint": "generation",
+        "spec_fingerprint": "spec",
+        "state_fingerprint": "state",
+        "teacher_model": {"fingerprint": manifest["fingerprint"], "manifest": manifest},
+        "student_tokenizer": {"vocab_size": 4},
+        "teacher_tokenizer": {"vocab_size": 4},
+        "intervention": {},
+        "logprob_floor": -10.0,
+    }
+    assessment = benchmark.assess_repair_compatibility(
+        existing_request=existing_request,
+        existing_fingerprint=benchmark.payload_fingerprint(existing_request),
+        existing_compatibility=None,
+        current_request=current_request,
+        endpoint_descriptor={
+            "model_fingerprint": manifest["fingerprint"],
+            "model_manifest": manifest,
+            "legacy_stat_model_fingerprint": legacy_fingerprint,
+        },
+        model_aliases={},
+    )
+    assert assessment["status"] == "legacy_stat_exact"
+    assert assessment["compatible"] is True
 
 
 def test_migrate_legacy_splits_benchmarks_without_deleting_source_on_cpu(tmp_path):
@@ -1066,6 +1558,17 @@ def test_repair_failure_preserves_raw_unit_and_resumes_only_missing_shards_on_cp
     monkeypatch.setattr(teacher_intervention, "OpenAICompletionAdapterConfig", FakeAdapterConfig)
     monkeypatch.setattr(teacher_intervention, "StandaloneTeacherInterventionRunner", FakeRunner)
     monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(AsyncOpenAI=FakeAsyncOpenAI))
+    teacher_model = tmp_path / "teacher-model"
+    teacher_model.mkdir()
+    (teacher_model / "config.json").write_text('{"model_type":"qwen2"}', encoding="utf-8")
+    (teacher_model / "model.safetensors").write_bytes(b"teacher-weights")
+    teacher_endpoint = tmp_path / "teacher-endpoint.json"
+    write_endpoint_descriptor(
+        teacher_endpoint,
+        base_url="http://teacher/v1",
+        served_model_name="teacher",
+        model_path=teacher_model,
+    )
     args = SimpleNamespace(
         result_root=str(result_root),
         benchmark="math-ai/aime24",
@@ -1078,7 +1581,8 @@ def test_repair_failure_preserves_raw_unit_and_resumes_only_missing_shards_on_cp
         teacher_base_url="http://teacher/v1",
         teacher_api_key="EMPTY",
         teacher_served_model_name="teacher",
-        teacher_model_fingerprint="teacher-fingerprint",
+        teacher_endpoint_descriptor=str(teacher_endpoint),
+        teacher_model_aliases=None,
         student_tokenizer_model="student",
         teacher_tokenizer_model="teacher",
         trust_remote_code=False,

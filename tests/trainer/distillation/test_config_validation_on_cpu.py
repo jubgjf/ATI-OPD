@@ -461,3 +461,43 @@ def test_student_support_strategies_reject_silent_fallback_training_paths_on_cpu
 
     with pytest.raises(ValueError, match=error):
         validate_distillation_intervention_training_config(config)
+
+
+@pytest.mark.parametrize(
+    ("intervention_override", "message"),
+    [
+        ({"confirmation_mode": "future_gap"}, "future_gap"),
+        ({"outcome_aware_candidate_selection_enabled": True}, "outcome_aware"),
+        ({"repair_for_evaluation": True}, "repair_for_evaluation"),
+    ],
+)
+def test_tool_aware_dmpd_unsupported_modes_fail_during_config_validation_on_cpu(
+    intervention_override,
+    message,
+):
+    intervention = {
+        "enabled": True,
+        "max_interventions_per_sample": 1,
+        "confirmation_mode": "none",
+        **intervention_override,
+    }
+    config = OmegaConf.create(
+        {
+            "distillation": {
+                "enabled": True,
+                "use_actor_loss": True,
+                "distillation_loss": {"use_task_rewards": False},
+                "intervention": intervention,
+            },
+            "algorithm": {"adv_estimator": "grpo", "rollout_correction": {"bypass_mode": False}},
+            "actor_rollout_ref": {
+                "rollout": {
+                    "multi_turn": {"enable": True},
+                    "agent": {"default_agent_loop": "tool_agent"},
+                }
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match=message):
+        validate_distillation_intervention_training_config(config)

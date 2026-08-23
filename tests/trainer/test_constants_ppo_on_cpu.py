@@ -61,3 +61,14 @@ def test_get_ppo_ray_runtime_env_passes_through_wandb_vars_without_job_runtime_e
     assert runtime_env["env_vars"]["WANDB_RESUME"] == "must"
     assert runtime_env["env_vars"]["WANDB_RUN_ID"] == "resume-run-id"
     assert runtime_env["env_vars"]["WANDB_DATA_DIR"] == "/shared/wandb-data"
+
+
+def test_get_ppo_ray_runtime_env_passes_sandbox_to_agent_loop_workers(monkeypatch):
+    monkeypatch.delenv(RAY_JOB_CONFIG_JSON_ENV_VAR, raising=False)
+    monkeypatch.setenv("PYTHON_SANDBOX_URL", "http://127.0.0.1:18081")
+    monkeypatch.setenv("PYTHON_SANDBOX_TIMEOUT", "17")
+
+    runtime_env = get_ppo_ray_runtime_env()
+
+    assert runtime_env["env_vars"]["PYTHON_SANDBOX_URL"] == "http://127.0.0.1:18081"
+    assert runtime_env["env_vars"]["PYTHON_SANDBOX_TIMEOUT"] == "17"

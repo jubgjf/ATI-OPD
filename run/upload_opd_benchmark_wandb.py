@@ -282,6 +282,30 @@ def unit_metric_payload(
     _finite_metric(payload, f"{prefix}/acc_ci95_low", acc_ci.get("ci95_low"))
     _finite_metric(payload, f"{prefix}/acc_ci95_high", acc_ci.get("ci95_high"))
 
+    tool_call = metrics.get("tool_call") or {}
+    if tool_call:
+        calls_per_trajectory = tool_call.get("calls_per_trajectory") or {}
+        observation_tokens = tool_call.get("observation_tokens") or {}
+        for name, value in {
+            "attempt_rate": tool_call.get("attempt_rate"),
+            "parse_success_rate": tool_call.get("parse_success_rate"),
+            "parse_failure_rate": tool_call.get("parse_failure_rate"),
+            "execution_success_rate": tool_call.get("execution_success_rate"),
+            "protocol_error_rate": tool_call.get("protocol_error_rate"),
+            "timeout_rate": tool_call.get("timeout_rate"),
+            "runtime_error_rate": tool_call.get("runtime_error_rate"),
+            "syntax_error_rate": tool_call.get("syntax_error_rate"),
+            "http_error_rate": tool_call.get("http_error_rate"),
+            "markdown_extraction_rate": tool_call.get("markdown_extraction_rate"),
+            "calls_per_trajectory_mean": calls_per_trajectory.get("mean"),
+            "observation_tokens_mean": observation_tokens.get("mean"),
+            "final_answer_after_tool_rate": tool_call.get("final_answer_after_tool_rate"),
+            "ended_after_observation_rate": tool_call.get("ended_after_observation_rate"),
+            "total_attempts": tool_call.get("total_attempts"),
+            "total_parsed_calls": tool_call.get("total_parsed_calls"),
+        }.items():
+            _finite_metric(payload, f"{test_prefix}/tool_call/{name}", value)
+
     repair = summary.get("repair") or {}
     repair_metrics = repair.get("metrics") or {}
     repair_accuracy = repair.get("accuracy_at_n") or {}

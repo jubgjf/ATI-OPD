@@ -5,6 +5,11 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     exit 1
 fi
 
+_COMMON_SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=run/python_sandbox_helper.sh
+. "$_COMMON_SCRIPT_DIR/python_sandbox_helper.sh"
+unset _COMMON_SCRIPT_DIR
+
 _load_external_train_config() {
     local train_config_path=${TRAIN_CONFIG_PATH:-/opt/huawei/algorithm/train.config}
     if [[ ! -s "$train_config_path" ]]; then
@@ -163,6 +168,87 @@ _configure_in_training_evaluation() {
     esac
 }
 
+_configure_verl_python_sandbox() {
+    local auto_start
+    if [[ -n "${AUTO_START_PYTHON_SANDBOX+x}" ]]; then
+        auto_start=$AUTO_START_PYTHON_SANDBOX
+    elif [[ -n "${PYTHON_SANDBOX_URL:-}" ]]; then
+        # Preserve explicit external-sandbox configurations. With neither
+        # variable set, tool mode defaults to one local sandbox per pod.
+        auto_start=False
+    else
+        auto_start=True
+    fi
+    case "$auto_start" in
+        True | true | 1) auto_start=True ;;
+        False | false | 0) auto_start=False ;;
+        *)
+            echo "AUTO_START_PYTHON_SANDBOX must be True or False, got: $auto_start" >&2
+            return 2
+            ;;
+    esac
+
+    local sandbox_bind_host=${PYTHON_SANDBOX_BIND_HOST:-127.0.0.1}
+    local sandbox_port=${PYTHON_SANDBOX_PORT:-8080}
+    local sandbox_max_concurrency=${PYTHON_SANDBOX_MAX_CONCURRENCY:-32}
+    local sandbox_timeout=${PYTHON_SANDBOX_TIMEOUT:-10}
+    local sandbox_startup_timeout=${PYTHON_SANDBOX_STARTUP_TIMEOUT:-60}
+    local setting_name setting_value
+    for setting_name in \
+        PYTHON_SANDBOX_PORT \
+        PYTHON_SANDBOX_MAX_CONCURRENCY \
+        PYTHON_SANDBOX_TIMEOUT \
+        PYTHON_SANDBOX_STARTUP_TIMEOUT; do
+        case "$setting_name" in
+            PYTHON_SANDBOX_PORT) setting_value=$sandbox_port ;;
+            PYTHON_SANDBOX_MAX_CONCURRENCY) setting_value=$sandbox_max_concurrency ;;
+            PYTHON_SANDBOX_TIMEOUT) setting_value=$sandbox_timeout ;;
+            PYTHON_SANDBOX_STARTUP_TIMEOUT) setting_value=$sandbox_startup_timeout ;;
+        esac
+        if [[ ! "$setting_value" =~ ^[1-9][0-9]*$ ]]; then
+            echo "$setting_name must be a positive integer, got: $setting_value" >&2
+            return 2
+        fi
+    done
+    if ((sandbox_port > 65535)); then
+        echo "PYTHON_SANDBOX_PORT must be at most 65535, got: $sandbox_port" >&2
+        return 2
+    fi
+
+    if [[ "$auto_start" == "True" ]]; then
+        local local_sandbox_url="http://127.0.0.1:${sandbox_port}"
+        if [[ -n "${PYTHON_SANDBOX_URL:-}" && "$PYTHON_SANDBOX_URL" != "$local_sandbox_url" ]]; then
+            echo "AUTO_START_PYTHON_SANDBOX=True uses $local_sandbox_url, but PYTHON_SANDBOX_URL=$PYTHON_SANDBOX_URL." >&2
+            echo "Unset PYTHON_SANDBOX_URL, or set AUTO_START_PYTHON_SANDBOX=False to use an external service." >&2
+            return 2
+        fi
+        python_sandbox_url=$local_sandbox_url
+        python_sandbox_log_path=${PYTHON_SANDBOX_LOG_PATH:-$default_local_dir/python_sandbox/node_${NODE_RANK}.log}
+        _start_verl_python_sandbox \
+            "$python_sandbox_url" \
+            "$sandbox_bind_host" \
+            "$sandbox_port" \
+            "$sandbox_max_concurrency" \
+            "$sandbox_timeout" \
+            "$sandbox_startup_timeout" \
+            "$python_sandbox_log_path" || return $?
+        trap _stop_verl_python_sandbox EXIT
+    else
+        python_sandbox_url=${PYTHON_SANDBOX_URL:-}
+        if [[ -z "$python_sandbox_url" ]]; then
+            echo "AUTO_START_PYTHON_SANDBOX=False requires PYTHON_SANDBOX_URL." >&2
+            return 2
+        fi
+    fi
+
+    export PYTHON_SANDBOX_URL=$python_sandbox_url
+    export PYTHON_SANDBOX_TIMEOUT=$sandbox_timeout
+    if ! _check_verl_python_sandbox_health "$python_sandbox_url" 5 >/dev/null 2>&1; then
+        echo "Python sandbox health check failed from node rank $NODE_RANK: $python_sandbox_url/health" >&2
+        return 2
+    fi
+}
+
 run_npu_opd_job() {
     HOME=/home/ma-user
     DATASET_DIR=/opt/huawei/dataset/jnguan
@@ -188,6 +274,8 @@ run_npu_opd_job() {
     pip install -e .
     echo ============================
 
+    export NODE_RANK=${NODE_RANK:-${VC_TASK_INDEX:-0}}
+
     export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-3600}
     export HCCL_LOG_LEVEL=${HCCL_LOG_LEVEL:-0}
     export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-3600}
@@ -202,9 +290,29 @@ run_npu_opd_job() {
     export VLLM_USE_V1=${VLLM_USE_V1:-1}
     ulimit -n "${ULIMIT_NOFILE:-65536}"
 
-    STUDENT_MODEL=${STUDENT_MODEL:-$DATASET_DIR/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
-    TEACHER_MODEL=${TEACHER_MODEL:-$DATASET_DIR/models/hbx/JustRL-DeepSeek-1.5B}
-    CHAT_TEMPLATE_MODEL=${CHAT_TEMPLATE_MODEL:-$TEACHER_MODEL}
+    enable_tool_call=${ENABLE_TOOL_CALL:-False}
+    case "$enable_tool_call" in
+        True | true | 1) enable_tool_call=True ;;
+        False | false | 0) enable_tool_call=False ;;
+        *)
+            echo "ENABLE_TOOL_CALL must be True or False, got: $enable_tool_call" >&2
+            return 2
+            ;;
+    esac
+
+    if [[ "$enable_tool_call" == "True" ]]; then
+        STUDENT_MODEL=${STUDENT_MODEL:-$DATASET_DIR/models/Qwen3-1.7B}
+        TEACHER_MODEL=${TEACHER_MODEL:-$DATASET_DIR/models/Qwen3-8B}
+        CHAT_TEMPLATE_MODEL=${CHAT_TEMPLATE_MODEL:-$STUDENT_MODEL}
+    else
+        STUDENT_MODEL=${STUDENT_MODEL:-$DATASET_DIR/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
+        TEACHER_MODEL=${TEACHER_MODEL:-$DATASET_DIR/models/hbx/JustRL-DeepSeek-1.5B}
+        CHAT_TEMPLATE_MODEL=${CHAT_TEMPLATE_MODEL:-$TEACHER_MODEL}
+    fi
+
+    python_sandbox_url=${PYTHON_SANDBOX_URL:-}
+    tool_system_prompt_path=${TOOL_SYSTEM_PROMPT_PATH:-$WORKSPACE/run/prompts/qwen3_math_tool_optional.txt}
+    function_tool_path=${FUNCTION_TOOL_PATH:-$WORKSPACE/verl/tools/code_interpreter_tool.py}
 
     TRAIN_DATASET=${TRAIN_DATASET:-dapo_math_17k}
     case "$TRAIN_DATASET" in
@@ -236,7 +344,11 @@ run_npu_opd_job() {
     sp_size=${SP_SIZE:-4}
     TEACHER_REPLICAS=${TEACHER_REPLICAS:-$((TEACHER_NNODES * TEACHER_NGPUS_PER_NODE / teacher_tp))}
 
-    max_prompt_length=${MAX_PROMPT_LENGTH:-$((1 * 1024))}
+    if [[ "$enable_tool_call" == "True" ]]; then
+        max_prompt_length=${MAX_PROMPT_LENGTH:-$((2 * 1024))}
+    else
+        max_prompt_length=${MAX_PROMPT_LENGTH:-$((1 * 1024))}
+    fi
     max_response_length=${MAX_RESPONSE_LENGTH:-$((23 * 1024))}
     max_num_tokens=${MAX_NUM_TOKENS:-$((max_prompt_length + max_response_length + 1))}
     rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-2048}
@@ -385,7 +497,19 @@ run_npu_opd_job() {
     echo "W&B resume: mode=$WANDB_MODE, required=$resume_required, run_id=${WANDB_RUN_ID:-unset}, resume=${WANDB_RESUME:-unset}"
     echo "W&B storage: run_root=$WANDB_DIR, upload_staging_root=$WANDB_DATA_DIR, cache_root=$WANDB_CACHE_DIR"
 
-    export NODE_RANK=${NODE_RANK:-$VC_TASK_INDEX}
+    if [[ "$enable_tool_call" == "True" ]]; then
+        if [[ ! -f "$tool_system_prompt_path" ]]; then
+            echo "Missing TOOL_SYSTEM_PROMPT_PATH: $tool_system_prompt_path" >&2
+            exit 2
+        fi
+        if [[ ! -f "$function_tool_path" ]]; then
+            echo "Missing FUNCTION_TOOL_PATH: $function_tool_path" >&2
+            exit 2
+        fi
+        _configure_verl_python_sandbox || exit $?
+        echo "Tool-call preflight passed: sandbox=$python_sandbox_url, prompt=$tool_system_prompt_path, node_rank=$NODE_RANK"
+    fi
+
     export MASTER_ADDR=${MASTER_ADDR:-"${MA_VJ_NAME}-${MA_TASK_NAME}-0.${MA_VJ_NAME}"}
     export TMPDIR=${TMPDIR:-/cache/ray_tmp}
     mkdir -p "$TMPDIR"
@@ -652,6 +776,22 @@ _submit_npu_verl_job() {
         "distillation.diagnostics.bad_tail_entropy_threshold=${opd_diagnostics_bad_tail_entropy_threshold}"
     )
 
+    if [[ "$enable_tool_call" == "True" ]]; then
+        hydra_args+=(
+            "data.system_prompt_path=${tool_system_prompt_path}"
+            "+data.apply_chat_template_kwargs.enable_thinking=True"
+            "actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent"
+            "actor_rollout_ref.rollout.multi_turn.enable=True"
+            "actor_rollout_ref.rollout.multi_turn.function_tool_path=${function_tool_path}"
+            "actor_rollout_ref.rollout.multi_turn.format=hermes"
+            "actor_rollout_ref.rollout.multi_turn.max_assistant_turns=null"
+            "actor_rollout_ref.rollout.multi_turn.max_user_turns=null"
+            "actor_rollout_ref.rollout.multi_turn.max_parallel_calls=1"
+            "actor_rollout_ref.rollout.multi_turn.max_tool_response_length=4096"
+            "actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=disable"
+        )
+    fi
+
     hydra_args+=("${METHOD_HYDRA_OVERRIDES[@]}")
 
     local runtime_env_json
@@ -668,7 +808,9 @@ _submit_npu_verl_job() {
                 "WANDB_DIR": "'"$WANDB_DIR"'",
                 "WANDB_DATA_DIR": "'"$WANDB_DATA_DIR"'",
                 "WANDB_RUN_ID": "'"$WANDB_RUN_ID"'",
-                "WANDB_RESUME": "'"$WANDB_RESUME"'"
+                "WANDB_RESUME": "'"$WANDB_RESUME"'",
+                "PYTHON_SANDBOX_URL": "'"$python_sandbox_url"'",
+                "PYTHON_SANDBOX_TIMEOUT": "'"${PYTHON_SANDBOX_TIMEOUT:-10}"'"
             }
         }'
     elif [[ -n "${WANDB_RUN_ID:-}" ]]; then
@@ -683,7 +825,9 @@ _submit_npu_verl_job() {
                 "WANDB_MODE": "'"$WANDB_MODE"'",
                 "WANDB_DIR": "'"$WANDB_DIR"'",
                 "WANDB_DATA_DIR": "'"$WANDB_DATA_DIR"'",
-                "WANDB_RUN_ID": "'"$WANDB_RUN_ID"'"
+                "WANDB_RUN_ID": "'"$WANDB_RUN_ID"'",
+                "PYTHON_SANDBOX_URL": "'"$python_sandbox_url"'",
+                "PYTHON_SANDBOX_TIMEOUT": "'"${PYTHON_SANDBOX_TIMEOUT:-10}"'"
             }
         }'
     else
@@ -697,7 +841,9 @@ _submit_npu_verl_job() {
                 "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
                 "WANDB_MODE": "'"$WANDB_MODE"'",
                 "WANDB_DIR": "'"$WANDB_DIR"'",
-                "WANDB_DATA_DIR": "'"$WANDB_DATA_DIR"'"
+                "WANDB_DATA_DIR": "'"$WANDB_DATA_DIR"'",
+                "PYTHON_SANDBOX_URL": "'"$python_sandbox_url"'",
+                "PYTHON_SANDBOX_TIMEOUT": "'"${PYTHON_SANDBOX_TIMEOUT:-10}"'"
             }
         }'
     fi

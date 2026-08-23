@@ -64,6 +64,42 @@ def validate_distillation_intervention_training_config(config: Any) -> None:
         raise ValueError(
             "distillation.intervention.repair_for_evaluation=true requires distillation.intervention.enabled=true."
         )
+    tool_agent_enabled = bool(
+        _get_nested(config, "actor_rollout_ref", "rollout", "multi_turn", "enable", default=False)
+        and _get_nested(
+            config,
+            "actor_rollout_ref",
+            "rollout",
+            "agent",
+            "default_agent_loop",
+            default="single_turn_agent",
+        )
+        == "tool_agent"
+    )
+    if intervention_enabled and tool_agent_enabled:
+        confirmation_mode = str(_get_nested(distillation_config, "intervention", "confirmation_mode", default="none"))
+        if confirmation_mode == "future_gap":
+            raise ValueError(
+                "Tool-aware DMPD does not yet support "
+                "distillation.intervention.confirmation_mode='future_gap'; use confirmation_mode='none'."
+            )
+        if bool(
+            _get_nested(
+                distillation_config,
+                "intervention",
+                "outcome_aware_candidate_selection_enabled",
+                default=False,
+            )
+        ):
+            raise ValueError(
+                "Tool-aware DMPD does not yet support "
+                "distillation.intervention.outcome_aware_candidate_selection_enabled=true."
+            )
+        if repair_for_evaluation:
+            raise ValueError(
+                "Tool-aware DMPD does not yet support "
+                "distillation.intervention.repair_for_evaluation=true; keep repair evaluation disabled."
+            )
     if collect_outcome_transitions and not intervention_enabled:
         raise ValueError(
             "distillation.diagnostics.collect_intervention_outcome_transitions=true requires "

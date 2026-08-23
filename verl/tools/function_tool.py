@@ -157,6 +157,25 @@ def load_function_tools_from_path(path: str) -> list[FunctionTool]:
     if abs_path in _LOADED_FUNCTION_TOOL_PATHS:
         return _LOADED_FUNCTION_TOOL_PATHS[abs_path]
 
+    # The same tool file may already have been imported through its package
+    # name (for example ``verl.tools.code_interpreter_tool``) before a runtime
+    # config refers to it via ``function_tool_path``. Re-executing it under the
+    # synthetic path module would create new function identities and trigger
+    # the registry's intentional same-name collision guard. Reuse only tools
+    # whose defining module resolves to this exact file; collisions from a
+    # different file remain errors.
+    real_path = os.path.realpath(abs_path)
+    loaded_module_names = {
+        module_name
+        for module_name, module in tuple(sys.modules.items())
+        if getattr(module, "__file__", None) and os.path.realpath(os.path.abspath(str(module.__file__))) == real_path
+    }
+    already_registered = [tool for tool in FUNCTION_TOOL_REGISTRY.values() if tool.fn.__module__ in loaded_module_names]
+    if already_registered:
+        tools = sorted(already_registered, key=lambda tool: tool.name)
+        _LOADED_FUNCTION_TOOL_PATHS[abs_path] = tools
+        return tools
+
     before = set(FUNCTION_TOOL_REGISTRY)
 
     # Use a path-derived synthetic module name so the imported file can

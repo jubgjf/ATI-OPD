@@ -12,10 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
+
+from verl.utils.evaluation.checkpoint_evaluation import payload_fingerprint, write_evaluation_state
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 LAUNCHER = REPO_ROOT / "run" / "opd_checkpoint_eval.sh"
@@ -56,6 +62,11 @@ def test_checkpoint_eval_launcher_supports_offline_shared_storage_and_manual_fil
     assert "EVAL_BENCHMARKS_TEXT" in source
     assert "EVAL_SKIP_BENCHMARKS_TEXT" in source
     assert "EVAL_ENABLE_REPAIR" in source
+    assert "EVAL_REPAIR_MODE" in source
+    assert "EVAL_TOOL_CALL_MODE" in source
+    assert "EVAL_TEACHER_MODEL_MANIFEST_CACHE_ROOT" in source
+    assert "EVAL_TEACHER_MODEL_ALIASES_FILE" in source
+    assert "EVAL_TEACHER_MODEL_MANIFEST_REHASH" in source
     assert "POLL_SECONDS=${POLL_SECONDS:-600}" in source
     assert source.count('sleep "$POLL_SECONDS"') == 1
     assert "released $candidate_experiment/global_step_$step; rescanning immediately" in source
@@ -100,6 +111,9 @@ def test_checkpoint_eval_launcher_uses_distributed_claims_and_instance_scoped_co
     assert 'json.loads(sys.argv[1])["source_checkpoint_identity"]' in source
     assert '--student-model-identity "$source_checkpoint_identity"' in source
     assert "--preflight-only" in source
+    assert "--manifest-cache-root" in source
+    assert "--teacher-endpoint-descriptor" in source
+    assert "--teacher-model-aliases" in source
     assert "discovered ${#candidates[@]} committed checkpoint(s); checking result state" in source
     assert "EVAL_CLAIM_STALE_SECONDS=${EVAL_CLAIM_STALE_SECONDS:-300}" in source
     assert 'if checkpoint_complete "$step" && checkpoint_wandb_is_staged "$step"; then' in source
@@ -121,12 +135,27 @@ def test_checkpoint_eval_launcher_supports_priority_raw_only_and_incremental_ben
     assert source.index("prioritize_pending_candidates\n") < source.index(
         'QUEUE_CANDIDATES=("${pending_candidates[@]}")'
     )
-    assert 'if [[ "$EVAL_ENABLE_REPAIR" == "1" ]]' in source
+    assert 'if [[ "$EFFECTIVE_REPAIR_ENABLED" == "1" ]]' in source
     assert "status_args+=(--no-require-repair)" in source
     assert "[wandb] deferred for raw-only global_step_$step" in source
     assert 'flags+=(--benchmark "$benchmark")' in source
     assert "excluded = set(sys.argv[3].split())" in source
     assert 'if ! text_list_contains "$benchmark" "$EVAL_SKIP_BENCHMARKS_TEXT"' in source
+
+
+def test_checkpoint_eval_launcher_resolves_tool_contract_per_experiment_and_forbids_repair_on_cpu():
+    source = LAUNCHER.read_text(encoding="utf-8")
+
+    assert "resolve_evaluation_modes" in source
+    assert 'resolve_evaluation_modes "$EVALUATION_SPEC"' in source
+    assert '--evaluation-spec "$EVALUATION_SPEC"' in source
+    assert '--tool-call-mode "$EFFECTIVE_TOOL_CALL_MODE"' in source
+    assert "Standalone repair is unsupported for tool-call evaluation" in source
+    assert 'if [[ "$EFFECTIVE_WANDB_PUBLISH_ENABLED" == "1" ]]' in source
+    assert "tool-aware raw-final" in source
+    assert "ensure_evaluation_python_sandbox" in source
+    assert "_stop_verl_python_sandbox" in source
+    assert (REPO_ROOT / "run" / "python_sandbox_helper.sh").is_file()
 
 
 def test_checkpoint_eval_launcher_validates_direct_merge_before_starting_vllm_on_cpu():
@@ -192,3 +221,95 @@ def test_checkpoint_eval_launcher_requires_a_shared_instance_identity_on_cpu(tmp
 
     assert completed.returncode == 2
     assert "EVAL_INSTANCE_ID is required" in completed.stderr
+
+
+def test_checkpoint_eval_launcher_rejects_legacy_and_new_repair_switch_together_on_cpu(tmp_path):
+    env = os.environ.copy()
+    env.update(
+        {
+            "EVAL_ENABLE_REPAIR": "1",
+            "EVAL_INSTANCE_ID": "repair-mode-conflict",
+            "EVAL_REPAIR_MODE": "auto",
+            "EVAL_ROLE": "controller",
+            "EVAL_SETUP_MODE": "skip",
+            "WANDB_MODE": "disabled",
+            "WORKSPACE": str(tmp_path),
+        }
+    )
+
+    completed = subprocess.run(["bash", str(LAUNCHER)], capture_output=True, env=env, text=True)
+
+    assert completed.returncode == 2
+    assert "cannot both be set" in completed.stderr
+
+
+def test_checkpoint_eval_launcher_fails_before_vllm_for_tool_plus_repair_on_cpu(tmp_path):
+    bash_major = int(
+        subprocess.run(["bash", "-c", 'printf %s "${BASH_VERSINFO[0]}"'], capture_output=True, text=True).stdout
+    )
+    if bash_major < 4:
+        pytest.skip("The production launcher requires Bash 4+ for mapfile/readarray.")
+
+    outputs = tmp_path / "outputs"
+    checkpoint_root = outputs / "tool-experiment"
+    prompt = "Use tools when useful."
+    tool_contract = {
+        "enabled": True,
+        "agent_loop": "tool_agent",
+        "format": "hermes",
+        "system_prompt": {
+            "content": prompt,
+            "sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        },
+    }
+    tool_contract["contract_fingerprint"] = payload_fingerprint(tool_contract)
+    semantic = {
+        "experiment_name": "tool-experiment",
+        "training_project": "DMPD",
+        "training": {"metric_logging_mode": "full"},
+        "tool_call": tool_contract,
+    }
+    spec = {
+        "schema_version": 2,
+        "spec_fingerprint": payload_fingerprint(semantic),
+        "training_run_id": "tool-run",
+        "semantic_config": semantic,
+    }
+    checkpoint_root.mkdir(parents=True)
+    (checkpoint_root / "evaluation_spec.json").write_text(json.dumps(spec), encoding="utf-8")
+    checkpoint = checkpoint_root / "global_step_1"
+    actor = checkpoint / "actor"
+    actor.mkdir(parents=True)
+    (checkpoint / "data.pt").write_bytes(b"data")
+    (actor / "model_world_size_1_rank_0.pt").write_bytes(b"model")
+    write_evaluation_state(
+        checkpoint,
+        checkpoint_step=1,
+        spec_fingerprint=spec["spec_fingerprint"],
+        teacher_nll_calibration=None,
+    )
+    (checkpoint_root / "latest_checkpointed_iteration.txt").write_text("1", encoding="utf-8")
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "ALLOW_DEBUG_OVERRIDES": "1",
+            "CHECKPOINT_SEARCH_ROOT": str(outputs),
+            "EVAL_INSTANCE_ID": "tool-repair-conflict",
+            "EVAL_REPAIR_MODE": "on",
+            "EVAL_ROLE": "controller",
+            "EVAL_SETUP_MODE": "skip",
+            "EVAL_WANDB_ROOT": str(tmp_path / "wandb"),
+            "EVAL_RESULTS_ROOT": str(tmp_path / "results"),
+            "PATH": os.pathsep.join((str(Path(sys.executable).parent), env.get("PATH", ""))),
+            "WANDB_MODE": "disabled",
+            "WATCH_ONCE": "1",
+            "WORKSPACE": str(tmp_path),
+        }
+    )
+    env.pop("EVAL_ENABLE_REPAIR", None)
+    completed = subprocess.run(["bash", str(LAUNCHER)], capture_output=True, env=env, text=True)
+
+    assert completed.returncode == 2
+    assert "Standalone repair is unsupported for tool-call evaluation" in completed.stderr
+    assert "[vllm] starting" not in completed.stdout

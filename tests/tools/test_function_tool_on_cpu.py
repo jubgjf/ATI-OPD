@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
+import sys
 import textwrap
 from pathlib import Path
 from typing import Literal
@@ -431,6 +433,39 @@ def test_load_is_idempotent_across_calls(tmp_path):
     assert [t.name for t in first] == ["idem"]
     assert second[0] is first[0]
     assert second[0].fn is first[0].fn
+
+
+def test_load_reuses_tool_when_same_file_was_imported_by_module_name(tmp_path):
+    path = _write_tool_file(
+        tmp_path,
+        """
+        from verl.tools.function_tool import function_tool
+
+        @function_tool("already_imported")
+        def already_imported(x: str) -> str:
+            '''Echo.
+
+            Args:
+                x: x.
+            '''
+            return x
+        """,
+    )
+    module_name = "_test_already_imported_function_tool"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        originally_registered = FUNCTION_TOOL_REGISTRY["already_imported"]
+
+        tools = load_function_tools_from_path(path)
+
+        assert tools == [originally_registered]
+        assert tools[0].fn is module.already_imported
+    finally:
+        sys.modules.pop(module_name, None)
 
 
 def test_load_returns_only_tools_added_by_this_file(tmp_path):
