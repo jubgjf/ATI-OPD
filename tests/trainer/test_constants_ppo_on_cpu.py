@@ -72,3 +72,27 @@ def test_get_ppo_ray_runtime_env_passes_sandbox_to_agent_loop_workers(monkeypatc
 
     assert runtime_env["env_vars"]["PYTHON_SANDBOX_URL"] == "http://127.0.0.1:18081"
     assert runtime_env["env_vars"]["PYTHON_SANDBOX_TIMEOUT"] == "17"
+
+
+def test_get_ppo_ray_runtime_env_skips_sandbox_vars_already_set_by_job(monkeypatch):
+    monkeypatch.setenv(
+        RAY_JOB_CONFIG_JSON_ENV_VAR,
+        json.dumps(
+            {
+                "runtime_env": {
+                    "working_dir": "gcs://_ray_pkg_test.zip",
+                    "env_vars": {
+                        "PYTHON_SANDBOX_URL": "http://127.0.0.1:8080",
+                        "PYTHON_SANDBOX_TIMEOUT": "10",
+                    },
+                }
+            }
+        ),
+    )
+    monkeypatch.setenv("PYTHON_SANDBOX_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("PYTHON_SANDBOX_TIMEOUT", "10")
+
+    runtime_env = get_ppo_ray_runtime_env()
+
+    assert "PYTHON_SANDBOX_URL" not in runtime_env["env_vars"]
+    assert "PYTHON_SANDBOX_TIMEOUT" not in runtime_env["env_vars"]

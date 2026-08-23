@@ -98,6 +98,6 @@ def get_ppo_ray_runtime_env():
         if key not in job_env_vars and (value := os.environ.get(key)) is not None:
             runtime_env["env_vars"][key] = value
     for key in TOOL_RAY_ENV_PASSTHROUGH:
-        if (value := os.environ.get(key)) is not None:
+        if key not in job_env_vars and (value := os.environ.get(key)) is not None:
             runtime_env["env_vars"][key] = value
     return runtime_env
