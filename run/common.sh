@@ -301,8 +301,8 @@ run_npu_opd_job() {
     esac
 
     if [[ "$enable_tool_call" == "True" ]]; then
-        STUDENT_MODEL=${STUDENT_MODEL:-$DATASET_DIR/models/Qwen3-1.7B}
-        TEACHER_MODEL=${TEACHER_MODEL:-$DATASET_DIR/models/Qwen3-8B}
+        STUDENT_MODEL=${STUDENT_MODEL:-$DATASET_DIR/models/Qwen/Qwen3-1.7B}
+        TEACHER_MODEL=${TEACHER_MODEL:-$DATASET_DIR/models/Qwen/Qwen3-8B}
         CHAT_TEMPLATE_MODEL=${CHAT_TEMPLATE_MODEL:-$STUDENT_MODEL}
     else
         STUDENT_MODEL=${STUDENT_MODEL:-$DATASET_DIR/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
