@@ -40,6 +40,9 @@ class FunctionCall(BaseModel):
     name: str
     """The name of the function to call."""
 
+    parse_recovery: Optional[str] = None
+    """Optional parser recovery used for otherwise unambiguous model output."""
+
 
 class ToolParser(ABC):
     _registry: dict[str, type["ToolParser"]] = {}
@@ -88,6 +91,67 @@ class HermesToolParser(ToolParser):
         self.tool_call_end_token: str = "</tool_call>"
         self.tool_call_regex = regex.compile(r"<tool_call>(.*?)</tool_call>", regex.DOTALL)
 
+    @staticmethod
+    def _matching_tool(
+        tools: Optional[list[OpenAIFunctionToolSchema]], name: Optional[str] = None
+    ) -> Optional[OpenAIFunctionToolSchema]:
+        candidates = [tool for tool in (tools or []) if tool.type == "function"]
+        if name is not None:
+            candidates = [tool for tool in candidates if tool.function.name == name]
+        return candidates[0] if len(candidates) == 1 else None
+
+    @classmethod
+    def _normalize_function_call(
+        cls,
+        payload: Any,
+        tools: Optional[list[OpenAIFunctionToolSchema]],
+    ) -> tuple[str, dict[str, Any], list[str]]:
+        if not isinstance(payload, dict):
+            raise TypeError("tool-call payload must be a JSON object")
+
+        recoveries: list[str] = []
+        name = payload.get("name")
+        arguments = payload.get("arguments")
+        if arguments is None and "parameters" in payload:
+            arguments = payload["parameters"]
+            recoveries.append("parameters_alias")
+
+        tool = cls._matching_tool(tools, str(name)) if name is not None else cls._matching_tool(tools)
+        if name is None and tool is not None:
+            name = tool.function.name
+            recoveries.append("single_tool_name_inference")
+
+        if arguments is None and tool is not None:
+            direct_arguments = {key: value for key, value in payload.items() if key != "name"}
+            property_names = set(tool.function.parameters.properties)
+            if direct_arguments and set(direct_arguments).issubset(property_names):
+                arguments = direct_arguments
+                recoveries.append("direct_arguments")
+
+        if not isinstance(name, str) or not name.strip():
+            raise KeyError("name")
+        if arguments is None:
+            raise KeyError("arguments")
+
+        if isinstance(arguments, str):
+            try:
+                decoded_arguments = json.loads(arguments, strict=False)
+            except json.JSONDecodeError:
+                decoded_arguments = None
+            if isinstance(decoded_arguments, dict):
+                arguments = decoded_arguments
+                recoveries.append("json_string_arguments")
+            elif tool is not None and len(tool.function.parameters.properties) == 1:
+                parameter_name, parameter_schema = next(iter(tool.function.parameters.properties.items()))
+                expected_type = parameter_schema.type
+                if expected_type == "string" or (isinstance(expected_type, list) and "string" in expected_type):
+                    arguments = {parameter_name: arguments}
+                    recoveries.append("single_string_argument")
+
+        if not isinstance(arguments, dict):
+            raise TypeError("tool-call arguments must be a JSON object")
+        return name, arguments, recoveries
+
     @rollout_trace_op
     async def extract_tool_calls(
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
@@ -100,12 +164,29 @@ class HermesToolParser(ToolParser):
         matches = self.tool_call_regex.findall(text)
         function_calls = []
         for match in matches:
+            recoveries: list[str] = []
             try:
-                function_call = json.loads(match)
-                name, arguments = function_call["name"], function_call["arguments"]
-                function_calls.append(FunctionCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False)))
+                try:
+                    function_call = json.loads(match)
+                except json.JSONDecodeError:
+                    # Qwen occasionally emits literal newlines/control
+                    # characters inside the code JSON string. Python's
+                    # non-strict decoder can recover that unambiguously.
+                    function_call = json.loads(match, strict=False)
+                    recoveries.append("non_strict_json")
+                name, arguments, normalization_recoveries = self._normalize_function_call(function_call, tools)
+                recoveries.extend(normalization_recoveries)
+                function_calls.append(
+                    FunctionCall(
+                        name=name,
+                        arguments=json.dumps(arguments, ensure_ascii=False),
+                        parse_recovery="+".join(recoveries) if recoveries else None,
+                    )
+                )
+                if recoveries:
+                    logger.warning("Recovered Hermes tool call using %s.", "+".join(recoveries))
             except Exception as e:
-                logger.error(f"Failed to decode tool call: {e}")
+                logger.warning("Failed to decode Hermes tool call: %s", e)
 
         # remaing text exclude tool call tokens
         content = self.tool_call_regex.sub("", text)

@@ -656,6 +656,7 @@ _VALIDATION_TOOL_METRIC_KEYS = (
     "tool_call/attempt_rate",
     "tool_call/parse_success_rate",
     "tool_call/parse_failure_rate",
+    "tool_call/parse_recovery_rate",
     "tool_call/execution_success_rate",
     "tool_call/protocol_error_rate",
     "tool_call/timeout_rate",
@@ -671,6 +672,7 @@ _VALIDATION_TOOL_METRIC_KEYS = (
     "tool_call/observation_tokens",
     "tool_call/final_answer_after_tool",
     "tool_call/ended_after_observation",
+    "tool_call/protocol_error_limit_reached",
 )
 
 
@@ -3482,6 +3484,17 @@ class RayPPOTrainer:
             "teacher_logprob_nonfinite_positions": teacher_logprob_nonfinite_positions,
             "entropy": entropy,
             "response_mask": response_mask,
+            "response_attention_mask": (
+                batch.batch["attention_mask"][:, -response_mask.shape[-1] :]
+                if "attention_mask" in batch.batch
+                else None
+            ),
+            "allow_multiple_thinking_blocks": "trajectory_spans" in batch.non_tensor_batch,
+            "trajectory_spans": (
+                self._non_tensor_to_list(batch.non_tensor_batch["trajectory_spans"])
+                if "trajectory_spans" in batch.non_tensor_batch
+                else None
+            ),
             "rm_scores": batch.batch.get("rm_scores", None),
             "bin_size": diagnostics_config.position_bin_size,
             "high_gap_threshold": diagnostics_config.high_gap_threshold,

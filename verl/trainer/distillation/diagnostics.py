@@ -761,6 +761,9 @@ def compute_phase_and_special_token_metrics(
     response_mask: torch.Tensor,
     special_token_ids: SpecialTokenIds,
     max_response_length: Optional[int] = None,
+    response_attention_mask: Optional[torch.Tensor] = None,
+    allow_multiple_thinking_blocks: bool = False,
+    trajectory_spans: Optional[list[Any]] = None,
 ) -> ResponsePhaseInfo:
     """Parse thinking/answering phases and terminal-token inclusion from generated responses."""
     if response_ids.shape != response_mask.shape:
@@ -769,7 +772,45 @@ def compute_phase_and_special_token_metrics(
         )
     response_ids_cpu = response_ids.detach().cpu()
     response_mask_cpu = response_mask.detach().bool().cpu()
+    if response_attention_mask is not None and response_attention_mask.shape != response_mask.shape:
+        raise ValueError(
+            "response_attention_mask and response_mask must align, got "
+            f"{response_attention_mask.shape=} and {response_mask.shape=}."
+        )
+    attention_mask_cpu = response_attention_mask.detach().bool().cpu() if response_attention_mask is not None else None
     batch_size, response_width = response_mask_cpu.shape
+    parse_mask_cpu = response_mask_cpu.clone()
+    if trajectory_spans is not None:
+        if len(trajectory_spans) != batch_size:
+            raise ValueError(
+                f"trajectory_spans must have one entry per sample, got {len(trajectory_spans)=} and {batch_size=}."
+            )
+        parse_mask_cpu.zero_()
+        think_start_patterns = _unique_sequence_tuple(
+            [special_token_ids.think_start_sequence, _unique_int_tuple([special_token_ids.think_start])]
+        )
+        for sample_idx, sample_spans in enumerate(trajectory_spans):
+            if sample_spans is None:
+                continue
+            for span in sample_spans:
+                if not isinstance(span, dict) or span.get("kind") != "assistant":
+                    continue
+                span_start = max(int(span.get("start", 0)), 0)
+                span_end = min(int(span.get("end", span_start)), response_width)
+                if span_end > span_start:
+                    parse_mask_cpu[sample_idx, span_start:span_end] = True
+                # Tool chat templates may append the next assistant's
+                # ``<think>`` opener to the zero-loss observation prefix. Pull
+                # only that structural tag into parsing; tool stdout remains
+                # excluded and cannot masquerade as model control syntax.
+                for pattern in think_start_patterns:
+                    prefix_start = span_start - len(pattern)
+                    if (
+                        prefix_start >= 0
+                        and tuple(response_ids_cpu[sample_idx, prefix_start:span_start].tolist()) == pattern
+                    ):
+                        parse_mask_cpu[sample_idx, prefix_start:span_start] = True
+                        break
     if max_response_length is None:
         max_response_length = response_width
 
@@ -778,7 +819,18 @@ def compute_phase_and_special_token_metrics(
     malformed_mask = torch.zeros_like(response_mask_cpu, dtype=torch.bool)
     carrier_mask = torch.zeros(batch_size, dtype=torch.bool)
 
-    lengths = response_mask_cpu.sum(dim=1).long()
+    if attention_mask_cpu is not None:
+        lengths = attention_mask_cpu.sum(dim=1).long()
+    else:
+        # response_mask is non-contiguous for tool trajectories. Its sum is
+        # the number of trainable assistant tokens, not the physical response
+        # length. Use the final active position so suffix turns are not
+        # accidentally dropped from format diagnostics.
+        lengths = torch.zeros(batch_size, dtype=torch.long)
+        for sample_idx in range(batch_size):
+            active = torch.nonzero(parse_mask_cpu[sample_idx], as_tuple=False).flatten()
+            if active.numel():
+                lengths[sample_idx] = int(active[-1].item()) + 1
     clipped_mask = lengths >= int(max_response_length)
     has_think_start = []
     has_think_end = []
@@ -809,12 +861,25 @@ def compute_phase_and_special_token_metrics(
     tokens_after_think_end = []
 
     for sample_idx in range(batch_size):
-        length = int(lengths[sample_idx].item())
-        valid_ids = [int(value) for value in response_ids_cpu[sample_idx, :length].tolist()]
+        physical_length = int(lengths[sample_idx].item())
+        active_mask = parse_mask_cpu[sample_idx, :physical_length]
+        if attention_mask_cpu is not None:
+            active_mask = active_mask & attention_mask_cpu[sample_idx, :physical_length]
+        active_positions = torch.nonzero(active_mask, as_tuple=False).flatten()
+        valid_ids = [int(value) for value in response_ids_cpu[sample_idx, active_positions].tolist()]
+        length = len(valid_ids)
         think_start_pattern = special_token_ids.think_start_sequence
         think_end_pattern = special_token_ids.think_end_sequence
         start_positions = _find_sequence_positions(valid_ids, think_start_pattern)
         end_positions = _find_sequence_positions(valid_ids, think_end_pattern)
+        if not think_start_pattern and special_token_ids.think_start is not None:
+            start_positions = [
+                index for index, token_id in enumerate(valid_ids) if token_id == int(special_token_ids.think_start)
+            ]
+        if not think_end_pattern and special_token_ids.think_end is not None:
+            end_positions = [
+                index for index, token_id in enumerate(valid_ids) if token_id == int(special_token_ids.think_end)
+            ]
         start_count = (
             len(start_positions) if think_start_pattern else _count_token(valid_ids, special_token_ids.think_start)
         )
@@ -827,7 +892,7 @@ def compute_phase_and_special_token_metrics(
         first_end_exclusive = (first_end + think_end_width) if first_end is not None else None
         has_start = first_start is not None
         has_end = first_end is not None
-        end_without_start = has_end and not has_start
+        end_without_start = has_end and (not has_start or (first_start is not None and first_end < first_start))
         reopened = False
         if has_end and first_end_exclusive is not None:
             suffix_after_first_end = valid_ids[first_end_exclusive:]
@@ -843,11 +908,21 @@ def compute_phase_and_special_token_metrics(
             (token_id,) for token_id in special_token_ids.foreign_control_ids
         )
         sample_foreign_control = _contains_any_sequence(valid_ids, foreign_control_patterns)
+        multi_block_structure_invalid = False
+        if allow_multiple_thinking_blocks and (start_positions or end_positions):
+            multi_block_structure_invalid = len(start_positions) != len(end_positions)
+            previous_end = -1
+            for block_start, block_end in zip(start_positions, end_positions, strict=False):
+                if block_start >= block_end or block_start <= previous_end:
+                    multi_block_structure_invalid = True
+                    break
+                previous_end = block_end
         sample_malformed = (
             end_without_start
-            or reopened
-            or start_count > 1
-            or end_count > 1
+            or multi_block_structure_invalid
+            or (reopened and not allow_multiple_thinking_blocks)
+            or (start_count > 1 and not allow_multiple_thinking_blocks)
+            or (end_count > 1 and not allow_multiple_thinking_blocks)
             or sample_generated_im_start
             or sample_foreign_control
         )
@@ -858,12 +933,34 @@ def compute_phase_and_special_token_metrics(
             think_end_positions.append(first_end)
             tokens_before_think_end.append(first_end_exclusive)
             tokens_after_think_end.append(max(length - first_end_exclusive, 0))
-        if has_start and not has_end:
-            unclosed = True
+        if allow_multiple_thinking_blocks:
+            unclosed = bool(
+                has_start
+                and (not has_end or (start_positions and end_positions and start_positions[-1] > end_positions[-1]))
+            )
         else:
-            unclosed = False
+            unclosed = has_start and not has_end
 
-        if (
+        if allow_multiple_thinking_blocks and start_positions and end_positions:
+            end_cursor = 0
+            previous_end_exclusive: Optional[int] = None
+            for block_start in start_positions:
+                while end_cursor < len(end_positions) and end_positions[end_cursor] < block_start:
+                    end_cursor += 1
+                if end_cursor >= len(end_positions):
+                    break
+                block_end_exclusive = end_positions[end_cursor] + think_end_width
+                selected = active_positions[block_start : min(block_end_exclusive, length)]
+                thinking_mask[sample_idx, selected] = True
+                if previous_end_exclusive is not None and previous_end_exclusive < block_start:
+                    answering_positions = active_positions[previous_end_exclusive:block_start]
+                    answering_mask[sample_idx, answering_positions] = True
+                previous_end_exclusive = block_end_exclusive
+                end_cursor += 1
+            if previous_end_exclusive is not None and previous_end_exclusive < length:
+                answering_positions = active_positions[previous_end_exclusive:length]
+                answering_mask[sample_idx, answering_positions] = True
+        elif (
             has_start
             and has_end
             and first_start is not None
@@ -871,15 +968,18 @@ def compute_phase_and_special_token_metrics(
             and first_end_exclusive is not None
             and first_start < first_end
         ):
-            thinking_mask[sample_idx, first_start : min(first_end_exclusive, length)] = True
+            selected = active_positions[first_start : min(first_end_exclusive, length)]
+            thinking_mask[sample_idx, selected] = True
             if first_end_exclusive < length:
-                answering_mask[sample_idx, first_end_exclusive:length] = True
+                selected = active_positions[first_end_exclusive:length]
+                answering_mask[sample_idx, selected] = True
         elif has_start and first_start is not None and not has_end:
-            thinking_mask[sample_idx, first_start:length] = True
+            selected = active_positions[first_start:length]
+            thinking_mask[sample_idx, selected] = True
         elif not has_start and has_end and first_end is not None:
-            malformed_mask[sample_idx, :length] = True
+            malformed_mask[sample_idx, active_positions] = True
         if sample_malformed:
-            malformed_mask[sample_idx, :length] = True
+            malformed_mask[sample_idx, active_positions] = True
         carrier_mask[sample_idx] = bool(sample_malformed or unclosed or (clipped_mask[sample_idx] and not has_end))
 
         has_think_start.append(has_start)
@@ -1786,6 +1886,8 @@ def compute_repetition_advantage_metrics(
     valid = response_mask_cpu & torch.isfinite(student_logprobs_cpu) & torch.isfinite(teacher_logprobs_cpu)
     valid = (
         valid
+        & (student_logprobs_cpu <= 1e-6)
+        & (teacher_logprobs_cpu <= 1e-6)
         & (student_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
         & (teacher_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
     )
@@ -1846,6 +1948,9 @@ def compute_opd_diagnostics_metrics(
     overlap_topk: Optional[int] = None,
     special_token_ids: Optional[SpecialTokenIds] = None,
     max_response_length: Optional[int] = None,
+    response_attention_mask: Optional[torch.Tensor] = None,
+    allow_multiple_thinking_blocks: bool = False,
+    trajectory_spans: Optional[list[Any]] = None,
     collect_repetition_metrics: bool = True,
     collect_train_text_zlib_repetition: bool = False,
     repetition_tail_chars: int = 10000,
@@ -1875,6 +1980,15 @@ def compute_opd_diagnostics_metrics(
     _put_if_present(metrics, "opd/response_len/p90", _safe_quantile(response_lens, 0.9))
     response_len_max = float(response_lens.max().item()) if response_lens.numel() else None
     _put_if_present(metrics, "opd/response_len/max", response_len_max)
+    if response_attention_mask is not None:
+        physical_response_lens = response_attention_mask.detach().bool().sum(dim=1).float().cpu()
+        _put_if_present(metrics, "opd/response_physical_len/mean", _safe_mean(physical_response_lens))
+        _put_if_present(metrics, "opd/response_physical_len/p90", _safe_quantile(physical_response_lens, 0.9))
+        _put_if_present(
+            metrics,
+            "opd/response_physical_len/max",
+            float(physical_response_lens.max().item()) if physical_response_lens.numel() else None,
+        )
     repetition_tail_mask: torch.Tensor | None = None
     if collect_repetition_metrics and response_ids is not None:
         repetition_metrics, repetition_tail_mask = compute_token_repetition_and_truncation_metrics(
@@ -1911,13 +2025,23 @@ def compute_opd_diagnostics_metrics(
             response_mask=response_mask,
             special_token_ids=special_token_ids,
             max_response_length=max_response_length,
+            response_attention_mask=response_attention_mask,
+            allow_multiple_thinking_blocks=allow_multiple_thinking_blocks,
+            trajectory_spans=trajectory_spans,
         )
         metrics.update(special_token_resolution_metrics(special_token_ids))
         metrics.update(phase_info.metrics)
 
     student_logprobs_cpu = _to_cpu_float(student_logprobs)
+    response_mask_cpu = response_mask.detach().bool().cpu()
+    positive_student_logprob = torch.isfinite(student_logprobs_cpu) & (student_logprobs_cpu > 1e-6)
+    _put_if_present(
+        metrics,
+        "distillation/student_logprob/positive_token_fraction",
+        _masked_event_fraction(positive_student_logprob, response_mask_cpu),
+    )
     student_prob = student_logprobs_cpu.exp()
-    student_prob_valid = response_mask.detach().bool().cpu() & torch.isfinite(student_prob)
+    student_prob_valid = response_mask_cpu & torch.isfinite(student_prob) & ~positive_student_logprob
     _put_if_present(metrics, "distillation/student_sampled_prob/mean", _masked_mean(student_prob, student_prob_valid))
     _put_if_present(
         metrics,
@@ -1972,6 +2096,8 @@ def compute_opd_diagnostics_metrics(
             gap_value_mask = (
                 torch.isfinite(student_logprobs_cpu)
                 & torch.isfinite(teacher_logprobs_cpu)
+                & (student_logprobs_cpu <= 1e-6)
+                & (teacher_logprobs_cpu <= 1e-6)
                 & (student_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
                 & (teacher_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
             )
@@ -2205,7 +2331,15 @@ def compute_opd_diagnostics_metrics(
     metrics.update(
         compute_bad_tail_metrics(
             response_mask=response_mask,
-            clipped_mask=response_lens >= max_response_length,
+            clipped_mask=(
+                phase_info.clipped_mask
+                if phase_info is not None
+                else (
+                    response_attention_mask.detach().bool().sum(dim=1).cpu() >= max_response_length
+                    if response_attention_mask is not None
+                    else response_lens >= max_response_length
+                )
+            ),
             phase_carrier_mask=None if phase_info is None else phase_info.carrier_mask,
             abs_gap=abs_gap_for_bad_tail,
             token_reward=token_reward_for_bad_tail,
@@ -2265,6 +2399,8 @@ def compute_gap_heatmap_row(
     gap_value_mask = (
         torch.isfinite(student_logprobs_cpu)
         & torch.isfinite(teacher_logprobs_cpu)
+        & (student_logprobs_cpu <= 1e-6)
+        & (teacher_logprobs_cpu <= 1e-6)
         & (student_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
         & (teacher_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
     )
@@ -2298,6 +2434,8 @@ def compute_gap_high_heatmap_row(
     gap_value_mask = (
         torch.isfinite(student_logprobs_cpu)
         & torch.isfinite(teacher_logprobs_cpu)
+        & (student_logprobs_cpu <= 1e-6)
+        & (teacher_logprobs_cpu <= 1e-6)
         & (student_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
         & (teacher_logprobs_cpu.abs() <= MAX_REASONABLE_LOGPROB_ABS)
     )

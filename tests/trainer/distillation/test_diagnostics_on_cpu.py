@@ -283,6 +283,74 @@ def test_phase_parser_handles_deepseek_style_multitoken_think_on_cpu():
     assert info.answering_mask[0, 5:7].all()
 
 
+def test_phase_parser_handles_noncontiguous_tool_masks_and_multiple_thinking_turns_on_cpu():
+    special = SpecialTokenIds(
+        im_end=151645,
+        endoftext=151643,
+        think_start=151667,
+        think_end=151668,
+        im_start=151644,
+        generation_stop_ids=(151645, 151643),
+    )
+    responses = torch.tensor([[151667, 10, 151668, 151644, 151667, 11, 151668, 20, 151645, 0]])
+    response_mask = torch.tensor([[1, 1, 1, 0, 1, 1, 1, 1, 1, 0]], dtype=torch.bool)
+    attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 0]], dtype=torch.bool)
+
+    info = compute_phase_and_special_token_metrics(
+        response_ids=responses,
+        response_mask=response_mask,
+        response_attention_mask=attention_mask,
+        special_token_ids=special,
+        max_response_length=10,
+        allow_multiple_thinking_blocks=True,
+    )
+
+    assert info.metrics["format/malformed_ratio"] == 0.0
+    assert info.metrics["format/generated_im_start_inside_response_ratio"] == 0.0
+    assert info.metrics["response_end/ended_by_generation_stop_count"] == 1.0
+    assert info.thinking_mask[0, :3].all()
+    assert info.thinking_mask[0, 4:7].all()
+    assert info.answering_mask[0, 7:9].all()
+    assert not info.thinking_mask[0, 3]
+
+
+def test_phase_parser_uses_teacher_assistant_spans_for_repaired_thinking_structure_on_cpu():
+    special = SpecialTokenIds(
+        im_end=151645,
+        endoftext=151643,
+        think_start=151667,
+        think_end=151668,
+        im_start=151644,
+        generation_stop_ids=(151645, 151643),
+    )
+    responses = torch.tensor([[151667, 10, 151668, 151644, 151667, 11, 151668, 20, 151645]])
+    response_mask = torch.tensor([[1, 1, 0, 0, 1, 1, 1, 1, 1]], dtype=torch.bool)
+    attention_mask = torch.ones_like(response_mask)
+    spans = [
+        [
+            {"kind": "assistant", "source": "student", "start": 0, "end": 2},
+            {"kind": "assistant", "source": "teacher", "start": 2, "end": 3},
+            {"kind": "tool_observation", "start": 3, "end": 4},
+            {"kind": "assistant", "source": "student", "start": 4, "end": 9},
+        ]
+    ]
+
+    info = compute_phase_and_special_token_metrics(
+        response_ids=responses,
+        response_mask=response_mask,
+        response_attention_mask=attention_mask,
+        special_token_ids=special,
+        max_response_length=9,
+        allow_multiple_thinking_blocks=True,
+        trajectory_spans=spans,
+    )
+
+    assert info.metrics["format/malformed_ratio"] == 0.0
+    assert info.thinking_mask[0, :2].all()
+    assert not info.thinking_mask[0, 2]
+    assert info.thinking_mask[0, 4:7].all()
+
+
 def test_distillation_diagnostics_bad_tail_threshold_validation_on_cpu():
     config = DistillationDiagnosticsConfig(
         bad_tail_min_position=4,
@@ -450,6 +518,20 @@ def test_compute_opd_diagnostics_metrics_logs_late_gap_and_entropy_on_cpu():
     assert metrics["opd/teacher_logprob_nonfinite_bin/0000_0002"] == pytest.approx(1 / 4)
     assert metrics["opd/teacher_logprob_nonfinite_bin/0002_0004"] == 1.0
     assert "opd/reward/correct_auc" in metrics
+
+
+def test_compute_opd_diagnostics_excludes_impossible_positive_logprobs_on_cpu():
+    metrics = compute_opd_diagnostics_metrics(
+        student_logprobs=torch.tensor([[5.0, -1.0]]),
+        teacher_logprobs=torch.tensor([[-1.0, -1.5]]),
+        response_mask=torch.ones((1, 2), dtype=torch.bool),
+        bin_size=2,
+    )
+
+    assert metrics["distillation/student_logprob/positive_token_fraction"] == pytest.approx(0.5)
+    assert metrics["distillation/student_sampled_prob/mean"] == pytest.approx(torch.exp(torch.tensor(-1.0)).item())
+    assert metrics["opd/gap_abs/outlier_token_fraction"] == pytest.approx(0.5)
+    assert metrics["opd/gap_abs/mean"] == pytest.approx(0.5)
 
 
 def test_compute_opd_diagnostics_metrics_logs_repetition_token_zlib_and_advantage_on_cpu():

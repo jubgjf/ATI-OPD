@@ -147,6 +147,8 @@ intervention:
   teacher_segment_loss_mode: opd
   teacher_segment_sft_loss_coef: 1.0
   min_trainable_tokens_after_repair: 1
+  # Protect the tokenization of think tags, while keeping the thought contents
+  # locally repairable. Complete tool-call blocks remain atomic.
   protect_thinking_blocks: true
   thinking_start_text: "<think>"
   thinking_end_text: "</think>"

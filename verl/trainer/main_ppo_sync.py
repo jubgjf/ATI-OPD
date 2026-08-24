@@ -1741,6 +1741,11 @@ class PPOTrainer:
                         response_texts=response_texts,
                         entropy=diagnostics_batch["entropy"],
                         response_mask=diagnostics_batch["response_mask"],
+                        response_attention_mask=(
+                            diagnostics_batch["attention_mask"][:, -diagnostics_batch["response_mask"].shape[-1] :]
+                            if "attention_mask" in diagnostics_batch
+                            else None
+                        ),
                         rm_scores=diagnostics_batch.get("rm_scores", None),
                         bin_size=diagnostics_config.position_bin_size,
                         high_gap_threshold=diagnostics_config.high_gap_threshold,

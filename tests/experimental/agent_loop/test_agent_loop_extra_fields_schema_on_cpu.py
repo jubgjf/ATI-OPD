@@ -4054,3 +4054,48 @@ async def test_skip_correct_allows_incorrect_on_policy_answer_to_continue_throug
     assert len(teacher_manager.scored_sequences) == 2
     assert len(worker.llm_client.calls) == (2 if confirmation_mode == "future_gap" else 1)
     assert len(teacher_manager.generated_prefixes) == 1
+
+
+@pytest.mark.asyncio
+async def test_skip_correct_stops_after_first_repair_that_becomes_correct_on_cpu():
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[31], stop_reason="completed", finish_reason="length"),
+        high_gap_start=0,
+        high_gap_width=1,
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=8,
+        student_segment_length=1,
+        teacher_segment_length=1,
+        max_interventions_per_sample=2,
+        skip_correct=True,
+    )
+    reward_handle = _SequenceAwareRewardHandle()
+    worker.reward_loop_worker_handles = [reward_handle]
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4],
+        response_mask=[1, 1, 1, 1],
+        response_logprobs=[-0.1] * 4,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "skip-after-correct-repair"},
+    )
+
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        data_source="openai/gsm8k",
+    )
+
+    assert internal.extra_fields["teacher_intervention_count"] == 1
+    outcome = internal.extra_fields["teacher_intervention_outcome"]
+    assert outcome["skip_correct_after_repair_applied"] is True
+    assert outcome["repair_stop_reason"] == "correct_after_repair"
+    assert outcome["post_repair_correctness_checks"] == [
+        {"intervention_count": 1, "correctness_value": 1.0, "correct": True}
+    ]
+    assert len(reward_handle.compute_score.responses) == 2

@@ -40,6 +40,10 @@ from verl.workers.rollout.replica import TokenOutput
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# This is a protocol-failure circuit breaker, not a limit on valid tool use.
+# Repeated valid calls remain bounded only by the response-token budget.
+MAX_CONSECUTIVE_PROTOCOL_ERRORS = 3
+
 
 class AgentState(Enum):
     PENDING = "pending"
@@ -85,6 +89,9 @@ class AgentData:
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
         self.pending_tool_event_indices: list[int] = []
+        self.pending_tool_protocol_error: Optional[str] = None
+        self.consecutive_protocol_errors = 0
+        self.protocol_error_limit_reached = False
 
         # Response-relative structured trajectory metadata.  It survives DMPD
         # suffix rewrites and is also used to derive tool-specific metrics.
@@ -256,6 +263,7 @@ class ToolAgentLoop(AgentLoopBase):
             for status in ("timeout", "runtime_error", "http_error", "syntax_error", "protocol_error")
         }
         markdown_count = sum(bool(event.get("markdown_extracted")) for event in events)
+        recovered_parse_count = sum(bool(event.get("parse_recovery")) for event in events)
         any_tool = attempts > 0
         final_after_tool = bool(any_tool and agent_data.last_final_assistant_ids)
         return {
@@ -265,12 +273,13 @@ class ToolAgentLoop(AgentLoopBase):
             "tool_call/parse_success_rate": float(parsed / attempts) if attempts else 0.0,
             "tool_call/parse_failure_rate": float((attempts - parsed) / attempts) if attempts else 0.0,
             "tool_call/execution_success_rate": float(executed / parsed) if parsed else 0.0,
-            "tool_call/protocol_error_rate": float(status_counts["protocol_error"] / parsed) if parsed else 0.0,
+            "tool_call/protocol_error_rate": float(status_counts["protocol_error"] / attempts) if attempts else 0.0,
             "tool_call/timeout_rate": float(status_counts["timeout"] / parsed) if parsed else 0.0,
             "tool_call/runtime_error_rate": float(status_counts["runtime_error"] / parsed) if parsed else 0.0,
             "tool_call/http_error_rate": float(status_counts["http_error"] / parsed) if parsed else 0.0,
             "tool_call/syntax_error_rate": float(status_counts["syntax_error"] / parsed) if parsed else 0.0,
             "tool_call/markdown_extraction_rate": float(markdown_count / parsed) if parsed else 0.0,
+            "tool_call/parse_recovery_rate": float(recovered_parse_count / parsed) if parsed else 0.0,
             "tool_call/student_call_rate": float(student_calls > 0),
             "tool_call/teacher_call_rate": float(teacher_calls > 0),
             "tool_call/student_calls": int(student_calls),
@@ -279,6 +288,7 @@ class ToolAgentLoop(AgentLoopBase):
             "tool_call/observation_tokens": int(observation_tokens),
             "tool_call/final_answer_after_tool": float(final_after_tool),
             "tool_call/ended_after_observation": float(agent_data.ended_after_observation),
+            "tool_call/protocol_error_limit_reached": float(agent_data.protocol_error_limit_reached),
             "tool_call/response_tokens": len(response_ids),
         }
 
@@ -434,6 +444,7 @@ class ToolAgentLoop(AgentLoopBase):
         ]
 
         agent_data.pending_tool_event_indices = []
+        agent_data.pending_tool_protocol_error = inspection["reason"]
         attempt_count = max(len(ranges), len(calls), int(inspection["has_any_tag"]))
         for call_index in range(attempt_count):
             call = calls[call_index] if call_index < len(calls) else None
@@ -445,6 +456,7 @@ class ToolAgentLoop(AgentLoopBase):
                 "name": call.name if call is not None else None,
                 "parse_status": parse_status,
                 "execution_status": None,
+                "parse_recovery": call.parse_recovery if call is not None else None,
                 "call_start": response_start + call_range[0] if call_range else None,
                 "call_end": response_start + call_range[1] if call_range else None,
             }
@@ -533,9 +545,27 @@ class ToolAgentLoop(AgentLoopBase):
         if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
             return AgentState.TERMINATED
 
-        if has_valid_calls:
+        if has_valid_calls or inspection["has_any_tag"]:
             return AgentState.PROCESSING_TOOLS
         return AgentState.TERMINATED
+
+    @staticmethod
+    def _tool_protocol_error_text(reason: Optional[str]) -> str:
+        if reason == "multiple_tool_calls_in_assistant_turn":
+            detail = "Exactly one tool call is allowed in each assistant turn."
+        elif reason == "incomplete_or_unbalanced_tool_call":
+            detail = "The <tool_call> block is incomplete or its tags are unbalanced."
+        elif reason in {"malformed_teacher_tool_call_json", "tool_call_missing_complete_tags"}:
+            detail = (
+                "The tool-call JSON is malformed. JSON strings must escape quotes and control characters, "
+                "and the object must contain name and arguments."
+            )
+        else:
+            detail = "The tool call does not match the required protocol."
+        return (
+            f"[tool protocol_error] {detail} Return exactly one complete "
+            '<tool_call>{"name": "...", "arguments": {...}}</tool_call> block and try again.'
+        )
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         """Handle the processing tools state: execute tool calls and prepare tool responses."""
@@ -545,17 +575,12 @@ class ToolAgentLoop(AgentLoopBase):
         # This experiment intentionally permits one call per assistant turn.
         # Multiple calls are made observable to the model instead of silently
         # dropping everything after max_parallel_calls.
-        protocol_error = len(agent_data.tool_calls) != 1
+        protocol_error = agent_data.pending_tool_protocol_error is not None or len(agent_data.tool_calls) != 1
         tool_call_names = [tool_call.name for tool_call in agent_data.tool_calls]
         if protocol_error:
             responses = [
                 (
-                    ToolResponse(
-                        text=(
-                            "[tool protocol_error] Exactly one tool call is allowed in each assistant turn. "
-                            "Please issue one call and try again."
-                        )
-                    ),
+                    ToolResponse(text=self._tool_protocol_error_text(agent_data.pending_tool_protocol_error)),
                     0.0,
                     {"tool_execution_status": "protocol_error"},
                 )
@@ -663,6 +688,10 @@ class ToolAgentLoop(AgentLoopBase):
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
         execution_status = response_metrics[0].get("tool_execution_status", "success") if response_metrics else "error"
+        if execution_status == "protocol_error":
+            agent_data.consecutive_protocol_errors += 1
+        else:
+            agent_data.consecutive_protocol_errors = 0
         observation_span = {
             "kind": "tool_observation",
             "turn": agent_data.user_turns + 1,
@@ -678,8 +707,13 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.user_turns += 1
         agent_data.tool_calls = []
         agent_data.pending_tool_event_indices = []
+        agent_data.pending_tool_protocol_error = None
         if len(agent_data.response_mask) >= self.response_length:
             agent_data.ended_after_observation = True
+            return AgentState.TERMINATED
+        if agent_data.consecutive_protocol_errors >= MAX_CONSECUTIVE_PROTOCOL_ERRORS:
+            agent_data.ended_after_observation = True
+            agent_data.protocol_error_limit_reached = True
             return AgentState.TERMINATED
         # Tool observations always hand control back to the student rollout
         # server.  This matters after a teacher intervention: the repaired

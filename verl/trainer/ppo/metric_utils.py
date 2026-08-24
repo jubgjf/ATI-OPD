@@ -683,25 +683,33 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
-    tool_metric_keys = (
-        "tool_call/attempt_rate",
-        "tool_call/parse_success_rate",
-        "tool_call/parse_failure_rate",
-        "tool_call/execution_success_rate",
-        "tool_call/protocol_error_rate",
-        "tool_call/timeout_rate",
-        "tool_call/runtime_error_rate",
-        "tool_call/http_error_rate",
-        "tool_call/syntax_error_rate",
-        "tool_call/markdown_extraction_rate",
-        "tool_call/student_call_rate",
-        "tool_call/teacher_call_rate",
-        "tool_call/student_calls",
-        "tool_call/teacher_calls",
-        "tool_call/calls_per_trajectory",
-        "tool_call/observation_tokens",
-        "tool_call/final_answer_after_tool",
-        "tool_call/ended_after_observation",
+    tool_metric_suffixes = (
+        "attempt_rate",
+        "parse_success_rate",
+        "parse_failure_rate",
+        "parse_recovery_rate",
+        "execution_success_rate",
+        "protocol_error_rate",
+        "timeout_rate",
+        "runtime_error_rate",
+        "http_error_rate",
+        "syntax_error_rate",
+        "markdown_extraction_rate",
+        "student_call_rate",
+        "teacher_call_rate",
+        "student_calls",
+        "teacher_calls",
+        "calls_per_trajectory",
+        "observation_tokens",
+        "final_answer_after_tool",
+        "ended_after_observation",
+        "protocol_error_limit_reached",
+    )
+    tool_metric_keys = tuple(
+        f"tool_call/{phase_prefix}{suffix}"
+        for phase_prefix in ("", "raw/", "final/")
+        for suffix in tool_metric_suffixes
+    ) + (
         "tool_call/dmpd_repair_count",
         "tool_call/dmpd_safe_boundary_expansion_count",
         "tool_call/dmpd_repair_rejection_count",

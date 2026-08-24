@@ -266,6 +266,9 @@ class DistillationInterventionConfig(BaseConfig):
     teacher_segment_loss_mode: str = "opd"
     teacher_segment_sft_loss_coef: float = 1.0
     min_trainable_tokens_after_repair: int = 1
+    # Keep think-tag token sequences structurally intact. The contents between
+    # the tags remain eligible for local fixed-token repair; only tool-call
+    # blocks are expanded atomically.
     protect_thinking_blocks: bool = True
     thinking_start_text: str = "<think>"
     thinking_end_text: str = "</think>"

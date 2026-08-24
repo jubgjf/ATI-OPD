@@ -88,12 +88,14 @@ class _ToolDMPDTeacherManager:
         high_gap_start: int | None = None,
         high_gap_markers: list[str | None] | None = None,
         teacher_text: str | list[str],
+        teacher_finish_reason: str = "stop",
     ):
         self.tokenizer = tokenizer
         self.prompt_length = prompt_length
         self.high_gap_start = high_gap_start
         self.high_gap_markers = high_gap_markers
         self.teacher_texts = [teacher_text] if isinstance(teacher_text, str) else list(teacher_text)
+        self.teacher_finish_reason = teacher_finish_reason
         self.score_calls = 0
         self.generated_prefixes: list[list[int]] = []
 
@@ -126,7 +128,11 @@ class _ToolDMPDTeacherManager:
         text_index = min(len(self.generated_prefixes) - 1, len(self.teacher_texts) - 1)
         token_ids = self.tokenizer.encode(self.teacher_texts[text_index])
         assert len(token_ids) <= max_tokens
-        return TeacherGenerationResult(token_ids=token_ids, stop_reason="completed", finish_reason="stop")
+        return TeacherGenerationResult(
+            token_ids=token_ids,
+            stop_reason="completed",
+            finish_reason=self.teacher_finish_reason,
+        )
 
 
 class _ToolDMPDWorker:
@@ -141,16 +147,20 @@ class _ToolDMPDWorker:
         *,
         max_interventions_per_sample: int = 1,
         skip_correct: bool = False,
+        student_segment_length: int = 2,
+        teacher_segment_length: int = 512,
+        gap_aggregation: str = "mean",
     ):
         self.tokenizer = tokenizer
         self.teacher_server_manager = teacher_manager
         self.teacher_intervention_enabled = True
         self.teacher_intervention_config = DistillationInterventionConfig(
             enabled=True,
-            student_segment_length=2,
-            teacher_segment_length=512,
+            student_segment_length=student_segment_length,
+            teacher_segment_length=teacher_segment_length,
             gap_metric="abs",
             gap_threshold=1.0,
+            gap_aggregation=gap_aggregation,
             max_interventions_per_sample=max_interventions_per_sample,
             skip_correct=skip_correct,
             train_on_teacher_segments=True,
@@ -293,13 +303,50 @@ async def test_response_budget_can_end_immediately_after_truncated_observation_o
 @pytest.mark.asyncio
 async def test_malformed_tool_json_is_tracked_and_not_executed_on_cpu():
     malformed = '<tool_call>{"name":"code_interpreter","arguments":</tool_call>'
-    loop, _, counter = _make_loop([malformed])
+    loop, tokenizer, counter = _make_loop([malformed, "\\boxed{0}"])
     output = await loop.run({"max_tokens": 4096}, raw_prompt=[{"role": "user", "content": "q"}])
 
     assert counter.get("calls", 0) == 0
     assert output.extra_fields["tool_call_attempts"] == 1
     assert output.extra_fields["tool_call/parse_success_rate"] == 0.0
+    assert output.extra_fields["tool_events"][0]["execution_status"] == "protocol_error"
+    assert any(span.get("tool_name") == "protocol_error" for span in output.extra_fields["trajectory_spans"])
+    assert output.extra_fields["reward_response_ids"] == tokenizer.encode("\\boxed{0}")
+
+
+@pytest.mark.asyncio
+async def test_repeated_protocol_errors_stop_without_limiting_valid_tool_calls_on_cpu():
+    malformed = '<tool_call>{"name":"code_interpreter","arguments":</tool_call>'
+    loop, _, counter = _make_loop([malformed, malformed, malformed])
+
+    output = await loop.run({"max_tokens": 4096}, raw_prompt=[{"role": "user", "content": "q"}])
+
+    assert counter.get("calls", 0) == 0
+    assert output.extra_fields["tool_call_attempts"] == 3
+    assert output.extra_fields["tool_call/protocol_error_rate"] == 1.0
+    assert output.extra_fields["tool_call/protocol_error_limit_reached"] == 1.0
+    assert output.extra_fields["tool_call/ended_after_observation"] == 1.0
     assert output.extra_fields["reward_response_ids"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_call",
+    [
+        '<tool_call>{"name":"code_interpreter","arguments":{"code":"x = 1\nx + 1"}}</tool_call>',
+        '<tool_call>{"code":"6 * 7"}</tool_call>',
+    ],
+)
+async def test_unambiguous_hermes_tool_call_variants_are_recovered_on_cpu(tool_call: str):
+    loop, tokenizer, counter = _make_loop([tool_call, "\\boxed{42}"])
+
+    output = await loop.run({"max_tokens": 4096}, raw_prompt=[{"role": "user", "content": "q"}])
+
+    assert counter["calls"] == 1
+    assert output.extra_fields["tool_call/parse_success_rate"] == 1.0
+    assert output.extra_fields["tool_call/parse_recovery_rate"] == 1.0
+    assert output.extra_fields["tool_events"][0]["parse_recovery"]
+    assert output.extra_fields["reward_response_ids"] == tokenizer.encode("\\boxed{42}")
 
 
 @pytest.mark.asyncio
@@ -469,6 +516,7 @@ async def test_dmpd_repair_executes_teacher_tool_and_discards_stale_environment_
                     "observation_end": stale_observation_end,
                 }
             ],
+            "tool_call/attempt_rate": 0.25,
         },
     )
 
@@ -517,6 +565,8 @@ async def test_dmpd_repair_executes_teacher_tool_and_discards_stale_environment_
     )
     assert output.extra_fields["tool_call/dmpd_repair_count"] == 1
     assert output.extra_fields["tool_call/dmpd_safe_boundary_expansion_count"] == 1
+    assert output.extra_fields["tool_call/raw/attempt_rate"] == 0.25
+    assert output.extra_fields["tool_call/final/attempt_rate"] == 1.0
     assert output.extra_fields["reward_response_ids"] == tokenizer.encode(final_answer)
 
 
@@ -583,6 +633,69 @@ async def test_dmpd_multiple_repairs_rescore_latest_tool_trajectory_on_cpu():
         assert output.teacher_segment_mask[span["start"] : span["end"]] == [1] * (span["end"] - span["start"])
     assert tokenizer.decode(output.response_ids).endswith(final_answer)
     assert output.extra_fields["reward_response_ids"] == tokenizer.encode(final_answer)
+
+
+@pytest.mark.asyncio
+async def test_dmpd_repair_inside_long_thinking_keeps_local_128_token_prefix_on_cpu():
+    teacher_segment = "T" * 128
+    student_suffix = "continued reasoning</think>\\boxed{42}"
+    loop, tokenizer, _ = _make_loop([student_suffix])
+    prompt_ids = tokenizer.encode("prompt")
+    original_text = "<think>" + ("a" * 256) + "GAP" + ("b" * 160) + "</think>\\boxed{0}"
+    original_ids = tokenizer.encode(original_text)
+    teacher_manager = _ToolDMPDTeacherManager(
+        tokenizer,
+        prompt_length=len(prompt_ids),
+        high_gap_markers=["GAP", None],
+        teacher_text=teacher_segment,
+        teacher_finish_reason="length",
+    )
+    worker = _ToolDMPDWorker(
+        tokenizer,
+        teacher_manager,
+        student_segment_length=128,
+        teacher_segment_length=128,
+        gap_aggregation="max",
+    )
+    output = AgentLoopOutput(
+        prompt_ids=prompt_ids,
+        response_ids=original_ids,
+        response_mask=[1] * len(original_ids),
+        response_logprobs=[-0.1] * len(original_ids),
+        metrics=AgentLoopMetrics(),
+        extra_fields={
+            "rollout_request_id": "tool-dmpd-local-thinking",
+            "trajectory_spans": [
+                {
+                    "kind": "assistant",
+                    "source": "student",
+                    "turn": 1,
+                    "start": 0,
+                    "end": len(original_ids),
+                    "tool_call_ranges": [],
+                }
+            ],
+            "tool_events": [],
+        },
+    )
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"max_tokens": 2048},
+        sample_kwargs={"raw_prompt": [{"role": "user", "content": "q"}]},
+        agent_loop=loop,
+    )
+
+    intervention = output.extra_fields["teacher_interventions"][0]
+    assert intervention["applied_start"] == 256
+    assert intervention["applied_end"] == 384
+    assert intervention["safe_boundary_expanded"] is False
+    assert intervention["teacher_tokens"] == 128
+    assert teacher_manager.generated_prefixes == [prompt_ids + original_ids[:256]]
+    assert tokenizer.decode(output.response_ids).startswith(original_text[:256] + teacher_segment)
+    assert tokenizer.decode(output.response_ids).endswith(student_suffix)
 
 
 @pytest.mark.asyncio
@@ -672,6 +785,8 @@ async def test_dmpd_skip_correct_scores_only_final_assistant_and_preserves_tool_
     assert output.teacher_segment_mask == [0] * len(original_ids)
     assert output.extra_fields["teacher_intervention_count"] == 0
     assert output.extra_fields["teacher_intervention_skipped"][0]["reason"] == "skip_correct"
+    assert output.extra_fields["tool_call/raw/attempt_rate"] == 1.0
+    assert output.extra_fields["tool_call/final/attempt_rate"] == 1.0
     assert output.extra_fields["reward_response_ids"] == tokenizer.encode(final_answer)
 
 
@@ -703,9 +818,9 @@ def test_observation_tokens_do_not_contribute_to_gap_trigger_on_cpu():
     assert _select_intervention_segment(gaps, [1, 0, 0, 1], config) is None
 
 
-@pytest.mark.parametrize(("open_tag", "close_tag"), [("<think>", "</think>"), ("<tool_call>", "</tool_call>")])
-def test_intervention_boundaries_expand_outside_think_and_tool_call_blocks_on_cpu(open_tag: str, close_tag: str):
+def test_intervention_boundaries_expand_outside_tool_call_blocks_on_cpu():
     tokenizer = _CharTokenizer()
+    open_tag, close_tag = "<tool_call>", "</tool_call>"
     text = f"aa{open_tag}payload{close_tag}zz"
     token_ids = tokenizer.encode(text)
     block_start = text.index(open_tag)
@@ -725,3 +840,28 @@ def test_intervention_boundaries_expand_outside_think_and_tool_call_blocks_on_cp
     )
 
     assert (start, end) == (block_start, block_end)
+
+
+def test_intervention_inside_long_thinking_block_stays_local_on_cpu():
+    tokenizer = _CharTokenizer()
+    payload = "x" * 1024
+    text = f"<think>{payload}</think>answer"
+    token_ids = tokenizer.encode(text)
+    local_start = text.index(payload) + 384
+    local_end = local_start + 128
+    dummy = SimpleNamespace(
+        _teacher_intervention_thinking_start_pattern=tokenizer.encode("<think>"),
+        _teacher_intervention_thinking_end_pattern=tokenizer.encode("</think>"),
+        _teacher_intervention_tool_call_start_pattern=tokenizer.encode("<tool_call>"),
+        _teacher_intervention_tool_call_end_pattern=tokenizer.encode("</tool_call>"),
+    )
+
+    start, end = AgentLoopWorker._expand_teacher_intervention_segment_for_token_patterns(
+        dummy,
+        token_ids,
+        local_start,
+        local_end,
+    )
+
+    assert (start, end) == (local_start, local_end)
+    assert end - start == 128
