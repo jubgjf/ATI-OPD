@@ -46,7 +46,6 @@ def test_teacher_segment_loss_config_defaults_to_legacy_opd_on_cpu():
     assert config.teacher_nll_calibration_min_samples == 16
     assert config.teacher_nll_initial_threshold is None
     assert config.teacher_nll_healthy_probe_probability == 0.1
-    assert config.repair_for_evaluation is False
 
 
 def test_joint_rlvr_loss_config_defaults_and_validation_on_cpu():
@@ -147,12 +146,6 @@ def test_intervention_outcome_observation_config_defaults_and_validation_on_cpu(
         DistillationDiagnosticsConfig(intervention_boundary_text_samples_per_step=-1)
     with pytest.raises(ValueError, match="intervention_boundary_text_context_tokens"):
         DistillationDiagnosticsConfig(intervention_boundary_text_context_tokens=0)
-
-    with pytest.raises(ValueError, match="repair_for_evaluation=true"):
-        DistillationInterventionConfig(repair_for_evaluation=True)
-
-    enabled = DistillationInterventionConfig(enabled=True, repair_for_evaluation=True)
-    assert enabled.repair_for_evaluation is True
 
     config = OmegaConf.create(
         {
@@ -468,7 +461,6 @@ def test_student_support_strategies_reject_silent_fallback_training_paths_on_cpu
     [
         ({"confirmation_mode": "future_gap"}, "future_gap"),
         ({"outcome_aware_candidate_selection_enabled": True}, "outcome_aware"),
-        ({"repair_for_evaluation": True}, "repair_for_evaluation"),
     ],
 )
 def test_tool_aware_dmpd_unsupported_modes_fail_during_config_validation_on_cpu(

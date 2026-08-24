@@ -39,7 +39,6 @@ METHOD_HYDRA_OVERRIDES=(
     "distillation.intervention.teacher_top_k=${teacher_intervention_top_k}"
     "distillation.intervention.confirmation_mode=none"
     "distillation.intervention.outcome_aware_candidate_selection_enabled=False"
-    "distillation.intervention.repair_for_evaluation=False"
     "distillation.diagnostics.collect_intervention_outcome_transitions=False"
 )
 

@@ -270,10 +270,6 @@ class DistillationInterventionConfig(BaseConfig):
     teacher_temperature: float = 0.6
     teacher_top_p: float = 0.95
     teacher_top_k: int = 20
-    # Opt-in paired student/repair evaluation. The raw student rollout remains
-    # the canonical validation result; the repaired branch is reported under a
-    # separate metric namespace.
-    repair_for_evaluation: bool = False
     # Opt-in outcome-aware candidate selection. Keeping this disabled preserves
     # the legacy one-teacher-segment intervention path exactly.
     outcome_aware_candidate_selection_enabled: bool = False
@@ -392,8 +388,6 @@ class DistillationInterventionConfig(BaseConfig):
             raise ValueError(f"teacher_top_p must be in (0, 1], got {self.teacher_top_p!r}.")
         if self.teacher_top_k < -1:
             raise ValueError(f"teacher_top_k must be -1 or non-negative, got {self.teacher_top_k!r}.")
-        if self.repair_for_evaluation and not self.enabled:
-            raise ValueError("repair_for_evaluation=true requires distillation.intervention.enabled=true.")
         if self.outcome_aware_candidate_selection_enabled and not self.enabled:
             raise ValueError(
                 "outcome_aware_candidate_selection_enabled=true requires distillation.intervention.enabled=true."

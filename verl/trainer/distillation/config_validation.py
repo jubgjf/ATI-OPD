@@ -35,9 +35,6 @@ def validate_distillation_intervention_training_config(config: Any) -> None:
     if not is_distillation_enabled(distillation_config):
         return
     intervention_enabled = bool(_get_nested(distillation_config, "intervention", "enabled", default=False))
-    repair_for_evaluation = bool(
-        _get_nested(distillation_config, "intervention", "repair_for_evaluation", default=False)
-    )
     diagnostics_enabled = bool(_get_nested(distillation_config, "diagnostics", "enabled", default=False))
     collect_intervention_metrics = bool(
         _get_nested(distillation_config, "diagnostics", "collect_intervention_metrics", default=True)
@@ -60,10 +57,6 @@ def validate_distillation_intervention_training_config(config: Any) -> None:
     )
     if outcome_case_samples_per_transition < 0:
         raise ValueError("distillation.diagnostics.outcome_case_samples_per_transition must be non-negative.")
-    if repair_for_evaluation and not intervention_enabled:
-        raise ValueError(
-            "distillation.intervention.repair_for_evaluation=true requires distillation.intervention.enabled=true."
-        )
     tool_agent_enabled = bool(
         _get_nested(config, "actor_rollout_ref", "rollout", "multi_turn", "enable", default=False)
         and _get_nested(
@@ -94,11 +87,6 @@ def validate_distillation_intervention_training_config(config: Any) -> None:
             raise ValueError(
                 "Tool-aware DMPD does not yet support "
                 "distillation.intervention.outcome_aware_candidate_selection_enabled=true."
-            )
-        if repair_for_evaluation:
-            raise ValueError(
-                "Tool-aware DMPD does not yet support "
-                "distillation.intervention.repair_for_evaluation=true; keep repair evaluation disabled."
             )
     if collect_outcome_transitions and not intervention_enabled:
         raise ValueError(

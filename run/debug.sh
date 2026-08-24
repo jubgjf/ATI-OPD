@@ -119,7 +119,7 @@ TEST_TEMPERATURE=${TEST_TEMPERATURE:-0.7}
 TEST_TOP_P=${TEST_TOP_P:-0.95}
 TEST_TOP_K=${TEST_TOP_K:-$ROLLOUT_TOP_K}
 TEST_DO_SAMPLE=${TEST_DO_SAMPLE:-True}
-TEST_N=${TEST_N:-16}
+TEST_BENCHMARK_N=${TEST_BENCHMARK_N:-${TEST_N:-16}}
 ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}
 TEACHER_ENFORCE_EAGER=${TEACHER_ENFORCE_EAGER:-False}
 SKIP_TOKENIZER_INIT=${SKIP_TOKENIZER_INIT:-True}
@@ -150,7 +150,6 @@ TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
 TRAINER_VAL_ONLY=${TRAINER_VAL_ONLY:-False}
 TEST_BENCHMARKS_MAX_RESPONSE_LENGTH=${TEST_BENCHMARKS_MAX_RESPONSE_LENGTH:-$MAX_RESPONSE_LENGTH}
 SAVE_FREQ=${SAVE_FREQ:--1}
-CHECKPOINT_EVALUATION_MANIFEST=${CHECKPOINT_EVALUATION_MANIFEST:-True}
 METRIC_LOGGING_MODE=${METRIC_LOGGING_MODE:-balanced}
 METRIC_LOGGING_RESUME_POLICY=${METRIC_LOGGING_RESUME_POLICY:-strict}
 METRIC_LOGGING_LIVE_KEY_WARNING_THRESHOLD=${METRIC_LOGGING_LIVE_KEY_WARNING_THRESHOLD:-250}
@@ -261,11 +260,11 @@ case "$IN_TRAIN_EVALUATION" in
         ;;
     True | true | 1)
         IN_TRAIN_EVALUATION=True
-        VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
+        VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-False}
         TEST_BEFORE_TRAIN=${TEST_BEFORE_TRAIN:-False}
         TEACHER_VAL_BEFORE_TRAIN=${TEACHER_VAL_BEFORE_TRAIN:-False}
         TEST_FREQ=${TEST_FREQ:--1}
-        TEST_BENCHMARKS_FREQ=${TEST_BENCHMARKS_FREQ:--1}
+        TEST_BENCHMARKS_FREQ=${TEST_BENCHMARKS_FREQ:-20}
         ;;
     *)
         echo "IN_TRAIN_EVALUATION must be True or False, got: $IN_TRAIN_EVALUATION" >&2
@@ -364,7 +363,6 @@ case "$DEBUG_MODE" in
             "distillation.intervention.teacher_top_k=${TEACHER_INTERVENTION_TOP_K}"
             "distillation.intervention.confirmation_mode=none"
             "distillation.intervention.outcome_aware_candidate_selection_enabled=False"
-            "distillation.intervention.repair_for_evaluation=False"
             "distillation.diagnostics.collect_intervention_outcome_transitions=False"
         )
         ;;
@@ -470,7 +468,17 @@ COMMON_OVERRIDES=(
     "actor_rollout_ref.rollout.test_kwargs.do_sample=${TEST_DO_SAMPLE}"
     "actor_rollout_ref.rollout.test_kwargs.top_p=${TEST_TOP_P}"
     "actor_rollout_ref.rollout.test_kwargs.top_k=${TEST_TOP_K}"
-    "actor_rollout_ref.rollout.test_kwargs.n=${TEST_N}"
+    "actor_rollout_ref.rollout.test_kwargs.n=${TEST_BENCHMARK_N}"
+    "actor_rollout_ref.rollout.benchmark_sampling_profiles.legacy.temperature=${TEST_TEMPERATURE}"
+    "actor_rollout_ref.rollout.benchmark_sampling_profiles.legacy.top_p=${TEST_TOP_P}"
+    "actor_rollout_ref.rollout.benchmark_sampling_profiles.legacy.top_k=${TEST_TOP_K}"
+    "actor_rollout_ref.rollout.benchmark_sampling_profiles.legacy.do_sample=${TEST_DO_SAMPLE}"
+    "actor_rollout_ref.rollout.benchmark_sampling_profiles.legacy.n=${TEST_BENCHMARK_N}"
+    "actor_rollout_ref.rollout.benchmark_sampling_profiles.train_sampling.temperature=${ROLLOUT_TEMPERATURE}"
+    "actor_rollout_ref.rollout.benchmark_sampling_profiles.train_sampling.top_p=${ROLLOUT_TOP_P}"
+    "actor_rollout_ref.rollout.benchmark_sampling_profiles.train_sampling.top_k=${ROLLOUT_TOP_K}"
+    "actor_rollout_ref.rollout.benchmark_sampling_profiles.train_sampling.do_sample=${ROLLOUT_DO_SAMPLE}"
+    "actor_rollout_ref.rollout.benchmark_sampling_profiles.train_sampling.n=${TEST_BENCHMARK_N}"
     "reward.reward_manager.name=naive"
     "critic.enable=False"
     "trainer.balance_batch=True"
@@ -489,7 +497,6 @@ COMMON_OVERRIDES=(
     "trainer.nnodes=${STUDENT_NNODES}"
     "trainer.device=cuda"
     "trainer.default_local_dir=${DEFAULT_LOCAL_DIR}"
-    "trainer.checkpoint_evaluation_manifest=${CHECKPOINT_EVALUATION_MANIFEST}"
     "trainer.val_before_train=${VAL_BEFORE_TRAIN}"
     "trainer.test_before_train=${TEST_BEFORE_TRAIN}"
     "trainer.teacher_val_before_train=${TEACHER_VAL_BEFORE_TRAIN}"
@@ -717,7 +724,7 @@ cat <<EOF
   wandb/ckpt:   WANDB_MODE=${WANDB_MODE}, WANDB_DIR=${WANDB_DIR:-default}, WANDB_DATA_DIR=${WANDB_DATA_DIR:-default}, WANDB_CACHE_DIR=${WANDB_CACHE_DIR:-default}, run_id=${WANDB_RUN_ID:-unset}, resume=${WANDB_RESUME:-unset}, save_freq=${SAVE_FREQ}
   train eval:   enabled=${IN_TRAIN_EVALUATION}, val_before=${VAL_BEFORE_TRAIN}, test_before=${TEST_BEFORE_TRAIN}, teacher_val_before=${TEACHER_VAL_BEFORE_TRAIN}, val_freq=${TEST_FREQ}, benchmark_freq=${TEST_BENCHMARKS_FREQ}
   val logging:  test_freq=${TEST_FREQ}, samples=${VAL_MAX_SAMPLES}, table_preview_rows=${LOG_VAL_GENERATIONS}
-  benchmarks:   before_train=${TEST_BEFORE_TRAIN}, freq=${TEST_BENCHMARKS_FREQ}, n=${TEST_N}, names=${TEST_BENCHMARKS}
+  benchmarks:   before_train=${TEST_BEFORE_TRAIN}, freq=${TEST_BENCHMARKS_FREQ}, n=${TEST_BENCHMARK_N}, names=${TEST_BENCHMARKS}
 EOF
 
 if [[ "$DRY_RUN" == "1" ]]; then

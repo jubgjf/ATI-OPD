@@ -100,11 +100,13 @@ _KNOWN_ALIAS_KEYS = frozenset(
         "response_length/main_mass_mean",
     }
 )
-_EVAL_AUX_PREFIXES = ("val-aux/", "test-aux/", "teacher-val-aux/")
-_REPAIR_EVAL_SCOPES = ("val-oracle-repair", "test-oracle-repair", "val-repair", "test-repair")
-_REPAIR_EVAL_AUX_PREFIXES = tuple(f"{scope}-aux/" for scope in _REPAIR_EVAL_SCOPES)
-_REPAIR_EVAL_CORE_PREFIXES = tuple(f"{scope}-core/" for scope in _REPAIR_EVAL_SCOPES)
-_REPAIR_EVAL_LIVE_CORE_RE = re.compile(r"/(?:acc|reward)/(?:mean|paired_delta)@\d+$")
+_BENCHMARK_EVAL_SCOPES = ("test-legacy", "test-train-sampling")
+_EVAL_AUX_PREFIXES = (
+    "val-aux/",
+    "test-aux/",
+    "teacher-val-aux/",
+    *(f"{scope}-aux/" for scope in _BENCHMARK_EVAL_SCOPES),
+)
 _LIVE_INTERVENTION_KEYS = frozenset(
     {
         "opd_intervention/rate",
@@ -1571,10 +1573,6 @@ def _coerce_numeric(value: Any) -> tuple[float, str] | None:
 def _should_archive_metric(metric_key: str, configured_topk: int | None) -> bool:
     if metric_key.startswith("opd_intervention/"):
         return metric_key not in _LIVE_INTERVENTION_KEYS
-    if metric_key.startswith(_REPAIR_EVAL_AUX_PREFIXES):
-        return True
-    if metric_key.startswith(_REPAIR_EVAL_CORE_PREFIXES):
-        return _REPAIR_EVAL_LIVE_CORE_RE.search(metric_key) is None
     if metric_key.startswith(_ALWAYS_ARCHIVE_PREFIXES):
         return True
     if metric_key.startswith(_DYNAMIC_REASON_PREFIXES):
@@ -1626,7 +1624,7 @@ def _parse_metric_dimensions(metric_key: str) -> dict[str, Any]:
     coarse_match = _COARSE_RE.search(metric_key)
     topk_matches = list(_TOPK_RE.finditer(metric_key))
     eval_scope = None
-    for prefix in (*_REPAIR_EVAL_SCOPES, "teacher-val", "test", "val"):
+    for prefix in (*_BENCHMARK_EVAL_SCOPES, "teacher-val", "test", "val"):
         if metric_key.startswith(f"{prefix}-"):
             eval_scope = prefix
             break

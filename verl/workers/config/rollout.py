@@ -210,6 +210,10 @@ class RolloutConfig(BaseConfig):
 
     test_kwargs: SamplingConfig = field(default_factory=SamplingConfig)
 
+    # Named sampling profiles used by in-training benchmark evaluation. Each
+    # profile is evaluated independently and receives its own metric namespace.
+    benchmark_sampling_profiles: dict[str, SamplingConfig] = field(default_factory=dict)
+
     max_model_len: Optional[int] = None
     max_num_seqs: int = 1024
 

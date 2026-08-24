@@ -17,7 +17,6 @@ teacher_intervention_min_trainable_tokens=${TEACHER_INTERVENTION_MIN_TRAINABLE_T
 teacher_intervention_temperature=${TEACHER_INTERVENTION_TEMPERATURE:-0.6}
 teacher_intervention_top_p=${TEACHER_INTERVENTION_TOP_P:-0.95}
 teacher_intervention_top_k=${TEACHER_INTERVENTION_TOP_K:-20}
-dmpd_repair_for_evaluation=${DMPD_REPAIR_FOR_EVALUATION:-True}
 dmpd_collect_outcome_transitions=${DMPD_COLLECT_OUTCOME_TRANSITIONS:-True}
 dmpd_outcome_cases_per_transition=${DMPD_OUTCOME_CASES_PER_TRANSITION:-8}
 
@@ -34,7 +33,6 @@ METHOD_HYDRA_OVERRIDES=(
     "distillation.intervention.teacher_temperature=${teacher_intervention_temperature}"
     "distillation.intervention.teacher_top_p=${teacher_intervention_top_p}"
     "distillation.intervention.teacher_top_k=${teacher_intervention_top_k}"
-    "distillation.intervention.repair_for_evaluation=${dmpd_repair_for_evaluation}"
     "distillation.diagnostics.collect_intervention_outcome_transitions=${dmpd_collect_outcome_transitions}"
     "distillation.diagnostics.outcome_case_samples_per_transition=${dmpd_outcome_cases_per_transition}"
 )

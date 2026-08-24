@@ -53,12 +53,22 @@ class HFRollout(BaseRollout):
     @torch.no_grad()
     def _generate_minibatch(self, prompts: DataProto) -> DataProto:
         # make sampling args can be overridden by inputs
-        do_sample = prompts.meta_info.get("do_sample", self.config.do_sample)
         is_validate = prompts.meta_info.get("validate", False)
         evaluation_mode = prompts.meta_info.get("evaluation_mode", "val")
         if evaluation_mode not in {"val", "test"}:
             raise ValueError(f"evaluation_mode must be 'val' or 'test', got {evaluation_mode!r}.")
         evaluation_config = self.config.test_kwargs if evaluation_mode == "test" else self.config.val_kwargs
+        evaluation_override = prompts.meta_info.get("evaluation_sampling_params")
+        if evaluation_override is not None and not isinstance(evaluation_override, dict):
+            raise TypeError("evaluation_sampling_params must be a dictionary when provided.")
+        evaluation_override = evaluation_override or {}
+        if is_validate:
+            do_sample = prompts.meta_info.get(
+                "do_sample",
+                evaluation_override.get("do_sample", evaluation_config.do_sample),
+            )
+        else:
+            do_sample = prompts.meta_info.get("do_sample", self.config.do_sample)
 
         temperature = prompts.meta_info.get("temperature", self.config.temperature)
         response_length = prompts.meta_info.get("response_length", self.config.response_length)
@@ -76,9 +86,9 @@ class HFRollout(BaseRollout):
             kwargs = {
                 "do_sample": True,
                 "num_beams": 1,
-                "top_k": max(0, evaluation_config.top_k),  # to be compatible with vllm
-                "top_p": evaluation_config.top_p,
-                "temperature": evaluation_config.temperature,
+                "top_k": max(0, int(evaluation_override.get("top_k", evaluation_config.top_k))),
+                "top_p": float(evaluation_override.get("top_p", evaluation_config.top_p)),
+                "temperature": float(evaluation_override.get("temperature", evaluation_config.temperature)),
                 "num_return_sequences": 1,  # if validate, already repeat in ray_trainer
             }
         else:

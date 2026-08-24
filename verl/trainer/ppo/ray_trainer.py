@@ -20,7 +20,6 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import asyncio
 import copy
-import hashlib
 import json
 import math
 import os
@@ -651,6 +650,68 @@ def _extend_reward_extra_infos(
             destination[key].append(info.get(key))
 
 
+_VALIDATION_TOOL_METRIC_KEYS = (
+    "tool_call_counts",
+    "tool_call_attempts",
+    "tool_call/attempt_rate",
+    "tool_call/parse_success_rate",
+    "tool_call/parse_failure_rate",
+    "tool_call/execution_success_rate",
+    "tool_call/protocol_error_rate",
+    "tool_call/timeout_rate",
+    "tool_call/runtime_error_rate",
+    "tool_call/http_error_rate",
+    "tool_call/syntax_error_rate",
+    "tool_call/markdown_extraction_rate",
+    "tool_call/student_call_rate",
+    "tool_call/teacher_call_rate",
+    "tool_call/student_calls",
+    "tool_call/teacher_calls",
+    "tool_call/calls_per_trajectory",
+    "tool_call/observation_tokens",
+    "tool_call/final_answer_after_tool",
+    "tool_call/ended_after_observation",
+)
+
+
+def _extend_validation_tool_metric_values(
+    destination: dict[str, list[float]],
+    non_tensor_batch: dict[str, Any],
+) -> None:
+    """Collect numeric per-trajectory tool metrics from a generated validation batch."""
+    for key in _VALIDATION_TOOL_METRIC_KEYS:
+        raw_values = non_tensor_batch.get(key)
+        if raw_values is None:
+            continue
+        values = np.asarray(raw_values, dtype=object).reshape(-1)
+        for raw_value in values:
+            if raw_value is None:
+                continue
+            value = float(raw_value)
+            if math.isfinite(value):
+                destination.setdefault(key, []).append(value)
+
+
+def _summarize_validation_tool_metrics(
+    values: dict[str, list[float]],
+    *,
+    metric_prefix: str,
+) -> dict[str, float]:
+    """Summarize raw tool usage under the active validation sampling profile."""
+    metrics: dict[str, float] = {}
+    for key, key_values in values.items():
+        if not key_values:
+            continue
+        value_array = np.asarray(key_values, dtype=np.float64)
+        if key in {"tool_call_counts", "tool_call_attempts"}:
+            metrics[f"{metric_prefix}-tool/{key}/min"] = float(value_array.min())
+            metrics[f"{metric_prefix}-tool/{key}/max"] = float(value_array.max())
+            metrics[f"{metric_prefix}-tool/{key}/mean"] = float(value_array.mean())
+        else:
+            metrics[f"{metric_prefix}-tool/{key}"] = float(value_array.mean())
+    return metrics
+
+
 def _reward_info_dict_to_samples(reward_extra_info: dict[str, Any], *, sample_count: int) -> list[dict[str, Any]]:
     result = [{} for _ in range(sample_count)]
     for key, values in reward_extra_info.items():
@@ -671,93 +732,6 @@ def _without_boundary_private_fields(value: Any) -> Any:
     if isinstance(value, list | tuple):
         return [_without_boundary_private_fields(item) for item in value]
     return copy.deepcopy(value)
-
-
-def _build_repair_evaluation_archive_records(
-    *,
-    evaluation_scope: str,
-    global_step: int,
-    inputs: list[str],
-    ground_truths: list[Any],
-    raw_outputs: list[str],
-    final_outputs: list[str],
-    raw_scores: list[float],
-    final_scores: list[float],
-    sample_uids: list[Any],
-    data_sources: list[Any],
-    outcomes: list[dict[str, Any]],
-    interventions: list[Any],
-    proposals: list[Any],
-    skipped_interventions: list[Any],
-    cases: list[Any],
-) -> list[dict[str, Any]]:
-    """Build compact paired records, adding full text only to selected cases."""
-    sample_count = len(inputs)
-    fields = {
-        "ground_truths": ground_truths,
-        "raw_outputs": raw_outputs,
-        "final_outputs": final_outputs,
-        "raw_scores": raw_scores,
-        "final_scores": final_scores,
-        "sample_uids": sample_uids,
-        "data_sources": data_sources,
-        "outcomes": outcomes,
-        "interventions": interventions,
-        "proposals": proposals,
-        "skipped_interventions": skipped_interventions,
-        "cases": cases,
-    }
-    mismatched = {name: len(values) for name, values in fields.items() if len(values) != sample_count}
-    if mismatched:
-        raise ValueError(
-            "Repair evaluation archive fields must have identical sample counts: "
-            f"inputs={sample_count}, mismatched={mismatched}."
-        )
-
-    records = []
-    for index in range(sample_count):
-        outcome = copy.deepcopy(outcomes[index])
-        outcome.pop("raw_response", None)
-        outcome.pop("_raw_response_ids", None)
-        sample_proposals = proposals[index]
-        sample_proposals = [sample_proposals] if isinstance(sample_proposals, dict) else list(sample_proposals or [])
-        candidate_outputs = [
-            str(item["candidate_response"])
-            for item in sample_proposals
-            if isinstance(item, dict) and item.get("candidate_response") is not None
-        ]
-        sanitized_proposals = build_future_gap_proposal_records([sample_proposals])
-        record = {
-            "evaluation_scope": evaluation_scope,
-            "global_step": int(global_step),
-            "sample_index": index,
-            "uid": sample_uids[index],
-            "data_source": data_sources[index],
-            "raw_score": raw_scores[index],
-            "final_score": final_scores[index],
-            "raw_output_sha256": hashlib.sha256(raw_outputs[index].encode("utf-8")).hexdigest(),
-            "final_output_sha256": hashlib.sha256(final_outputs[index].encode("utf-8")).hexdigest(),
-            "outcome": outcome,
-            "interventions": _without_boundary_private_fields(interventions[index]),
-            "future_gap_proposals": sanitized_proposals,
-            "skipped_interventions": skipped_interventions[index],
-            "oracle": bool(outcome.get("oracle_gate_used", False)),
-            "case_included": isinstance(cases[index], dict),
-        }
-        if candidate_outputs:
-            record["rejected_candidate_outputs"] = candidate_outputs
-        if isinstance(cases[index], dict):
-            record.update(
-                {
-                    "input": inputs[index],
-                    "ground_truth": ground_truths[index],
-                    "raw_output": raw_outputs[index],
-                    "final_output": final_outputs[index],
-                    "repair_segments": cases[index].get("repair_segments", []),
-                }
-            )
-        records.append(record)
-    return records
 
 
 def _build_training_intervention_outcome_archive_records(
@@ -822,209 +796,6 @@ def _build_training_intervention_outcome_archive_records(
             )
         records.append(record)
     return records
-
-
-def _average_ranks(values: np.ndarray) -> np.ndarray:
-    """Return deterministic average ranks for a one-dimensional array."""
-    order = np.argsort(values, kind="mergesort")
-    ranks = np.empty(values.size, dtype=np.float64)
-    start = 0
-    while start < values.size:
-        end = start + 1
-        while end < values.size and values[order[end]] == values[order[start]]:
-            end += 1
-        ranks[order[start:end]] = (start + end - 1) / 2.0
-        start = end
-    return ranks
-
-
-def _correctness_transition(raw_correct: bool, candidate_correct: bool) -> str:
-    if raw_correct:
-        return "pre_correct_post_correct" if candidate_correct else "pre_correct_post_wrong"
-    return "pre_wrong_post_correct" if candidate_correct else "pre_wrong_post_wrong"
-
-
-def _build_future_gap_evaluation_summary(
-    *,
-    evaluation_scope: str,
-    global_step: int,
-    data_sources: list[Any],
-    outcomes: list[dict[str, Any]],
-    proposals: list[Any],
-) -> tuple[dict[str, float], list[dict[str, Any]]]:
-    """Summarize future-gap/outcome association over the complete evaluation event."""
-    if not (len(data_sources) == len(outcomes) == len(proposals)):
-        raise ValueError("Future-gap evaluation inputs must have identical sample counts.")
-    sample_rows: list[dict[str, Any]] = []
-    for data_source, outcome, sample_proposals in zip(data_sources, outcomes, proposals, strict=True):
-        if not isinstance(outcome, dict):
-            continue
-        proposal_items = (
-            [sample_proposals]
-            if isinstance(sample_proposals, dict)
-            else [item for item in (sample_proposals or []) if isinstance(item, dict)]
-        )
-        proposal = proposal_items[0] if proposal_items else None
-        raw_correct = bool(outcome.get("raw_correct", False))
-        gated_correct = bool(outcome.get("final_correct", raw_correct))
-        candidate_available = bool(proposal and proposal.get("candidate_outcome_available", False))
-        candidate_correct = bool(proposal.get("candidate_correct")) if candidate_available else raw_correct
-        sample_rows.append(
-            {
-                "data_source": str(data_source),
-                "raw_correct": raw_correct,
-                "gated_correct": gated_correct,
-                "always_candidate_correct": candidate_correct,
-                "proposal": proposal,
-                "candidate_available": candidate_available,
-            }
-        )
-
-    group_names = ["overall", *sorted({row["data_source"] for row in sample_rows})]
-    metrics: dict[str, float] = {}
-    records: list[dict[str, Any]] = []
-    for group_name in group_names:
-        rows = sample_rows if group_name == "overall" else [r for r in sample_rows if r["data_source"] == group_name]
-        if not rows:
-            continue
-        raw_accuracy = float(np.mean([row["raw_correct"] for row in rows]))
-        gated_accuracy = float(np.mean([row["gated_correct"] for row in rows]))
-        always_accuracy = float(np.mean([row["always_candidate_correct"] for row in rows]))
-        proposal_rows = [row for row in rows if row["proposal"] is not None]
-        paired_rows = [row for row in proposal_rows if row["candidate_available"]]
-        transition_counts = {
-            transition: 0
-            for transition in (
-                "pre_correct_post_correct",
-                "pre_correct_post_wrong",
-                "pre_wrong_post_correct",
-                "pre_wrong_post_wrong",
-            )
-        }
-        transition_counts_by_decision = {
-            decision: dict.fromkeys(transition_counts, 0) for decision in ("accepted", "rejected")
-        }
-        accepted_help = accepted_harm = all_help = all_harm = accepted_count = 0
-        reductions: list[float] = []
-        correctness_deltas: list[float] = []
-        for row in paired_rows:
-            proposal = row["proposal"]
-            transition = _correctness_transition(bool(row["raw_correct"]), bool(row["always_candidate_correct"]))
-            transition_counts[transition] += 1
-            accepted = bool(proposal.get("accepted", False))
-            decision = "accepted" if accepted else "rejected"
-            transition_counts_by_decision[decision][transition] += 1
-            accepted_count += int(accepted)
-            is_help = transition == "pre_wrong_post_correct"
-            is_harm = transition == "pre_correct_post_wrong"
-            all_help += int(is_help)
-            all_harm += int(is_harm)
-            accepted_help += int(accepted and is_help)
-            accepted_harm += int(accepted and is_harm)
-            reduction = proposal.get("future_gap_reduction")
-            if reduction is not None and math.isfinite(float(reduction)):
-                reductions.append(float(reduction))
-                correctness_deltas.append(float(row["always_candidate_correct"]) - float(row["raw_correct"]))
-
-        prefix = f"{evaluation_scope}-aux/future_gap/{group_name}"
-        metrics.update(
-            {
-                f"{prefix}/sample_count": float(len(rows)),
-                f"{prefix}/proposal_count": float(len(proposal_rows)),
-                f"{prefix}/candidate_outcome_pair_count": float(len(paired_rows)),
-                f"{prefix}/raw_accuracy": raw_accuracy,
-                f"{prefix}/always_candidate_accuracy": always_accuracy,
-                f"{prefix}/gated_accuracy": gated_accuracy,
-                f"{prefix}/always_candidate_delta": always_accuracy - raw_accuracy,
-                f"{prefix}/gated_delta": gated_accuracy - raw_accuracy,
-                f"{prefix}/help_probability_among_accepted": accepted_help / accepted_count if accepted_count else 0.0,
-                f"{prefix}/harm_probability_among_accepted": accepted_harm / accepted_count if accepted_count else 0.0,
-                f"{prefix}/benefit_recall": accepted_help / all_help if all_help else 0.0,
-                f"{prefix}/harm_acceptance_rate": accepted_harm / all_harm if all_harm else 0.0,
-            }
-        )
-        for transition, count in transition_counts.items():
-            metrics[f"{prefix}/{transition}_count"] = float(count)
-        for decision, decision_counts in transition_counts_by_decision.items():
-            for transition, count in decision_counts.items():
-                metrics[f"{prefix}/{decision}/{transition}_count"] = float(count)
-
-        correlation_available = False
-        pearson = spearman = None
-        if len(reductions) >= 8:
-            reduction_array = np.asarray(reductions, dtype=np.float64)
-            delta_array = np.asarray(correctness_deltas, dtype=np.float64)
-            if np.ptp(reduction_array) > 0 and np.ptp(delta_array) > 0:
-                pearson = float(np.corrcoef(reduction_array, delta_array)[0, 1])
-                spearman = float(np.corrcoef(_average_ranks(reduction_array), _average_ranks(delta_array))[0, 1])
-                correlation_available = math.isfinite(pearson) and math.isfinite(spearman)
-        if correlation_available:
-            metrics[f"{prefix}/reduction_correctness_pearson"] = pearson
-            metrics[f"{prefix}/reduction_correctness_spearman"] = spearman
-
-        quantile_bins = []
-        if reductions:
-            reduction_array = np.asarray(reductions, dtype=np.float64)
-            delta_array = np.asarray(correctness_deltas, dtype=np.float64)
-            edges = np.quantile(reduction_array, [0.0, 0.25, 0.5, 0.75, 1.0])
-            assignments = np.searchsorted(edges[1:-1], reduction_array, side="right")
-            for bin_index in range(4):
-                selected = assignments == bin_index
-                selected_deltas = delta_array[selected]
-                quantile_bins.append(
-                    {
-                        "bin": bin_index,
-                        "lower": float(edges[bin_index]),
-                        "upper": float(edges[bin_index + 1]),
-                        "count": int(selected.sum()),
-                        "correctness_delta_mean": (float(selected_deltas.mean()) if selected_deltas.size else None),
-                        "help_fraction": (float((selected_deltas > 0).mean()) if selected_deltas.size else None),
-                        "harm_fraction": (float((selected_deltas < 0).mean()) if selected_deltas.size else None),
-                    }
-                )
-        records.append(
-            {
-                "schema_version": 1,
-                "evaluation_scope": evaluation_scope,
-                "global_step": int(global_step),
-                "data_source": None if group_name == "overall" else group_name,
-                "conditional_population": "coarse_triggered_proposals",
-                "sample_count": len(rows),
-                "proposal_count": len(proposal_rows),
-                "candidate_outcome_pair_count": len(paired_rows),
-                "raw_accuracy": raw_accuracy,
-                "always_candidate_accuracy": always_accuracy,
-                "gated_accuracy": gated_accuracy,
-                "transition_counts": transition_counts,
-                "transition_counts_by_decision": transition_counts_by_decision,
-                "correlation_pair_count": len(reductions),
-                "correlation_available": correlation_available,
-                "correlation_unavailable_reason": (
-                    None if correlation_available else "requires_at_least_8_pairs_and_nonconstant_variables"
-                ),
-                "reduction_correctness_pearson": pearson if correlation_available else None,
-                "reduction_correctness_spearman": spearman if correlation_available else None,
-                "reduction_quantile_bins": quantile_bins,
-            }
-        )
-    return metrics, records
-
-
-def _cap_ranked_outcome_cases(cases: list[Any], *, case_limit: int) -> list[Any]:
-    """Apply one deterministic per-transition case cap across a complete event."""
-    if case_limit < 0:
-        raise ValueError(f"case_limit must be non-negative, got {case_limit}.")
-    candidates: dict[str, list[tuple[float, int]]] = defaultdict(list)
-    for index, case in enumerate(cases):
-        if not isinstance(case, dict):
-            continue
-        transition = case.get("transition")
-        case_rank = case.get("case_rank")
-        if transition is None or case_rank is None:
-            continue
-        candidates[str(transition)].append((float(case_rank), index))
-    selected = {index for transition_cases in candidates.values() for _, index in sorted(transition_cases)[:case_limit]}
-    return [case if index in selected else None for index, case in enumerate(cases)]
 
 
 def _aggregate_generation_timing(timings: list[dict[str, Any]]) -> dict[str, float]:
@@ -1539,12 +1310,15 @@ class RayPPOTrainer:
             experiment_name=self.config.trainer.experiment_name,
             cumulative_wandb_table=cumulative_generation_tables,
         )
-        self.test_benchmark_generations_logger = ValidationGenerationsLogger(
-            project_name=self.config.trainer.project_name,
-            experiment_name=self.config.trainer.experiment_name,
-            table_name="test/generations",
-            cumulative_wandb_table=cumulative_generation_tables,
-        )
+        self.test_benchmark_generations_loggers = {
+            profile_name: ValidationGenerationsLogger(
+                project_name=self.config.trainer.project_name,
+                experiment_name=self.config.trainer.experiment_name,
+                table_name=f"test/{profile_name}/generations",
+                cumulative_wandb_table=cumulative_generation_tables,
+            )
+            for profile_name in ("legacy", "train_sampling")
+        }
         self.teacher_validation_generations_logger = ValidationGenerationsLogger(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -1593,7 +1367,6 @@ class RayPPOTrainer:
         self._offline_live_metric_buffer: list[tuple[int, dict[str, Any]]] = []
         self._pending_event_record_archives: list[_PendingEventRecordsArchive] = []
         self._event_record_archive_warning_emitted = False
-        self._checkpoint_evaluation_spec: dict[str, Any] | None = None
 
     def _create_dataloader(
         self,
@@ -1822,7 +1595,7 @@ class RayPPOTrainer:
     ) -> None:
         """Queue complete val/test records for the metric event at this step."""
 
-        if evaluation_scope not in {"val", "test"}:
+        if evaluation_scope not in {"val", "test"} and not evaluation_scope.startswith("test-"):
             return
         # Preserve the historical generation-logging behavior outside balanced
         # mode; the explicit warning below is reserved for newly requested
@@ -1963,48 +1736,36 @@ class RayPPOTrainer:
         validation_data_dir: str | None = None,
         dump_filename_prefix: str | None = None,
         include_format_metrics: bool = False,
+        sampling_config=None,
+        sampling_profile_name: str | None = None,
         repeat_times: int | None = None,
         do_sample: bool | None = None,
         generation_max_tokens: int | None = None,
         suppress_tracking: bool = False,
-        repair_for_evaluation: bool | None = None,
     ):
         if evaluation_mode not in {"val", "test"}:
             raise ValueError(f"evaluation_mode must be 'val' or 'test', got {evaluation_mode!r}.")
         dataloader = self.val_dataloader if dataloader is None else dataloader
         default_generation_manager = getattr(self, "async_rollout_manager", None)
-        uses_student_generation_manager = generation_manager is None or generation_manager is default_generation_manager
         generation_manager = generation_manager or default_generation_manager
         if generation_manager is None:
             raise RuntimeError("Validation requires a generation manager.")
-        intervention_config = getattr(getattr(self, "distillation_config", None), "intervention", None)
-        configured_repair_evaluation = bool(
-            intervention_config is not None
-            and getattr(intervention_config, "enabled", False)
-            and getattr(intervention_config, "repair_for_evaluation", False)
-        )
-        repair_for_evaluation = (
-            uses_student_generation_manager and configured_repair_evaluation
-            if repair_for_evaluation is None
-            else bool(repair_for_evaluation)
-        )
-        if repair_for_evaluation and not (uses_student_generation_manager and configured_repair_evaluation):
-            raise ValueError(
-                "Paired repair evaluation requires the student generation manager and "
-                "distillation.intervention.repair_for_evaluation=true."
+        if sampling_config is None:
+            sampling_config = (
+                self.config.actor_rollout_ref.rollout.test_kwargs
+                if evaluation_mode == "test"
+                else self.config.actor_rollout_ref.rollout.val_kwargs
             )
-        repair_metric_prefix = None
-        if repair_for_evaluation:
-            oracle_gate = bool(getattr(intervention_config, "outcome_aware_candidate_selection_enabled", False))
-            repair_metric_prefix = f"{metric_prefix}-oracle-repair" if oracle_gate else f"{metric_prefix}-repair"
-        sampling_config = (
-            self.config.actor_rollout_ref.rollout.test_kwargs
-            if evaluation_mode == "test"
-            else self.config.actor_rollout_ref.rollout.val_kwargs
-        )
         repeat_times = int(sampling_config.n) if repeat_times is None else int(repeat_times)
         if repeat_times <= 0:
             raise ValueError(f"Evaluation repeat_times must be positive, got {repeat_times}.")
+        resolved_do_sample = bool(sampling_config.do_sample if do_sample is None else do_sample)
+        evaluation_sampling_params = {
+            "temperature": float(sampling_config.temperature),
+            "top_p": float(sampling_config.top_p),
+            "top_k": int(sampling_config.top_k),
+            "do_sample": resolved_do_sample,
+        }
         if generation_max_tokens is not None:
             generation_max_tokens = int(generation_max_tokens)
             if generation_max_tokens <= 0:
@@ -2024,18 +1785,7 @@ class RayPPOTrainer:
         sample_uids = []
         sample_response_lengths = []
         sample_finish_reasons = []
-        repair_outputs: list[str] = []
-        repair_scores: list[float] = []
-        repair_reward_extra_infos_dict: dict[str, list] = defaultdict(list)
-        repair_response_lengths: list[int] = []
-        repair_finish_reasons: list[Any] = []
-        repair_outcomes: list[dict[str, Any]] = []
-        repair_interventions: list[Any] = []
-        repair_proposals: list[Any] = []
-        repair_skipped_interventions: list[Any] = []
-        repair_cases: list[Any] = []
-        future_gap_eval_metrics: dict[str, float] = {}
-        future_gap_eval_records: list[dict[str, Any]] = []
+        validation_tool_metric_values: dict[str, list[float]] = defaultdict(list)
         processed_samples = 0
 
         for test_data in dataloader:
@@ -2075,13 +1825,14 @@ class RayPPOTrainer:
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
                 "recompute_log_prob": False,
-                "do_sample": sampling_config.do_sample if do_sample is None else do_sample,
+                "do_sample": resolved_do_sample,
                 "validate": True,
                 "evaluation_mode": evaluation_mode,
+                "evaluation_sampling_params": evaluation_sampling_params,
                 "global_steps": self.global_steps,
             }
-            if repair_for_evaluation:
-                test_gen_batch.meta_info["repair_for_evaluation"] = True
+            if sampling_profile_name is not None:
+                test_gen_batch.meta_info["evaluation_sampling_profile"] = sampling_profile_name
             if generation_max_tokens is not None:
                 test_gen_batch.meta_info["generation_max_tokens"] = generation_max_tokens
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
@@ -2103,6 +1854,10 @@ class RayPPOTrainer:
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            _extend_validation_tool_metric_values(
+                validation_tool_metric_values,
+                test_output_gen_batch.non_tensor_batch,
+            )
 
             print("validation generation end")
 
@@ -2118,123 +1873,37 @@ class RayPPOTrainer:
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
 
-            # The tensor batch is the repaired branch when paired evaluation is
-            # enabled, and the ordinary student branch otherwise.
             reward_tensor, reward_extra_info = extract_reward(test_batch)
             final_scores = reward_tensor.sum(-1).cpu().tolist()
             final_reward_infos = _reward_info_dict_to_samples(
                 reward_extra_info,
                 sample_count=len(final_scores),
             )
-
-            if repair_for_evaluation:
-                outcome_values = test_output_gen_batch.non_tensor_batch.get("teacher_intervention_outcome")
-                if outcome_values is None:
-                    raise RuntimeError(
-                        "Paired repair evaluation did not receive teacher_intervention_outcome metadata from "
-                        "the agent-loop worker."
-                    )
-                batch_outcomes = outcome_values.tolist()
-                if len(batch_outcomes) != len(final_scores) or not all(
-                    isinstance(item, dict) and item.get("evaluation_pair") for item in batch_outcomes
-                ):
-                    raise RuntimeError(
-                        "Paired repair evaluation requires one complete raw/final outcome record per sample."
-                    )
-                batch_raw_outputs = [str(item["raw_response"]) for item in batch_outcomes]
-                batch_raw_scores = [float(item["raw_reward_score"]) for item in batch_outcomes]
-                batch_raw_infos = [dict(item.get("raw_reward_extra_info", {})) for item in batch_outcomes]
-                sample_outputs.extend(batch_raw_outputs)
-                sample_scores.extend(batch_raw_scores)
-                sample_response_lengths.extend(int(item["raw_response_length"]) for item in batch_outcomes)
-                sample_finish_reasons.extend(item.get("raw_finish_reason") for item in batch_outcomes)
-                _extend_reward_extra_infos(
-                    reward_extra_infos_dict,
-                    scores=batch_raw_scores,
-                    per_sample_infos=batch_raw_infos,
+            prior_output_count = len(sample_outputs)
+            output_count = len(final_output_texts)
+            sample_outputs.extend(final_output_texts)
+            sample_scores.extend(final_scores)
+            if "response_mask" in test_output_gen_batch.batch:
+                sample_response_lengths.extend(
+                    [int(length) for length in test_output_gen_batch.batch["response_mask"].sum(dim=-1).cpu().tolist()]
                 )
-
-                repair_outputs.extend(final_output_texts)
-                repair_scores.extend(final_scores)
-                repair_response_lengths.extend(int(item["final_response_length"]) for item in batch_outcomes)
-                repair_finish_reasons.extend(item.get("final_finish_reason") for item in batch_outcomes)
-                _extend_reward_extra_infos(
-                    repair_reward_extra_infos_dict,
-                    scores=final_scores,
-                    per_sample_infos=final_reward_infos,
-                )
-                repair_outcomes.extend(batch_outcomes)
-                repair_interventions.extend(
-                    test_output_gen_batch.non_tensor_batch.get(
-                        "teacher_interventions",
-                        np.asarray([[] for _ in batch_outcomes], dtype=object),
-                    ).tolist()
-                )
-                repair_proposals.extend(
-                    test_output_gen_batch.non_tensor_batch.get(
-                        "teacher_intervention_proposals",
-                        np.asarray([[] for _ in batch_outcomes], dtype=object),
-                    ).tolist()
-                )
-                repair_skipped_interventions.extend(
-                    test_output_gen_batch.non_tensor_batch.get(
-                        "teacher_intervention_skipped",
-                        np.asarray([[] for _ in batch_outcomes], dtype=object),
-                    ).tolist()
-                )
-                repair_cases.extend(
-                    test_output_gen_batch.non_tensor_batch.get(
-                        "teacher_intervention_outcome_case",
-                        np.asarray([None for _ in batch_outcomes], dtype=object),
-                    ).tolist()
-                )
-            else:
-                prior_output_count = len(sample_outputs)
-                output_count = len(final_output_texts)
-                sample_outputs.extend(final_output_texts)
-                sample_scores.extend(final_scores)
-                if "response_mask" in test_output_gen_batch.batch:
-                    sample_response_lengths.extend(
-                        [
-                            int(length)
-                            for length in test_output_gen_batch.batch["response_mask"].sum(dim=-1).cpu().tolist()
-                        ]
-                    )
-                if "finish_reason" in test_output_gen_batch.non_tensor_batch:
-                    if len(sample_finish_reasons) < prior_output_count:
-                        sample_finish_reasons.extend([None] * (prior_output_count - len(sample_finish_reasons)))
-                    sample_finish_reasons.extend(test_output_gen_batch.non_tensor_batch["finish_reason"].tolist())
-                elif sample_finish_reasons:
-                    sample_finish_reasons.extend([None] * output_count)
-                _extend_reward_extra_infos(
-                    reward_extra_infos_dict,
-                    scores=final_scores,
-                    per_sample_infos=final_reward_infos,
-                )
+            if "finish_reason" in test_output_gen_batch.non_tensor_batch:
+                if len(sample_finish_reasons) < prior_output_count:
+                    sample_finish_reasons.extend([None] * (prior_output_count - len(sample_finish_reasons)))
+                sample_finish_reasons.extend(test_output_gen_batch.non_tensor_batch["finish_reason"].tolist())
+            elif sample_finish_reasons:
+                sample_finish_reasons.extend([None] * output_count)
+            _extend_reward_extra_infos(
+                reward_extra_infos_dict,
+                scores=final_scores,
+                per_sample_infos=final_reward_infos,
+            )
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
-
-        if repair_for_evaluation:
-            diagnostics_config = getattr(getattr(self, "distillation_config", None), "diagnostics", None)
-            repair_cases = _cap_ranked_outcome_cases(
-                repair_cases,
-                case_limit=int(getattr(diagnostics_config, "outcome_case_samples_per_transition", 0) or 0),
-            )
-            assert repair_metric_prefix is not None
-            intervention_config = getattr(getattr(self, "distillation_config", None), "intervention", None)
-            if getattr(intervention_config, "confirmation_mode", "none") == "future_gap":
-                flattened_data_sources = np.concatenate(data_source_lst, axis=0).tolist()
-                future_gap_eval_metrics, future_gap_eval_records = _build_future_gap_evaluation_summary(
-                    evaluation_scope=repair_metric_prefix,
-                    global_step=self.global_steps,
-                    data_sources=flattened_data_sources,
-                    outcomes=repair_outcomes,
-                    proposals=repair_proposals,
-                )
 
         sample_records = (
             _build_validation_sample_records(
@@ -2275,35 +1944,6 @@ class RayPPOTrainer:
                     evaluation_scope=metric_prefix,
                     records=generation_archive_records,
                 )
-            if repair_for_evaluation:
-                assert repair_metric_prefix is not None
-                flattened_data_sources = np.concatenate(data_source_lst, axis=0).tolist()
-                repair_archive_records = _build_repair_evaluation_archive_records(
-                    evaluation_scope=repair_metric_prefix,
-                    global_step=self.global_steps,
-                    inputs=sample_inputs,
-                    ground_truths=sample_gts,
-                    raw_outputs=sample_outputs,
-                    final_outputs=repair_outputs,
-                    raw_scores=sample_scores,
-                    final_scores=repair_scores,
-                    sample_uids=sample_uids,
-                    data_sources=flattened_data_sources,
-                    outcomes=repair_outcomes,
-                    interventions=repair_interventions,
-                    proposals=repair_proposals,
-                    skipped_interventions=repair_skipped_interventions,
-                    cases=repair_cases,
-                )
-                self._queue_event_records_archive(
-                    metric_key=f"{repair_metric_prefix}/paired_outcomes",
-                    records=repair_archive_records,
-                )
-                if future_gap_eval_records:
-                    self._queue_event_records_archive(
-                        metric_key=f"{repair_metric_prefix}/future_gap_summary",
-                        records=future_gap_eval_records,
-                    )
             validation_media = self._maybe_log_val_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
@@ -2328,20 +1968,6 @@ class RayPPOTrainer:
 
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
-        if repair_for_evaluation:
-            for key_info, lst in repair_reward_extra_infos_dict.items():
-                assert len(lst) == len(repair_scores), f"{key_info}: {len(lst)=}, {len(repair_scores)=}"
-            if not (
-                len(sample_scores)
-                == len(repair_scores)
-                == len(repair_outputs)
-                == len(repair_outcomes)
-                == len(repair_interventions)
-                == len(repair_proposals)
-                == len(repair_skipped_interventions)
-                == len(repair_cases)
-            ):
-                raise RuntimeError("Paired repair evaluation accumulators became misaligned.")
 
         if merged:
             print("_merge_validation_results validate result will be merged")
@@ -2374,49 +2000,12 @@ class RayPPOTrainer:
                     prefix=f"{metric_prefix}-aux",
                 )
             )
-        if repair_for_evaluation:
-            assert repair_metric_prefix is not None
-            metrics.update(
-                self._val_metrics_update(
-                    data_sources,
-                    sample_uids,
-                    repair_reward_extra_infos_dict,
-                    sample_turns,
-                    metric_prefix=repair_metric_prefix,
-                    core_mean_only=True,
-                )
+        metrics.update(
+            _summarize_validation_tool_metrics(
+                validation_tool_metric_values,
+                metric_prefix=metric_prefix,
             )
-            metrics.update(
-                self._repair_evaluation_pair_metrics(
-                    data_sources=data_sources,
-                    raw_reward_extra_infos=reward_extra_infos_dict,
-                    final_reward_extra_infos=repair_reward_extra_infos_dict,
-                    outcomes=repair_outcomes,
-                    metric_prefix=repair_metric_prefix,
-                    repeat_times=repeat_times,
-                )
-            )
-            metrics.update(future_gap_eval_metrics)
-            if include_format_metrics:
-                for metric_name, value in _compute_validation_format_metrics(
-                    repair_outputs,
-                    repair_reward_extra_infos_dict,
-                ).items():
-                    metrics[f"{repair_metric_prefix}-aux/{metric_name}"] = value
-                validation_max_response_length = int(
-                    generation_max_tokens
-                    if generation_max_tokens is not None
-                    else self.config.actor_rollout_ref.rollout.response_length
-                )
-                metrics.update(
-                    compute_text_repetition_and_truncation_metrics(
-                        outputs=repair_outputs,
-                        response_lengths=repair_response_lengths,
-                        max_response_length=validation_max_response_length,
-                        finish_reasons=repair_finish_reasons,
-                        prefix=f"{repair_metric_prefix}-aux",
-                    )
-                )
+        )
         metrics.update(validation_media)
         return metrics
 
@@ -2458,55 +2047,6 @@ class RayPPOTrainer:
 
         return metric_dict
 
-    def _repair_evaluation_pair_metrics(
-        self,
-        *,
-        data_sources: np.ndarray,
-        raw_reward_extra_infos: dict[str, list],
-        final_reward_extra_infos: dict[str, list],
-        outcomes: list[dict[str, Any]],
-        metric_prefix: str,
-        repeat_times: int,
-    ) -> dict[str, float]:
-        """Compute paired deltas plus detailed repair transition summaries."""
-        core_var = "acc" if "acc" in raw_reward_extra_infos and "acc" in final_reward_extra_infos else "reward"
-        raw_values = np.asarray(raw_reward_extra_infos[core_var], dtype=np.float64)
-        final_values = np.asarray(final_reward_extra_infos[core_var], dtype=np.float64)
-        if raw_values.shape != final_values.shape or raw_values.shape[0] != len(outcomes):
-            raise RuntimeError(
-                "Paired repair evaluation values must align sample-for-sample: "
-                f"raw={raw_values.shape}, final={final_values.shape}, outcomes={len(outcomes)}."
-            )
-
-        metrics: dict[str, float] = {}
-        for data_source in dict.fromkeys(data_sources.tolist()):
-            indices = np.flatnonzero(data_sources == data_source)
-            source_outcomes = [outcomes[int(index)] for index in indices]
-            paired_delta = float((final_values[indices] - raw_values[indices]).mean())
-            metrics[f"{metric_prefix}-core/{data_source}/{core_var}/paired_delta@{repeat_times}"] = paired_delta
-
-            repaired = [item for item in source_outcomes if bool(item.get("repair_executed", False))]
-            repaired_count = len(repaired)
-            base = f"{metric_prefix}-aux/{data_source}/outcome"
-            metrics[f"{base}/sample_count"] = float(len(source_outcomes))
-            metrics[f"{base}/repair_executed_count"] = float(repaired_count)
-            metrics[f"{base}/repair_executed_fraction"] = repaired_count / max(len(source_outcomes), 1)
-            for transition in (
-                "pre_correct_post_correct",
-                "pre_correct_post_wrong",
-                "pre_wrong_post_correct",
-                "pre_wrong_post_wrong",
-            ):
-                count = sum(item.get("transition") == transition for item in repaired)
-                metrics[f"{base}/{transition}_count"] = float(count)
-                metrics[f"{base}/{transition}_fraction_among_repaired"] = (
-                    count / repaired_count if repaired_count else 0.0
-                )
-            rescued = sum(item.get("transition") == "pre_wrong_post_correct" for item in repaired)
-            harmed = sum(item.get("transition") == "pre_correct_post_wrong" for item in repaired)
-            metrics[f"{base}/net_accuracy_delta_all_samples"] = (rescued - harmed) / max(len(source_outcomes), 1)
-        return metrics
-
     def _validate_test_benchmarks(self, *, suppress_tracking: bool = False) -> dict[str, Any]:
         """Run the configured benchmark datasets through the student validation path."""
         if self.test_benchmark_dataloader is None:
@@ -2526,19 +2066,41 @@ class RayPPOTrainer:
                 f"Got {generation_max_tokens} > {self.config.actor_rollout_ref.rollout.response_length}."
             )
 
+        profiles = self.config.actor_rollout_ref.rollout.get("benchmark_sampling_profiles", None)
+        if not profiles:
+            raise ValueError("Benchmark evaluation requires actor_rollout_ref.rollout.benchmark_sampling_profiles.")
+        expected_profiles = ("legacy", "train_sampling")
+        missing_profiles = [name for name in expected_profiles if name not in profiles]
+        extra_profiles = [name for name in profiles if name not in expected_profiles]
+        if missing_profiles or extra_profiles:
+            raise ValueError(
+                "Benchmark sampling profiles must be exactly legacy and train_sampling; "
+                f"missing={missing_profiles}, extra={extra_profiles}."
+            )
+
         test_data_dir = self.config.trainer.get("test_data_dir", None)
-        metrics = self._validate(
-            dataloader=self.test_benchmark_dataloader,
-            metric_prefix="test",
-            evaluation_mode="test",
-            log_generations=int(self.config.trainer.get("log_test_generations", 0)),
-            validation_generations_logger=self.test_benchmark_generations_logger,
-            validation_data_dir=test_data_dir or "",
-            dump_filename_prefix="test_benchmarks",
-            include_format_metrics=True,
-            generation_max_tokens=generation_max_tokens,
-            suppress_tracking=suppress_tracking,
-        )
+        metrics: dict[str, Any] = {}
+        for profile_name in expected_profiles:
+            sampling_config = profiles[profile_name]
+            metric_profile_name = profile_name.replace("_", "-")
+            profile_metrics = self._validate(
+                dataloader=self.test_benchmark_dataloader,
+                metric_prefix=f"test-{metric_profile_name}",
+                evaluation_mode="test",
+                sampling_config=sampling_config,
+                sampling_profile_name=profile_name,
+                log_generations=int(self.config.trainer.get("log_test_generations", 0)),
+                validation_generations_logger=self.test_benchmark_generations_loggers[profile_name],
+                validation_data_dir=test_data_dir or "",
+                dump_filename_prefix=f"test_benchmarks_{profile_name}",
+                include_format_metrics=True,
+                generation_max_tokens=generation_max_tokens,
+                suppress_tracking=suppress_tracking,
+            )
+            duplicate_keys = metrics.keys() & profile_metrics.keys()
+            if duplicate_keys:
+                raise RuntimeError(f"Benchmark sampling profiles produced duplicate metrics: {sorted(duplicate_keys)}")
+            metrics.update(profile_metrics)
         assert metrics, f"{metrics=}"
         return metrics
 
@@ -2598,7 +2160,6 @@ class RayPPOTrainer:
             include_format_metrics=True,
             generation_max_tokens=teacher_generation_max_tokens,
             suppress_tracking=suppress_tracking,
-            repair_for_evaluation=False,
         )
         assert teacher_metrics, f"{teacher_metrics=}"
         return teacher_metrics
@@ -2900,69 +2461,7 @@ class RayPPOTrainer:
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
-        self._write_checkpoint_evaluation_state(local_global_step_folder)
         return local_global_step_folder
-
-    def _checkpoint_evaluation_manifest_enabled(self) -> bool:
-        return bool(self.config.trainer.get("checkpoint_evaluation_manifest", False))
-
-    def _initialize_checkpoint_evaluation_manifest(self, logger) -> None:
-        if not self._checkpoint_evaluation_manifest_enabled():
-            return
-        retention = self.config.trainer.get("max_actor_ckpt_to_keep", None)
-        if isinstance(retention, int) and not isinstance(retention, bool) and retention > 0:
-            print(
-                "WARNING: standalone checkpoint evaluation is enabled while max_actor_ckpt_to_keep="
-                f"{retention}. A slow evaluator can lose queued checkpoints before consuming them; "
-                "the safe default is null (retain all actor checkpoints)."
-            )
-        from verl.utils.evaluation.checkpoint_evaluation import write_evaluation_spec
-
-        run_info = logger.wandb_run_info
-        training_run_id = (
-            run_info.run_id
-            if run_info is not None and run_info.run_id is not None
-            else self._logical_run_id or os.environ.get("WANDB_RUN_ID")
-        )
-        self._checkpoint_evaluation_spec = write_evaluation_spec(
-            self.config.trainer.default_local_dir,
-            self.config,
-            training_run_id=training_run_id,
-        )
-        print(
-            "Standalone checkpoint evaluation manifest ready: "
-            f"root={os.path.abspath(self.config.trainer.default_local_dir)!r}, "
-            f"fingerprint={self._checkpoint_evaluation_spec['spec_fingerprint']}."
-        )
-
-    def _write_checkpoint_evaluation_state(self, checkpoint_dir: str) -> None:
-        if not self._checkpoint_evaluation_manifest_enabled():
-            return
-        if self._checkpoint_evaluation_spec is None:
-            raise RuntimeError("Checkpoint evaluation manifest was not initialized before checkpoint saving.")
-
-        intervention_config = self.config.distillation.intervention
-        outcome_aware = bool(intervention_config.get("outcome_aware_candidate_selection_enabled", False))
-        calibration_state = None
-        if outcome_aware:
-            manager = getattr(self, "async_rollout_manager", None)
-            exporter = getattr(manager, "export_teacher_nll_calibration_state", None)
-            if exporter is None:
-                raise RuntimeError(
-                    "Outcome-aware checkpoint evaluation requires the manager-owned teacher-NLL calibration state."
-                )
-            calibration_state = exporter()
-            if calibration_state is None:
-                raise RuntimeError("Outcome-aware checkpoint evaluation received an empty teacher-NLL calibration.")
-
-        from verl.utils.evaluation.checkpoint_evaluation import write_evaluation_state
-
-        write_evaluation_state(
-            checkpoint_dir,
-            checkpoint_step=self.global_steps,
-            spec_fingerprint=str(self._checkpoint_evaluation_spec["spec_fingerprint"]),
-            teacher_nll_calibration=calibration_state,
-        )
 
     def _commit_checkpoint_tracker(self, checkpoint_step: int) -> None:
         """Atomically make a fully written checkpoint visible to resume discovery."""
@@ -4380,7 +3879,6 @@ class RayPPOTrainer:
                 config=OmegaConf.to_container(self.config, resolve=True),
                 wandb_resume=wandb_resume,
             )
-            self._initialize_checkpoint_evaluation_manifest(logger)
             if self._metric_archive_writer is not None:
                 run_info = logger.wandb_run_info
                 self._metric_archive_writer.register_wandb_session(
@@ -4623,7 +4121,7 @@ class RayPPOTrainer:
 
         # Perform validation and optional benchmark testing before training.
         initial_metrics = {}
-        if self.config.trainer.get("val_before_train", True):
+        if self.config.trainer.get("val_before_train", False):
             val_metrics = self._validate(
                 include_format_metrics=True,
                 suppress_tracking=resumed_initial_evaluation,

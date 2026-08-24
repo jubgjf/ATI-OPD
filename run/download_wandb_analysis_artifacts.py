@@ -15,8 +15,8 @@
 
 """Incrementally mirror W&B run records for local analysis.
 
-By default this script downloads ``jubgjf/DMPD`` and ``jubgjf/DMPD-eval``
-into ``./analysis_artifacts``. Each run contains:
+By default this script downloads ``jubgjf/DMPD`` into
+``./analysis_artifacts``. Each run contains:
 
 * ``run.json``: run metadata, config, and summary;
 * ``history/steps_<start>_<end>.jsonl.gz``: complete, unsampled history;
@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 SCHEMA_VERSION = 1
-DEFAULT_PROJECTS = ("jubgjf/DMPD", "jubgjf/DMPD-eval")
+DEFAULT_PROJECTS = ("jubgjf/DMPD",)
 HISTORY_SHARD_RE = re.compile(r"steps_(\d{12})_(\d{12})\.jsonl\.gz$")
 METADATA_FILE_NAMES = {
     "config.yaml",
@@ -596,7 +596,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--project",
         action="append",
         dest="projects",
-        help="W&B project as ENTITY/PROJECT. Repeatable; defaults to jubgjf/DMPD and jubgjf/DMPD-eval.",
+        help="W&B project as ENTITY/PROJECT. Repeatable; defaults to jubgjf/DMPD.",
     )
     parser.add_argument(
         "--output-dir",

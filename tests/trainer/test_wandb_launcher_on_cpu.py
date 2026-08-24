@@ -165,7 +165,13 @@ def test_in_training_evaluation_is_fully_disabled_by_default_on_cpu():
     assert result.stdout.strip() == "False|False|False|False|-1|-1"
 
 
-def test_in_training_evaluation_opt_in_preserves_legacy_controls_on_cpu():
+def test_in_training_evaluation_opt_in_defaults_to_benchmark_only_on_cpu():
+    result = _run_in_training_evaluation_config({"IN_TRAIN_EVALUATION": "True"})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "True|False|False|False|-1|20"
+
+
+def test_in_training_evaluation_opt_in_preserves_explicit_controls_on_cpu():
     result = _run_in_training_evaluation_config(
         {
             "IN_TRAIN_EVALUATION": "True",
@@ -178,3 +184,17 @@ def test_in_training_evaluation_opt_in_preserves_legacy_controls_on_cpu():
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "True|False|True|True|7|11"
+
+
+def test_common_launcher_configures_two_benchmark_profiles_with_shared_n_on_cpu():
+    source = COMMON_SH.read_text(encoding="utf-8")
+
+    assert "test_benchmark_n=${TEST_BENCHMARK_N:-${TEST_N:-16}}" in source
+    for profile_name in ("legacy", "train_sampling"):
+        prefix = f"actor_rollout_ref.rollout.benchmark_sampling_profiles.{profile_name}"
+        assert f'"{prefix}.n=${{test_benchmark_n}}"' in source
+    assert (
+        '"actor_rollout_ref.rollout.benchmark_sampling_profiles.train_sampling.temperature=${rollout_temperature}"'
+        in source
+    )
+    assert '"actor_rollout_ref.rollout.benchmark_sampling_profiles.legacy.temperature=${test_temperature}"' in source

@@ -16,7 +16,9 @@ import json
 
 import pandas as pd
 import pytest
+from omegaconf import OmegaConf
 
+from verl.trainer.main_ppo import create_math_benchmark_dataset
 from verl.utils.dataset.math_benchmark_dataset import MathBenchmarkDataset
 from verl.utils.reward_score import default_compute_score
 
@@ -76,6 +78,83 @@ def test_math_benchmark_dataset_builds_stable_validation_rows_on_cpu(tmp_path):
     assert amc_row["reward_model"]["ground_truth"] == "27"
     assert amc_row["extra_info"]["reward_data_source"] == "math_verify"
     assert "put your final answer within \\boxed{}" in aime_row["raw_prompt"][0]["content"]
+
+
+def test_math_benchmark_dataset_preserves_tool_agent_and_system_prompt_on_cpu(tmp_path):
+    dataset_root = tmp_path / "datasets"
+    _write_benchmarks(dataset_root)
+    system_prompt_path = tmp_path / "tool-system.txt"
+    system_prompt_path.write_text("You may call code_interpreter.", encoding="utf-8")
+
+    dataset = MathBenchmarkDataset(
+        dataset_root=dataset_root,
+        benchmarks=["aime24"],
+        max_samples_per_benchmark=1,
+        system_prompt_path=system_prompt_path,
+        agent_name="tool_agent",
+    )
+
+    row = dataset[0]
+    assert row["agent_name"] == "tool_agent"
+    assert row["raw_prompt"][0] == {"role": "system", "content": "You may call code_interpreter."}
+    assert row["raw_prompt"][1]["role"] == "user"
+
+
+def test_create_math_benchmark_dataset_uses_training_tool_environment_on_cpu(tmp_path):
+    dataset_root = tmp_path / "datasets"
+    _write_benchmarks(dataset_root)
+    system_prompt_path = tmp_path / "tool-system.txt"
+    system_prompt_path.write_text("Use the configured code tool when useful.", encoding="utf-8")
+    config = OmegaConf.create(
+        {
+            "trainer": {"test_before_train": False, "test_benchmarks_freq": 20},
+            "data": {
+                "system_prompt_path": str(system_prompt_path),
+                "test_benchmarks": {
+                    "root": str(dataset_root),
+                    "names": ["aime24"],
+                    "reward_data_source": "math_verify",
+                    "max_samples_per_benchmark": 1,
+                },
+            },
+            "actor_rollout_ref": {
+                "rollout": {
+                    "agent": {"default_agent_loop": "tool_agent"},
+                    "multi_turn": {
+                        "enable": True,
+                        "tool_config_path": None,
+                        "function_tool_path": "verl/tools/code_interpreter_tool.py",
+                    },
+                }
+            },
+        }
+    )
+
+    dataset = create_math_benchmark_dataset(config)
+    row = dataset[0]
+
+    assert row["agent_name"] == "tool_agent"
+    assert row["raw_prompt"][0]["content"] == "Use the configured code tool when useful."
+
+
+def test_create_math_benchmark_dataset_rejects_tool_agent_without_tools_on_cpu(tmp_path):
+    dataset_root = tmp_path / "datasets"
+    _write_benchmarks(dataset_root)
+    config = OmegaConf.create(
+        {
+            "trainer": {"test_before_train": False, "test_benchmarks_freq": 20},
+            "data": {"test_benchmarks": {"root": str(dataset_root), "names": ["aime24"]}},
+            "actor_rollout_ref": {
+                "rollout": {
+                    "agent": {"default_agent_loop": "tool_agent"},
+                    "multi_turn": {"enable": True, "tool_config_path": None, "function_tool_path": None},
+                }
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires multi_turn.tool_config_path or multi_turn.function_tool_path"):
+        create_math_benchmark_dataset(config)
 
 
 def test_math_benchmark_dataset_preserves_amo_metadata_and_prompt_on_cpu(tmp_path):

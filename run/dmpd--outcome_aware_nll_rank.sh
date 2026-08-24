@@ -31,7 +31,6 @@ teacher_nll_calibration_window=${TEACHER_NLL_CALIBRATION_WINDOW:-256}
 teacher_nll_calibration_min_samples=${TEACHER_NLL_CALIBRATION_MIN_SAMPLES:-16}
 teacher_nll_initial_threshold=${TEACHER_NLL_INITIAL_THRESHOLD:-null}
 teacher_nll_healthy_probe_probability=${TEACHER_NLL_HEALTHY_PROBE_PROBABILITY:-0.1}
-dmpd_repair_for_evaluation=${DMPD_REPAIR_FOR_EVALUATION:-True}
 dmpd_collect_outcome_transitions=${DMPD_COLLECT_OUTCOME_TRANSITIONS:-True}
 dmpd_outcome_cases_per_transition=${DMPD_OUTCOME_CASES_PER_TRANSITION:-8}
 
@@ -62,7 +61,6 @@ METHOD_HYDRA_OVERRIDES=(
     "distillation.intervention.teacher_nll_calibration_min_samples=${teacher_nll_calibration_min_samples}"
     "distillation.intervention.teacher_nll_initial_threshold=${teacher_nll_initial_threshold}"
     "distillation.intervention.teacher_nll_healthy_probe_probability=${teacher_nll_healthy_probe_probability}"
-    "distillation.intervention.repair_for_evaluation=${dmpd_repair_for_evaluation}"
     "distillation.diagnostics.collect_intervention_outcome_transitions=${dmpd_collect_outcome_transitions}"
     "distillation.diagnostics.outcome_case_samples_per_transition=${dmpd_outcome_cases_per_transition}"
 )

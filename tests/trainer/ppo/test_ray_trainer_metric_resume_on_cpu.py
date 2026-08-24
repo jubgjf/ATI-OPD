@@ -474,7 +474,7 @@ def test_full_metric_mode_warns_once_when_detailed_event_archive_is_unavailable_
     trainer._event_record_archive_warning_emitted = False
 
     trainer._queue_event_records_archive(metric_key="opd_intervention/outcome_pairs", records=[{"uid": "one"}])
-    trainer._queue_event_records_archive(metric_key="test-repair/paired_outcomes", records=[{"uid": "two"}])
+    trainer._queue_event_records_archive(metric_key="test-legacy/generations_full", records=[{"uid": "two"}])
 
     assert capsys.readouterr().out.count("JSONL/Artifact records are unavailable") == 1
     assert trainer._event_record_archive_warning_emitted is True

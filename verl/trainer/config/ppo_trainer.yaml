@@ -169,7 +169,7 @@ trainer:
   log_test_generations: 0
 
   # Run a small teacher validation pass at step 0 when val_before_train and distillation are enabled
-  teacher_val_before_train: true
+  teacher_val_before_train: false
 
   # Maximum number of original validation samples for teacher validation; set negative for all, 0 to skip
   teacher_val_max_samples: 256
@@ -212,7 +212,7 @@ trainer:
   resume_from_path: null
 
   # Whether to run validation before training begins
-  val_before_train: True
+  val_before_train: False
 
   # Whether to run configured test benchmarks before training begins
   test_before_train: False
@@ -240,10 +240,6 @@ trainer:
 
   # Default local directory for saving checkpoints
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
-
-  # Write the immutable spec and checkpoint-local online state consumed by the
-  # standalone checkpoint evaluation workflow.
-  checkpoint_evaluation_manifest: false
 
   # Maximum number of actor checkpoints to keep
   max_actor_ckpt_to_keep: null

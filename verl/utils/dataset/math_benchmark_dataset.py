@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -69,6 +70,8 @@ class MathBenchmarkDataset(Dataset):
         benchmarks: Sequence[str],
         reward_data_source: str = "math_verify",
         max_samples_per_benchmark: int = -1,
+        system_prompt_path: str | Path | None = None,
+        agent_name: str | None = None,
     ) -> None:
         root = Path(dataset_root).expanduser()
         raw_benchmark_paths = [str(path).strip() for path in benchmarks if str(path).strip()]
@@ -98,6 +101,17 @@ class MathBenchmarkDataset(Dataset):
         self.benchmark_names = tuple(benchmark_names)
         self.reward_data_source = reward_data_source
         self.max_samples_per_benchmark = max_samples_per_benchmark
+        self.agent_name = str(agent_name).strip() if agent_name is not None else None
+        if self.agent_name == "":
+            raise ValueError("MathBenchmarkDataset agent_name must be non-empty when provided.")
+        self.system_prompt = None
+        if system_prompt_path:
+            expanded_prompt_path = Path(os.path.abspath(os.path.expanduser(str(system_prompt_path))))
+            if not expanded_prompt_path.is_file():
+                raise FileNotFoundError(f"MathBenchmarkDataset system_prompt_path does not exist: {system_prompt_path}")
+            self.system_prompt = expanded_prompt_path.read_text(encoding="utf-8").strip()
+            if not self.system_prompt:
+                raise ValueError(f"MathBenchmarkDataset system_prompt_path is empty: {system_prompt_path}")
         self.records: list[_BenchmarkRecord] = []
 
         max_samples = None if max_samples_per_benchmark < 0 else max_samples_per_benchmark
@@ -140,12 +154,20 @@ class MathBenchmarkDataset(Dataset):
             extra_info["answer_type"] = record.answer_type
         if record.grader is not None:
             extra_info["grader"] = record.grader
-        return {
-            "raw_prompt": build_math_chat_messages(
-                record.problem,
-                idx=record.index,
-                use_raw_prompt=record.use_raw_prompt,
-            ),
+        raw_prompt = build_math_chat_messages(
+            record.problem,
+            idx=record.index,
+            use_raw_prompt=record.use_raw_prompt,
+        )
+        if self.system_prompt:
+            system_message = {"role": "system", "content": self.system_prompt}
+            if raw_prompt and raw_prompt[0].get("role") == "system" and isinstance(raw_prompt[0].get("content"), str):
+                existing = raw_prompt[0]["content"].strip()
+                raw_prompt[0]["content"] = f"{self.system_prompt}\n\n{existing}" if existing else self.system_prompt
+            else:
+                raw_prompt.insert(0, system_message)
+        row = {
+            "raw_prompt": raw_prompt,
             "data_source": record.benchmark,
             "reward_model": {"style": "rule", "ground_truth": record.ground_truth},
             "extra_info": extra_info,
@@ -155,3 +177,6 @@ class MathBenchmarkDataset(Dataset):
             "interaction_kwargs": {},
             "dummy_tensor": torch.tensor([0], dtype=torch.uint8),
         }
+        if self.agent_name is not None:
+            row["agent_name"] = self.agent_name
+        return row

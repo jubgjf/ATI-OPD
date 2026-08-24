@@ -143,7 +143,7 @@ _configure_wandb_storage() {
 }
 
 _configure_in_training_evaluation() {
-    in_train_evaluation=${IN_TRAIN_EVALUATION:-False}
+    in_train_evaluation=${IN_TRAIN_EVALUATION:-True}
     case "$in_train_evaluation" in
         False | false | 0)
             in_train_evaluation=False
@@ -155,10 +155,10 @@ _configure_in_training_evaluation() {
             ;;
         True | true | 1)
             in_train_evaluation=True
-            val_before_train=${VAL_BEFORE_TRAIN:-True}
-            test_before_train=${TEST_BEFORE_TRAIN:-True}
+            val_before_train=${VAL_BEFORE_TRAIN:-False}
+            test_before_train=${TEST_BEFORE_TRAIN:-False}
             teacher_val_before_train=${TEACHER_VAL_BEFORE_TRAIN:-False}
-            test_freq=${TEST_FREQ:-10}
+            test_freq=${TEST_FREQ:--1}
             test_benchmarks_freq=${TEST_BENCHMARKS_FREQ:-20}
             ;;
         *)
@@ -369,7 +369,7 @@ run_npu_opd_job() {
     test_top_p=${TEST_TOP_P:-0.95}
     test_top_k=${TEST_TOP_K:-$rollout_top_k}
     test_do_sample=${TEST_DO_SAMPLE:-True}
-    test_n=${TEST_N:-16}
+    test_benchmark_n=${TEST_BENCHMARK_N:-${TEST_N:-16}}
 
     actor_lr=${ACTOR_LR:-1e-6}
     train_batch_size=${TRAIN_BATCH_SIZE:-64}
@@ -450,7 +450,6 @@ run_npu_opd_job() {
     default_local_dir=${DEFAULT_LOCAL_DIR:-$WORKSPACE/outputs/${experiment_name}}
     total_epochs=${TOTAL_EPOCHS:-1}
     save_freq=${SAVE_FREQ:-20}
-    checkpoint_evaluation_manifest=${CHECKPOINT_EVALUATION_MANIFEST:-True}
     metric_logging_mode=${METRIC_LOGGING_MODE:-balanced}
     metric_logging_resume_policy=${METRIC_LOGGING_RESUME_POLICY:-strict}
     metric_logging_live_key_warning_threshold=${METRIC_LOGGING_LIVE_KEY_WARNING_THRESHOLD:-250}
@@ -690,7 +689,17 @@ _submit_npu_verl_job() {
         "actor_rollout_ref.rollout.test_kwargs.top_p=${test_top_p}"
         "actor_rollout_ref.rollout.test_kwargs.top_k=${test_top_k}"
         "actor_rollout_ref.rollout.test_kwargs.do_sample=${test_do_sample}"
-        "actor_rollout_ref.rollout.test_kwargs.n=${test_n}"
+        "actor_rollout_ref.rollout.test_kwargs.n=${test_benchmark_n}"
+        "actor_rollout_ref.rollout.benchmark_sampling_profiles.legacy.temperature=${test_temperature}"
+        "actor_rollout_ref.rollout.benchmark_sampling_profiles.legacy.top_p=${test_top_p}"
+        "actor_rollout_ref.rollout.benchmark_sampling_profiles.legacy.top_k=${test_top_k}"
+        "actor_rollout_ref.rollout.benchmark_sampling_profiles.legacy.do_sample=${test_do_sample}"
+        "actor_rollout_ref.rollout.benchmark_sampling_profiles.legacy.n=${test_benchmark_n}"
+        "actor_rollout_ref.rollout.benchmark_sampling_profiles.train_sampling.temperature=${rollout_temperature}"
+        "actor_rollout_ref.rollout.benchmark_sampling_profiles.train_sampling.top_p=${rollout_top_p}"
+        "actor_rollout_ref.rollout.benchmark_sampling_profiles.train_sampling.top_k=${rollout_top_k}"
+        "actor_rollout_ref.rollout.benchmark_sampling_profiles.train_sampling.do_sample=${rollout_do_sample}"
+        "actor_rollout_ref.rollout.benchmark_sampling_profiles.train_sampling.n=${test_benchmark_n}"
         "reward.reward_manager.name=${reward_manager_name}"
         "trainer.balance_batch=True"
         "trainer.logger=${trainer_logger}"
@@ -708,7 +717,6 @@ _submit_npu_verl_job() {
         "trainer.nnodes=${STUDENT_NNODES}"
         "trainer.device=${trainer_device}"
         "trainer.default_local_dir=${default_local_dir}"
-        "trainer.checkpoint_evaluation_manifest=${checkpoint_evaluation_manifest}"
         "trainer.val_before_train=${val_before_train}"
         "trainer.test_before_train=${test_before_train}"
         "trainer.teacher_val_before_train=${teacher_val_before_train}"

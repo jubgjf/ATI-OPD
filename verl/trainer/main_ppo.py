@@ -368,11 +368,27 @@ def create_math_benchmark_dataset(config):
 
     from verl.utils.dataset.math_benchmark_dataset import MathBenchmarkDataset
 
+    rollout_config = config.actor_rollout_ref.rollout
+    default_agent_loop = str(rollout_config.agent.default_agent_loop)
+    if default_agent_loop == "tool_agent":
+        multi_turn_config = rollout_config.multi_turn
+        if not bool(multi_turn_config.enable):
+            raise ValueError(
+                "tool_agent benchmark evaluation requires actor_rollout_ref.rollout.multi_turn.enable=true."
+            )
+        if not (multi_turn_config.get("tool_config_path", None) or multi_turn_config.get("function_tool_path", None)):
+            raise ValueError(
+                "tool_agent benchmark evaluation requires multi_turn.tool_config_path or "
+                "multi_turn.function_tool_path so the model can actually invoke a tool."
+            )
+
     return MathBenchmarkDataset(
         dataset_root=dataset_root,
         benchmarks=benchmark_names,
         reward_data_source=benchmark_config.get("reward_data_source", "math_verify"),
         max_samples_per_benchmark=int(benchmark_config.get("max_samples_per_benchmark", -1)),
+        system_prompt_path=config.data.get("system_prompt_path", None),
+        agent_name=default_agent_loop,
     )
 
 

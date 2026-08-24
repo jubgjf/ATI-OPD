@@ -283,6 +283,21 @@ actor_rollout_ref:
       temperature: 0
       'n': 1
       do_sample: false
+    benchmark_sampling_profiles:
+      legacy:
+        _target_: verl.workers.config.SamplingConfig
+        top_k: -1
+        top_p: 0.95
+        temperature: 0.7
+        'n': 16
+        do_sample: true
+      train_sampling:
+        _target_: verl.workers.config.SamplingConfig
+        top_k: -1
+        top_p: 1.0
+        temperature: 1.0
+        'n': 16
+        do_sample: true
     multi_turn:
       _target_: verl.workers.config.MultiTurnConfig
       enable: false
@@ -839,7 +854,6 @@ distillation:
     teacher_temperature: 0.6
     teacher_top_p: 0.95
     teacher_top_k: 20
-    repair_for_evaluation: false
     outcome_aware_candidate_selection_enabled: false
     outcome_correctness_key: acc
     outcome_correctness_threshold: 0.5
@@ -939,7 +953,7 @@ trainer:
       finish_timeout_seconds: 60
   log_val_generations: 0
   log_test_generations: 0
-  teacher_val_before_train: true
+  teacher_val_before_train: false
   teacher_val_max_samples: 256
   log_teacher_val_generations: 32
   rollout_data_dir: null
@@ -951,7 +965,7 @@ trainer:
   esi_redundant_time: 0
   resume_mode: auto
   resume_from_path: null
-  val_before_train: true
+  val_before_train: false
   test_before_train: false
   val_only: false
   test_freq: -1
@@ -961,7 +975,6 @@ trainer:
   default_hdfs_dir: null
   del_local_ckpt_after_load: false
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
-  checkpoint_evaluation_manifest: false
   max_actor_ckpt_to_keep: null
   max_critic_ckpt_to_keep: null
   ray_wait_register_center_timeout: 300

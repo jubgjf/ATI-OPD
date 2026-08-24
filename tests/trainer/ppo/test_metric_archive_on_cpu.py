@@ -196,7 +196,7 @@ def test_balanced_router_warns_but_never_truncates_live_metrics(caplog):
     assert "exceeds warning threshold" in caplog.text
 
 
-def test_balanced_routing_keeps_only_fixed_outcome_and_paired_repair_surface_live_on_cpu():
+def test_balanced_routing_keeps_raw_benchmark_profiles_separate_on_cpu():
     outcome_prefix = "opd_intervention/outcome"
     metrics = {
         f"{outcome_prefix}/pre_correct_post_correct_fraction_among_repaired": 0.1,
@@ -206,13 +206,14 @@ def test_balanced_routing_keeps_only_fixed_outcome_and_paired_repair_surface_liv
         f"{outcome_prefix}/net_accuracy_delta_all_samples": 0.1,
         f"{outcome_prefix}/sample_count": 32,
         f"{outcome_prefix}/pre_wrong_post_correct_count": 3,
-        "test-repair-core/aime24/acc/mean@16": 0.5,
-        "test-repair-core/aime24/acc/paired_delta@16": 0.125,
-        "test-repair-core/aime24/acc/maj@16": 0.6,
-        "test-repair-aux/aime24/outcome/repair_executed_count": 8,
-        "val-oracle-repair-core/math/reward/mean@4": 0.75,
-        "val-oracle-repair-core/math/reward/paired_delta@4": 0.25,
-        "val-oracle-repair-aux/math/outcome/pre_wrong_post_correct_count": 2,
+        "test-legacy-core/aime24/acc/mean@16": 0.5,
+        "test-legacy-core/aime24/acc/maj@16": 0.6,
+        "test-legacy-aux/aime24/acc/best@16/std": 0.1,
+        "test-train-sampling-core/aime24/acc/mean@16": 0.4,
+        "test-train-sampling-core/aime24/acc/maj@16": 0.5,
+        "test-train-sampling-aux/aime24/acc/best@16/std": 0.2,
+        "test-legacy-tool/tool_call/attempt_rate": 0.25,
+        "test-train-sampling-tool/tool_call/execution_success_rate": 0.75,
     }
 
     route = MetricRouter("balanced").route(metrics)
@@ -221,18 +222,22 @@ def test_balanced_routing_keeps_only_fixed_outcome_and_paired_repair_surface_liv
         f"{outcome_prefix}/pre_correct_post_wrong_fraction_among_repaired",
         f"{outcome_prefix}/pre_wrong_post_correct_fraction_among_repaired",
         f"{outcome_prefix}/net_accuracy_delta_all_samples",
-        "test-repair-core/aime24/acc/mean@16",
-        "test-repair-core/aime24/acc/paired_delta@16",
-        "val-oracle-repair-core/math/reward/mean@4",
-        "val-oracle-repair-core/math/reward/paired_delta@4",
+        "test-legacy-core/aime24/acc/mean@16",
+        "test-legacy-core/aime24/acc/maj@16",
+        "test-train-sampling-core/aime24/acc/mean@16",
+        "test-train-sampling-core/aime24/acc/maj@16",
+        "test-legacy-tool/tool_call/attempt_rate",
+        "test-train-sampling-tool/tool_call/execution_success_rate",
     }
     assert expected_live <= set(route.live_metrics)
     assert f"{outcome_prefix}/pre_correct_post_correct_fraction_among_repaired" in route.detailed_metrics
     assert f"{outcome_prefix}/pre_wrong_post_wrong_fraction_among_repaired" in route.detailed_metrics
     assert set(route.detailed_metrics) == set(metrics) - expected_live
-    assert _parse_metric_dimensions("test-repair-core/aime24/acc/mean@16")["eval_scope"] == "test-repair"
+    assert "test-legacy-aux/aime24/acc/best@16/std" in route.detailed_metrics
+    assert "test-train-sampling-aux/aime24/acc/best@16/std" in route.detailed_metrics
+    assert _parse_metric_dimensions("test-legacy-core/aime24/acc/mean@16")["eval_scope"] == "test-legacy"
     assert (
-        _parse_metric_dimensions("val-oracle-repair-aux/math/outcome/sample_count")["eval_scope"] == "val-oracle-repair"
+        _parse_metric_dimensions("test-train-sampling-core/aime24/acc/mean@16")["eval_scope"] == "test-train-sampling"
     )
 
 
@@ -289,7 +294,7 @@ def test_23k_128_token_bins_and_bootstrap_metrics_collapse_to_small_live_surface
             "student/prob_topk/think_end_bin",
         ):
             metrics[f"{family}/{start:04d}_{end:04d}"] = float(start)
-    for scope in ("val", "test", "teacher-val"):
+    for scope in ("val", "test", "test-legacy", "test-train-sampling", "teacher-val"):
         for source in ("aime", "math", "olympiad", "gpqa"):
             for variable in ("acc", "score", "reward", "invalid_pred"):
                 for statistic in (

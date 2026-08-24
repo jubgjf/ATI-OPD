@@ -295,7 +295,6 @@ def test_teacher_validation_before_train_uses_val_kwargs_on_cpu():
     assert "repeat_times" not in captured
     assert "do_sample" not in captured
     assert captured["generation_max_tokens"] == 128
-    assert captured["repair_for_evaluation"] is False
 
 
 def test_validation_generation_logger_supports_teacher_record_shape_on_cpu():
