@@ -400,6 +400,7 @@ run_npu_opd_job() {
     distillation_log_prob_min_clamp=${DISTILLATION_LOG_PROB_MIN_CLAMP:--10.0}
     teacher_intervention_rejection_token_cap=${TEACHER_INTERVENTION_REJECTION_TOKEN_CAP:-10.0}
     teacher_intervention_skip_correct=${TEACHER_INTERVENTION_SKIP_CORRECT:-False}
+    teacher_intervention_prune=${TEACHER_INTERVENTION_PRUNE:-False}
     opd_diagnostics_enabled=${OPD_DIAGNOSTICS_ENABLED:-True}
     opd_diagnostics_collect_topk_overlap=${OPD_DIAGNOSTICS_COLLECT_TOPK_OVERLAP:-True}
     opd_diagnostics_collect_rethinking_opd=${OPD_DIAGNOSTICS_COLLECT_RETHINKING_OPD:-True}
@@ -754,6 +755,7 @@ _submit_npu_verl_job() {
         "distillation.distillation_loss.log_prob_min_clamp=${distillation_log_prob_min_clamp}"
         "distillation.intervention.teacher_rejection_token_cap=${teacher_intervention_rejection_token_cap}"
         "distillation.intervention.skip_correct=${teacher_intervention_skip_correct}"
+        "distillation.intervention.prune=${teacher_intervention_prune}"
         "distillation.diagnostics.enabled=${opd_diagnostics_enabled}"
         "distillation.diagnostics.collect_topk_overlap=${opd_diagnostics_collect_topk_overlap}"
         "distillation.diagnostics.collect_rethinking_opd_metrics=${opd_diagnostics_collect_rethinking_opd}"

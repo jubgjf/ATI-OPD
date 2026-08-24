@@ -115,12 +115,12 @@ def test_update_actor_keeps_teacher_supervision_before_padding(monkeypatch):
     assert "teacher_segment_mask" in captured_keys
 
 
-def _make_actor_update_trainer(*, horizon_mode="fixed", intervention_enabled=False):
+def _make_actor_update_trainer(*, horizon_mode="fixed", intervention_enabled=False, prune=False):
     trainer = object.__new__(RayPPOTrainer)
     trainer.distillation_config = SimpleNamespace(
         enabled=True,
         use_actor_loss=False,
-        intervention=SimpleNamespace(enabled=intervention_enabled),
+        intervention=SimpleNamespace(enabled=intervention_enabled, prune=prune),
         distillation_loss=SimpleNamespace(horizon=SimpleNamespace(mode=horizon_mode)),
     )
     trainer.config = SimpleNamespace(
@@ -152,6 +152,31 @@ def test_update_actor_copies_horizon_mask_to_actor_local_policy_mask_on_cpu(monk
         _make_actor_update_trainer(horizon_mode=horizon_mode)._update_actor(batch)
 
     assert torch.equal(captured_policy_mask, horizon_mask)
+    assert "policy_loss_mask" not in batch.batch
+
+
+def test_update_actor_copies_prune_mask_to_actor_local_policy_mask_on_cpu(monkeypatch):
+    captured_policy_mask = None
+
+    def fake_left_right_2_no_padding(batch_td):
+        nonlocal captured_policy_mask
+        captured_policy_mask = batch_td["policy_loss_mask"].clone()
+        raise StopBeforeWorker
+
+    monkeypatch.setattr(ray_trainer_module, "left_right_2_no_padding", fake_left_right_2_no_padding)
+
+    batch = _make_distillation_batch()
+    prune_mask = torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.int64)
+    batch.batch["distillation_loss_mask"] = prune_mask
+
+    with pytest.raises(StopBeforeWorker):
+        _make_actor_update_trainer(
+            horizon_mode="full",
+            intervention_enabled=True,
+            prune=True,
+        )._update_actor(batch)
+
+    assert torch.equal(captured_policy_mask, prune_mask)
     assert "policy_loss_mask" not in batch.batch
 
 

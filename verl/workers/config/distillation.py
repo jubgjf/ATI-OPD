@@ -260,6 +260,9 @@ class DistillationInterventionConfig(BaseConfig):
     future_gap_max_threshold: Optional[float] = None
     future_gap_min_reduction: float = 0.0
     train_on_teacher_segments: bool = False
+    # Keep the complete repaired rollout for rewards and diagnostics, but stop
+    # distillation supervision at the end of the first inserted teacher span.
+    prune: bool = False
     teacher_segment_loss_mode: str = "opd"
     teacher_segment_sft_loss_coef: float = 1.0
     min_trainable_tokens_after_repair: int = 1
@@ -308,6 +311,8 @@ class DistillationInterventionConfig(BaseConfig):
             )
         if self.skip_correct and not self.enabled:
             raise ValueError("skip_correct=true requires distillation.intervention.enabled=true.")
+        if self.prune and not self.enabled:
+            raise ValueError("prune=true requires distillation.intervention.enabled=true.")
         if self.confirmation_mode == "future_gap" and self.max_interventions_per_sample != 1:
             raise ValueError(
                 "confirmation_mode='future_gap' currently requires max_interventions_per_sample=1 so each "

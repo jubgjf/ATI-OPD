@@ -1005,6 +1005,7 @@ class _DirectInterventionWorker:
         future_gap_max_threshold: Optional[float] = None,
         future_gap_min_reduction: float = 0.0,
         train_on_teacher_segments: bool = False,
+        prune: bool = False,
         teacher_segment_loss_mode: str = "opd",
         min_trainable_tokens_after_repair: int = 1,
         gap_metric: str = "abs",
@@ -1059,6 +1060,7 @@ class _DirectInterventionWorker:
             future_gap_max_threshold=future_gap_max_threshold,
             future_gap_min_reduction=future_gap_min_reduction,
             train_on_teacher_segments=train_on_teacher_segments,
+            prune=prune,
             teacher_segment_loss_mode=teacher_segment_loss_mode,
             min_trainable_tokens_after_repair=min_trainable_tokens_after_repair,
             thinking_start_text=thinking_start_text,
@@ -2218,6 +2220,44 @@ async def test_teacher_intervention_skips_zero_trainable_repair_and_preserves_or
         }
     ]
     assert worker.llm_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_teacher_intervention_prune_ignores_generated_suffix_for_min_trainable_tokens_on_cpu():
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[30], stop_reason="completed", finish_reason="length"),
+        high_gap_start=0,
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=4,
+        teacher_segment_length=1,
+        prune=True,
+    )
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[1, 2, 3, 4],
+        response_mask=[1, 1, 1, 1],
+        response_logprobs=[-0.1] * 4,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"rollout_request_id": "prune-zero-trainable"},
+    )
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert output.response_ids == [1, 2, 3, 4]
+    assert output.response_mask == [1, 1, 1, 1]
+    assert output.extra_fields["teacher_intervention_count"] == 0
+    skipped = output.extra_fields["teacher_intervention_skipped"][0]
+    assert skipped["reason"] == "insufficient_trainable_tokens"
+    assert skipped["candidate_trainable_tokens"] == 0
+    assert worker.llm_client.calls
 
 
 @pytest.mark.asyncio

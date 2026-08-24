@@ -37,6 +37,7 @@ def test_teacher_segment_loss_config_defaults_to_legacy_opd_on_cpu():
     assert config.future_gap_min_valid_tokens == 32
     assert config.future_gap_max_threshold is None
     assert config.future_gap_min_reduction == 0.0
+    assert config.prune is False
     assert config.outcome_aware_candidate_selection_enabled is False
     assert config.outcome_correctness_key == "acc"
     assert config.teacher_candidate_count == 4
@@ -129,6 +130,34 @@ def test_future_gap_and_skip_correct_config_validation_on_cpu():
         DistillationInterventionConfig(future_gap_min_reduction=-0.1)
     with pytest.raises(ValueError, match="skip_correct=true"):
         DistillationInterventionConfig(skip_correct=True)
+
+
+def test_prune_config_requires_intervention_but_allows_no_teacher_training_on_cpu():
+    with pytest.raises(ValueError, match="prune=true"):
+        DistillationInterventionConfig(prune=True)
+
+    config = DistillationInterventionConfig(
+        enabled=True,
+        prune=True,
+        train_on_teacher_segments=False,
+    )
+    assert config.prune is True
+    assert config.train_on_teacher_segments is False
+
+    omega_config = OmegaConf.create(
+        {
+            "distillation": {
+                "enabled": True,
+                "intervention": {"enabled": False, "prune": True},
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="prune=true"):
+        validate_distillation_intervention_training_config(omega_config)
+
+    omega_config.distillation.enabled = False
+    with pytest.raises(ValueError, match="prune=true"):
+        validate_distillation_intervention_training_config(omega_config)
 
 
 def test_intervention_outcome_observation_config_defaults_and_validation_on_cpu():

@@ -245,6 +245,11 @@ def test_balanced_routing_keeps_only_compact_dmpd_boundary_allowlist_live_on_cpu
     live_keys = {
         "opd_intervention/rate",
         "opd_intervention/first_position_frac_mean",
+        "opd_intervention/prune/opd_token_fraction",
+        "opd_intervention/prune/excluded_student_tokens_mean_among_repaired",
+        "opd_intervention/prune/cutoff_position_mean",
+        "opd_intervention/prune/cutoff_position_frac_mean",
+        "opd_intervention/prune/empty_opd_sample_fraction",
         "opd_intervention/future_gap/proposal_rate",
         "opd_intervention/future_gap/acceptance_fraction_among_proposals",
         "opd_intervention/future_gap/active_gap/reduction_mean_among_accepted",

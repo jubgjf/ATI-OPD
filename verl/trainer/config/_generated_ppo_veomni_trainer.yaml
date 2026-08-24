@@ -836,6 +836,7 @@ distillation:
     future_gap_max_threshold: null
     future_gap_min_reduction: 0.0
     train_on_teacher_segments: false
+    prune: false
     teacher_segment_loss_mode: opd
     teacher_segment_sft_loss_coef: 1.0
     min_trainable_tokens_after_repair: 1

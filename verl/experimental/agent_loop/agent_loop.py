@@ -960,6 +960,7 @@ def _record_skipped_intervention(
     end: int,
     candidate_response_ids: Optional[list[int]] = None,
     candidate_response_mask: Optional[list[int]] = None,
+    candidate_trainable_tokens: Optional[int] = None,
     teacher_tokens: int = 0,
     student_suffix_tokens: int = 0,
 ) -> None:
@@ -970,11 +971,37 @@ def _record_skipped_intervention(
             "start": int(start),
             "end": int(end),
             "candidate_tokens": 0 if candidate_response_ids is None else len(candidate_response_ids),
-            "candidate_trainable_tokens": 0 if candidate_response_mask is None else int(sum(candidate_response_mask)),
+            "candidate_trainable_tokens": (
+                int(candidate_trainable_tokens)
+                if candidate_trainable_tokens is not None
+                else (0 if candidate_response_mask is None else int(sum(candidate_response_mask)))
+            ),
             "teacher_tokens": int(teacher_tokens),
             "student_suffix_tokens": int(student_suffix_tokens),
         }
     )
+
+
+def _count_intervention_trainable_tokens(
+    *,
+    response_mask: list[int],
+    teacher_segment_mask: Optional[list[int]],
+    prune: bool,
+    cutoff: int,
+) -> int:
+    """Count tokens that remain supervised after an optional prune cutoff."""
+    if teacher_segment_mask is not None and len(teacher_segment_mask) != len(response_mask):
+        raise RuntimeError(
+            "Teacher intervention trainable-token masks are misaligned: "
+            f"len(response_mask)={len(response_mask)}, len(teacher_segment_mask)={len(teacher_segment_mask)}."
+        )
+    if cutoff < 0 or cutoff > len(response_mask):
+        raise RuntimeError(f"Teacher intervention prune cutoff must be in [0, {len(response_mask)}], got {cutoff}.")
+    supervised_end = cutoff if prune else len(response_mask)
+    trainable_tokens = int(sum(response_mask[:supervised_end]))
+    if teacher_segment_mask is not None:
+        trainable_tokens += int(sum(teacher_segment_mask[:supervised_end]))
+    return trainable_tokens
 
 
 _MOE_CONFIG_ATTRIBUTES = (
@@ -3829,6 +3856,7 @@ class AgentLoopWorker:
                     intervention_config=intervention_config,
                 )
                 proposal["future_gap_confirmation_accepted"] = accepted
+                candidate_trainable_tokens = None
                 if accepted:
                     confirmation_terminal = bool(proposal.get("future_gap_confirmation_terminal", False))
                     continuation_budget = 0
@@ -3940,9 +3968,18 @@ class AgentLoopWorker:
                             **combined_logprob_metadata,
                         }
                     )
-                    candidate_trainable_tokens = sum(response_mask)
-                    if teacher_segment_mask is not None:
-                        candidate_trainable_tokens += sum(teacher_segment_mask)
+                    candidate_supervision_cutoff = pending.after_intervention_start
+                    if intervention_config.prune and interventions:
+                        first_intervention = interventions[0]
+                        candidate_supervision_cutoff = int(first_intervention["start"]) + int(
+                            first_intervention["teacher_tokens"]
+                        )
+                    candidate_trainable_tokens = _count_intervention_trainable_tokens(
+                        response_mask=response_mask,
+                        teacher_segment_mask=teacher_segment_mask,
+                        prune=intervention_config.prune,
+                        cutoff=candidate_supervision_cutoff,
+                    )
                     if accepted and candidate_trainable_tokens < min_trainable_tokens:
                         accepted = False
                         proposal.update(
@@ -3968,6 +4005,7 @@ class AgentLoopWorker:
                         end=int(proposal.get("end", 0)),
                         candidate_response_ids=response_ids,
                         candidate_response_mask=response_mask,
+                        candidate_trainable_tokens=candidate_trainable_tokens,
                         teacher_tokens=int(proposal.get("teacher_tokens", 0)),
                         student_suffix_tokens=int(proposal.get("student_suffix_tokens", 0)),
                     )
@@ -4474,9 +4512,18 @@ class AgentLoopWorker:
                 )
                 skipped_interventions[-1].update(student_suffix_logprob_metadata)
                 break
-            candidate_trainable_tokens = sum(candidate_response_mask)
-            if candidate_teacher_segment_mask is not None:
-                candidate_trainable_tokens += sum(candidate_teacher_segment_mask)
+            candidate_supervision_cutoff = start + len(teacher_segment_ids)
+            if intervention_config.prune and interventions:
+                first_intervention = interventions[0]
+                candidate_supervision_cutoff = int(first_intervention["start"]) + int(
+                    first_intervention["teacher_tokens"]
+                )
+            candidate_trainable_tokens = _count_intervention_trainable_tokens(
+                response_mask=candidate_response_mask,
+                teacher_segment_mask=candidate_teacher_segment_mask,
+                prune=intervention_config.prune,
+                cutoff=candidate_supervision_cutoff,
+            )
             if not future_gap_confirmation and candidate_trainable_tokens < min_trainable_tokens:
                 _record_skipped_intervention(
                     skipped_interventions,
@@ -4486,6 +4533,7 @@ class AgentLoopWorker:
                     end=end,
                     candidate_response_ids=candidate_response_ids,
                     candidate_response_mask=candidate_response_mask,
+                    candidate_trainable_tokens=candidate_trainable_tokens,
                     teacher_tokens=len(teacher_segment_ids),
                     student_suffix_tokens=len(student_suffix_result.token_ids),
                 )

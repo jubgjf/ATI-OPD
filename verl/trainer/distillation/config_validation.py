@@ -32,9 +32,12 @@ def _get_nested(config: Any, *keys: str, default: Any = None) -> Any:
 def validate_distillation_intervention_training_config(config: Any) -> None:
     """Validate cross-feature combinations that cannot be represented in one dataclass."""
     distillation_config = _get_nested(config, "distillation")
+    intervention_enabled = bool(_get_nested(distillation_config, "intervention", "enabled", default=False))
+    prune = bool(_get_nested(distillation_config, "intervention", "prune", default=False))
+    if prune and not intervention_enabled:
+        raise ValueError("distillation.intervention.prune=true requires distillation.intervention.enabled=true.")
     if not is_distillation_enabled(distillation_config):
         return
-    intervention_enabled = bool(_get_nested(distillation_config, "intervention", "enabled", default=False))
     diagnostics_enabled = bool(_get_nested(distillation_config, "diagnostics", "enabled", default=False))
     collect_intervention_metrics = bool(
         _get_nested(distillation_config, "diagnostics", "collect_intervention_metrics", default=True)

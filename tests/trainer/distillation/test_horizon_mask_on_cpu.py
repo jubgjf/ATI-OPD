@@ -14,6 +14,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from tensordict import TensorDict
@@ -23,9 +24,16 @@ from verl.trainer.distillation import losses as distillation_losses_module
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     apply_distillation_horizon_mask,
+    apply_intervention_prune_mask,
     build_distillation_prefix_mask,
     compute_distillation_horizon_tokens,
 )
+
+
+def _object_array(values):
+    result = np.empty(len(values), dtype=object)
+    result[:] = values
+    return result
 
 
 def test_fixed_horizon_masks_prefix_without_mutating_response_mask_on_cpu():
@@ -98,6 +106,200 @@ def test_full_horizon_does_not_attach_distillation_loss_mask_on_cpu():
 
     assert metrics == {}
     assert "distillation_loss_mask" not in data.batch.keys()
+
+
+def test_prune_uses_first_intervention_and_keeps_unrepaired_samples_full_on_cpu():
+    response_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    batch = TensorDict(
+        {
+            "attention_mask": response_mask.clone(),
+            "response_mask": response_mask.clone(),
+        },
+        batch_size=[2],
+    )
+    data = DataProto(
+        batch=batch,
+        non_tensor_batch={
+            "teacher_interventions": _object_array(
+                [
+                    [
+                        {"start": 2, "teacher_tokens": 1},
+                        {"start": 4, "teacher_tokens": 1},
+                    ],
+                    [],
+                ]
+            )
+        },
+    )
+
+    metrics = apply_intervention_prune_mask(
+        data=data,
+        intervention_config=SimpleNamespace(enabled=True, prune=True),
+    )
+
+    assert torch.equal(data.batch["response_mask"], response_mask)
+    assert torch.equal(
+        data.batch["distillation_loss_mask"],
+        torch.tensor(
+            [
+                [1, 1, 1, 0, 0, 0],
+                [1, 1, 1, 1, 0, 0],
+            ]
+        ),
+    )
+    assert metrics["opd_intervention/prune/opd_token_fraction"] == pytest.approx(7 / 9)
+    assert metrics["opd_intervention/prune/excluded_student_tokens_mean_among_repaired"] == 1.0
+    assert metrics["opd_intervention/prune/cutoff_position_mean"] == 3.0
+    assert metrics["opd_intervention/prune/cutoff_position_frac_mean"] == pytest.approx(3 / 5)
+    assert metrics["opd_intervention/prune/empty_opd_sample_fraction"] == 0.0
+
+
+def test_prune_sft_keeps_only_first_teacher_span_and_masks_student_suffix_on_cpu():
+    response_mask = torch.tensor([[1, 1, 0, 1, 0, 1, 1]], dtype=torch.long)
+    teacher_segment_mask = torch.tensor([[0, 0, 1, 0, 1, 0, 0]], dtype=torch.long)
+    batch = TensorDict(
+        {
+            "attention_mask": torch.ones(1, 7, dtype=torch.long),
+            "response_mask": response_mask.clone(),
+            "teacher_segment_mask": teacher_segment_mask.clone(),
+        },
+        batch_size=[1],
+    )
+    data = DataProto(
+        batch=batch,
+        non_tensor_batch={
+            "teacher_interventions": _object_array(
+                [[{"start": 2, "teacher_tokens": 1}, {"start": 4, "teacher_tokens": 1}]]
+            )
+        },
+    )
+
+    apply_intervention_prune_mask(
+        data=data,
+        intervention_config=SimpleNamespace(enabled=True, prune=True),
+    )
+
+    assert torch.equal(data.batch["response_mask"], response_mask)
+    assert torch.equal(data.batch["distillation_loss_mask"], torch.tensor([[1, 1, 0, 0, 0, 0, 0]]))
+    assert torch.equal(data.batch["teacher_segment_mask"], torch.tensor([[0, 0, 1, 0, 0, 0, 0]]))
+
+
+def test_prune_allows_empty_opd_prefix_when_sft_teacher_starts_at_zero_on_cpu():
+    batch = TensorDict(
+        {
+            "attention_mask": torch.tensor([[1, 1, 1, 0]], dtype=torch.long),
+            "response_mask": torch.tensor([[0, 1, 1, 0]], dtype=torch.long),
+            "teacher_segment_mask": torch.tensor([[1, 0, 0, 0]], dtype=torch.long),
+        },
+        batch_size=[1],
+    )
+    data = DataProto(
+        batch=batch,
+        non_tensor_batch={"teacher_interventions": _object_array([[{"start": 0, "teacher_tokens": 1}]])},
+    )
+
+    metrics = apply_intervention_prune_mask(
+        data=data,
+        intervention_config=SimpleNamespace(enabled=True, prune=True),
+    )
+
+    assert not data.batch["distillation_loss_mask"].any()
+    assert torch.equal(data.batch["teacher_segment_mask"], torch.tensor([[1, 0, 0, 0]]))
+    assert metrics["opd_intervention/prune/empty_opd_sample_fraction"] == 1.0
+
+
+def test_prune_teacher_terminal_at_response_end_keeps_all_available_supervision_on_cpu():
+    response_mask = torch.ones(1, 3, dtype=torch.long)
+    data = DataProto(
+        batch=TensorDict(
+            {
+                "attention_mask": response_mask.clone(),
+                "response_mask": response_mask.clone(),
+            },
+            batch_size=[1],
+        ),
+        non_tensor_batch={"teacher_interventions": _object_array([[{"start": 1, "teacher_tokens": 2}]])},
+    )
+
+    metrics = apply_intervention_prune_mask(
+        data=data,
+        intervention_config=SimpleNamespace(enabled=True, prune=True),
+    )
+
+    assert torch.equal(data.batch["distillation_loss_mask"], response_mask)
+    assert metrics["opd_intervention/prune/excluded_student_tokens_mean_among_repaired"] == 0.0
+    assert metrics["opd_intervention/prune/cutoff_position_frac_mean"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "horizon_config",
+    [
+        SimpleNamespace(mode="fixed", tokens=2),
+        SimpleNamespace(
+            mode="progressive",
+            start_tokens=2,
+            end_tokens=6,
+            increment_tokens=2,
+            interval_steps=10,
+        ),
+    ],
+)
+def test_prune_intersects_existing_horizon_mask_on_cpu(horizon_config):
+    response_mask = torch.ones(1, 6, dtype=torch.long)
+    data = DataProto(
+        batch=TensorDict(
+            {
+                "attention_mask": response_mask.clone(),
+                "response_mask": response_mask.clone(),
+            },
+            batch_size=[1],
+        ),
+        non_tensor_batch={"teacher_interventions": _object_array([[{"start": 3, "teacher_tokens": 1}]])},
+    )
+    apply_distillation_horizon_mask(
+        data=data,
+        horizon_config=horizon_config,
+        global_steps=1,
+    )
+
+    apply_intervention_prune_mask(
+        data=data,
+        intervention_config=SimpleNamespace(enabled=True, prune=True),
+    )
+
+    assert torch.equal(data.batch["distillation_loss_mask"], torch.tensor([[1, 1, 0, 0, 0, 0]]))
+
+
+def test_prune_rejects_missing_or_out_of_range_intervention_metadata_on_cpu():
+    response_mask = torch.ones(1, 3, dtype=torch.long)
+    batch = TensorDict(
+        {"attention_mask": response_mask.clone(), "response_mask": response_mask.clone()},
+        batch_size=[1],
+    )
+    config = SimpleNamespace(enabled=True, prune=True)
+
+    with pytest.raises(RuntimeError, match="teacher_interventions metadata"):
+        apply_intervention_prune_mask(data=DataProto(batch=batch.clone()), intervention_config=config)
+
+    data = DataProto(
+        batch=batch.clone(),
+        non_tensor_batch={"teacher_interventions": _object_array([None])},
+    )
+    with pytest.raises(RuntimeError, match="null teacher_interventions metadata"):
+        apply_intervention_prune_mask(data=data, intervention_config=config)
+
+    data = DataProto(
+        batch=batch.clone(),
+        non_tensor_batch={"teacher_interventions": _object_array([[{"start": 2, "teacher_tokens": 2}]])},
+    )
+    with pytest.raises(RuntimeError, match="teacher span exceeds"):
+        apply_intervention_prune_mask(data=data, intervention_config=config)
 
 
 def test_distillation_ppo_loss_keeps_task_ppo_on_full_response_mask_on_cpu(monkeypatch):
@@ -175,6 +377,7 @@ def _make_horizon_policy_trainer(
     horizon_mode="fixed",
     adv_estimator="token_reward_direct",
     intervention_enabled=False,
+    prune=False,
     use_actor_loss=False,
     policy_loss_mode="vanilla",
     loss_agg_mode="token-mean",
@@ -183,7 +386,7 @@ def _make_horizon_policy_trainer(
     trainer.distillation_config = SimpleNamespace(
         enabled=True,
         use_actor_loss=use_actor_loss,
-        intervention=SimpleNamespace(enabled=intervention_enabled),
+        intervention=SimpleNamespace(enabled=intervention_enabled, prune=prune),
         distillation_loss=SimpleNamespace(horizon=SimpleNamespace(mode=horizon_mode)),
     )
     trainer.config = SimpleNamespace(
@@ -199,20 +402,23 @@ def _make_horizon_policy_trainer(
 
 
 def test_horizon_policy_loss_normalization_gate_accepts_topd_and_popd_on_cpu():
-    assert _make_horizon_policy_trainer(horizon_mode="fixed")._uses_horizon_policy_loss_normalization()
-    assert _make_horizon_policy_trainer(horizon_mode="progressive")._uses_horizon_policy_loss_normalization()
+    assert _make_horizon_policy_trainer(horizon_mode="fixed")._uses_distillation_policy_loss_mask()
+    assert _make_horizon_policy_trainer(horizon_mode="progressive")._uses_distillation_policy_loss_mask()
+    assert _make_horizon_policy_trainer(
+        horizon_mode="full", intervention_enabled=True, prune=True
+    )._uses_distillation_policy_loss_mask()
 
 
 def test_horizon_policy_loss_normalization_gate_isolates_other_paths_on_cpu():
-    assert not _make_horizon_policy_trainer(horizon_mode="full")._uses_horizon_policy_loss_normalization()
-    assert not _make_horizon_policy_trainer(intervention_enabled=True)._uses_horizon_policy_loss_normalization()
-    assert not _make_horizon_policy_trainer(adv_estimator="grpo")._uses_horizon_policy_loss_normalization()
+    assert not _make_horizon_policy_trainer(horizon_mode="full")._uses_distillation_policy_loss_mask()
+    assert not _make_horizon_policy_trainer(intervention_enabled=True)._uses_distillation_policy_loss_mask()
+    assert not _make_horizon_policy_trainer(adv_estimator="grpo")._uses_distillation_policy_loss_mask()
 
 
 def test_horizon_policy_loss_normalization_gate_rejects_unsupported_actor_loss_on_cpu():
     with pytest.raises(NotImplementedError, match="loss_mode='vanilla'"):
-        _make_horizon_policy_trainer(policy_loss_mode="dppo_tv")._uses_horizon_policy_loss_normalization()
+        _make_horizon_policy_trainer(policy_loss_mode="dppo_tv")._uses_distillation_policy_loss_mask()
     with pytest.raises(NotImplementedError, match="loss_agg_mode='token-mean'"):
-        _make_horizon_policy_trainer(loss_agg_mode="seq-mean-token-mean")._uses_horizon_policy_loss_normalization()
+        _make_horizon_policy_trainer(loss_agg_mode="seq-mean-token-mean")._uses_distillation_policy_loss_mask()
     with pytest.raises(ValueError, match="use_actor_loss=False"):
-        _make_horizon_policy_trainer(use_actor_loss=True)._uses_horizon_policy_loss_normalization()
+        _make_horizon_policy_trainer(use_actor_loss=True)._uses_distillation_policy_loss_mask()

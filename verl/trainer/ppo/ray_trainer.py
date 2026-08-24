@@ -955,14 +955,18 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def _get_horizon_config_value(horizon_config: Any, key: str, default: Any = None) -> Any:
-    if horizon_config is None:
+def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
+    if config is None:
         return default
-    if isinstance(horizon_config, dict):
-        return horizon_config.get(key, default)
-    if hasattr(horizon_config, "get"):
-        return horizon_config.get(key, default)
-    return getattr(horizon_config, key, default)
+    if isinstance(config, dict):
+        return config.get(key, default)
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _get_horizon_config_value(horizon_config: Any, key: str, default: Any = None) -> Any:
+    return _get_config_value(horizon_config, key, default)
 
 
 def compute_distillation_horizon_tokens(horizon_config: Any, global_steps: int) -> Optional[int]:
@@ -1023,6 +1027,160 @@ def apply_distillation_horizon_mask(
         "distillation/mask_token_fraction": float(token_fraction),
         "distillation/mask_tokens/mean": loss_tokens.float().mean().item(),
         "distillation/mask_clipped_sample_fraction": float(clipped_sample_fraction),
+    }
+
+
+def apply_intervention_prune_mask(
+    data: DataProto,
+    intervention_config: Any,
+) -> dict[str, float]:
+    """Limit distillation supervision to the first repaired prefix and teacher span."""
+    if not bool(_get_config_value(intervention_config, "prune", False)):
+        return {}
+    if not bool(_get_config_value(intervention_config, "enabled", False)):
+        raise ValueError("distillation.intervention.prune=true requires intervention.enabled=true.")
+    if "teacher_interventions" not in data.non_tensor_batch:
+        raise RuntimeError(
+            "DMPD prune requires teacher_interventions metadata for every rollout sample, but the batch has no "
+            "teacher_interventions field."
+        )
+    if "response_mask" not in data.batch or "attention_mask" not in data.batch:
+        raise RuntimeError("DMPD prune requires response_mask and attention_mask tensors.")
+
+    response_mask = data.batch["response_mask"]
+    if response_mask.ndim != 2:
+        raise ValueError(f"DMPD prune expects response_mask with shape [B,T], got {tuple(response_mask.shape)}.")
+    batch_size, response_width = response_mask.shape
+    attention_mask = data.batch["attention_mask"]
+    if attention_mask.ndim != 2 or attention_mask.shape[0] != batch_size or attention_mask.shape[1] < response_width:
+        raise ValueError(
+            "DMPD prune expects attention_mask to contain the response suffix, but got "
+            f"response_mask.shape={tuple(response_mask.shape)} and attention_mask.shape={tuple(attention_mask.shape)}."
+        )
+
+    raw_interventions = data.non_tensor_batch["teacher_interventions"]
+    if raw_interventions is None:
+        raise RuntimeError("DMPD prune found a null teacher_interventions batch field; expected one list per sample.")
+    if isinstance(raw_interventions, np.ndarray):
+        sample_interventions = raw_interventions.tolist()
+    else:
+        sample_interventions = list(raw_interventions)
+    if len(sample_interventions) != batch_size:
+        raise RuntimeError(
+            "DMPD prune requires one teacher_interventions entry per sample, "
+            f"got {len(sample_interventions)} entries for batch size {batch_size}."
+        )
+
+    response_mask_bool = response_mask.bool()
+    base_loss_mask = data.batch.get("distillation_loss_mask", response_mask)
+    if base_loss_mask.shape != response_mask.shape:
+        raise ValueError(
+            "DMPD prune requires distillation_loss_mask to be response-aligned, "
+            f"got {tuple(base_loss_mask.shape)} and {tuple(response_mask.shape)}."
+        )
+    base_loss_mask_bool = base_loss_mask.bool()
+    if (base_loss_mask_bool & ~response_mask_bool).any().item():
+        raise ValueError("distillation_loss_mask must be a subset of response_mask before applying DMPD prune.")
+
+    response_attention_mask = attention_mask[:, -response_width:].to(device=response_mask.device).bool()
+    valid_response_lengths = response_attention_mask.sum(dim=-1)
+    cutoffs = torch.full((batch_size,), response_width, dtype=torch.long, device=response_mask.device)
+    repaired_samples = torch.zeros(batch_size, dtype=torch.bool, device=response_mask.device)
+    teacher_token_positions = torch.zeros_like(response_mask_bool)
+
+    for sample_idx, raw_sample_records in enumerate(sample_interventions):
+        if raw_sample_records is None:
+            raise RuntimeError(
+                f"DMPD prune found null teacher_interventions metadata for sample {sample_idx}; use [] when no "
+                "intervention succeeded."
+            )
+        elif isinstance(raw_sample_records, dict):
+            records = [raw_sample_records]
+        elif isinstance(raw_sample_records, np.ndarray):
+            records = raw_sample_records.tolist()
+        elif isinstance(raw_sample_records, list | tuple):
+            records = list(raw_sample_records)
+        else:
+            raise RuntimeError(
+                "DMPD prune teacher_interventions entries must be lists of records, "
+                f"but sample {sample_idx} has {type(raw_sample_records).__name__}."
+            )
+        if any(not isinstance(record, dict) for record in records):
+            raise RuntimeError(f"DMPD prune found a non-dict intervention record for sample {sample_idx}.")
+        if not records:
+            continue
+
+        valid_response_length = int(valid_response_lengths[sample_idx].item())
+        for record_idx, record in enumerate(records):
+            start = record.get("start")
+            teacher_tokens = record.get("teacher_tokens")
+            if isinstance(start, bool) or not isinstance(start, int | np.integer) or int(start) < 0:
+                raise RuntimeError(
+                    "DMPD prune requires a non-negative integer start for "
+                    f"sample {sample_idx} intervention {record_idx}, got {start!r}."
+                )
+            if (
+                isinstance(teacher_tokens, bool)
+                or not isinstance(teacher_tokens, int | np.integer)
+                or int(teacher_tokens) <= 0
+            ):
+                raise RuntimeError(
+                    "DMPD prune requires a positive integer teacher_tokens value for "
+                    f"sample {sample_idx} intervention {record_idx}, got {teacher_tokens!r}."
+                )
+            teacher_end = int(start) + int(teacher_tokens)
+            if teacher_end > valid_response_length:
+                raise RuntimeError(
+                    "DMPD prune teacher span exceeds the non-padding response length for "
+                    f"sample {sample_idx} intervention {record_idx}: end={teacher_end}, "
+                    f"response_length={valid_response_length}."
+                )
+            teacher_token_positions[sample_idx, int(start) : teacher_end] = True
+            if record_idx == 0:
+                cutoffs[sample_idx] = teacher_end
+        repaired_samples[sample_idx] = True
+
+    positions = torch.arange(response_width, device=response_mask.device).unsqueeze(0)
+    positional_mask = positions < cutoffs.unsqueeze(1)
+    loss_mask_bool = base_loss_mask_bool & positional_mask
+    data.batch["distillation_loss_mask"] = loss_mask_bool.to(dtype=response_mask.dtype)
+
+    teacher_segment_mask = data.batch.get("teacher_segment_mask")
+    if teacher_segment_mask is not None:
+        if teacher_segment_mask.shape != response_mask.shape:
+            raise ValueError(
+                "DMPD prune requires teacher_segment_mask to be response-aligned, "
+                f"got {tuple(teacher_segment_mask.shape)} and {tuple(response_mask.shape)}."
+            )
+        data.batch["teacher_segment_mask"] = (teacher_segment_mask.bool() & positional_mask).to(
+            dtype=teacher_segment_mask.dtype
+        )
+
+    total_response_tokens = int(response_mask_bool.sum().item())
+    total_loss_tokens = int(loss_mask_bool.sum().item())
+    repaired_count = int(repaired_samples.sum().item())
+    excluded_student_tokens = (response_mask_bool & ~positional_mask & ~teacher_token_positions).sum(dim=-1).float()
+    if repaired_count > 0:
+        repaired_cutoffs = cutoffs[repaired_samples].float()
+        repaired_lengths = valid_response_lengths[repaired_samples].float()
+        cutoff_position_mean = repaired_cutoffs.mean().item()
+        cutoff_position_frac_mean = (repaired_cutoffs / repaired_lengths.clamp_min(1.0)).mean().item()
+        excluded_tokens_mean = excluded_student_tokens[repaired_samples].mean().item()
+    else:
+        cutoff_position_mean = 0.0
+        cutoff_position_frac_mean = 0.0
+        excluded_tokens_mean = 0.0
+
+    return {
+        "opd_intervention/prune/opd_token_fraction": (
+            float(total_loss_tokens) / float(total_response_tokens) if total_response_tokens > 0 else 0.0
+        ),
+        "opd_intervention/prune/excluded_student_tokens_mean_among_repaired": float(excluded_tokens_mean),
+        "opd_intervention/prune/cutoff_position_mean": float(cutoff_position_mean),
+        "opd_intervention/prune/cutoff_position_frac_mean": float(cutoff_position_frac_mean),
+        "opd_intervention/prune/empty_opd_sample_fraction": float(
+            (loss_mask_bool.sum(dim=-1) == 0).float().mean().item()
+        ),
     }
 
 
@@ -2846,13 +3004,13 @@ class RayPPOTrainer:
         batch.meta_info["temperature"] = rollout_config.temperature
         # update actor
         batch_td = batch.to_tensordict()
-        if self._uses_horizon_policy_loss_normalization():
+        if self._uses_distillation_policy_loss_mask():
             if "distillation_loss_mask" not in batch_td:
                 raise RuntimeError(
-                    "TOPD/POPD policy-loss normalization requires distillation_loss_mask to be attached "
+                    "Masked token-reward distillation requires distillation_loss_mask to be attached "
                     "before the actor update."
                 )
-            # Keep the horizon mask actor-local. response_mask remains the full rollout mask for
+            # Keep the supervision mask actor-local. response_mask remains the full rollout mask for
             # old/reference log-probabilities, entropy, KL, rewards, and diagnostics.
             batch_td["policy_loss_mask"] = batch_td["distillation_loss_mask"].clone()
         # step 2: convert from padding to no-padding
@@ -2916,19 +3074,20 @@ class RayPPOTrainer:
             return False
         return bool(self.distillation_config.distillation_loss.use_task_rewards)
 
-    def _uses_horizon_policy_loss_normalization(self) -> bool:
-        """Return whether this actor update is the supported TOPD/POPD policy-loss path."""
+    def _uses_distillation_policy_loss_mask(self) -> bool:
+        """Return whether token-reward OPD needs an actor-local supervision mask."""
         distillation_config = getattr(self, "distillation_config", None)
         if not is_distillation_enabled(distillation_config):
             return False
 
         intervention_config = getattr(distillation_config, "intervention", None)
-        if intervention_config is not None and bool(getattr(intervention_config, "enabled", False)):
-            return False
+        intervention_enabled = bool(_get_config_value(intervention_config, "enabled", False))
+        prune_enabled = intervention_enabled and bool(_get_config_value(intervention_config, "prune", False))
 
         loss_config = distillation_config.distillation_loss
         horizon_mode = str(_get_horizon_config_value(loss_config.horizon, "mode", "full")).lower()
-        if horizon_mode not in {"fixed", "progressive"}:
+        horizon_enabled = not intervention_enabled and horizon_mode in {"fixed", "progressive"}
+        if not (prune_enabled or horizon_enabled):
             return False
 
         adv_estimator = self.config.algorithm.adv_estimator
@@ -2938,7 +3097,7 @@ class RayPPOTrainer:
 
         if getattr(distillation_config, "use_actor_loss", True):
             raise ValueError(
-                "TOPD/POPD policy-loss normalization requires distillation.use_actor_loss=False when "
+                "Masked token-reward distillation requires distillation.use_actor_loss=False when "
                 "ADV_ESTIMATOR=token_reward_direct."
             )
 
@@ -2947,12 +3106,12 @@ class RayPPOTrainer:
         policy_loss_mode = policy_loss_config.get("loss_mode", "vanilla")
         if policy_loss_mode != "vanilla":
             raise NotImplementedError(
-                "TOPD/POPD policy-loss normalization currently supports only "
+                "Masked token-reward distillation currently supports only "
                 f"actor.policy_loss.loss_mode='vanilla', got {policy_loss_mode!r}."
             )
         if actor_config.loss_agg_mode != "token-mean":
             raise NotImplementedError(
-                "TOPD/POPD policy-loss normalization currently supports only "
+                "Masked token-reward distillation currently supports only "
                 f"actor.loss_agg_mode='token-mean', got {actor_config.loss_agg_mode!r}."
             )
         return True
@@ -4286,6 +4445,12 @@ class RayPPOTrainer:
                                 data=batch,
                                 horizon_config=self.distillation_config.distillation_loss.horizon,
                                 global_steps=self.global_steps,
+                            )
+                        )
+                        metrics.update(
+                            apply_intervention_prune_mask(
+                                data=batch,
+                                intervention_config=self.distillation_config.intervention,
                             )
                         )
 

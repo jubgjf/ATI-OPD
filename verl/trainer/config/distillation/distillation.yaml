@@ -139,6 +139,9 @@ intervention:
   future_gap_max_threshold: null
   future_gap_min_reduction: 0.0
   train_on_teacher_segments: false
+  # Keep full repaired generations for rewards and diagnostics, while limiting
+  # distillation supervision to the first prefix plus inserted teacher span.
+  prune: false
   # Training objective for teacher-inserted tokens when train_on_teacher_segments=true.
   # opd preserves the legacy behavior; sft applies CE only on teacher-inserted tokens.
   teacher_segment_loss_mode: opd
