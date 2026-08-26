@@ -151,18 +151,10 @@ printf '%s\n' \
     )
 
 
-def test_in_training_evaluation_is_fully_disabled_by_default_on_cpu():
-    result = _run_in_training_evaluation_config(
-        {
-            "VAL_BEFORE_TRAIN": "True",
-            "TEST_BEFORE_TRAIN": "True",
-            "TEACHER_VAL_BEFORE_TRAIN": "True",
-            "TEST_FREQ": "10",
-            "TEST_BENCHMARKS_FREQ": "20",
-        }
-    )
+def test_in_training_evaluation_defaults_to_benchmark_only_on_cpu():
+    result = _run_in_training_evaluation_config()
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "False|False|False|False|-1|-1"
+    assert result.stdout.strip() == "True|False|False|False|-1|20"
 
 
 def test_in_training_evaluation_opt_in_defaults_to_benchmark_only_on_cpu():

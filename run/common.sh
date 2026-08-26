@@ -290,6 +290,10 @@ run_npu_opd_job() {
     export VLLM_USE_V1=${VLLM_USE_V1:-1}
     ulimit -n "${ULIMIT_NOFILE:-65536}"
 
+    TRAIN_DATASET=${TRAIN_DATASET:-dapo_math_17k}
+    model_root=${MODEL_ROOT:-$DATASET_DIR/models}
+    dataset_root=${DATASET_ROOT:-$DATASET_DIR/datasets}
+
     enable_tool_call=${ENABLE_TOOL_CALL:-False}
     case "$enable_tool_call" in
         True | true | 1) enable_tool_call=True ;;
@@ -300,13 +304,13 @@ run_npu_opd_job() {
             ;;
     esac
 
-    if [[ "$enable_tool_call" == "True" ]]; then
-        STUDENT_MODEL=${STUDENT_MODEL:-$DATASET_DIR/models/Qwen/Qwen3-1.7B}
-        TEACHER_MODEL=${TEACHER_MODEL:-$DATASET_DIR/models/Qwen/Qwen3-8B}
+    if [[ "$enable_tool_call" == "True" || "$TRAIN_DATASET" == "nemotron_cascade_2_rl_mopd" ]]; then
+        STUDENT_MODEL=${STUDENT_MODEL:-$model_root/Qwen/Qwen3-1.7B}
+        TEACHER_MODEL=${TEACHER_MODEL:-$model_root/Qwen/Qwen3-8B}
         CHAT_TEMPLATE_MODEL=${CHAT_TEMPLATE_MODEL:-$STUDENT_MODEL}
     else
-        STUDENT_MODEL=${STUDENT_MODEL:-$DATASET_DIR/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
-        TEACHER_MODEL=${TEACHER_MODEL:-$DATASET_DIR/models/hbx/JustRL-DeepSeek-1.5B}
+        STUDENT_MODEL=${STUDENT_MODEL:-$model_root/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
+        TEACHER_MODEL=${TEACHER_MODEL:-$model_root/hbx/JustRL-DeepSeek-1.5B}
         CHAT_TEMPLATE_MODEL=${CHAT_TEMPLATE_MODEL:-$TEACHER_MODEL}
     fi
 
@@ -314,18 +318,21 @@ run_npu_opd_job() {
     tool_system_prompt_path=${TOOL_SYSTEM_PROMPT_PATH:-$WORKSPACE/run/prompts/qwen3_math_tool_optional.txt}
     function_tool_path=${FUNCTION_TOOL_PATH:-$WORKSPACE/verl/tools/code_interpreter_tool.py}
 
-    TRAIN_DATASET=${TRAIN_DATASET:-dapo_math_17k}
     case "$TRAIN_DATASET" in
         dapo_math_17k)
-            default_train_file=${DAPO_MATH_TRAIN:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl--qwen3/train.parquet}
-            default_valid_file=${DAPO_MATH_VALID:-$DATASET_DIR/datasets/open-r1/DAPO-Math-17k-Processed-verl--qwen3/test.parquet}
+            default_train_file=${DAPO_MATH_TRAIN:-$dataset_root/open-r1/DAPO-Math-17k-Processed-verl--qwen3/train.parquet}
+            default_valid_file=${DAPO_MATH_VALID:-$dataset_root/open-r1/DAPO-Math-17k-Processed-verl--qwen3/test.parquet}
             ;;
         deepmath_103k)
-            default_train_file=${DEEPMATH_103K_TRAIN:-$DATASET_DIR/datasets/zwhe99/DeepMath-103K-verl--qwen3/train.parquet}
-            default_valid_file=${DEEPMATH_103K_VALID:-$DATASET_DIR/datasets/zwhe99/DeepMath-103K-verl--qwen3/test.parquet}
+            default_train_file=${DEEPMATH_103K_TRAIN:-$dataset_root/zwhe99/DeepMath-103K-verl--qwen3/train.parquet}
+            default_valid_file=${DEEPMATH_103K_VALID:-$dataset_root/zwhe99/DeepMath-103K-verl--qwen3/test.parquet}
+            ;;
+        nemotron_cascade_2_rl_mopd)
+            default_train_file=${NEMOTRON_CASCADE_2_RL_MOPD_TRAIN:-$dataset_root/nvidia/Nemotron-Cascade-2-RL-data-MOPD-verl--qwen3/train.parquet}
+            default_valid_file=${NEMOTRON_CASCADE_2_RL_MOPD_VALID:-$dataset_root/nvidia/Nemotron-Cascade-2-RL-data-MOPD-verl--qwen3/test.parquet}
             ;;
         *)
-            echo "Unsupported TRAIN_DATASET=$TRAIN_DATASET. Use dapo_math_17k or deepmath_103k." >&2
+            echo "Unsupported TRAIN_DATASET=$TRAIN_DATASET. Use dapo_math_17k, deepmath_103k, or nemotron_cascade_2_rl_mopd." >&2
             return 2
             ;;
     esac
@@ -350,7 +357,17 @@ run_npu_opd_job() {
         max_prompt_length=${MAX_PROMPT_LENGTH:-$((1 * 1024))}
     fi
     max_response_length=${MAX_RESPONSE_LENGTH:-$((23 * 1024))}
-    max_num_tokens=${MAX_NUM_TOKENS:-$((max_prompt_length + max_response_length + 1))}
+    sequence_token_budget=$((max_prompt_length + max_response_length + 1))
+    max_num_tokens=${MAX_NUM_TOKENS:-${MAX_MODEL_LEN:-$sequence_token_budget}}
+    if [[ "$TRAIN_DATASET" == "nemotron_cascade_2_rl_mopd" ]]; then
+        default_rollout_max_model_len=32768
+        default_teacher_max_model_len=$sequence_token_budget
+    else
+        default_rollout_max_model_len=$max_num_tokens
+        default_teacher_max_model_len=$max_num_tokens
+    fi
+    rollout_max_model_len=${ROLLOUT_MAX_MODEL_LEN:-${STUDENT_MAX_MODEL_LEN:-${MAX_MODEL_LEN:-${MAX_NUM_TOKENS:-$default_rollout_max_model_len}}}}
+    teacher_max_model_len=${TEACHER_MAX_MODEL_LEN:-${MAX_MODEL_LEN:-${MAX_NUM_TOKENS:-$default_teacher_max_model_len}}}
     rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-2048}
     teacher_max_num_batched_tokens=${TEACHER_MAX_NUM_BATCHED_TOKENS:-2048}
     rollout_max_num_seqs=${ROLLOUT_MAX_NUM_SEQS:-128}
@@ -378,9 +395,20 @@ run_npu_opd_job() {
     train_max_samples=${TRAIN_MAX_SAMPLES:--1}
     val_max_samples=${VAL_MAX_SAMPLES:-256}
     val_batch_size=${VAL_BATCH_SIZE:-256}
-    test_benchmark_root=${TEST_BENCHMARK_ROOT:-$DATASET_DIR/datasets}
-    validation_reward_data_source=${VALIDATION_REWARD_DATA_SOURCE:-math_verify}
-    test_benchmarks=${TEST_BENCHMARKS:-"['math-ai/aime24','math-ai/aime25','math-ai/amc23','meituan-longcat/AMO-Bench']"}
+    test_benchmark_root=${TEST_BENCHMARK_ROOT:-$dataset_root}
+    if [[ "$TRAIN_DATASET" == "nemotron_cascade_2_rl_mopd" ]]; then
+        validation_reward_data_source=${VALIDATION_REWARD_DATA_SOURCE:-nemotron_cascade_mopd}
+        default_test_benchmark_suite=nemotron_cascade
+        default_test_benchmarks="[]"
+        export NLTK_DATA=${NEMOTRON_NLTK_DATA:-${NLTK_DATA:-$dataset_root/nltk_data}}
+    else
+        validation_reward_data_source=${VALIDATION_REWARD_DATA_SOURCE:-math_verify}
+        default_test_benchmark_suite=
+        default_test_benchmarks="['math-ai/aime24','math-ai/aime25','math-ai/amc23','meituan-longcat/AMO-Bench']"
+    fi
+    test_benchmark_suite=${TEST_BENCHMARK_SUITE:-$default_test_benchmark_suite}
+    test_benchmark_seed=${TEST_BENCHMARK_SEED:-42}
+    test_benchmarks=${TEST_BENCHMARKS:-$default_test_benchmarks}
     test_benchmark_reward_data_source=${TEST_BENCHMARK_REWARD_DATA_SOURCE:-math_verify}
     test_benchmark_max_samples=${TEST_BENCHMARK_MAX_SAMPLES:--1}
     test_benchmark_batch_size=${TEST_BENCHMARK_BATCH_SIZE:-256}
@@ -494,6 +522,9 @@ run_npu_opd_job() {
 
     echo "Metric logging: mode=$metric_logging_mode, archive=$metric_logging_archive_enabled, shard_interval=$metric_logging_archive_shard_interval_steps, upload=$metric_logging_archive_upload_to_wandb"
     echo "In-training evaluation: enabled=$in_train_evaluation, val_before=$val_before_train, test_before=$test_before_train, teacher_val_before=$teacher_val_before_train, val_freq=$test_freq, benchmark_freq=$test_benchmarks_freq"
+    echo "Sequence lengths: prompt=$max_prompt_length, response=$max_response_length, rollout_model=$rollout_max_model_len, teacher_model=$teacher_max_model_len"
+    echo "Chat template: source=$CHAT_TEMPLATE_MODEL"
+    echo "Benchmarks: seed=$test_benchmark_seed, names=$test_benchmarks, suite=${test_benchmark_suite:-legacy}"
     echo "W&B resume: mode=$WANDB_MODE, required=$resume_required, run_id=${WANDB_RUN_ID:-unset}, resume=${WANDB_RESUME:-unset}"
     echo "W&B storage: run_root=$WANDB_DIR, upload_staging_root=$WANDB_DATA_DIR, cache_root=$WANDB_CACHE_DIR"
 
@@ -645,6 +676,7 @@ _submit_npu_verl_job() {
         "data.validation_reward_data_source=${validation_reward_data_source}"
         "data.test_benchmarks.root=${test_benchmark_root}"
         "data.test_benchmarks.names=${test_benchmarks}"
+        "data.test_benchmarks.seed=${test_benchmark_seed}"
         "data.test_benchmarks.batch_size=${test_benchmark_batch_size}"
         "data.test_benchmarks.max_samples_per_benchmark=${test_benchmark_max_samples}"
         "data.test_benchmarks.reward_data_source=${test_benchmark_reward_data_source}"
@@ -676,7 +708,7 @@ _submit_npu_verl_job() {
         "actor_rollout_ref.rollout.top_p=${rollout_top_p}"
         "actor_rollout_ref.rollout.top_k=${rollout_top_k}"
         "actor_rollout_ref.rollout.do_sample=${rollout_do_sample}"
-        "actor_rollout_ref.rollout.max_model_len=${max_num_tokens}"
+        "actor_rollout_ref.rollout.max_model_len=${rollout_max_model_len}"
         "actor_rollout_ref.rollout.max_num_batched_tokens=${rollout_max_num_batched_tokens}"
         "actor_rollout_ref.rollout.max_num_seqs=${rollout_max_num_seqs}"
         "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True"
@@ -738,7 +770,7 @@ _submit_npu_verl_job() {
         "distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=${teacher_tp}"
         "distillation.teacher_models.teacher_model.inference.name=vllm"
         "distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=${teacher_gpu_mem_util}"
-        "distillation.teacher_models.teacher_model.inference.max_model_len=${max_num_tokens}"
+        "distillation.teacher_models.teacher_model.inference.max_model_len=${teacher_max_model_len}"
         "distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=${teacher_max_num_batched_tokens}"
         "distillation.teacher_models.teacher_model.inference.max_num_seqs=${teacher_max_num_seqs}"
         "distillation.distillation_loss.loss_mode=${distillation_loss_mode}"
@@ -785,6 +817,10 @@ _submit_npu_verl_job() {
         "distillation.diagnostics.bad_tail_reward_threshold=${opd_diagnostics_bad_tail_reward_threshold}"
         "distillation.diagnostics.bad_tail_entropy_threshold=${opd_diagnostics_bad_tail_entropy_threshold}"
     )
+
+    if [[ -n "$test_benchmark_suite" ]]; then
+        hydra_args+=("+test_benchmarks@data.test_benchmarks=${test_benchmark_suite}")
+    fi
 
     if [[ "$enable_tool_call" == "True" ]]; then
         hydra_args+=(

@@ -19,7 +19,7 @@ import logging
 import os
 import re
 import traceback
-from collections import defaultdict
+from collections import Counter, defaultdict
 from io import BytesIO
 from typing import Any, Optional
 
@@ -211,6 +211,11 @@ class RLHFDataset(Dataset):
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
         # filter out too long prompts
         if self.filter_overlong_prompts:
+            nemotron_domain_counts_before = None
+            if "data_source" in dataframe.column_names and "ability" in dataframe.column_names:
+                data_sources = set(dataframe.unique("data_source"))
+                if "nemotron_cascade_mopd" in data_sources:
+                    nemotron_domain_counts_before = Counter(str(value) for value in dataframe["ability"])
             tokenizer = self.tokenizer
             processor = self.processor
             prompt_key = self.prompt_key
@@ -287,6 +292,20 @@ class RLHFDataset(Dataset):
             )
 
             print(f"filter dataset len: {len(dataframe)}")
+            if nemotron_domain_counts_before is not None:
+                domain_counts_after = Counter(str(value) for value in dataframe["ability"])
+                summary = {
+                    domain: {
+                        "before": int(nemotron_domain_counts_before[domain]),
+                        "after": int(domain_counts_after[domain]),
+                        "filtered": int(nemotron_domain_counts_before[domain] - domain_counts_after[domain]),
+                    }
+                    for domain in sorted(nemotron_domain_counts_before)
+                }
+                print(
+                    "Nemotron MOPD runtime prompt filtering summary "
+                    f"(max_prompt_length={self.max_prompt_length}, chat-template aware): {summary}"
+                )
         return dataframe
 
     def resume_dataset_state(self):

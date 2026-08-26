@@ -450,6 +450,8 @@ data:
     batch_size: null
     max_samples_per_benchmark: -1
     reward_data_source: math_verify
+    seed: 42
+    entries: []
   prompt_key: prompt
   reward_fn_key: data_source
   max_prompt_length: 512

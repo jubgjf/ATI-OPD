@@ -47,6 +47,14 @@ test_benchmarks:
   # Reward implementation used while retaining the benchmark name for metric grouping.
   reward_data_source: math_verify
 
+  # Deterministic seed used for stratified selection, option shuffling, and per-generation sampling.
+  seed: 42
+
+  # Optional typed benchmark entries. A non-empty list enables the multi-domain path and each entry controls its
+  # own adapter, batch size, prompt/output budgets, and legacy/train_sampling repeat counts. Empty preserves the
+  # legacy math-only names configuration above.
+  entries: []
+
 # The field in the dataset where the prompt is located. Default is 'prompt'.
 prompt_key: prompt
 

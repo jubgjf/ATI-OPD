@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import asyncio
 import copy
+import hashlib
 import json
 import math
 import os
@@ -153,6 +154,15 @@ def _with_reward_data_source(
         info["reward_data_source"] = reward_data_source
         copied.append(info)
     return np.asarray(copied, dtype=object)
+
+
+def _stable_evaluation_rollout_seed(
+    *, suite_seed: int, benchmark_name: str, sample_uid: str, rollout_index: int, profile_name: str
+) -> int:
+    """Derive a backend seed without depending on process-local hash randomization."""
+    seed_material = f"{int(suite_seed)}\x1f{benchmark_name}\x1f{sample_uid}\x1f{int(rollout_index)}\x1f{profile_name}"
+    digest = hashlib.sha256(seed_material.encode()).digest()
+    return int.from_bytes(digest[:4], "big", signed=False)
 
 
 def _has_answer_pattern(text: Any) -> bool:
@@ -1593,7 +1603,25 @@ class RayPPOTrainer:
 
         self.test_benchmark_dataset = test_benchmark_dataset
         self.test_benchmark_dataloader = None
-        if test_benchmark_dataset is not None:
+        self.test_benchmark_datasets: dict[str, Dataset] = {}
+        self.test_benchmark_dataloaders: dict[str, StatefulDataLoader] = {}
+        if isinstance(test_benchmark_dataset, dict):
+            self.test_benchmark_datasets = dict(test_benchmark_dataset)
+            for benchmark_name, dataset in self.test_benchmark_datasets.items():
+                spec = getattr(dataset, "spec", None)
+                if spec is None:
+                    raise TypeError(
+                        f"Typed benchmark dataset {benchmark_name!r} must expose its validated BenchmarkSpec."
+                    )
+                self.test_benchmark_dataloaders[benchmark_name] = StatefulDataLoader(
+                    dataset=dataset,
+                    batch_size=int(spec.batch_size),
+                    num_workers=num_workers,
+                    shuffle=False,
+                    drop_last=False,
+                    collate_fn=collate_fn,
+                )
+        elif test_benchmark_dataset is not None:
             benchmark_config = self.config.data.test_benchmarks
             test_batch_size = benchmark_config.get("batch_size", None)
             if test_batch_size is None:
@@ -1621,6 +1649,11 @@ class RayPPOTrainer:
             print(
                 "Size of test benchmark dataloader: "
                 f"{len(self.test_benchmark_dataloader)} ({len(self.test_benchmark_dataset)} problems)"
+            )
+        for benchmark_name, dataloader in self.test_benchmark_dataloaders.items():
+            print(
+                f"Size of typed test benchmark {benchmark_name!r}: {len(dataloader)} "
+                f"({len(self.test_benchmark_datasets[benchmark_name])} problems)"
             )
 
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
@@ -1901,6 +1934,11 @@ class RayPPOTrainer:
         repeat_times: int | None = None,
         do_sample: bool | None = None,
         generation_max_tokens: int | None = None,
+        evaluation_prompt_length: int | None = None,
+        evaluation_response_length: int | None = None,
+        evaluation_seed: int | None = None,
+        evaluation_seed_namespace: str | None = None,
+        return_details: bool = False,
         suppress_tracking: bool = False,
     ):
         if evaluation_mode not in {"val", "test"}:
@@ -1930,6 +1968,19 @@ class RayPPOTrainer:
             generation_max_tokens = int(generation_max_tokens)
             if generation_max_tokens <= 0:
                 raise ValueError(f"generation_max_tokens must be positive, got {generation_max_tokens}.")
+        if evaluation_prompt_length is not None:
+            evaluation_prompt_length = int(evaluation_prompt_length)
+            if evaluation_prompt_length <= 0:
+                raise ValueError(f"evaluation_prompt_length must be positive, got {evaluation_prompt_length}.")
+        if evaluation_response_length is not None:
+            evaluation_response_length = int(evaluation_response_length)
+            if evaluation_response_length <= 0:
+                raise ValueError(f"evaluation_response_length must be positive, got {evaluation_response_length}.")
+            if generation_max_tokens is not None and generation_max_tokens > evaluation_response_length:
+                raise ValueError(
+                    "generation_max_tokens cannot exceed evaluation_response_length: "
+                    f"{generation_max_tokens} > {evaluation_response_length}."
+                )
         validation_data_dir = (
             self.config.trainer.get("validation_data_dir", None) if validation_data_dir is None else validation_data_dir
         )
@@ -1974,6 +2025,25 @@ class RayPPOTrainer:
 
             # repeat test batch
             test_batch = test_batch.repeat(repeat_times=repeat_times, interleave=True)
+            if evaluation_seed is not None:
+                if not evaluation_seed_namespace:
+                    raise ValueError("evaluation_seed_namespace must be non-empty when evaluation_seed is configured.")
+                occurrence_by_uid: dict[str, int] = defaultdict(int)
+                evaluation_seeds = []
+                for uid in test_batch.non_tensor_batch["uid"]:
+                    uid = str(uid)
+                    rollout_index = occurrence_by_uid[uid]
+                    occurrence_by_uid[uid] += 1
+                    evaluation_seeds.append(
+                        _stable_evaluation_rollout_seed(
+                            suite_seed=evaluation_seed,
+                            benchmark_name=evaluation_seed_namespace,
+                            sample_uid=uid,
+                            rollout_index=rollout_index,
+                            profile_name=sampling_profile_name or evaluation_mode,
+                        )
+                    )
+                test_batch.non_tensor_batch["__evaluation_seed__"] = np.asarray(evaluation_seeds, dtype=np.int64)
 
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
@@ -1995,6 +2065,10 @@ class RayPPOTrainer:
                 test_gen_batch.meta_info["evaluation_sampling_profile"] = sampling_profile_name
             if generation_max_tokens is not None:
                 test_gen_batch.meta_info["generation_max_tokens"] = generation_max_tokens
+            if evaluation_prompt_length is not None:
+                test_gen_batch.meta_info["evaluation_prompt_length"] = evaluation_prompt_length
+            if evaluation_response_length is not None:
+                test_gen_batch.meta_info["evaluation_response_length"] = evaluation_response_length
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
@@ -2167,6 +2241,12 @@ class RayPPOTrainer:
             )
         )
         metrics.update(validation_media)
+        if return_details:
+            return metrics, {
+                "sample_uids": list(sample_uids),
+                "reward_extra_infos_dict": dict(reward_extra_infos_dict),
+                "data_sources": np.concatenate(data_source_lst, axis=0).tolist() if data_source_lst else [],
+            }
         return metrics
 
     def _val_metrics_update(
@@ -2209,6 +2289,9 @@ class RayPPOTrainer:
 
     def _validate_test_benchmarks(self, *, suppress_tracking: bool = False) -> dict[str, Any]:
         """Run the configured benchmark datasets through the student validation path."""
+        typed_dataloaders = getattr(self, "test_benchmark_dataloaders", {})
+        if typed_dataloaders:
+            return self._validate_typed_test_benchmarks(suppress_tracking=suppress_tracking)
         if self.test_benchmark_dataloader is None:
             raise RuntimeError(
                 "Test benchmark evaluation was requested, but the benchmark dataloader is not initialized."
@@ -2261,6 +2344,72 @@ class RayPPOTrainer:
             if duplicate_keys:
                 raise RuntimeError(f"Benchmark sampling profiles produced duplicate metrics: {sorted(duplicate_keys)}")
             metrics.update(profile_metrics)
+        assert metrics, f"{metrics=}"
+        return metrics
+
+    def _validate_typed_test_benchmarks(self, *, suppress_tracking: bool = False) -> dict[str, Any]:
+        """Run each typed benchmark with its own tensor budgets and repeat counts."""
+        from verl.utils.evaluation.multi_domain_benchmark import (
+            BENCHMARK_SAMPLING_PROFILES,
+            aggregate_benchmark_details,
+        )
+
+        profiles = self.config.actor_rollout_ref.rollout.get("benchmark_sampling_profiles", None)
+        if not profiles:
+            raise ValueError("Typed benchmark evaluation requires benchmark_sampling_profiles.")
+        missing_profiles = [name for name in BENCHMARK_SAMPLING_PROFILES if name not in profiles]
+        if missing_profiles:
+            raise ValueError(f"Typed benchmark sampling profiles are missing {missing_profiles}.")
+
+        suite_seed = int(self.config.data.test_benchmarks.get("seed", 42))
+        test_data_dir = self.config.trainer.get("test_data_dir", None)
+        metrics: dict[str, Any] = {}
+        for benchmark_name, dataloader in self.test_benchmark_dataloaders.items():
+            dataset = self.test_benchmark_datasets[benchmark_name]
+            spec = dataset.spec
+            for profile_name in BENCHMARK_SAMPLING_PROFILES:
+                sampling_config = copy.deepcopy(profiles[profile_name])
+                sampling_config.n = int(spec.profiles[profile_name].n)
+                if profile_name == "legacy":
+                    sampling_config.temperature = 0.0
+                    sampling_config.top_p = 1.0
+                    sampling_config.top_k = -1
+                    sampling_config.do_sample = False
+                metric_profile_name = profile_name.replace("_", "-")
+                profile_metrics, details = self._validate(
+                    dataloader=dataloader,
+                    metric_prefix=f"test-{metric_profile_name}",
+                    evaluation_mode="test",
+                    sampling_config=sampling_config,
+                    sampling_profile_name=profile_name,
+                    log_generations=int(self.config.trainer.get("log_test_generations", 0)),
+                    validation_generations_logger=self.test_benchmark_generations_loggers[profile_name],
+                    validation_data_dir=test_data_dir or "",
+                    dump_filename_prefix=f"test_benchmarks_{benchmark_name}_{profile_name}",
+                    include_format_metrics=True,
+                    generation_max_tokens=int(spec.generation_max_tokens),
+                    evaluation_prompt_length=int(spec.prompt_max_length),
+                    evaluation_response_length=int(spec.generation_max_tokens),
+                    evaluation_seed=suite_seed,
+                    evaluation_seed_namespace=spec.name,
+                    return_details=True,
+                    suppress_tracking=suppress_tracking,
+                )
+                profile_metrics.update(
+                    aggregate_benchmark_details(
+                        adapter=spec.adapter,
+                        metric_name=spec.metric_name,
+                        metric_prefix=f"test-{metric_profile_name}",
+                        sample_uids=details["sample_uids"],
+                        reward_extra_infos=details["reward_extra_infos_dict"],
+                    )
+                )
+                duplicate_keys = metrics.keys() & profile_metrics.keys()
+                if duplicate_keys:
+                    raise RuntimeError(
+                        f"Typed benchmark {benchmark_name!r} produced duplicate metrics: {sorted(duplicate_keys)}"
+                    )
+                metrics.update(profile_metrics)
         assert metrics, f"{metrics=}"
         return metrics
 

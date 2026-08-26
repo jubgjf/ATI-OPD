@@ -462,6 +462,7 @@ async def test_agent_loop_generate_sequences_applies_raw_benchmark_sampling_over
                 dtype=object,
             ),
             "uid": np.array(["sample-a", "sample-b"], dtype=object),
+            "__evaluation_seed__": np.array([7, 8], dtype=np.int64),
         },
         meta_info={
             "global_steps": 17,
@@ -469,6 +470,8 @@ async def test_agent_loop_generate_sequences_applies_raw_benchmark_sampling_over
             "evaluation_mode": "test",
             "do_sample": True,
             "evaluation_sampling_profile": "train_sampling",
+            "evaluation_prompt_length": 4096,
+            "evaluation_response_length": 1024,
             "evaluation_sampling_params": {
                 "temperature": 1.0,
                 "top_p": 1.0,
@@ -481,12 +484,29 @@ async def test_agent_loop_generate_sequences_applies_raw_benchmark_sampling_over
     await AgentLoopWorker.generate_sequences(worker, batch)
 
     assert [kwargs["global_steps"] for kwargs in worker.seen_kwargs] == [17, 17]
+    assert [kwargs["__evaluation_prompt_length__"] for kwargs in worker.seen_kwargs] == [4096, 4096]
+    assert [kwargs["__evaluation_response_length__"] for kwargs in worker.seen_kwargs] == [1024, 1024]
     assert [trajectory["step"] for trajectory in worker.seen_trajectories] == [17, 17]
     assert worker.seen_sampling_params == [
-        {"temperature": 1.0, "top_p": 1.0, "top_k": -1, "repetition_penalty": 1.0, "logprobs": False},
-        {"temperature": 1.0, "top_p": 1.0, "top_k": -1, "repetition_penalty": 1.0, "logprobs": False},
+        {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "repetition_penalty": 1.0,
+            "logprobs": False,
+            "seed": 7,
+        },
+        {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "repetition_penalty": 1.0,
+            "logprobs": False,
+            "seed": 8,
+        },
     ]
     assert "global_steps" not in worker.postprocess_input_non_tensor_batch
+    assert "__evaluation_seed__" not in worker.postprocess_input_non_tensor_batch
 
 
 @pytest.mark.asyncio
@@ -538,6 +558,65 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
     torch.testing.assert_close(internal.routed_experts[:, 2:6], expected)
     assert torch.count_nonzero(internal.routed_experts[:, :2]) == 0
     assert torch.count_nonzero(internal.routed_experts[:, 6:]) == 0
+
+
+@pytest.mark.asyncio
+async def test_evaluation_padding_widths_can_exceed_training_prompt_without_changing_training_contract_on_cpu():
+    class _DummyWorker:
+        _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
+        _compute_position_ids = AgentLoopWorker._compute_position_ids
+        _get_mm_processor_kwargs = AgentLoopWorker._get_mm_processor_kwargs
+        _compute_score = AgentLoopWorker._compute_score
+        _compute_teacher_logprobs = AgentLoopWorker._compute_teacher_logprobs
+        distillation_enabled = False
+        teacher_intervention_enabled = False
+
+        def __init__(self):
+            self.tokenizer = _FakeTokenizer()
+            self.rollout_config = OmegaConf.create({"prompt_length": 4, "response_length": 6})
+            self.processor = None
+            self.mm_processor_kwargs = {}
+            self.reward_loop_worker_handles = None
+
+    worker = _DummyWorker()
+    evaluation_output = AgentLoopOutput(
+        prompt_ids=[101, 102, 103, 104, 105, 106],
+        response_ids=[11, 12],
+        response_mask=[1, 1],
+        metrics=AgentLoopMetrics(),
+        extra_fields={},
+    )
+    evaluation = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        evaluation_output,
+        validate=True,
+        raw_prompt=[{"role": "user", "content": "long benchmark"}],
+        __evaluation_prompt_length__=8,
+        __evaluation_response_length__=3,
+    )
+
+    training_output = AgentLoopOutput(
+        prompt_ids=[101, 102, 103, 104],
+        response_ids=[11, 12],
+        response_mask=[1, 1],
+        metrics=AgentLoopMetrics(),
+        extra_fields={},
+    )
+    training = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        training_output,
+        validate=False,
+        raw_prompt=[{"role": "user", "content": "training"}],
+        __evaluation_prompt_length__=8,
+        __evaluation_response_length__=3,
+    )
+
+    assert evaluation.prompt_ids.shape == (1, 8)
+    assert evaluation.response_ids.shape == (1, 3)
+    assert evaluation.input_ids.shape == (1, 11)
+    assert training.prompt_ids.shape == (1, 4)
+    assert training.response_ids.shape == (1, 6)
+    assert training.input_ids.shape == (1, 10)
 
 
 class _FakeInterventionTeacherManager:

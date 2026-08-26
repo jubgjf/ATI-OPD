@@ -289,7 +289,7 @@ class TaskRunner:
             is_train=False,
             max_samples=config.data.get("val_max_samples", -1),
         )
-        test_benchmark_dataset = create_math_benchmark_dataset(config)
+        test_benchmark_dataset = create_test_benchmark_datasets(config, tokenizer)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
@@ -390,6 +390,58 @@ def create_math_benchmark_dataset(config):
         system_prompt_path=config.data.get("system_prompt_path", None),
         agent_name=default_agent_loop,
     )
+
+
+def create_test_benchmark_datasets(config, tokenizer):
+    """Create typed benchmark datasets, falling back to the legacy math-only adapter."""
+    test_before_train = bool(config.trainer.get("test_before_train", False))
+    test_benchmarks_freq = int(config.trainer.get("test_benchmarks_freq", -1))
+    if not test_before_train and test_benchmarks_freq <= 0:
+        return None
+
+    benchmark_config = config.data.get("test_benchmarks", None)
+    entries = benchmark_config.get("entries", []) if benchmark_config is not None else []
+    if not entries:
+        return create_math_benchmark_dataset(config)
+
+    dataset_root = benchmark_config.get("root", None)
+    if not dataset_root:
+        raise ValueError("Typed benchmark testing requires data.test_benchmarks.root.")
+
+    from verl.utils.dataset.multi_domain_benchmark_dataset import MultiDomainBenchmarkDataset
+    from verl.utils.evaluation.multi_domain_benchmark import parse_benchmark_specs
+
+    specs = parse_benchmark_specs(entries)
+    rollout_config = config.actor_rollout_ref.rollout
+    rollout_max_model_len = int(rollout_config.get("max_model_len", 0))
+    if rollout_max_model_len <= 0:
+        raise ValueError("Typed benchmark testing requires actor_rollout_ref.rollout.max_model_len to be positive.")
+    default_agent_loop = str(rollout_config.agent.default_agent_loop)
+    if default_agent_loop != "single_turn_agent":
+        raise ValueError(
+            "Typed multi-domain benchmark evaluation currently requires the single_turn_agent so verifier prompts "
+            f"cannot be modified by a tool environment, got {default_agent_loop!r}."
+        )
+
+    seed = int(benchmark_config.get("seed", 42))
+    chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {}) or {}
+    datasets = {}
+    for spec in specs:
+        required_context = spec.prompt_max_length + spec.generation_max_tokens
+        if required_context > rollout_max_model_len:
+            raise ValueError(
+                f"Benchmark {spec.name!r} requires prompt+generation={required_context} tokens, exceeding "
+                f"actor_rollout_ref.rollout.max_model_len={rollout_max_model_len}."
+            )
+        datasets[spec.name] = MultiDomainBenchmarkDataset(
+            dataset_root=dataset_root,
+            spec=spec,
+            tokenizer=tokenizer,
+            seed=seed,
+            chat_template_kwargs=chat_template_kwargs,
+            agent_name=default_agent_loop,
+        )
+    return datasets
 
 
 def create_rl_sampler(data_config, dataset):

@@ -2493,6 +2493,14 @@ class AgentLoopWorker:
             if has_global_steps and "global_steps" not in kwargs:
                 kwargs["global_steps"] = global_steps
             sample_sampling_params = dict(sampling_params)
+            evaluation_seed = kwargs.pop("__evaluation_seed__", None)
+            if evaluation_seed is not None:
+                sample_sampling_params["seed"] = int(evaluation_seed)
+            if validate:
+                if "evaluation_prompt_length" in batch.meta_info:
+                    kwargs["__evaluation_prompt_length__"] = int(batch.meta_info["evaluation_prompt_length"])
+                if "evaluation_response_length" in batch.meta_info:
+                    kwargs["__evaluation_response_length__"] = int(batch.meta_info["evaluation_response_length"])
             if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
                 apply_greedy_sampling_params(sample_sampling_params)
             tasks.append(
@@ -2507,8 +2515,11 @@ class AgentLoopWorker:
             )
         outputs = await asyncio.gather(*tasks)
 
+        output_non_tensor_batch = {
+            key: value for key, value in batch.non_tensor_batch.items() if not key.startswith("__evaluation_")
+        }
         output = self._postprocess(
-            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+            outputs, input_non_tensor_batch=output_non_tensor_batch, validate=batch.meta_info.get("validate", False)
         )
         return output
 
@@ -2562,6 +2573,26 @@ class AgentLoopWorker:
         **kwargs,
     ) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
+        prompt_pad_length = int(self.rollout_config.prompt_length)
+        response_pad_length = int(self.rollout_config.response_length)
+        if validate:
+            prompt_pad_length = int(kwargs.get("__evaluation_prompt_length__", prompt_pad_length))
+            response_pad_length = int(kwargs.get("__evaluation_response_length__", response_pad_length))
+        if prompt_pad_length <= 0 or response_pad_length <= 0:
+            raise ValueError(
+                "Agent-loop padding lengths must be positive: "
+                f"prompt={prompt_pad_length}, response={response_pad_length}."
+            )
+        if len(output.prompt_ids) > prompt_pad_length:
+            raise ValueError(
+                f"Generated prompt has {len(output.prompt_ids)} tokens, exceeding evaluation padding width "
+                f"{prompt_pad_length}. Benchmark adapters must enforce their prompt budget before rollout."
+            )
+        if len(output.response_ids) > response_pad_length:
+            raise ValueError(
+                f"Generated response has {len(output.response_ids)} tokens, exceeding evaluation padding width "
+                f"{response_pad_length}."
+            )
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
         if getattr(self, "teacher_intervention_enabled", False) and not validate:
             skip_correct = bool(
@@ -2663,7 +2694,7 @@ class AgentLoopWorker:
         prompt_output = self.tokenizer.pad(
             {"input_ids": output.prompt_ids},
             padding="max_length",
-            max_length=self.rollout_config.prompt_length,
+            max_length=prompt_pad_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
@@ -2675,7 +2706,7 @@ class AgentLoopWorker:
         response_output = self.tokenizer.pad(
             {"input_ids": output.response_ids},
             padding="max_length",
-            max_length=self.rollout_config.response_length,
+            max_length=response_pad_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
@@ -2686,7 +2717,7 @@ class AgentLoopWorker:
         response_mask_output = self.tokenizer.pad(
             {"input_ids": output.response_mask},
             padding="max_length",
-            max_length=self.rollout_config.response_length,
+            max_length=response_pad_length,
             return_tensors="pt",
             return_attention_mask=False,
         )
@@ -2698,7 +2729,7 @@ class AgentLoopWorker:
             teacher_segment_mask_output = self.tokenizer.pad(
                 {"input_ids": output.teacher_segment_mask},
                 padding="max_length",
-                max_length=self.rollout_config.response_length,
+                max_length=response_pad_length,
                 return_tensors="pt",
                 return_attention_mask=False,
             )
@@ -2709,7 +2740,7 @@ class AgentLoopWorker:
 
         response_logprobs = None
         if output.response_logprobs is not None:
-            pad_size = self.rollout_config.response_length - len(output.response_logprobs)
+            pad_size = response_pad_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]

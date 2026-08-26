@@ -76,6 +76,14 @@ def default_compute_score(
         res["score"] = float(verified_score)
         res["acc"] = bool(verified_score > 0.0)
         res["math_verify_score"] = float(verified_score)
+    elif reward_data_source == "nemotron_cascade_mopd":
+        from . import nemotron_cascade_mopd
+
+        res = nemotron_cascade_mopd.compute_score(solution_str, ground_truth)
+    elif reward_data_source == "multi_domain_benchmark":
+        from . import multi_domain_benchmark
+
+        res = multi_domain_benchmark.compute_score(solution_str, ground_truth, extra_info=extra_info)
     elif reward_data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",
