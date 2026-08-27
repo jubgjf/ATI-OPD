@@ -67,6 +67,7 @@ from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import simple_timer
 from verl.utils.ray_utils import auto_await, get_event_loop
+from verl.utils.reward_score.reward_extra import collate_reward_extra_infos
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
     rollout_trace_attr,
@@ -1587,6 +1588,52 @@ def _require_consistent_optional_field(inputs: list["_InternalAgentLoopOutput"],
             "Keep the field present for every sample in the batch, or disable the feature that produces mixed outputs."
         )
     return all(present)
+
+
+def _align_reward_extra_info_outputs(outputs: list[DataProto]) -> list[str]:
+    """Align optional reward diagnostics before concatenating worker outputs."""
+    if not outputs:
+        return []
+
+    per_output_keys = [output.meta_info.get("reward_extra_keys") for output in outputs]
+    if all(keys is None for keys in per_output_keys):
+        return []
+    if any(keys is None for keys in per_output_keys):
+        missing_indices = [index for index, keys in enumerate(per_output_keys) if keys is None]
+        raise RuntimeError(
+            "Inconsistent reward outputs across agent loop workers: reward_extra_keys is missing "
+            f"from worker outputs {missing_indices}."
+        )
+
+    reward_extra_keys: set[str] = set()
+    for output_index, keys in enumerate(per_output_keys):
+        if not isinstance(keys, list | tuple):
+            raise TypeError(
+                "reward_extra_keys must be a list or tuple; "
+                f"got {type(keys).__name__} from worker output {output_index}."
+            )
+        invalid_keys = [key for key in keys if not isinstance(key, str)]
+        if invalid_keys:
+            raise TypeError(
+                f"reward_extra_keys must contain only strings; got {invalid_keys!r} from worker output {output_index}."
+            )
+        reward_extra_keys.update(keys)
+
+    sorted_keys = sorted(reward_extra_keys)
+    for output_index, (output, keys) in enumerate(zip(outputs, per_output_keys, strict=True)):
+        local_keys = set(keys)
+        missing_columns = local_keys - output.non_tensor_batch.keys()
+        if missing_columns:
+            raise RuntimeError(
+                "Agent loop worker declared reward diagnostics that are absent from its batch: "
+                f"worker_output={output_index}, missing_keys={sorted(missing_columns)}."
+            )
+        for key in sorted_keys:
+            if key not in local_keys:
+                output.non_tensor_batch[key] = np.full(len(output), None, dtype=object)
+        output.meta_info["reward_extra_keys"] = sorted_keys
+
+    return sorted_keys
 
 
 class AgentLoopMetrics(BaseModel):
@@ -5027,9 +5074,8 @@ class AgentLoopWorker:
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
-        for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+        reward_extra_keys, reward_extra_columns = collate_reward_extra_infos(reward_extra_infos)
+        non_tensor_batch.update(reward_extra_columns)
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
@@ -5250,6 +5296,7 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        _align_reward_extra_info_outputs(outputs)
         output = DataProto.concat(outputs)
         self._cap_intervention_outcome_cases(output)
         self._cap_intervention_boundary_cases(output)

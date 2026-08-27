@@ -31,6 +31,7 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopOutput,
     AgentLoopWorker,
     DictConfigWrap,
+    _align_reward_extra_info_outputs,
     _apply_generation_max_tokens,
     _compute_distribution_intervention_gap,
     _compute_intervention_gap,
@@ -316,6 +317,65 @@ def _to_internal(
         metrics=metrics,
         extra_fields=extra_fields,
     )
+
+
+def test_agent_loop_postprocess_aligns_heterogeneous_reward_extra_info_on_cpu():
+    inputs = []
+    for reward_score, reward_extra_info in (
+        (1.0, {"acc": True, "task_type": "stem_mcqa", "predicted_answer": "C"}),
+        (0.0, {"acc": False, "task_type": "structured_output", "json_parsed": False}),
+    ):
+        output = _to_internal(
+            output_prompt_ids=[1, 2],
+            output_response_ids=[3, 4],
+            output_response_mask=[1, 1],
+            metrics=AgentLoopMetrics(),
+            extra_fields={"reward_extra_info": reward_extra_info},
+            num_turns=1,
+            prompt_len=2,
+            response_len=2,
+        )
+        output.reward_score = reward_score
+        inputs.append(output)
+
+    dummy_worker = type(
+        "_DummyWorker",
+        (),
+        {"reward_loop_worker_handles": None, "distillation_enabled": False},
+    )()
+    result = AgentLoopWorker._postprocess(dummy_worker, inputs=inputs)
+
+    assert result.meta_info["reward_extra_keys"] == [
+        "acc",
+        "json_parsed",
+        "predicted_answer",
+        "task_type",
+    ]
+    assert result.non_tensor_batch["predicted_answer"].tolist() == ["C", None]
+    assert result.non_tensor_batch["json_parsed"].tolist() == [None, False]
+
+
+def test_agent_loop_manager_aligns_reward_extra_info_across_worker_outputs_on_cpu():
+    outputs = [
+        DataProto.from_dict(
+            tensors={"rm_scores": torch.tensor([[1.0]])},
+            non_tensors={"acc": [True], "predicted_answer": ["C"]},
+            meta_info={"reward_extra_keys": ["acc", "predicted_answer"]},
+        ),
+        DataProto.from_dict(
+            tensors={"rm_scores": torch.tensor([[0.0]])},
+            non_tensors={"acc": [False], "json_parsed": [False]},
+            meta_info={"reward_extra_keys": ["acc", "json_parsed"]},
+        ),
+    ]
+
+    keys = _align_reward_extra_info_outputs(outputs)
+    result = DataProto.concat(outputs)
+
+    assert keys == ["acc", "json_parsed", "predicted_answer"]
+    assert result.meta_info["reward_extra_keys"] == keys
+    assert result.non_tensor_batch["predicted_answer"].tolist() == ["C", None]
+    assert result.non_tensor_batch["json_parsed"].tolist() == [None, False]
 
 
 @pytest.mark.asyncio
