@@ -33,6 +33,7 @@ from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.experimental.agent_loop.utils import build_gpt_oss_tool_response_text
 from verl.tools.function_tool import FunctionTool, normalize_function_tool_return
 from verl.tools.schemas import ToolResponse
+from verl.utils.chat_template import apply_chat_template as render_chat_template
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
@@ -43,6 +44,11 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # This is a protocol-failure circuit breaker, not a limit on valid tool use.
 # Repeated valid calls remain bounded only by the response-token budget.
 MAX_CONSECUTIVE_PROTOCOL_ERRORS = 3
+
+# A literal marker lets us recover the assistant-turn suffix from the active
+# chat template without hard-coding model-specific tokens such as Qwen's
+# ``<|im_end|>``.
+ASSISTANT_BOUNDARY_MARKER = "__VERL_ASSISTANT_BOUNDARY_MARKER_7f4c9d__"
 
 
 class AgentState(Enum):
@@ -135,6 +141,66 @@ class ToolAgentLoop(AgentLoopBase):
         self.response_length = self.rollout_config.response_length
         self.tool_call_start_pattern = self.tokenizer.encode("<tool_call>", add_special_tokens=False)
         self.tool_call_end_pattern = self.tokenizer.encode("</tool_call>", add_special_tokens=False)
+        self.assistant_turn_boundary_ids = self._derive_assistant_turn_boundary_ids()
+
+    def _derive_assistant_turn_boundary_ids(self) -> list[int]:
+        """Derive tokens between assistant content and the following tool observation.
+
+        Rollout backends commonly omit stop tokens from returned token IDs.  For
+        Qwen this drops ``<|im_end|>\n`` even though the canonical chat template
+        places it between an assistant tool call and the tool observation.  The
+        suffix is template-specific, so derive it from the active processing
+        class instead of assuming a token ID.
+        """
+        processing_class = self.processor if self.processor is not None else self.tokenizer
+        rendered = render_chat_template(
+            processing_class,
+            [{"role": "assistant", "content": ASSISTANT_BOUNDARY_MARKER}],
+            tools=None,
+            add_generation_prompt=False,
+            tokenize=False,
+            **self.apply_chat_template_kwargs,
+        )
+        if not isinstance(rendered, str):
+            raise TypeError(
+                "Chat template must return text when deriving the assistant turn boundary, "
+                f"got {type(rendered).__name__}."
+            )
+        marker_position = rendered.rfind(ASSISTANT_BOUNDARY_MARKER)
+        if marker_position < 0:
+            raise RuntimeError(
+                "Could not locate the assistant boundary marker in the rendered chat template. "
+                "The template rewrites assistant content and cannot be safely used for incremental tool rollout."
+            )
+        suffix = rendered[marker_position + len(ASSISTANT_BOUNDARY_MARKER) :]
+        return list(self.tokenizer.encode(suffix, add_special_tokens=False))
+
+    @staticmethod
+    def _missing_assistant_turn_boundary(sequence_ids: list[int], boundary_ids: list[int]) -> list[int]:
+        """Return only the boundary suffix not already emitted by the backend."""
+        if not boundary_ids:
+            return []
+        max_overlap = min(len(sequence_ids), len(boundary_ids))
+        for overlap in range(max_overlap, 0, -1):
+            if sequence_ids[-overlap:] == boundary_ids[:overlap]:
+                return boundary_ids[overlap:]
+        return list(boundary_ids)
+
+    def _append_missing_assistant_turn_boundary(self, agent_data: AgentData) -> list[int]:
+        """Append the canonical assistant boundary as zero-loss structural tokens."""
+        missing_ids = self._missing_assistant_turn_boundary(
+            agent_data.prompt_ids,
+            self.assistant_turn_boundary_ids,
+        )
+        remaining_tokens = max(self.response_length - len(agent_data.response_mask), 0)
+        appended_ids = missing_ids[:remaining_tokens]
+        if not appended_ids:
+            return []
+        agent_data.prompt_ids += appended_ids
+        agent_data.response_mask += [0] * len(appended_ids)
+        if agent_data.response_logprobs:
+            agent_data.response_logprobs += [0.0] * len(appended_ids)
+        return appended_ids
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
@@ -680,6 +746,10 @@ class ToolAgentLoop(AgentLoopBase):
             for img in new_images_this_turn:
                 agent_data.image_data.append(img)
 
+        # vLLM excludes stop tokens from generated token IDs.  Restore the
+        # template's assistant terminator before appending the incremental tool
+        # message so future student and teacher forwards see canonical context.
+        self._append_missing_assistant_turn_boundary(agent_data)
         observation_start = len(agent_data.response_mask)
         remaining_tokens = max(self.response_length - observation_start, 0)
         response_ids = response_ids[:remaining_tokens]

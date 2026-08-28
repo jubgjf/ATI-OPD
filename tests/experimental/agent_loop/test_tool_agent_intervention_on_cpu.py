@@ -63,6 +63,30 @@ class _CharTokenizer:
         return self.encode(text) if tokenize else text
 
 
+class _BoundaryCharTokenizer(_CharTokenizer):
+    assistant_boundary = "<assistant_end>\n"
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        add_generation_prompt: bool,
+        tokenize: bool,
+        tools=None,
+        **kwargs,
+    ):
+        del tools, kwargs
+        parts = []
+        for message in messages:
+            parts.append(f"<{message['role']}>{message.get('content', '')}")
+            if message["role"] == "assistant":
+                parts.append(self.assistant_boundary)
+        if add_generation_prompt:
+            parts.append("<assistant>")
+        text = "".join(parts)
+        return self.encode(text) if tokenize else text
+
+
 class _QueuedServer:
     def __init__(self, tokenizer: _CharTokenizer, outputs: list[str]):
         self.tokenizer = tokenizer
@@ -209,8 +233,14 @@ def _make_tool(counter: dict[str, int]) -> FunctionTool:
     return FunctionTool(name="code_interpreter", fn=execute, tool_schema=schema, is_async=True)
 
 
-def _make_loop(outputs: list[str], *, response_length: int = 4096, counter: dict[str, int] | None = None):
-    tokenizer = _CharTokenizer()
+def _make_loop(
+    outputs: list[str],
+    *,
+    response_length: int = 4096,
+    counter: dict[str, int] | None = None,
+    tokenizer: _CharTokenizer | None = None,
+):
+    tokenizer = tokenizer or _CharTokenizer()
     counter = counter if counter is not None else {}
     config = OmegaConf.create(
         {
@@ -263,6 +293,45 @@ async def test_tool_agent_records_masks_spans_events_and_final_answer_on_cpu():
     assert output.extra_fields["tool_events"][0]["execution_status"] == "success"
     assert output.extra_fields["tool_call_counts"] == 1
     assert output.extra_fields["reward_response_ids"] == tokenizer.encode(final_answer)
+
+
+@pytest.mark.asyncio
+async def test_tool_agent_restores_template_assistant_boundary_as_zero_loss_tokens_on_cpu():
+    tokenizer = _BoundaryCharTokenizer()
+    tool_call = _tool_call()
+    loop, _, counter = _make_loop([tool_call, "\\boxed{42}"], tokenizer=tokenizer)
+
+    output = await loop.run({"max_tokens": 4096}, raw_prompt=[{"role": "user", "content": "q"}])
+
+    assert counter["calls"] == 1
+    call_end = len(tokenizer.encode(tool_call))
+    boundary_ids = tokenizer.encode(tokenizer.assistant_boundary)
+    boundary_slice = slice(call_end, call_end + len(boundary_ids))
+    assert output.response_ids[boundary_slice] == boundary_ids
+    assert output.response_mask[boundary_slice] == [0] * len(boundary_ids)
+    assert output.response_logprobs[boundary_slice] == [0.0] * len(boundary_ids)
+    observation = next(span for span in output.extra_fields["trajectory_spans"] if span["kind"] == "tool_observation")
+    assert observation["start"] == call_end + len(boundary_ids)
+
+
+@pytest.mark.asyncio
+async def test_tool_agent_does_not_duplicate_boundary_already_returned_by_backend_on_cpu():
+    tokenizer = _BoundaryCharTokenizer()
+    first_turn = _tool_call() + tokenizer.assistant_boundary
+    loop, _, _ = _make_loop([first_turn, "\\boxed{42}"], tokenizer=tokenizer)
+
+    output = await loop.run({"max_tokens": 4096}, raw_prompt=[{"role": "user", "content": "q"}])
+
+    decoded_response = tokenizer.decode(output.response_ids)
+    assert decoded_response.count(tokenizer.assistant_boundary) == 1
+    observation = next(span for span in output.extra_fields["trajectory_spans"] if span["kind"] == "tool_observation")
+    assert observation["start"] == len(tokenizer.encode(first_turn))
+
+
+def test_missing_assistant_boundary_only_returns_unemitted_suffix_on_cpu():
+    assert ToolAgentLoop._missing_assistant_turn_boundary([1, 2], [2, 3]) == [3]
+    assert ToolAgentLoop._missing_assistant_turn_boundary([1, 2, 3], [2, 3]) == []
+    assert ToolAgentLoop._missing_assistant_turn_boundary([1], [2, 3]) == [2, 3]
 
 
 @pytest.mark.asyncio
