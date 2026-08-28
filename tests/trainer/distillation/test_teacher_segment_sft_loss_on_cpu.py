@@ -209,6 +209,7 @@ def test_teacher_only_batch_skips_ppo_and_keeps_sft_on_cpu(monkeypatch):
 
 def test_fsdp_token_reward_direct_preserves_scalar_log_probs_for_teacher_sft_on_cpu():
     engine = object.__new__(FSDPEngineWithLMHead)
+    engine.model_config = SimpleNamespace(tokenizer=range(5), processor=None)
     engine.use_ulysses_sp = False
     engine.engine_config = SimpleNamespace(entropy_checkpointing=False)
     engine._response_target_ids_rmpad = lambda **kwargs: torch.tensor(  # type: ignore[method-assign]

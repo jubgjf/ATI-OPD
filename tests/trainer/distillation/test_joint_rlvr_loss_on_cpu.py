@@ -250,6 +250,7 @@ def test_joint_rlvr_empty_local_mask_keeps_dp_metric_schema_on_cpu():
 
 def test_fsdp_token_reward_direct_preserves_scalar_log_probs_for_joint_rlvr_on_cpu():
     engine = object.__new__(FSDPEngineWithLMHead)
+    engine.model_config = SimpleNamespace(tokenizer=range(5), processor=None)
     engine.use_ulysses_sp = False
     engine.engine_config = SimpleNamespace(entropy_checkpointing=False)
     engine._response_target_ids_rmpad = lambda **kwargs: torch.tensor(  # type: ignore[method-assign]

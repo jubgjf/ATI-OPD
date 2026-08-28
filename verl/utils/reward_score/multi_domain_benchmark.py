@@ -31,6 +31,18 @@ _CHOICE_PATTERNS = (
 )
 _THINK_OPEN_RE = re.compile(r"<think(?:\s[^>]*)?>", re.IGNORECASE)
 _THINK_CLOSE_RE = re.compile(r"</think\s*>", re.IGNORECASE)
+_MULTIPLE_CHOICE_METADATA_KEYS = (
+    "benchmark",
+    "category",
+    "length_bucket",
+    "original_prompt_tokens",
+    "original_prompt_tokens_exact",
+    "formatted_prompt_tokens",
+    "original_context_tokens",
+    "retained_context_tokens",
+    "retained_ratio",
+    "truncated",
+)
 
 
 def _parse_payload(ground_truth: Any) -> dict[str, Any]:
@@ -214,18 +226,7 @@ def _score_multiple_choice(solution: str, payload: dict[str, Any]) -> dict[str, 
         "pred": pred if pred is not None else "[INVALID]",
         "parse_failure": pred is None,
     }
-    for key in (
-        "benchmark",
-        "category",
-        "length_bucket",
-        "original_prompt_tokens",
-        "original_prompt_tokens_exact",
-        "formatted_prompt_tokens",
-        "original_context_tokens",
-        "retained_context_tokens",
-        "retained_ratio",
-        "truncated",
-    ):
+    for key in _MULTIPLE_CHOICE_METADATA_KEYS:
         if key in payload:
             result[key] = payload[key]
     return result
@@ -282,7 +283,9 @@ def compute_score(
             "pred": "[INVALID]",
             "parse_failure": True,
         }
-        if task_type == "ifbench":
+        if task_type == "aime":
+            result["math_verify_score"] = 0.0
+        elif task_type == "ifbench":
             instruction_ids = payload["instruction_id_list"]
             result.update(
                 {
@@ -293,6 +296,10 @@ def compute_score(
                     "instruction_count": len(instruction_ids),
                 }
             )
+        elif task_type == "multiple_choice":
+            for key in _MULTIPLE_CHOICE_METADATA_KEYS:
+                if key in payload:
+                    result[key] = payload[key]
     elif task_type == "aime":
         result = _score_aime(visible, payload, extra_info)
     elif task_type == "ifbench":

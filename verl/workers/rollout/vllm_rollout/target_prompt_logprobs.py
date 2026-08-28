@@ -274,25 +274,41 @@ def patch_vllm_model_runner_target_prompt_logprobs(
             target_rows = extra_args[VERL_TARGET_PROMPT_TOKEN_IDS_KEY]
             target_tensor = target_tensor_cache.get(request_id)
             if target_tensor is None:
-                target_tensor = torch.as_tensor(target_rows, dtype=torch.long).to(self.device, non_blocking=True)
-                if target_tensor.ndim != 2:
+                # Validate on CPU before the non-blocking device copy. Besides
+                # producing a useful error, this prevents an invalid gather
+                # index from surfacing later as an asynchronous device fault.
+                target_tensor_cpu = torch.as_tensor(target_rows, dtype=torch.long)
+                if target_tensor_cpu.ndim != 2:
                     raise ValueError(
                         "Target prompt token ids must have shape [prompt_len, topk], "
-                        f"got {tuple(target_tensor.shape)} for request {request_id!r}."
+                        f"got {tuple(target_tensor_cpu.shape)} for request {request_id!r}."
                     )
-                if target_tensor.shape[0] != len(prompt_token_ids_list):
+                if target_tensor_cpu.shape[0] != len(prompt_token_ids_list):
                     raise ValueError(
-                        "Target prompt token ids must contain one row per prompt token (the final row is a dummy), "
-                        f"got target_rows={target_tensor.shape[0]}, prompt_len={len(prompt_token_ids_list)} "
+                        "Target prompt token ids must contain one row per prompt token, "
+                        f"got target_rows={target_tensor_cpu.shape[0]}, prompt_len={len(prompt_token_ids_list)} "
                         f"for request {request_id!r}."
                     )
                 expected_width = int(request_widths[request_id])
-                if target_tensor.shape[1] != expected_width:
+                if target_tensor_cpu.shape[1] != expected_width:
                     raise ValueError(
                         "Target prompt token-id width must equal prompt_logprobs, "
-                        f"got target_width={target_tensor.shape[1]}, prompt_logprobs={expected_width} "
+                        f"got target_width={target_tensor_cpu.shape[1]}, prompt_logprobs={expected_width} "
                         f"for request {request_id!r}."
                     )
+
+                if vocab_size is not None and target_tensor_cpu.numel() > 0:
+                    invalid = (target_tensor_cpu < 0) | (target_tensor_cpu >= vocab_size)
+                    if invalid.any().item():
+                        row, column = (int(value) for value in torch.nonzero(invalid, as_tuple=False)[0].tolist())
+                        token_id = int(target_tensor_cpu[row, column].item())
+                        raise ValueError(
+                            "Target prompt token id is outside the tokenizer vocabulary before device transfer: "
+                            f"request={request_id!r}, row={row}, column={column}, token_id={token_id}, "
+                            f"valid_range=[0, {vocab_size})."
+                        )
+
+                target_tensor = target_tensor_cpu.to(self.device, non_blocking=True)
                 target_tensor_cache[request_id] = target_tensor
 
             prompt_token_ids = torch.as_tensor(prompt_token_ids_list, dtype=torch.long).to(

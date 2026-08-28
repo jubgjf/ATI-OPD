@@ -17,6 +17,7 @@ import json
 import pandas as pd
 
 from verl.third_party import ifbench as vendored_ifbench
+from verl.trainer.ppo.metric_utils import process_validation_metrics
 from verl.utils.dataset.multi_domain_benchmark_dataset import MultiDomainBenchmarkDataset
 from verl.utils.evaluation.multi_domain_benchmark import (
     LONG_BENCH_METRIC_NAME,
@@ -289,8 +290,10 @@ def test_unclosed_qwen_thinking_cannot_leak_a_hidden_benchmark_answer_on_cpu():
     payload = json.dumps(
         {
             "task_type": "multiple_choice",
+            "benchmark": "mmlu_pro",
             "expected_answer": "B",
             "valid_labels": ["A", "B", "C"],
+            "category": "physics",
         }
     )
 
@@ -298,3 +301,49 @@ def test_unclosed_qwen_thinking_cannot_leak_a_hidden_benchmark_answer_on_cpu():
 
     assert result["score"] == 0.0
     assert result["parse_failure"] is True
+    assert result["benchmark"] == "mmlu_pro"
+    assert result["category"] == "physics"
+
+
+def test_unclosed_qwen_thinking_returns_zero_aime_diagnostics_on_cpu():
+    payload = json.dumps(
+        {
+            "task_type": "aime",
+            "expected_answer": "42",
+        }
+    )
+
+    result = compute_score("<think>The answer might be 42.", payload)
+
+    assert result["score"] == 0.0
+    assert result["acc"] is False
+    assert result["parse_failure"] is True
+    assert result["math_verify_score"] == 0.0
+
+
+def test_aime_valid_and_unclosed_outputs_aggregate_without_missing_values_on_cpu(monkeypatch):
+    from verl.utils.reward_score import math_verify
+
+    monkeypatch.setattr(math_verify, "compute_score", lambda *args, **kwargs: 1.0)
+    payload = json.dumps(
+        {
+            "task_type": "aime",
+            "expected_answer": "42",
+        }
+    )
+    results = [
+        compute_score("The answer is 42.", payload),
+        compute_score("<think>The answer might be 42.", payload),
+    ]
+    info_keys = set().union(*(result.keys() for result in results))
+    infos_dict = {key: [result.get(key) for result in results] for key in info_keys}
+
+    metrics = process_validation_metrics(
+        ["aime25", "aime25"],
+        ["aime25:1", "aime25:1"],
+        infos_dict,
+        seed=42,
+    )
+
+    assert metrics["aime25"]["score"]["mean@2"] == 0.5
+    assert metrics["aime25"]["math_verify_score"]["mean@2"] == 0.5

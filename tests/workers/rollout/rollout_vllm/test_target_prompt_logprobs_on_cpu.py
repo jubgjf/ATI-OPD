@@ -297,6 +297,23 @@ def test_vllm_target_prompt_patch_rejects_corrupt_completed_token_ids_on_cpu():
         _validate_completed_token_ids({"target": output}, vocab_size=5)
 
 
+@pytest.mark.parametrize("invalid_token_id", [-1, 5])
+def test_vllm_target_prompt_patch_rejects_invalid_target_ids_before_device_transfer_on_cpu(invalid_token_id):
+    runner, _ = _target_runner()
+    runner.requests["target"].sampling_params.extra_args[VERL_TARGET_PROMPT_TOKEN_IDS_KEY][1][0] = invalid_token_id
+    patch_vllm_model_runner_target_prompt_logprobs(
+        runner,
+        logprobs_tensors_cls=_FakeLogprobsTensors,
+        vocab_size=5,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"row=1, column=0, token_id={invalid_token_id}, valid_range=\[0, 5\)",
+    ):
+        runner._get_prompt_logprobs_dict(torch.randn(3, 5), {"target": 4})
+
+
 def test_vllm_target_prompt_patch_supports_inherited_vllm_ascend_v013_contract_on_cpu():
     """Exercise the GPUModelRunner-compatible contract used since Ascend 0.13."""
     runner, target_rows = _target_runner()

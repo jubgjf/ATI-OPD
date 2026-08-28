@@ -914,6 +914,25 @@ class EngineTrainModeCtx(BaseEngineCtx):
 
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithLMHead(FSDPEngine):
+    def _mask_tokenizer_invalid_logits_(self, logits: torch.Tensor) -> None:
+        """Exclude padded model-head rows that do not represent tokenizer tokens."""
+        tokenizer = self.model_config.tokenizer
+        if tokenizer is None:
+            tokenizer = getattr(self.model_config.processor, "tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError("Cannot mask tokenizer-invalid logits because the model tokenizer is unavailable.")
+
+        tokenizer_vocab_size = len(tokenizer)
+        model_vocab_size = int(logits.shape[-1])
+        if tokenizer_vocab_size <= 0 or tokenizer_vocab_size > model_vocab_size:
+            raise RuntimeError(
+                "Tokenizer vocabulary size must be within the model output dimension, "
+                f"got tokenizer_vocab_size={tokenizer_vocab_size}, model_vocab_size={model_vocab_size}."
+            )
+
+        if tokenizer_vocab_size < model_vocab_size:
+            logits[..., tokenizer_vocab_size:].fill_(float("-inf"))
+
     @staticmethod
     def _response_target_ids_rmpad(
         *,
@@ -1167,6 +1186,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
             else:
                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                self._mask_tokenizer_invalid_logits_(logits_rmpad)
                 logits_rmpad.div_(temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype))
 
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
@@ -1328,6 +1348,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
             else:
                 logits = output.logits  # (bsz, response_length, vocab_size)
+                self._mask_tokenizer_invalid_logits_(logits)
                 temperature = output_args["temperature"]  # (bsz,)
                 temperature = temperature.unsqueeze(-1).unsqueeze(-1)
                 logits.div_(temperature.clamp(min=1e-8).to(logits.dtype))

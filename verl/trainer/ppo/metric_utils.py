@@ -1103,13 +1103,30 @@ def process_validation_metrics(
 
         for uid, var2vals in uid2var2vals.items():
             pred_vals = var2vals.get("pred")
-            has_pred = pred_vals is not None
             var_dict = uid_dict.setdefault(uid, {})
 
-            for var_name, var_vals in var2vals.items():
-                # skip empty or string values
-                if not var_vals or isinstance(var_vals[0], str):
+            for var_name, raw_var_vals in var2vals.items():
+                # Reward diagnostics are heterogeneous: their collation contract
+                # represents a field missing from one response with ``None``.
+                # Aggregate the observations that are present, and ignore
+                # metadata/string/object fields instead of passing an object
+                # array containing ``None`` to numpy.
+                indexed_values = [(index, value) for index, value in enumerate(raw_var_vals) if value is not None]
+                if not indexed_values:
                     continue
+                if not all(
+                    isinstance(value, bool | int | float | np.bool_ | np.integer | np.floating)
+                    for _, value in indexed_values
+                ):
+                    continue
+
+                value_indices = [index for index, _ in indexed_values]
+                var_vals = [float(value) for _, value in indexed_values]
+                aligned_pred_vals = None
+                if pred_vals is not None and len(pred_vals) == len(raw_var_vals):
+                    candidate_pred_vals = [pred_vals[index] for index in value_indices]
+                    if all(pred is not None for pred in candidate_pred_vals):
+                        aligned_pred_vals = candidate_pred_vals
 
                 # compute mean and std
                 n_resps = len(var_vals)
@@ -1139,10 +1156,11 @@ def process_validation_metrics(
                         metric[f"worst@{n}/std"] = won_std
 
                         # compute maj metrics
-                        if has_pred:
+                        if aligned_pred_vals is not None:
                             # create vote_data
                             vote_data = [
-                                {"val": val, "pred": pred} for val, pred in zip(var_vals, pred_vals, strict=True)
+                                {"val": val, "pred": pred}
+                                for val, pred in zip(var_vals, aligned_pred_vals, strict=True)
                             ]
                             # compute maj metrics
                             [(maj_n_mean, maj_n_std)] = bootstrap_metric(
