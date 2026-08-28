@@ -3243,6 +3243,7 @@ def compute_intervention_metrics(
     local_effect_pairs: list[dict[str, float]] = []
     local_effect_total = 0
     local_effect_unavailable_reasons: dict[str, int] = {}
+    prune_future_items: list[dict[str, Any]] = []
     valid_lengths = valid_lengths_tensor.tolist()
     for sample_idx, sample_interventions in enumerate(interventions):
         if sample_interventions is None:
@@ -3251,6 +3252,8 @@ def compute_intervention_metrics(
             if not isinstance(item, dict):
                 continue
             local_effect_total += 1
+            if "prune_future_cutoff" in item:
+                prune_future_items.append(item)
             teacher_tokens += int(item.get("teacher_tokens", 0) or 0)
             suffix_tokens += int(item.get("student_suffix_tokens", 0) or 0)
             score = item.get("score")
@@ -3358,6 +3361,104 @@ def compute_intervention_metrics(
     unavailable_denom = max(sum(local_effect_unavailable_reasons.values()), 1)
     for reason, count in local_effect_unavailable_reasons.items():
         metrics[f"opd_intervention/local_effect/unavailable_reason/{reason}"] = count / unavailable_denom
+
+    calibration_observations = [
+        item
+        for item in (intervention_outcomes or [])
+        if isinstance(item, dict) and item.get("prune_future_calibration_threshold") is not None
+    ]
+    if calibration_observations:
+        thresholds = np.asarray(
+            [float(item["prune_future_calibration_threshold"]) for item in calibration_observations],
+            dtype=np.float64,
+        )
+        calibration_counts = np.asarray(
+            [float(item.get("prune_future_calibration_count", 0) or 0) for item in calibration_observations],
+            dtype=np.float64,
+        )
+        calibration_versions = np.asarray(
+            [float(item.get("prune_future_calibration_version", 0) or 0) for item in calibration_observations],
+            dtype=np.float64,
+        )
+        metrics.update(
+            {
+                "opd_intervention/prune_future/threshold/mean": float(thresholds.mean()),
+                "opd_intervention/prune_future/threshold/p50": float(np.quantile(thresholds, 0.50)),
+                "opd_intervention/prune_future/threshold/p90": float(np.quantile(thresholds, 0.90)),
+                "opd_intervention/prune_future/calibration/count_mean": float(calibration_counts.mean()),
+                "opd_intervention/prune_future/calibration/count_max": float(calibration_counts.max()),
+                "opd_intervention/prune_future/calibration/version_max": float(calibration_versions.max()),
+                "opd_intervention/prune_future/calibration/current_batch_healthy_update_count": float(
+                    sum(int(item.get("prune_future_healthy_update_count", 0) or 0) for item in calibration_observations)
+                ),
+                "opd_intervention/prune_future/calibration/healthy_available_blocks": float(
+                    sum(
+                        int(item.get("prune_future_healthy_available_blocks", 0) or 0)
+                        for item in calibration_observations
+                    )
+                ),
+                "opd_intervention/prune_future/calibration/healthy_unavailable_blocks": float(
+                    sum(
+                        int(item.get("prune_future_healthy_unavailable_blocks", 0) or 0)
+                        for item in calibration_observations
+                    )
+                ),
+            }
+        )
+        source_counts: dict[str, int] = {}
+        for item in calibration_observations:
+            source = str(item.get("prune_future_calibration_source") or "unknown")
+            source_counts[source] = source_counts.get(source, 0) + 1
+        for source, count in source_counts.items():
+            metrics[f"opd_intervention/prune_future/threshold/source/{source}_fraction"] = count / len(
+                calibration_observations
+            )
+
+    if prune_future_items:
+        horizons = np.asarray(
+            [float(item["prune_future_horizon_tokens"]) for item in prune_future_items], dtype=np.float64
+        )
+        retained = np.asarray(
+            [float(item["prune_future_retained_fraction"]) for item in prune_future_items], dtype=np.float64
+        )
+        metrics.update(
+            {
+                "opd_intervention/prune_future/horizon_tokens/mean": float(horizons.mean()),
+                "opd_intervention/prune_future/horizon_tokens/p50": float(np.quantile(horizons, 0.50)),
+                "opd_intervention/prune_future/horizon_tokens/p90": float(np.quantile(horizons, 0.90)),
+                "opd_intervention/prune_future/suffix_retained_fraction/mean": float(retained.mean()),
+                "opd_intervention/prune_future/no_cut_fraction": float(
+                    np.mean([bool(item.get("prune_future_no_cut", False)) for item in prune_future_items])
+                ),
+                "opd_intervention/prune_future/persistent_bad_fraction": float(
+                    np.mean([bool(item.get("prune_future_persistent_bad", False)) for item in prune_future_items])
+                ),
+                "opd_intervention/prune_future/evaluated_blocks/mean": float(
+                    np.mean([float(item.get("prune_future_evaluated_blocks", 0) or 0) for item in prune_future_items])
+                ),
+                "opd_intervention/prune_future/bad_blocks/mean": float(
+                    np.mean([float(item.get("prune_future_bad_blocks", 0) or 0) for item in prune_future_items])
+                ),
+                "opd_intervention/prune_future/unavailable_blocks/mean": float(
+                    np.mean([float(item.get("prune_future_unavailable_blocks", 0) or 0) for item in prune_future_items])
+                ),
+            }
+        )
+        for transition in (
+            "pre_wrong_post_correct",
+            "pre_wrong_post_wrong",
+            "pre_correct_post_correct",
+            "pre_correct_post_wrong",
+        ):
+            transition_items = [item for item in prune_future_items if str(item.get("transition")) == transition]
+            if not transition_items:
+                continue
+            metrics[f"opd_intervention/prune_future/outcome/{transition}/horizon_tokens_mean"] = float(
+                np.mean([float(item["prune_future_horizon_tokens"]) for item in transition_items])
+            )
+            metrics[f"opd_intervention/prune_future/outcome/{transition}/retained_fraction_mean"] = float(
+                np.mean([float(item["prune_future_retained_fraction"]) for item in transition_items])
+            )
 
     skipped_counts = []
     skipped_reason_counts: dict[str, int] = {}

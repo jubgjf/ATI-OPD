@@ -260,6 +260,62 @@ class _GlobalTeacherNLLCalibration:
         return self.snapshot()
 
 
+@dataclass(frozen=True)
+class _PruneFutureCalibrationSnapshot:
+    """Read-only raw-correct gap calibration broadcast at rollout-batch boundaries."""
+
+    threshold: float
+    source: str
+    count: int
+    version: int
+
+
+class _GlobalPruneFutureCalibration:
+    """Manager-owned rolling raw-correct block-gap reference for adaptive prune."""
+
+    def __init__(self, config: DistillationInterventionConfig):
+        self.quantile = float(config.prune_future_healthy_quantile)
+        self.min_blocks = int(config.prune_future_calibration_min_blocks)
+        configured_initial = config.prune_future_initial_threshold
+        self.initial_threshold = float(config.gap_threshold if configured_initial is None else configured_initial)
+        self.initial_source = "gap_threshold_fallback" if configured_initial is None else "configured_initial"
+        self.history: deque[float] = deque(maxlen=int(config.prune_future_calibration_window_blocks))
+        self.version = 0
+
+    def snapshot(self) -> _PruneFutureCalibrationSnapshot:
+        """Return the threshold snapshot to use for the next rollout batch."""
+        count = len(self.history)
+        if count >= self.min_blocks:
+            threshold = float(np.quantile(np.asarray(self.history, dtype=np.float64), self.quantile))
+            source = "rolling_raw_correct_quantile"
+        else:
+            threshold = self.initial_threshold
+            source = self.initial_source
+        return _PruneFutureCalibrationSnapshot(
+            threshold=threshold,
+            source=source,
+            count=count,
+            version=self.version,
+        )
+
+    def add_updates(self, worker_updates: list[list[float]]) -> _PruneFutureCalibrationSnapshot:
+        """Merge one completed batch; its values can only affect the following batch."""
+        updates: list[float] = []
+        for worker_index, values in enumerate(worker_updates):
+            for value_index, value in enumerate(values):
+                value = float(value)
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "Global prune-future calibration updates must be finite, "
+                        f"but worker {worker_index} update {value_index} was {value!r}."
+                    )
+                updates.append(value)
+        if updates:
+            self.history.extend(updates)
+            self.version += 1
+        return self.snapshot()
+
+
 def _as_single_float(value: Any, *, context: str) -> float:
     """Normalize a reward-manager scalar without silently reducing a batch."""
     if isinstance(value, torch.Tensor):
@@ -1182,6 +1238,192 @@ def _aggregate_intervention_span(
     return float(score.item()), valid_count
 
 
+def _prune_future_gap_blocks(
+    *,
+    scores: torch.Tensor,
+    eligibility_mask: list[int],
+    start: int,
+    window_tokens: int,
+    min_valid_tokens: int,
+    aggregation: str,
+    nonfinite_positions: Optional[list[int]] = None,
+) -> list[dict[str, Any]]:
+    """Return physical non-overlapping gap windows without smoothing invalid blocks."""
+    if len(eligibility_mask) != scores.numel():
+        raise RuntimeError(
+            "Prune-future eligibility mask is not aligned with gap values: "
+            f"len(mask)={len(eligibility_mask)}, num_scores={scores.numel()}."
+        )
+    if start < 0 or start > scores.numel():
+        raise ValueError(f"Invalid prune-future start={start} for {scores.numel()} token scores.")
+    if window_tokens <= 0 or min_valid_tokens <= 0 or min_valid_tokens > window_tokens:
+        raise ValueError(
+            "Prune-future window sizes must satisfy 0 < min_valid_tokens <= window_tokens, "
+            f"got min_valid_tokens={min_valid_tokens}, window_tokens={window_tokens}."
+        )
+    if aggregation not in {"mean", "max"}:
+        raise ValueError(f"Unsupported prune-future gap aggregation: {aggregation!r}.")
+    invalid_values = sorted({value for value in eligibility_mask if value not in (0, 1)})
+    if invalid_values:
+        raise ValueError(f"Prune-future eligibility mask contains non-binary values: {invalid_values}.")
+
+    explicit_nonfinite = set(nonfinite_positions or [])
+    blocks: list[dict[str, Any]] = []
+    for block_index, block_start in enumerate(range(start, scores.numel(), window_tokens)):
+        block_end = min(block_start + window_tokens, scores.numel())
+        positions = list(range(block_start, block_end))
+        eligible_positions = [position for position in positions if eligibility_mask[position] == 1]
+        has_nonfinite = any(position in explicit_nonfinite for position in positions) or any(
+            not math.isfinite(float(scores[position].item())) for position in eligible_positions
+        )
+        # In the supported single-turn path every physical suffix token should
+        # be scoreable. A masked/nonfinite token censors the entire block so it
+        # cannot accidentally bridge two bad windows.
+        has_ineligible_token = len(eligible_positions) != len(positions)
+        available = not has_nonfinite and not has_ineligible_token and len(eligible_positions) >= min_valid_tokens
+        gap = None
+        unavailable_reason = None
+        if available:
+            values = scores[block_start:block_end].float()
+            aggregate = values.max() if aggregation == "max" else values.mean()
+            gap = float(aggregate.item())
+            if not math.isfinite(gap):
+                available = False
+                gap = None
+                unavailable_reason = "nonfinite"
+        elif has_nonfinite or has_ineligible_token:
+            unavailable_reason = "nonfinite_or_ineligible"
+        else:
+            unavailable_reason = "insufficient_valid_tokens"
+        blocks.append(
+            {
+                "index": block_index,
+                "start": block_start,
+                "end": block_end,
+                "valid_tokens": len(eligible_positions),
+                "available": available,
+                "gap": gap,
+                "unavailable_reason": unavailable_reason,
+            }
+        )
+    return blocks
+
+
+def _evenly_spaced_prune_future_values(values: list[float], limit: int) -> list[float]:
+    """Bound one sample's calibration weight while retaining its endpoints."""
+    if limit <= 0:
+        raise ValueError(f"Prune-future calibration sample limit must be positive, got {limit}.")
+    if len(values) <= limit:
+        return list(values)
+    if limit == 1:
+        return [values[0]]
+    indices = [round(index * (len(values) - 1) / (limit - 1)) for index in range(limit)]
+    return [values[index] for index in indices]
+
+
+def _collect_prune_future_calibration_values(
+    *,
+    scores: torch.Tensor,
+    eligibility_mask: list[int],
+    intervention_config: DistillationInterventionConfig,
+    nonfinite_positions: Optional[list[int]] = None,
+) -> tuple[list[float], dict[str, int]]:
+    """Collect bounded healthy raw-response blocks for the next batch's q90."""
+    blocks = _prune_future_gap_blocks(
+        scores=scores,
+        eligibility_mask=eligibility_mask,
+        start=0,
+        window_tokens=int(intervention_config.prune_future_window_tokens),
+        min_valid_tokens=int(intervention_config.prune_future_min_valid_tokens),
+        aggregation=str(intervention_config.gap_aggregation),
+        nonfinite_positions=nonfinite_positions,
+    )
+    available_values = [float(block["gap"]) for block in blocks if block["available"]]
+    selected = _evenly_spaced_prune_future_values(
+        available_values,
+        int(intervention_config.prune_future_max_healthy_blocks_per_sample),
+    )
+    return selected, {
+        "total_blocks": len(blocks),
+        "available_blocks": len(available_values),
+        "unavailable_blocks": len(blocks) - len(available_values),
+        "selected_blocks": len(selected),
+    }
+
+
+def _compute_prune_future_horizon_metadata(
+    *,
+    scores: torch.Tensor,
+    eligibility_mask: list[int],
+    teacher_end: int,
+    intervention_config: DistillationInterventionConfig,
+    calibration: _PruneFutureCalibrationSnapshot,
+    nonfinite_positions: Optional[list[int]] = None,
+) -> dict[str, Any]:
+    """Compute H_i* for a repaired suffix while preserving the rollout itself."""
+    threshold = float(calibration.threshold)
+    if not math.isfinite(threshold):
+        raise ValueError(f"Prune-future threshold must be finite, got {threshold!r}.")
+    blocks = _prune_future_gap_blocks(
+        scores=scores,
+        eligibility_mask=eligibility_mask,
+        start=teacher_end,
+        window_tokens=int(intervention_config.prune_future_window_tokens),
+        min_valid_tokens=int(intervention_config.prune_future_min_valid_tokens),
+        aggregation=str(intervention_config.gap_aggregation),
+        nonfinite_positions=nonfinite_positions,
+    )
+    persistence = int(intervention_config.prune_future_bad_window_persistence)
+    consecutive_bad: list[dict[str, Any]] = []
+    persistent_first: Optional[dict[str, Any]] = None
+    bad_blocks = 0
+    evaluated_blocks = 0
+    for block in blocks:
+        if not block["available"]:
+            consecutive_bad = []
+            continue
+        evaluated_blocks += 1
+        block["bad"] = bool(float(block["gap"]) > threshold)
+        if block["bad"]:
+            bad_blocks += 1
+            consecutive_bad.append(block)
+            if len(consecutive_bad) >= persistence and persistent_first is None:
+                persistent_first = consecutive_bad[-persistence]
+        else:
+            consecutive_bad = []
+
+    response_length = scores.numel()
+    cutoff = response_length if persistent_first is None else int(persistent_first["start"])
+    if not teacher_end <= cutoff <= response_length:
+        raise RuntimeError(
+            "Computed prune-future cutoff is outside the repaired suffix: "
+            f"teacher_end={teacher_end}, cutoff={cutoff}, response_length={response_length}."
+        )
+    suffix_tokens = response_length - teacher_end
+    horizon_tokens = cutoff - teacher_end
+    no_cut = cutoff == response_length
+    return {
+        "prune_future_cutoff": int(cutoff),
+        "prune_future_threshold": threshold,
+        "prune_future_threshold_source": str(calibration.source),
+        "prune_future_calibration_count": int(calibration.count),
+        "prune_future_calibration_version": int(calibration.version),
+        "prune_future_window_tokens": int(intervention_config.prune_future_window_tokens),
+        "prune_future_min_valid_tokens": int(intervention_config.prune_future_min_valid_tokens),
+        "prune_future_bad_window_persistence": persistence,
+        "prune_future_evaluated_blocks": evaluated_blocks,
+        "prune_future_bad_blocks": bad_blocks,
+        "prune_future_unavailable_blocks": len(blocks) - evaluated_blocks,
+        "prune_future_first_bad_block_index": (None if persistent_first is None else int(persistent_first["index"])),
+        "prune_future_first_bad_block_start": (None if persistent_first is None else int(persistent_first["start"])),
+        "prune_future_horizon_tokens": int(horizon_tokens),
+        "prune_future_available_suffix_tokens": int(suffix_tokens),
+        "prune_future_retained_fraction": float(horizon_tokens / suffix_tokens) if suffix_tokens else 1.0,
+        "prune_future_no_cut": bool(no_cut),
+        "prune_future_persistent_bad": persistent_first is not None,
+    }
+
+
 def _teacher_rejection_persistence_threshold(intervention_config: DistillationInterventionConfig) -> float:
     threshold = intervention_config.teacher_rejection_persistence_threshold
     return float(intervention_config.gap_threshold if threshold is None else threshold)
@@ -2014,6 +2256,13 @@ class AgentLoopWorker:
             version=0,
         )
         self._teacher_nll_pending_updates: list[float] = []
+        self._prune_future_calibration_snapshot = _PruneFutureCalibrationSnapshot(
+            threshold=0.0,
+            source="unavailable",
+            count=0,
+            version=0,
+        )
+        self._prune_future_pending_updates: list[float] = []
         self._teacher_candidate_rpc_semaphore: Optional[asyncio.Semaphore] = None
         if self.distillation_enabled:
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
@@ -2033,6 +2282,18 @@ class AgentLoopWorker:
                 self._teacher_nll_calibration_snapshot = _TeacherNLLCalibrationSnapshot(
                     threshold=None if initial_threshold is None else float(initial_threshold),
                     source="unavailable" if initial_threshold is None else "initial",
+                    count=0,
+                    version=0,
+                )
+            if self.teacher_intervention_config.prune_mode == "adaptive_future":
+                configured_initial = self.teacher_intervention_config.prune_future_initial_threshold
+                self._prune_future_calibration_snapshot = _PruneFutureCalibrationSnapshot(
+                    threshold=float(
+                        self.teacher_intervention_config.gap_threshold
+                        if configured_initial is None
+                        else configured_initial
+                    ),
+                    source="gap_threshold_fallback" if configured_initial is None else "configured_initial",
                     count=0,
                     version=0,
                 )
@@ -2649,6 +2910,10 @@ class AgentLoopWorker:
                 self.teacher_intervention_config is not None
                 and self.teacher_intervention_config.outcome_aware_candidate_selection_enabled
             )
+            adaptive_future_prune = bool(
+                self.teacher_intervention_config is not None
+                and self.teacher_intervention_config.prune_mode == "adaptive_future"
+            )
             collect_training_outcomes = AgentLoopWorker._collect_training_intervention_outcomes(
                 self,
                 validate=bool(validate),
@@ -2662,6 +2927,7 @@ class AgentLoopWorker:
                 or collect_training_outcomes
                 or needs_joint_rlvr_raw_outcome
                 or (outcome_aware_selection and not validate)
+                or adaptive_future_prune
             )
             if observe_outcome:
                 # The raw student answer must be judged before any token is
@@ -2853,7 +3119,13 @@ class AgentLoopWorker:
                     "repair_ineffective": repair_executed and not raw_correct and not final_correct,
                 }
             )
-            transition = None
+            adaptive_future_prune = bool(
+                self.teacher_intervention_config is not None
+                and self.teacher_intervention_config.prune_mode == "adaptive_future"
+            )
+            transition = (
+                _outcome_transition(raw_correct, final_correct) if repair_executed and adaptive_future_prune else None
+            )
             if outcome_metadata.get("transition_observation_event"):
                 transition = _outcome_transition(raw_correct, final_correct) if repair_executed else "not_repaired"
                 final_output_token_sha256 = _token_ids_sha256(output.response_ids)
@@ -3261,6 +3533,55 @@ class AgentLoopWorker:
     def _current_teacher_nll_threshold(self) -> tuple[Optional[float], str, int]:
         snapshot = AgentLoopWorker._teacher_nll_calibration_state(self)
         return snapshot.threshold, snapshot.source, snapshot.count
+
+    def _prune_future_calibration_state(self) -> _PruneFutureCalibrationSnapshot:
+        snapshot = getattr(self, "_prune_future_calibration_snapshot", None)
+        if isinstance(snapshot, _PruneFutureCalibrationSnapshot):
+            return snapshot
+        config: DistillationInterventionConfig = self.teacher_intervention_config
+        configured_initial = config.prune_future_initial_threshold
+        snapshot = _PruneFutureCalibrationSnapshot(
+            threshold=float(config.gap_threshold if configured_initial is None else configured_initial),
+            source="gap_threshold_fallback" if configured_initial is None else "configured_initial",
+            count=0,
+            version=0,
+        )
+        self._prune_future_calibration_snapshot = snapshot
+        return snapshot
+
+    def set_prune_future_calibration_state(self, snapshot: _PruneFutureCalibrationSnapshot) -> None:
+        """Install the manager-computed q90 snapshot for one complete rollout batch."""
+        if not isinstance(snapshot, _PruneFutureCalibrationSnapshot):
+            raise TypeError(
+                "Prune-future calibration broadcasts must use _PruneFutureCalibrationSnapshot, "
+                f"got {type(snapshot).__name__}."
+            )
+        if not math.isfinite(snapshot.threshold):
+            raise ValueError(f"Prune-future calibration threshold must be finite, got {snapshot.threshold!r}.")
+        if snapshot.count < 0 or snapshot.version < 0:
+            raise ValueError(
+                "Prune-future calibration count and version must be non-negative, "
+                f"got count={snapshot.count}, version={snapshot.version}."
+            )
+        self._prune_future_calibration_snapshot = snapshot
+
+    def drain_prune_future_calibration_updates(self) -> list[float]:
+        """Return and clear raw-correct gap blocks accumulated in the previous batch."""
+        updates = list(getattr(self, "_prune_future_pending_updates", []))
+        self._prune_future_pending_updates = []
+        return updates
+
+    def _queue_prune_future_calibration_updates(self, values: list[float]) -> int:
+        pending = getattr(self, "_prune_future_pending_updates", None)
+        if not isinstance(pending, list):
+            pending = []
+            self._prune_future_pending_updates = pending
+        for value in values:
+            value = float(value)
+            if not math.isfinite(value):
+                raise ValueError(f"Healthy prune-future calibration update must be finite, got {value!r}.")
+            pending.append(value)
+        return len(values)
 
     def _teacher_candidate_rpc_limiter(self) -> asyncio.Semaphore:
         """Return the worker-wide limiter shared by all candidate RPC stages."""
@@ -3747,10 +4068,18 @@ class AgentLoopWorker:
 
         intervention_config: DistillationInterventionConfig = self.teacher_intervention_config
         future_gap_confirmation = intervention_config.confirmation_mode == "future_gap"
+        adaptive_future_prune = bool(intervention_config.prune and intervention_config.prune_mode == "adaptive_future")
         proposals: list[dict[str, Any]] = []
         if future_gap_confirmation:
             output.extra_fields["teacher_intervention_proposals"] = proposals
         outcome_metadata = output.extra_fields.get("teacher_intervention_outcome")
+        if adaptive_future_prune and (not isinstance(outcome_metadata, dict) or "raw_correct" not in outcome_metadata):
+            raise RuntimeError(
+                "prune_mode='adaptive_future' requires raw correctness before teacher intervention so its healthy "
+                "gap calibration can use raw-correct responses only. Call _agent_loop_postprocess instead of "
+                "invoking _maybe_repair_with_teacher directly."
+            )
+        skip_correct_raw = False
         if intervention_config.skip_correct:
             if not isinstance(outcome_metadata, dict) or "raw_correct" not in outcome_metadata:
                 raise RuntimeError(
@@ -3758,6 +4087,7 @@ class AgentLoopWorker:
                     "Call _agent_loop_postprocess instead of invoking _maybe_repair_with_teacher directly."
                 )
             if bool(outcome_metadata["raw_correct"]):
+                skip_correct_raw = True
                 response_length = min(len(output.response_ids), self.rollout_config.response_length)
                 if (
                     intervention_config.train_on_teacher_segments
@@ -3783,7 +4113,8 @@ class AgentLoopWorker:
                 )
                 if environment_aware_resume:
                     _copy_tool_call_metric_phase(output.extra_fields, "final")
-                return
+                if not adaptive_future_prune:
+                    return
 
         if output.routed_experts is not None:
             raise NotImplementedError(
@@ -3901,6 +4232,7 @@ class AgentLoopWorker:
                     f"prompt_len={len(prompt_ids)}, response_len={len(response_ids)}, attempt={attempt}."
                 )
             distribution_scores = None
+            distribution_nonfinite_positions: list[int] = []
             if _uses_intervention_distribution_gap(intervention_config.gap_metric):
                 student_result = await self._score_student_sequence_for_intervention(
                     request_id=f"{base_request_id}:student-score:{attempt}",
@@ -3917,6 +4249,11 @@ class AgentLoopWorker:
                     tokenizer=self.tokenizer,
                     log_prob_floor=_logprob_floor_from_distillation_config(self.distillation_config),
                 )
+                distribution_nonfinite_positions = _response_relative_nonfinite_positions(
+                    student_result,
+                    prompt_len=len(prompt_ids),
+                    response_len=len(response_ids),
+                )
             score_result = _compose_intervention_score(
                 student_logprobs=student_response_logprobs,
                 teacher_logprobs=teacher_response_logprobs,
@@ -3929,12 +4266,45 @@ class AgentLoopWorker:
                 prompt_len=len(prompt_ids),
                 response_len=len(response_ids),
             )
-            for token_index in teacher_nonfinite_positions:
+            gap_nonfinite_positions = sorted(set(teacher_nonfinite_positions + distribution_nonfinite_positions))
+            for token_index in gap_nonfinite_positions:
                 if 0 <= token_index < len(gap_mask):
                     gap_mask[token_index] = 0
             for token_index, teacher_logprob in enumerate(teacher_response_logprobs.tolist()):
                 if float(teacher_logprob) > 1e-6:
                     gap_mask[token_index] = 0
+            if adaptive_future_prune and attempt == 0 and not interventions:
+                calibration = AgentLoopWorker._prune_future_calibration_state(self)
+                calibration_values: list[float] = []
+                calibration_block_counts = {
+                    "total_blocks": 0,
+                    "available_blocks": 0,
+                    "unavailable_blocks": 0,
+                    "selected_blocks": 0,
+                }
+                if bool(outcome_metadata["raw_correct"]):
+                    calibration_values, calibration_block_counts = _collect_prune_future_calibration_values(
+                        scores=score_result.active_scores,
+                        eligibility_mask=gap_mask,
+                        intervention_config=intervention_config,
+                        nonfinite_positions=gap_nonfinite_positions,
+                    )
+                    AgentLoopWorker._queue_prune_future_calibration_updates(self, calibration_values)
+                outcome_metadata.update(
+                    {
+                        "prune_future_calibration_threshold": float(calibration.threshold),
+                        "prune_future_calibration_source": str(calibration.source),
+                        "prune_future_calibration_count": int(calibration.count),
+                        "prune_future_calibration_version": int(calibration.version),
+                        "prune_future_healthy_update_count": len(calibration_values),
+                        "prune_future_healthy_total_blocks": calibration_block_counts["total_blocks"],
+                        "prune_future_healthy_available_blocks": calibration_block_counts["available_blocks"],
+                        "prune_future_healthy_unavailable_blocks": calibration_block_counts["unavailable_blocks"],
+                        "prune_future_calibration_read_only": False,
+                    }
+                )
+                if skip_correct_raw:
+                    break
             if intervention_search_start:
                 gap_mask[: min(intervention_search_start, len(gap_mask))] = [0] * min(
                     intervention_search_start, len(gap_mask)
@@ -3951,6 +4321,25 @@ class AgentLoopWorker:
                     teacher_nonfinite_positions=teacher_nonfinite_positions,
                 )
                 pending_local_effect = None
+            if adaptive_future_prune and interventions:
+                if len(interventions) != 1:
+                    raise RuntimeError(
+                        "prune_mode='adaptive_future' requires exactly one committed intervention before horizon "
+                        f"scoring, got {len(interventions)}."
+                    )
+                first_intervention = interventions[0]
+                teacher_end = int(first_intervention["start"]) + int(first_intervention["teacher_tokens"])
+                first_intervention.update(
+                    _compute_prune_future_horizon_metadata(
+                        scores=score_result.active_scores,
+                        eligibility_mask=gap_mask,
+                        teacher_end=teacher_end,
+                        intervention_config=intervention_config,
+                        calibration=AgentLoopWorker._prune_future_calibration_state(self),
+                        nonfinite_positions=gap_nonfinite_positions,
+                    )
+                )
+                break
             gaps = score_result.active_scores
             bad_segment = _select_intervention_segment(gaps, gap_mask, intervention_config)
             if pending_future_gap is not None:
@@ -4802,11 +5191,15 @@ class AgentLoopWorker:
                 interventions.append(intervention_item)
                 if isinstance(outcome_metadata, dict):
                     outcome_metadata["repair_executed"] = True
-                if candidate_terminal and not environment_aware_resume:
+                if candidate_terminal and not environment_aware_resume and not adaptive_future_prune:
                     _mark_local_effect_unavailable(intervention_item, "terminal_response")
                     break
                 pending_local_effect = (intervention_item, start + len(teacher_segment_ids))
-                if intervention_config.skip_correct and getattr(self, "reward_loop_worker_handles", None) is not None:
+                if (
+                    intervention_config.skip_correct
+                    and not adaptive_future_prune
+                    and getattr(self, "reward_loop_worker_handles", None) is not None
+                ):
                     # ``skip_correct`` is also a causal stopping rule: once a
                     # repaired trajectory is correct, do not let a later gap
                     # rewrite it again. Tool trajectories are scored through
@@ -4866,6 +5259,11 @@ class AgentLoopWorker:
             teacher_segment_mask = pending_future_gap.raw_teacher_segment_mask
             cached_teacher_result = pending_future_gap.raw_teacher_result
             pending_future_gap = None
+
+        if adaptive_future_prune and interventions and "prune_future_cutoff" not in interventions[0]:
+            raise RuntimeError(
+                "Adaptive prune committed a teacher intervention without scoring the final repaired suffix."
+            )
 
         if future_gap_confirmation:
             for proposal in proposals:
@@ -4968,9 +5366,16 @@ class AgentLoopWorker:
                 existing_ids is not None
                 and existing_logprobs is not None
                 and existing_ids.shape[0] == existing_logprobs.shape[0] == len(prompt_ids) + len(response_ids)
-                and existing_logprobs.shape[-1] == expected_width
+                and existing_ids.shape[-1] == existing_logprobs.shape[-1]
+                and existing_logprobs.shape[-1] >= expected_width
                 and has_required_sampled_fields
             ):
+                if existing_logprobs.shape[-1] > expected_width:
+                    # Intervention-only distribution metrics may request a
+                    # wider support than the training loss. Reuse that scoring
+                    # call and trim it to the schema expected downstream.
+                    output.extra_fields["teacher_ids"] = existing_ids[:, :expected_width]
+                    output.extra_fields["teacher_logprobs"] = existing_logprobs[:, :expected_width]
                 output.extra_fields.setdefault("teacher_logprob_nonfinite_count", 0)
                 output.extra_fields.setdefault("teacher_logprob_nonfinite_positions", [])
                 output.extra_fields.setdefault(
@@ -5161,6 +5566,7 @@ class AgentLoopManager:
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
         self._global_teacher_nll_calibration: Optional[_GlobalTeacherNLLCalibration] = None
+        self._global_prune_future_calibration: Optional[_GlobalPruneFutureCalibration] = None
 
         distillation_config = getattr(config, "distillation", None)
         if is_distillation_enabled(distillation_config):
@@ -5170,6 +5576,8 @@ class AgentLoopManager:
             )
             if intervention_config.outcome_aware_candidate_selection_enabled:
                 self._global_teacher_nll_calibration = _GlobalTeacherNLLCalibration(intervention_config)
+            if intervention_config.prune_mode == "adaptive_future":
+                self._global_prune_future_calibration = _GlobalPruneFutureCalibration(intervention_config)
 
         if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
@@ -5191,16 +5599,23 @@ class AgentLoopManager:
         return self._global_teacher_nll_calibration.add_updates(worker_updates)
 
     async def _refresh_global_teacher_nll_calibration(self) -> None:
-        """Aggregate the previous batch's updates and broadcast one snapshot before the next batch."""
-        if self._global_teacher_nll_calibration is None:
-            return
-        worker_updates = await asyncio.gather(
-            *[worker.drain_teacher_nll_calibration_updates.remote() for worker in self.agent_loop_workers]
-        )
-        snapshot = self._apply_global_teacher_nll_calibration_updates(worker_updates)
-        await asyncio.gather(
-            *[worker.set_teacher_nll_calibration_state.remote(snapshot) for worker in self.agent_loop_workers]
-        )
+        """Aggregate previous-batch calibration updates and broadcast next-batch snapshots."""
+        if getattr(self, "_global_teacher_nll_calibration", None) is not None:
+            worker_updates = await asyncio.gather(
+                *[worker.drain_teacher_nll_calibration_updates.remote() for worker in self.agent_loop_workers]
+            )
+            snapshot = self._apply_global_teacher_nll_calibration_updates(worker_updates)
+            await asyncio.gather(
+                *[worker.set_teacher_nll_calibration_state.remote(snapshot) for worker in self.agent_loop_workers]
+            )
+        if getattr(self, "_global_prune_future_calibration", None) is not None:
+            worker_updates = await asyncio.gather(
+                *[worker.drain_prune_future_calibration_updates.remote() for worker in self.agent_loop_workers]
+            )
+            snapshot = self._global_prune_future_calibration.add_updates(worker_updates)
+            await asyncio.gather(
+                *[worker.set_prune_future_calibration_state.remote(snapshot) for worker in self.agent_loop_workers]
+            )
 
     def _cap_intervention_outcome_cases(self, output: DataProto) -> None:
         """Apply the configured global per-transition full-text case cap."""
@@ -5248,13 +5663,18 @@ class AgentLoopManager:
 
     def _refresh_global_teacher_nll_calibration_blocking(self) -> None:
         """Blocking equivalent used by the TransferQueue rollout manager."""
-        if self._global_teacher_nll_calibration is None:
-            return
-        worker_updates = ray.get(
-            [worker.drain_teacher_nll_calibration_updates.remote() for worker in self.agent_loop_workers]
-        )
-        snapshot = self._apply_global_teacher_nll_calibration_updates(worker_updates)
-        ray.get([worker.set_teacher_nll_calibration_state.remote(snapshot) for worker in self.agent_loop_workers])
+        if getattr(self, "_global_teacher_nll_calibration", None) is not None:
+            worker_updates = ray.get(
+                [worker.drain_teacher_nll_calibration_updates.remote() for worker in self.agent_loop_workers]
+            )
+            snapshot = self._apply_global_teacher_nll_calibration_updates(worker_updates)
+            ray.get([worker.set_teacher_nll_calibration_state.remote(snapshot) for worker in self.agent_loop_workers])
+        if getattr(self, "_global_prune_future_calibration", None) is not None:
+            worker_updates = ray.get(
+                [worker.drain_prune_future_calibration_updates.remote() for worker in self.agent_loop_workers]
+            )
+            snapshot = self._global_prune_future_calibration.add_updates(worker_updates)
+            ray.get([worker.set_prune_future_calibration_state.remote(snapshot) for worker in self.agent_loop_workers])
 
     async def _init_agent_loop_workers(self):
         self.agent_loop_workers = []

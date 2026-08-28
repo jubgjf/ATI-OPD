@@ -38,6 +38,15 @@ def test_teacher_segment_loss_config_defaults_to_legacy_opd_on_cpu():
     assert config.future_gap_max_threshold is None
     assert config.future_gap_min_reduction == 0.0
     assert config.prune is False
+    assert config.prune_mode == "teacher_end"
+    assert config.prune_future_window_tokens == 64
+    assert config.prune_future_min_valid_tokens == 32
+    assert config.prune_future_bad_window_persistence == 2
+    assert config.prune_future_healthy_quantile == 0.90
+    assert config.prune_future_calibration_window_blocks == 2048
+    assert config.prune_future_calibration_min_blocks == 128
+    assert config.prune_future_max_healthy_blocks_per_sample == 8
+    assert config.prune_future_initial_threshold is None
     assert config.outcome_aware_candidate_selection_enabled is False
     assert config.outcome_correctness_key == "acc"
     assert config.teacher_candidate_count == 4
@@ -158,6 +167,78 @@ def test_prune_config_requires_intervention_but_allows_no_teacher_training_on_cp
     omega_config.distillation.enabled = False
     with pytest.raises(ValueError, match="prune=true"):
         validate_distillation_intervention_training_config(omega_config)
+
+
+def test_adaptive_prune_future_config_validation_on_cpu():
+    config = DistillationInterventionConfig(
+        enabled=True,
+        prune=True,
+        prune_mode="adaptive_future",
+        max_interventions_per_sample=1,
+        confirmation_mode="none",
+    )
+    assert config.prune_mode == "adaptive_future"
+
+    with pytest.raises(ValueError, match="prune_mode"):
+        DistillationInterventionConfig(prune_mode="unknown")
+    with pytest.raises(ValueError, match="requires intervention.enabled=true and prune=true"):
+        DistillationInterventionConfig(enabled=True, prune_mode="adaptive_future", max_interventions_per_sample=1)
+    with pytest.raises(ValueError, match="max_interventions_per_sample=1"):
+        DistillationInterventionConfig(enabled=True, prune=True, prune_mode="adaptive_future")
+    with pytest.raises(ValueError, match="confirmation_mode='none'"):
+        DistillationInterventionConfig(
+            enabled=True,
+            prune=True,
+            prune_mode="adaptive_future",
+            max_interventions_per_sample=1,
+            confirmation_mode="future_gap",
+        )
+    with pytest.raises(ValueError, match="outcome_aware_candidate_selection_enabled"):
+        DistillationInterventionConfig(
+            enabled=True,
+            prune=True,
+            prune_mode="adaptive_future",
+            max_interventions_per_sample=1,
+            outcome_aware_candidate_selection_enabled=True,
+        )
+    for field, value in (
+        ("prune_future_window_tokens", 0),
+        ("prune_future_min_valid_tokens", 0),
+        ("prune_future_bad_window_persistence", 0),
+        ("prune_future_healthy_quantile", 1.0),
+        ("prune_future_calibration_window_blocks", 0),
+        ("prune_future_calibration_min_blocks", 0),
+        ("prune_future_max_healthy_blocks_per_sample", 0),
+        ("prune_future_initial_threshold", float("nan")),
+    ):
+        with pytest.raises(ValueError, match=field):
+            DistillationInterventionConfig(**{field: value})
+    with pytest.raises(ValueError, match="must not exceed prune_future_window_tokens"):
+        DistillationInterventionConfig(prune_future_window_tokens=8, prune_future_min_valid_tokens=9)
+    with pytest.raises(ValueError, match="must not exceed prune_future_calibration_window_blocks"):
+        DistillationInterventionConfig(
+            prune_future_calibration_window_blocks=8,
+            prune_future_calibration_min_blocks=9,
+        )
+
+
+def test_adaptive_prune_future_rejects_multi_turn_cross_config_on_cpu():
+    config = OmegaConf.create(
+        {
+            "distillation": {
+                "enabled": True,
+                "intervention": {
+                    "enabled": True,
+                    "prune": True,
+                    "prune_mode": "adaptive_future",
+                    "max_interventions_per_sample": 1,
+                },
+            },
+            "actor_rollout_ref": {"rollout": {"multi_turn": {"enable": True}}},
+        }
+    )
+    with pytest.raises(ValueError, match="single-turn, non-tool"):
+        validate_distillation_intervention_training_config(config)
 
 
 def test_intervention_outcome_observation_config_defaults_and_validation_on_cpu():

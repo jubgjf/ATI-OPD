@@ -1046,11 +1046,14 @@ def apply_intervention_prune_mask(
     data: DataProto,
     intervention_config: Any,
 ) -> dict[str, float]:
-    """Limit distillation supervision to the first repaired prefix and teacher span."""
+    """Apply hard or rollout-provided adaptive intervention supervision cutoffs."""
     if not bool(_get_config_value(intervention_config, "prune", False)):
         return {}
     if not bool(_get_config_value(intervention_config, "enabled", False)):
         raise ValueError("distillation.intervention.prune=true requires intervention.enabled=true.")
+    prune_mode = str(_get_config_value(intervention_config, "prune_mode", "teacher_end"))
+    if prune_mode not in {"teacher_end", "adaptive_future"}:
+        raise ValueError(f"Unsupported distillation.intervention.prune_mode={prune_mode!r}.")
     if "teacher_interventions" not in data.non_tensor_batch:
         raise RuntimeError(
             "DMPD prune requires teacher_interventions metadata for every rollout sample, but the batch has no "
@@ -1121,6 +1124,11 @@ def apply_intervention_prune_mask(
             raise RuntimeError(f"DMPD prune found a non-dict intervention record for sample {sample_idx}.")
         if not records:
             continue
+        if prune_mode == "adaptive_future" and len(records) != 1:
+            raise RuntimeError(
+                "Adaptive DMPD prune requires exactly one intervention record per repaired sample, "
+                f"but sample {sample_idx} has {len(records)}."
+            )
 
         valid_response_length = int(valid_response_lengths[sample_idx].item())
         for record_idx, record in enumerate(records):
@@ -1149,7 +1157,22 @@ def apply_intervention_prune_mask(
                 )
             teacher_token_positions[sample_idx, int(start) : teacher_end] = True
             if record_idx == 0:
-                cutoffs[sample_idx] = teacher_end
+                cutoff = teacher_end
+                if prune_mode == "adaptive_future":
+                    cutoff = record.get("prune_future_cutoff")
+                    if isinstance(cutoff, bool) or not isinstance(cutoff, int | np.integer):
+                        raise RuntimeError(
+                            "Adaptive DMPD prune requires an integer prune_future_cutoff for "
+                            f"sample {sample_idx}, got {cutoff!r}."
+                        )
+                    cutoff = int(cutoff)
+                    if cutoff < teacher_end or cutoff > valid_response_length:
+                        raise RuntimeError(
+                            "Adaptive DMPD prune cutoff must satisfy teacher_end <= cutoff <= response_length for "
+                            f"sample {sample_idx}, got teacher_end={teacher_end}, cutoff={cutoff}, "
+                            f"response_length={valid_response_length}."
+                        )
+                cutoffs[sample_idx] = cutoff
         repaired_samples[sample_idx] = True
 
     positions = torch.arange(response_width, device=response_mask.device).unsqueeze(0)

@@ -1028,6 +1028,84 @@ def test_compute_intervention_metrics_counts_zero_trainable_samples_on_cpu():
     assert metrics["opd_intervention/trainable_token_fraction"] == 1 / 6
 
 
+def test_compute_intervention_metrics_aggregates_prune_future_and_outcome_strata_on_cpu():
+    interventions = [
+        [
+            {
+                "start": 2,
+                "teacher_tokens": 2,
+                "student_suffix_tokens": 12,
+                "prune_future_cutoff": 8,
+                "prune_future_horizon_tokens": 4,
+                "prune_future_retained_fraction": 0.5,
+                "prune_future_no_cut": False,
+                "prune_future_persistent_bad": True,
+                "prune_future_evaluated_blocks": 3,
+                "prune_future_bad_blocks": 2,
+                "prune_future_unavailable_blocks": 1,
+                "transition": "pre_wrong_post_correct",
+            }
+        ],
+        [
+            {
+                "start": 1,
+                "teacher_tokens": 1,
+                "student_suffix_tokens": 8,
+                "prune_future_cutoff": 10,
+                "prune_future_horizon_tokens": 8,
+                "prune_future_retained_fraction": 1.0,
+                "prune_future_no_cut": True,
+                "prune_future_persistent_bad": False,
+                "prune_future_evaluated_blocks": 2,
+                "prune_future_bad_blocks": 1,
+                "prune_future_unavailable_blocks": 0,
+                "transition": "pre_wrong_post_wrong",
+            }
+        ],
+    ]
+    outcomes = [
+        {
+            "enabled": True,
+            "raw_correct": False,
+            "prune_future_calibration_threshold": 0.2,
+            "prune_future_calibration_source": "rolling_raw_correct_quantile",
+            "prune_future_calibration_count": 256,
+            "prune_future_calibration_version": 4,
+            "prune_future_healthy_update_count": 0,
+        },
+        {
+            "enabled": True,
+            "raw_correct": True,
+            "prune_future_calibration_threshold": 0.2,
+            "prune_future_calibration_source": "rolling_raw_correct_quantile",
+            "prune_future_calibration_count": 256,
+            "prune_future_calibration_version": 4,
+            "prune_future_healthy_update_count": 8,
+            "prune_future_healthy_available_blocks": 10,
+            "prune_future_healthy_unavailable_blocks": 1,
+        },
+    ]
+
+    metrics = compute_intervention_metrics(
+        intervention_counts=[1, 1],
+        interventions=interventions,
+        intervention_skipped=[[], []],
+        intervention_outcomes=outcomes,
+        response_mask=torch.ones((2, 16), dtype=torch.bool),
+    )
+
+    prefix = "opd_intervention/prune_future"
+    assert metrics[f"{prefix}/threshold/mean"] == pytest.approx(0.2)
+    assert metrics[f"{prefix}/calibration/current_batch_healthy_update_count"] == 8.0
+    assert metrics[f"{prefix}/horizon_tokens/mean"] == 6.0
+    assert metrics[f"{prefix}/horizon_tokens/p50"] == 6.0
+    assert metrics[f"{prefix}/suffix_retained_fraction/mean"] == 0.75
+    assert metrics[f"{prefix}/no_cut_fraction"] == 0.5
+    assert metrics[f"{prefix}/persistent_bad_fraction"] == 0.5
+    assert metrics[f"{prefix}/outcome/pre_wrong_post_correct/horizon_tokens_mean"] == 4.0
+    assert metrics[f"{prefix}/outcome/pre_wrong_post_wrong/retained_fraction_mean"] == 1.0
+
+
 def test_compute_intervention_metrics_aggregates_future_gap_proposals_on_cpu():
     proposals = [
         [

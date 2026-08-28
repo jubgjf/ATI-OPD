@@ -237,6 +237,64 @@ def test_prune_teacher_terminal_at_response_end_keeps_all_available_supervision_
     assert metrics["opd_intervention/prune/cutoff_position_frac_mean"] == 1.0
 
 
+def test_adaptive_prune_uses_metadata_cutoff_and_preserves_full_rollout_on_cpu():
+    response_mask = torch.ones(1, 8, dtype=torch.long)
+    original_attention_mask = response_mask.clone()
+    data = DataProto(
+        batch=TensorDict(
+            {
+                "attention_mask": original_attention_mask.clone(),
+                "response_mask": response_mask.clone(),
+                "distillation_loss_mask": torch.tensor([[1, 1, 1, 1, 1, 1, 1, 0]], dtype=torch.long),
+                "teacher_segment_mask": torch.tensor([[0, 0, 1, 1, 0, 0, 0, 0]], dtype=torch.long),
+                "rm_scores": torch.tensor([[0, 0, 0, 0, 0, 0, 0, 1]], dtype=torch.float32),
+            },
+            batch_size=[1],
+        ),
+        non_tensor_batch={
+            "teacher_interventions": _object_array([[{"start": 2, "teacher_tokens": 2, "prune_future_cutoff": 6}]])
+        },
+    )
+    original_reward = data.batch["rm_scores"].clone()
+
+    metrics = apply_intervention_prune_mask(
+        data=data,
+        intervention_config=SimpleNamespace(enabled=True, prune=True, prune_mode="adaptive_future"),
+    )
+
+    assert torch.equal(data.batch["response_mask"], response_mask)
+    assert torch.equal(data.batch["attention_mask"], original_attention_mask)
+    assert torch.equal(data.batch["rm_scores"], original_reward)
+    assert torch.equal(data.batch["distillation_loss_mask"], torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]]))
+    assert torch.equal(data.batch["teacher_segment_mask"], torch.tensor([[0, 0, 1, 1, 0, 0, 0, 0]]))
+    assert metrics["opd_intervention/prune/cutoff_position_mean"] == 6.0
+
+
+@pytest.mark.parametrize(
+    ("record", "message"),
+    [
+        ({"start": 1, "teacher_tokens": 2}, "prune_future_cutoff"),
+        ({"start": 1, "teacher_tokens": 2, "prune_future_cutoff": 2}, "teacher_end <= cutoff"),
+        ({"start": 1, "teacher_tokens": 2, "prune_future_cutoff": 6}, "teacher_end <= cutoff"),
+    ],
+)
+def test_adaptive_prune_rejects_missing_or_out_of_range_cutoff_on_cpu(record, message):
+    response_mask = torch.ones(1, 5, dtype=torch.long)
+    data = DataProto(
+        batch=TensorDict(
+            {"attention_mask": response_mask.clone(), "response_mask": response_mask.clone()},
+            batch_size=[1],
+        ),
+        non_tensor_batch={"teacher_interventions": _object_array([[record]])},
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        apply_intervention_prune_mask(
+            data=data,
+            intervention_config=SimpleNamespace(enabled=True, prune=True, prune_mode="adaptive_future"),
+        )
+
+
 @pytest.mark.parametrize(
     "horizon_config",
     [

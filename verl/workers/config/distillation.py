@@ -263,6 +263,19 @@ class DistillationInterventionConfig(BaseConfig):
     # Keep the complete repaired rollout for rewards and diagnostics, but stop
     # distillation supervision at the end of the first inserted teacher span.
     prune: bool = False
+    # ``teacher_end`` preserves the original hard-prune behavior. ``adaptive_future``
+    # keeps supervising the repaired student suffix until its active gap leaves
+    # the rolling raw-correct reference distribution for a persistent horizon.
+    prune_mode: str = "teacher_end"
+    prune_future_window_tokens: int = 64
+    prune_future_min_valid_tokens: int = 32
+    prune_future_bad_window_persistence: int = 2
+    prune_future_healthy_quantile: float = 0.90
+    prune_future_calibration_window_blocks: int = 2048
+    prune_future_calibration_min_blocks: int = 128
+    prune_future_max_healthy_blocks_per_sample: int = 8
+    # null reuses gap_threshold until the global raw-correct calibration warms up.
+    prune_future_initial_threshold: Optional[float] = None
     teacher_segment_loss_mode: str = "opd"
     teacher_segment_sft_loss_coef: float = 1.0
     min_trainable_tokens_after_repair: int = 1
@@ -316,6 +329,43 @@ class DistillationInterventionConfig(BaseConfig):
             raise ValueError("skip_correct=true requires distillation.intervention.enabled=true.")
         if self.prune and not self.enabled:
             raise ValueError("prune=true requires distillation.intervention.enabled=true.")
+        if self.prune_mode not in {"teacher_end", "adaptive_future"}:
+            raise ValueError(
+                f"prune_mode must be one of {{'teacher_end', 'adaptive_future'}}, got {self.prune_mode!r}."
+            )
+        if self.prune_mode == "adaptive_future":
+            if not self.enabled or not self.prune:
+                raise ValueError("prune_mode='adaptive_future' requires intervention.enabled=true and prune=true.")
+            if self.max_interventions_per_sample != 1:
+                raise ValueError("prune_mode='adaptive_future' requires max_interventions_per_sample=1.")
+            if self.confirmation_mode != "none":
+                raise ValueError("prune_mode='adaptive_future' requires confirmation_mode='none'.")
+            if self.outcome_aware_candidate_selection_enabled:
+                raise ValueError(
+                    "prune_mode='adaptive_future' is incompatible with outcome_aware_candidate_selection_enabled=true."
+                )
+        if self.prune_future_window_tokens <= 0:
+            raise ValueError("prune_future_window_tokens must be positive.")
+        if self.prune_future_min_valid_tokens <= 0:
+            raise ValueError("prune_future_min_valid_tokens must be positive.")
+        if self.prune_future_min_valid_tokens > self.prune_future_window_tokens:
+            raise ValueError("prune_future_min_valid_tokens must not exceed prune_future_window_tokens.")
+        if self.prune_future_bad_window_persistence <= 0:
+            raise ValueError("prune_future_bad_window_persistence must be positive.")
+        if not math.isfinite(self.prune_future_healthy_quantile) or not 0 < self.prune_future_healthy_quantile < 1:
+            raise ValueError("prune_future_healthy_quantile must be finite and in (0, 1).")
+        if self.prune_future_calibration_window_blocks <= 0:
+            raise ValueError("prune_future_calibration_window_blocks must be positive.")
+        if self.prune_future_calibration_min_blocks <= 0:
+            raise ValueError("prune_future_calibration_min_blocks must be positive.")
+        if self.prune_future_calibration_min_blocks > self.prune_future_calibration_window_blocks:
+            raise ValueError(
+                "prune_future_calibration_min_blocks must not exceed prune_future_calibration_window_blocks."
+            )
+        if self.prune_future_max_healthy_blocks_per_sample <= 0:
+            raise ValueError("prune_future_max_healthy_blocks_per_sample must be positive.")
+        if self.prune_future_initial_threshold is not None and not math.isfinite(self.prune_future_initial_threshold):
+            raise ValueError("prune_future_initial_threshold must be finite when set.")
         if self.confirmation_mode == "future_gap" and self.max_interventions_per_sample != 1:
             raise ValueError(
                 "confirmation_mode='future_gap' currently requires max_interventions_per_sample=1 so each "

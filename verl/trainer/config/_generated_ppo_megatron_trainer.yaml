@@ -914,6 +914,15 @@ distillation:
     future_gap_min_reduction: 0.0
     train_on_teacher_segments: false
     prune: false
+    prune_mode: teacher_end
+    prune_future_window_tokens: 64
+    prune_future_min_valid_tokens: 32
+    prune_future_bad_window_persistence: 2
+    prune_future_healthy_quantile: 0.9
+    prune_future_calibration_window_blocks: 2048
+    prune_future_calibration_min_blocks: 128
+    prune_future_max_healthy_blocks_per_sample: 8
+    prune_future_initial_threshold: null
     teacher_segment_loss_mode: opd
     teacher_segment_sft_loss_coef: 1.0
     min_trainable_tokens_after_repair: 1

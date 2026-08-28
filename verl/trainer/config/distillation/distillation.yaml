@@ -142,6 +142,19 @@ intervention:
   # Keep full repaired generations for rewards and diagnostics, while limiting
   # distillation supervision to the first prefix plus inserted teacher span.
   prune: false
+  # teacher_end preserves hard prune. adaptive_future scans the repaired student
+  # suffix in fixed windows and truncates only the distillation loss mask after
+  # a persistent departure from the rolling raw-correct gap distribution.
+  prune_mode: teacher_end
+  prune_future_window_tokens: 64
+  prune_future_min_valid_tokens: 32
+  prune_future_bad_window_persistence: 2
+  prune_future_healthy_quantile: 0.90
+  prune_future_calibration_window_blocks: 2048
+  prune_future_calibration_min_blocks: 128
+  prune_future_max_healthy_blocks_per_sample: 8
+  # null reuses gap_threshold until calibration is warm.
+  prune_future_initial_threshold: null
   # Training objective for teacher-inserted tokens when train_on_teacher_segments=true.
   # opd preserves the legacy behavior; sft applies CE only on teacher-inserted tokens.
   teacher_segment_loss_mode: opd

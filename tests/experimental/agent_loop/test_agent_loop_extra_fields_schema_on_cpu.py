@@ -39,6 +39,7 @@ from verl.experimental.agent_loop.agent_loop import (
     _GlobalTeacherNLLCalibration,
     _InternalAgentLoopOutput,
     _is_moe_like_hf_config,
+    _PruneFutureCalibrationSnapshot,
     _select_intervention_segment,
     _TeacherNLLCalibrationSnapshot,
 )
@@ -1145,6 +1146,14 @@ class _DirectInterventionWorker:
         future_gap_min_reduction: float = 0.0,
         train_on_teacher_segments: bool = False,
         prune: bool = False,
+        prune_mode: str = "teacher_end",
+        prune_future_window_tokens: int = 64,
+        prune_future_min_valid_tokens: int = 32,
+        prune_future_bad_window_persistence: int = 2,
+        prune_future_calibration_window_blocks: int = 2048,
+        prune_future_calibration_min_blocks: int = 128,
+        prune_future_max_healthy_blocks_per_sample: int = 8,
+        prune_future_initial_threshold: Optional[float] = None,
         teacher_segment_loss_mode: str = "opd",
         min_trainable_tokens_after_repair: int = 1,
         gap_metric: str = "abs",
@@ -1200,6 +1209,14 @@ class _DirectInterventionWorker:
             future_gap_min_reduction=future_gap_min_reduction,
             train_on_teacher_segments=train_on_teacher_segments,
             prune=prune,
+            prune_mode=prune_mode,
+            prune_future_window_tokens=prune_future_window_tokens,
+            prune_future_min_valid_tokens=prune_future_min_valid_tokens,
+            prune_future_bad_window_persistence=prune_future_bad_window_persistence,
+            prune_future_calibration_window_blocks=prune_future_calibration_window_blocks,
+            prune_future_calibration_min_blocks=prune_future_calibration_min_blocks,
+            prune_future_max_healthy_blocks_per_sample=prune_future_max_healthy_blocks_per_sample,
+            prune_future_initial_threshold=prune_future_initial_threshold,
             teacher_segment_loss_mode=teacher_segment_loss_mode,
             min_trainable_tokens_after_repair=min_trainable_tokens_after_repair,
             thinking_start_text=thinking_start_text,
@@ -1246,6 +1263,15 @@ class _DirectInterventionWorker:
             version=0,
         )
         self._teacher_nll_pending_updates = []
+        self._prune_future_calibration_snapshot = _PruneFutureCalibrationSnapshot(
+            threshold=float(
+                gap_threshold if prune_future_initial_threshold is None else prune_future_initial_threshold
+            ),
+            source="gap_threshold_fallback" if prune_future_initial_threshold is None else "configured_initial",
+            count=0,
+            version=0,
+        )
+        self._prune_future_pending_updates = []
         self._teacher_candidate_rpc_semaphore = None
 
 
@@ -3730,6 +3756,24 @@ class _FutureGapTeacherManager(_FixedGapTeacherManager):
         return await super().compute_teacher_logprobs_single(*args, **kwargs)
 
 
+class _AdaptivePruneTeacherManager(_FixedGapTeacherManager):
+    def __init__(self):
+        super().__init__(
+            TeacherGenerationResult(token_ids=[30, 31], stop_reason="completed", finish_reason="length"),
+            high_gap_start=0,
+            high_gap_width=2,
+        )
+
+    async def compute_teacher_logprobs_single(self, *args, **kwargs):
+        if self.scored_sequences:
+            # The repaired response has a two-token teacher span followed by
+            # three two-token student windows. Make the first two suffix
+            # windows persistently bad so H_i* lands at teacher_end.
+            self.high_gap_start = 2
+            self.high_gap_width = 4
+        return await super().compute_teacher_logprobs_single(*args, **kwargs)
+
+
 class _FutureGapCandidateSelectionTeacherManager(_CandidateSelectionTeacherManager):
     def __init__(self):
         super().__init__(
@@ -4110,6 +4154,159 @@ async def test_future_gap_does_not_add_training_reward_calls_on_cpu(confirmation
     assert reward_handle.compute_score.responses == [expected_response]
     assert len(teacher_manager.scored_sequences) == (3 if confirmation_mode == "future_gap" else 2)
     assert internal.teacher_logprobs is not None
+
+
+@pytest.mark.asyncio
+async def test_adaptive_prune_skip_correct_calibrates_raw_correct_without_duplicate_teacher_scoring_on_cpu():
+    teacher_manager = _FutureGapTeacherManager(improved=True)
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        gap_metric="k3",
+        gap_threshold=0.15,
+        skip_correct=True,
+        prune=True,
+        prune_mode="adaptive_future",
+        prune_future_window_tokens=2,
+        prune_future_min_valid_tokens=2,
+        prune_future_calibration_min_blocks=2,
+        train_on_teacher_segments=True,
+        teacher_segment_loss_mode="opd",
+    )
+    output = _future_gap_output("adaptive-prune-skip-correct")
+    output.extra_fields["teacher_intervention_outcome"] = {
+        "enabled": True,
+        "raw_correct": True,
+        "trigger_detected": False,
+        "repair_executed": False,
+    }
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+    score_calls_after_intervention = len(teacher_manager.scored_sequences)
+    await AgentLoopWorker._compute_teacher_logprobs(
+        worker,
+        output,
+        prompt_ids=output.prompt_ids,
+        response_ids=output.response_ids,
+        validate=False,
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert output.response_ids == [1, 2, 3, 4, 5, 6]
+    assert output.extra_fields["teacher_intervention_count"] == 0
+    assert output.extra_fields["teacher_intervention_skipped"][0]["reason"] == "skip_correct"
+    assert score_calls_after_intervention == 1
+    assert len(teacher_manager.scored_sequences) == 1
+    assert len(AgentLoopWorker.drain_prune_future_calibration_updates(worker)) == 3
+
+
+@pytest.mark.asyncio
+async def test_adaptive_prune_non_skip_forces_raw_correctness_and_contributes_healthy_calibration_on_cpu():
+    teacher_manager = _FixedGapTeacherManager(
+        TeacherGenerationResult(token_ids=[30], finish_reason="length"),
+        high_gap_width=0,
+    )
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=6,
+        gap_metric="k3",
+        gap_threshold=0.15,
+        skip_correct=False,
+        prune=True,
+        prune_mode="adaptive_future",
+        prune_future_window_tokens=2,
+        prune_future_min_valid_tokens=2,
+        prune_future_calibration_min_blocks=2,
+    )
+    reward_handle = _SequenceAwareRewardHandle()
+    worker.reward_loop_worker_handles = [reward_handle]
+    output = _future_gap_output("adaptive-prune-non-skip-correct")
+    output.response_ids[1] = 31
+
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        data_source="openai/gsm8k",
+    )
+
+    assert output.extra_fields["teacher_intervention_outcome"]["raw_correct"] is True
+    assert output.extra_fields["teacher_intervention_count"] == 0
+    assert reward_handle.compute_score.responses == [[1, 31, 3, 4, 5, 6]]
+    assert len(teacher_manager.scored_sequences) == 1
+    assert len(AgentLoopWorker.drain_prune_future_calibration_updates(worker)) == 3
+    assert internal.teacher_logprobs is not None
+
+
+@pytest.mark.asyncio
+async def test_adaptive_prune_scores_full_repaired_suffix_once_and_only_writes_cutoff_metadata_on_cpu():
+    teacher_manager = _AdaptivePruneTeacherManager()
+    worker = _DirectInterventionWorker(
+        teacher_manager=teacher_manager,
+        response_length=8,
+        gap_metric="k3",
+        gap_threshold=0.15,
+        prune=True,
+        prune_mode="adaptive_future",
+        prune_future_window_tokens=2,
+        prune_future_min_valid_tokens=2,
+        prune_future_bad_window_persistence=2,
+        train_on_teacher_segments=True,
+        teacher_segment_loss_mode="opd",
+    )
+    worker.llm_client = _SequencedRepairStudentClient(
+        [
+            TokenOutput(
+                token_ids=[40, 41, 42, 43, 44, 45],
+                log_probs=[-0.2] * 6,
+                extra_fields={"finish_reason": "length"},
+            )
+        ]
+    )
+    output = _future_gap_output("adaptive-prune-repaired")
+    output.extra_fields["teacher_intervention_outcome"] = {
+        "enabled": True,
+        "raw_correct": False,
+        "trigger_detected": False,
+        "repair_executed": False,
+    }
+
+    await AgentLoopWorker._maybe_repair_with_teacher(
+        worker,
+        output,
+        validate=False,
+        sampling_params={"temperature": 0.8, "logprobs": True},
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+    score_calls_after_intervention = len(teacher_manager.scored_sequences)
+    await AgentLoopWorker._compute_teacher_logprobs(
+        worker,
+        output,
+        prompt_ids=output.prompt_ids,
+        response_ids=output.response_ids,
+        validate=False,
+        sample_kwargs={"data_source": "openai/gsm8k"},
+    )
+
+    assert output.response_ids == [30, 31, 40, 41, 42, 43, 44, 45]
+    assert output.response_mask == [1] * 8
+    assert output.extra_fields["teacher_intervention_count"] == 1
+    intervention = output.extra_fields["teacher_interventions"][0]
+    assert intervention["prune_future_cutoff"] == 2
+    assert intervention["prune_future_horizon_tokens"] == 0
+    assert intervention["prune_future_persistent_bad"] is True
+    assert score_calls_after_intervention == 2
+    assert len(teacher_manager.scored_sequences) == 2
+    assert worker.llm_client.calls[0]["sampling_params"]["max_tokens"] == 6
+    assert AgentLoopWorker.drain_prune_future_calibration_updates(worker) == []
 
 
 @pytest.mark.asyncio

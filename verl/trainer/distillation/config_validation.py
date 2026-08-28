@@ -34,8 +34,38 @@ def validate_distillation_intervention_training_config(config: Any) -> None:
     distillation_config = _get_nested(config, "distillation")
     intervention_enabled = bool(_get_nested(distillation_config, "intervention", "enabled", default=False))
     prune = bool(_get_nested(distillation_config, "intervention", "prune", default=False))
+    prune_mode = str(_get_nested(distillation_config, "intervention", "prune_mode", default="teacher_end"))
     if prune and not intervention_enabled:
         raise ValueError("distillation.intervention.prune=true requires distillation.intervention.enabled=true.")
+    if prune_mode == "adaptive_future" and (not intervention_enabled or not prune):
+        raise ValueError(
+            "distillation.intervention.prune_mode='adaptive_future' requires intervention.enabled=true and prune=true."
+        )
+    if prune_mode == "adaptive_future":
+        max_interventions = int(
+            _get_nested(distillation_config, "intervention", "max_interventions_per_sample", default=4)
+        )
+        if max_interventions != 1:
+            raise ValueError(
+                "distillation.intervention.prune_mode='adaptive_future' requires max_interventions_per_sample=1."
+            )
+        confirmation_mode = str(_get_nested(distillation_config, "intervention", "confirmation_mode", default="none"))
+        if confirmation_mode != "none":
+            raise ValueError(
+                "distillation.intervention.prune_mode='adaptive_future' requires confirmation_mode='none'."
+            )
+        if bool(
+            _get_nested(
+                distillation_config,
+                "intervention",
+                "outcome_aware_candidate_selection_enabled",
+                default=False,
+            )
+        ):
+            raise ValueError(
+                "distillation.intervention.prune_mode='adaptive_future' is incompatible with "
+                "outcome_aware_candidate_selection_enabled=true."
+            )
     if not is_distillation_enabled(distillation_config):
         return
     diagnostics_enabled = bool(_get_nested(distillation_config, "diagnostics", "enabled", default=False))
@@ -72,6 +102,14 @@ def validate_distillation_intervention_training_config(config: Any) -> None:
         )
         == "tool_agent"
     )
+    multi_turn_enabled = bool(
+        _get_nested(config, "actor_rollout_ref", "rollout", "multi_turn", "enable", default=False)
+    )
+    if prune_mode == "adaptive_future" and multi_turn_enabled:
+        raise ValueError(
+            "distillation.intervention.prune_mode='adaptive_future' currently supports only single-turn, non-tool "
+            "rollouts; set actor_rollout_ref.rollout.multi_turn.enable=false."
+        )
     if intervention_enabled and tool_agent_enabled:
         confirmation_mode = str(_get_nested(distillation_config, "intervention", "confirmation_mode", default="none"))
         if confirmation_mode == "future_gap":
