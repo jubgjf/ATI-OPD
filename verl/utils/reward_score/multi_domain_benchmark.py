@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 from typing import Any, Mapping
 
@@ -84,6 +85,17 @@ def extract_choice(text: str, valid_labels: tuple[str, ...]) -> str | None:
     return None
 
 
+def _normalize_ifbench_kwarg(value: Any) -> Any:
+    """Restore integer-valued numbers lost to Arrow/JSON schema widening."""
+    if isinstance(value, Mapping):
+        return {str(key): _normalize_ifbench_kwarg(item) for key, item in value.items()}
+    if isinstance(value, tuple | list):
+        return [_normalize_ifbench_kwarg(item) for item in value]
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return value
+
+
 def _check_ifbench_instruction(
     *,
     instruction_id: str,
@@ -102,7 +114,7 @@ def _check_ifbench_instruction(
     instruction_cls = instructions_registry.INSTRUCTION_DICT[instruction_id]
     for response in responses:
         instruction = instruction_cls(instruction_id)
-        clean_kwargs = {key: value for key, value in kwargs.items() if value is not None}
+        clean_kwargs = {key: _normalize_ifbench_kwarg(value) for key, value in kwargs.items() if value is not None}
         instruction.build_description(**clean_kwargs)
         args = instruction.get_instruction_args()
         if args and "prompt" in args:
@@ -123,7 +135,9 @@ def _validate_ifbench_verifier_payload(payload: Mapping[str, Any]) -> None:
         instruction_cls = instructions_registry.INSTRUCTION_DICT.get(instruction_id)
         if instruction_cls is None:
             raise ValueError(f"Unknown IFBench instruction_id {instruction_id!r}.")
-        clean_kwargs = {key: value for key, value in dict(kwargs).items() if value is not None}
+        clean_kwargs = {
+            key: _normalize_ifbench_kwarg(value) for key, value in dict(kwargs).items() if value is not None
+        }
         try:
             instruction = instruction_cls(instruction_id)
             instruction.build_description(**clean_kwargs)

@@ -205,8 +205,14 @@ def _json_native(value: Any) -> Any:
         return {str(key): _json_native(item) for key, item in value.items()}
     if isinstance(value, tuple | list):
         return [_json_native(item) for item in value]
-    if isinstance(value, float) and math.isnan(value):
-        return None
+    if isinstance(value, float):
+        if math.isnan(value):
+            return None
+        # Arrow promotes nullable integer fields in IFBench's union-like
+        # kwargs struct to floats. Restore their JSON integer representation;
+        # several official verifiers use these values in range() or slices.
+        if math.isfinite(value) and value.is_integer():
+            return int(value)
     return value
 
 

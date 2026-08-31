@@ -129,6 +129,52 @@ def test_ifbench_uses_vendored_official_verifier_and_reports_all_four_metrics_on
     assert result["instruction_strict_acc"] == 1.0
 
 
+def test_ifbench_restores_arrow_promoted_integer_kwargs_on_cpu(tmp_path, monkeypatch):
+    benchmark_dir = tmp_path / "allenai" / "IFBench_test" / "data"
+    benchmark_dir.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "key": "repeat-span",
+                "prompt": "Copy the requested span.",
+                "instruction_id_list": "['repeat:repeat_span']",
+                "kwargs": "[{'prompt_to_repeat': 'abcdef', 'n_start': 1.0, 'n_end': 3.0}]",
+            }
+        ]
+    ).to_parquet(benchmark_dir / "train.parquet")
+    dataset = MultiDomainBenchmarkDataset(
+        dataset_root=tmp_path,
+        spec=_spec("ifbench", name="ifbench", path="allenai/IFBench_test"),
+        tokenizer=_CharacterTokenizer(),
+    )
+    payload = json.loads(dataset[0]["reward_model"]["ground_truth"])
+
+    assert payload["kwargs"] == [{"prompt_to_repeat": "abcdef", "n_start": 1, "n_end": 3}]
+
+    monkeypatch.setattr(vendored_ifbench, "require_nltk_resources", lambda: None)
+    result = compute_score("bcd", json.dumps(payload))
+
+    assert result["acc"] is True
+    assert result["prompt_loose_acc"] == 1.0
+
+
+def test_ifbench_scorer_defensively_normalizes_integer_valued_float_kwargs_on_cpu(monkeypatch):
+    monkeypatch.setattr(vendored_ifbench, "require_nltk_resources", lambda: None)
+    payload = json.dumps(
+        {
+            "task_type": "ifbench",
+            "prompt": "Copy the requested span.",
+            "instruction_id_list": ["repeat:repeat_span"],
+            "kwargs": [{"prompt_to_repeat": "abcdef", "n_start": 1.0, "n_end": 3.0}],
+        }
+    )
+
+    result = compute_score("bcd", payload)
+
+    assert result["acc"] is True
+    assert result["prompt_strict_acc"] == 1.0
+
+
 def test_mmlu_pro_selects_exact_stratified_thousand_and_uses_five_shots_on_cpu(tmp_path):
     benchmark_dir = tmp_path / "TIGER-Lab" / "MMLU-Pro" / "data"
     benchmark_dir.mkdir(parents=True)
