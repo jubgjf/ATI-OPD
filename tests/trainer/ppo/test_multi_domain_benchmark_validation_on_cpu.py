@@ -78,7 +78,12 @@ def test_typed_benchmarks_use_per_entry_sampling_and_tensor_budgets_on_cpu():
         )
         n = int(kwargs["sampling_config"].n)
         return (
-            {f"{kwargs['metric_prefix']}-core/{benchmark}/acc/mean@{n}": 0.5},
+            {
+                f"{kwargs['metric_prefix']}-core/{benchmark}/acc/mean@{n}": 0.5,
+                f"{kwargs['metric_prefix']}-aux/format/answer_pattern_rate": 0.25,
+                f"{kwargs['metric_prefix']}-aux/response_length/mean": 128.0,
+                f"{kwargs['metric_prefix']}-tool/tool_call/attempt_rate": 0.0,
+            },
             {
                 "sample_uids": [f"{benchmark}:1"] * n,
                 "reward_extra_infos_dict": {
@@ -111,6 +116,11 @@ def test_typed_benchmarks_use_per_entry_sampling_and_tensor_budgets_on_cpu():
     assert train_long["evaluation_seed"] == 42
     assert train_long["evaluation_seed_namespace"] == "longbench-v2"
     assert "test-train-sampling-core/longbench-v2/acc/mean@4" in metrics
+    assert "test-legacy-aux/ifbench/format/answer_pattern_rate" in metrics
+    assert "test-legacy-aux/longbench-v2/format/answer_pattern_rate" in metrics
+    assert "test-legacy-aux/ifbench/response_length/mean" in metrics
+    assert "test-legacy-tool/longbench-v2/tool_call/attempt_rate" in metrics
+    assert "test-legacy-aux/format/answer_pattern_rate" not in metrics
 
 
 def test_typed_benchmark_rollout_seed_uses_full_stable_namespace_on_cpu():

@@ -724,6 +724,32 @@ def _summarize_validation_tool_metrics(
     return metrics
 
 
+def _scope_typed_benchmark_metrics(
+    metrics: dict[str, Any],
+    *,
+    metric_prefix: str,
+    metric_namespace: str,
+) -> dict[str, Any]:
+    """Add a benchmark namespace to generic metrics from one typed evaluation."""
+    scoped: dict[str, Any] = {}
+    for key, value in metrics.items():
+        scoped_key = key
+        for section in ("core", "aux", "tool"):
+            section_prefix = f"{metric_prefix}-{section}/"
+            if not key.startswith(section_prefix):
+                continue
+            suffix = key[len(section_prefix) :]
+            if suffix != metric_namespace and not suffix.startswith(f"{metric_namespace}/"):
+                scoped_key = f"{section_prefix}{metric_namespace}/{suffix}"
+            break
+        if scoped_key in scoped:
+            raise RuntimeError(
+                f"Typed benchmark metric scoping produced a duplicate key: original={key!r}, scoped={scoped_key!r}."
+            )
+        scoped[scoped_key] = value
+    return scoped
+
+
 def _reward_info_dict_to_samples(reward_extra_info: dict[str, Any], *, sample_count: int) -> list[dict[str, Any]]:
     result = [{} for _ in range(sample_count)]
     for key, values in reward_extra_info.items():
@@ -2399,9 +2425,10 @@ class RayPPOTrainer:
                     sampling_config.top_k = -1
                     sampling_config.do_sample = False
                 metric_profile_name = profile_name.replace("_", "-")
+                metric_prefix = f"test-{metric_profile_name}"
                 profile_metrics, details = self._validate(
                     dataloader=dataloader,
-                    metric_prefix=f"test-{metric_profile_name}",
+                    metric_prefix=metric_prefix,
                     evaluation_mode="test",
                     sampling_config=sampling_config,
                     sampling_profile_name=profile_name,
@@ -2422,10 +2449,18 @@ class RayPPOTrainer:
                     aggregate_benchmark_details(
                         adapter=spec.adapter,
                         metric_name=spec.metric_name,
-                        metric_prefix=f"test-{metric_profile_name}",
+                        metric_prefix=metric_prefix,
                         sample_uids=details["sample_uids"],
                         reward_extra_infos=details["reward_extra_infos_dict"],
                     )
+                )
+                # Reward-specific metrics already contain ``metric_name``;
+                # generic format, length, repetition, turn, and tool metrics
+                # do not. Scope the latter before merging benchmark results.
+                profile_metrics = _scope_typed_benchmark_metrics(
+                    profile_metrics,
+                    metric_prefix=metric_prefix,
+                    metric_namespace=spec.metric_name,
                 )
                 duplicate_keys = metrics.keys() & profile_metrics.keys()
                 if duplicate_keys:
