@@ -304,7 +304,34 @@ run_npu_opd_job() {
             ;;
     esac
 
-    if [[ "$enable_tool_call" == "True" || "$TRAIN_DATASET" == "nemotron_cascade_2_rl_mopd" ]]; then
+    sod_style=${SOD_STYLE:-False}
+    case "$sod_style" in
+        True | true | 1) sod_style=True ;;
+        False | false | 0) sod_style=False ;;
+        *)
+            echo "SOD_STYLE must be True or False, got: $sod_style" >&2
+            return 2
+            ;;
+    esac
+    if [[ "$sod_style" == "True" && "$enable_tool_call" != "True" ]]; then
+        echo "SOD_STYLE=True requires ENABLE_TOOL_CALL=True." >&2
+        return 2
+    fi
+    if [[ "$sod_style" == "True" ]]; then
+        case "$TRAIN_DATASET" in
+            dapo_math_17k | deepmath_103k) ;;
+            *)
+                echo "SOD_STYLE=True currently supports only dapo_math_17k and deepmath_103k, got: $TRAIN_DATASET" >&2
+                return 2
+                ;;
+        esac
+    fi
+
+    if [[ "$sod_style" == "True" ]]; then
+        STUDENT_MODEL=${STUDENT_MODEL:-$model_root/Qwen/Qwen3-1.7B}
+        TEACHER_MODEL=${TEACHER_MODEL:-$model_root/youngzhong/SOD-GRPO_teacher-4B}
+        CHAT_TEMPLATE_MODEL=${CHAT_TEMPLATE_MODEL:-$STUDENT_MODEL}
+    elif [[ "$enable_tool_call" == "True" || "$TRAIN_DATASET" == "nemotron_cascade_2_rl_mopd" ]]; then
         STUDENT_MODEL=${STUDENT_MODEL:-$model_root/Qwen/Qwen3-1.7B}
         TEACHER_MODEL=${TEACHER_MODEL:-$model_root/Qwen/Qwen3-8B}
         CHAT_TEMPLATE_MODEL=${CHAT_TEMPLATE_MODEL:-$STUDENT_MODEL}
@@ -315,8 +342,25 @@ run_npu_opd_job() {
     fi
 
     python_sandbox_url=${PYTHON_SANDBOX_URL:-}
-    tool_system_prompt_path=${TOOL_SYSTEM_PROMPT_PATH:-$WORKSPACE/run/prompts/qwen3_math_tool_optional.txt}
-    function_tool_path=${FUNCTION_TOOL_PATH:-$WORKSPACE/verl/tools/code_interpreter_tool.py}
+    if [[ "$sod_style" == "True" ]]; then
+        tool_system_prompt_path=null
+        tool_user_prompt_suffix_path=${TOOL_USER_PROMPT_SUFFIX_PATH:-$WORKSPACE/run/prompts/qwen3_math_tool_sod.txt}
+        function_tool_path=${FUNCTION_TOOL_PATH:-$WORKSPACE/verl/tools/sod_code_interpreter_tool.py}
+        tool_max_assistant_turns=${TOOL_MAX_ASSISTANT_TURNS:-16}
+        tool_max_user_turns=${TOOL_MAX_USER_TURNS:-16}
+        tool_max_response_chars=${TOOL_MAX_RESPONSE_CHARS:-256}
+        tool_response_truncate_side=${TOOL_RESPONSE_TRUNCATE_SIDE:-middle}
+        export PYTHON_SANDBOX_TIMEOUT=${PYTHON_SANDBOX_TIMEOUT:-60}
+    else
+        tool_system_prompt_path=${TOOL_SYSTEM_PROMPT_PATH:-$WORKSPACE/run/prompts/qwen3_math_tool_optional.txt}
+        tool_user_prompt_suffix_path=${TOOL_USER_PROMPT_SUFFIX_PATH:-null}
+        function_tool_path=${FUNCTION_TOOL_PATH:-$WORKSPACE/verl/tools/code_interpreter_tool.py}
+        tool_max_assistant_turns=${TOOL_MAX_ASSISTANT_TURNS:-null}
+        tool_max_user_turns=${TOOL_MAX_USER_TURNS:-null}
+        tool_max_response_chars=${TOOL_MAX_RESPONSE_CHARS:-4096}
+        tool_response_truncate_side=${TOOL_RESPONSE_TRUNCATE_SIDE:-middle}
+        export PYTHON_SANDBOX_TIMEOUT=${PYTHON_SANDBOX_TIMEOUT:-10}
+    fi
 
     case "$TRAIN_DATASET" in
         dapo_math_17k)
@@ -351,12 +395,16 @@ run_npu_opd_job() {
     sp_size=${SP_SIZE:-4}
     TEACHER_REPLICAS=${TEACHER_REPLICAS:-$((TEACHER_NNODES * TEACHER_NGPUS_PER_NODE / teacher_tp))}
 
-    if [[ "$enable_tool_call" == "True" ]]; then
+    if [[ "$sod_style" == "True" ]]; then
+        max_prompt_length=${MAX_PROMPT_LENGTH:-2560}
+        max_response_length=${MAX_RESPONSE_LENGTH:-20480}
+    elif [[ "$enable_tool_call" == "True" ]]; then
         max_prompt_length=${MAX_PROMPT_LENGTH:-$((2 * 1024))}
+        max_response_length=${MAX_RESPONSE_LENGTH:-$((23 * 1024))}
     else
         max_prompt_length=${MAX_PROMPT_LENGTH:-$((1 * 1024))}
+        max_response_length=${MAX_RESPONSE_LENGTH:-$((23 * 1024))}
     fi
-    max_response_length=${MAX_RESPONSE_LENGTH:-$((23 * 1024))}
     sequence_token_budget=$((max_prompt_length + max_response_length + 1))
     max_num_tokens=${MAX_NUM_TOKENS:-${MAX_MODEL_LEN:-$sequence_token_budget}}
     if [[ "$TRAIN_DATASET" == "nemotron_cascade_2_rl_mopd" ]]; then
@@ -524,21 +572,54 @@ run_npu_opd_job() {
     echo "In-training evaluation: enabled=$in_train_evaluation, val_before=$val_before_train, test_before=$test_before_train, teacher_val_before=$teacher_val_before_train, val_freq=$test_freq, benchmark_freq=$test_benchmarks_freq"
     echo "Sequence lengths: prompt=$max_prompt_length, response=$max_response_length, rollout_model=$rollout_max_model_len, teacher_model=$teacher_max_model_len"
     echo "Chat template: source=$CHAT_TEMPLATE_MODEL"
+    echo "Tool style: enabled=$enable_tool_call, sod=$sod_style, function=${function_tool_path:-null}, system_prompt=${tool_system_prompt_path:-null}, user_suffix=${tool_user_prompt_suffix_path:-null}"
     echo "Benchmarks: seed=$test_benchmark_seed, names=$test_benchmarks, suite=${test_benchmark_suite:-legacy}"
     echo "W&B resume: mode=$WANDB_MODE, required=$resume_required, run_id=${WANDB_RUN_ID:-unset}, resume=${WANDB_RESUME:-unset}"
     echo "W&B storage: run_root=$WANDB_DIR, upload_staging_root=$WANDB_DATA_DIR, cache_root=$WANDB_CACHE_DIR"
 
     if [[ "$enable_tool_call" == "True" ]]; then
-        if [[ ! -f "$tool_system_prompt_path" ]]; then
+        local turn_limit
+        for turn_limit in "$tool_max_assistant_turns" "$tool_max_user_turns"; do
+            if [[ "$turn_limit" != "null" && ! "$turn_limit" =~ ^[1-9][0-9]*$ ]]; then
+                echo "TOOL_MAX_ASSISTANT_TURNS and TOOL_MAX_USER_TURNS must be null or positive integers, got: $turn_limit" >&2
+                exit 2
+            fi
+        done
+        if [[ ! "$tool_max_response_chars" =~ ^[1-9][0-9]*$ ]]; then
+            echo "TOOL_MAX_RESPONSE_CHARS must be a positive integer, got: $tool_max_response_chars" >&2
+            exit 2
+        fi
+        case "$tool_response_truncate_side" in
+            left | middle | right) ;;
+            *)
+                echo "TOOL_RESPONSE_TRUNCATE_SIDE must be left, middle, or right, got: $tool_response_truncate_side" >&2
+                exit 2
+                ;;
+        esac
+        if [[ "$tool_system_prompt_path" != "null" && ! -f "$tool_system_prompt_path" ]]; then
             echo "Missing TOOL_SYSTEM_PROMPT_PATH: $tool_system_prompt_path" >&2
+            exit 2
+        fi
+        if [[ "$tool_user_prompt_suffix_path" != "null" && ! -f "$tool_user_prompt_suffix_path" ]]; then
+            echo "Missing TOOL_USER_PROMPT_SUFFIX_PATH: $tool_user_prompt_suffix_path" >&2
             exit 2
         fi
         if [[ ! -f "$function_tool_path" ]]; then
             echo "Missing FUNCTION_TOOL_PATH: $function_tool_path" >&2
             exit 2
         fi
+        if [[ "$sod_style" == "True" ]]; then
+            local compatibility_dir="$default_local_dir/sod_compatibility"
+            local compatibility_report="$compatibility_dir/node_${NODE_RANK}.json"
+            mkdir -p "$compatibility_dir"
+            python -m verl.utils.opd_model_compatibility \
+                --student "$STUDENT_MODEL" \
+                --teacher "$TEACHER_MODEL" \
+                --sequence-length "$sequence_token_budget" \
+                --report "$compatibility_report" || exit $?
+        fi
         _configure_verl_python_sandbox || exit $?
-        echo "Tool-call preflight passed: sandbox=$python_sandbox_url, prompt=$tool_system_prompt_path, node_rank=$NODE_RANK"
+        echo "Tool-call preflight passed: sandbox=$python_sandbox_url, system_prompt=$tool_system_prompt_path, user_suffix=$tool_user_prompt_suffix_path, node_rank=$NODE_RANK"
     fi
 
     export MASTER_ADDR=${MASTER_ADDR:-"${MA_VJ_NAME}-${MA_TASK_NAME}-0.${MA_VJ_NAME}"}
@@ -682,6 +763,7 @@ _submit_npu_verl_job() {
         "data.test_benchmarks.reward_data_source=${test_benchmark_reward_data_source}"
         "data.max_prompt_length=${max_prompt_length}"
         "data.max_response_length=${max_response_length}"
+        "data.user_prompt_suffix_path=${tool_user_prompt_suffix_path}"
         "data.filter_overlong_prompts=${filter_overlong_prompts}"
         "data.truncation=${data_truncation}"
         "data.shuffle=${data_shuffle}"
@@ -830,10 +912,11 @@ _submit_npu_verl_job() {
             "actor_rollout_ref.rollout.multi_turn.enable=True"
             "actor_rollout_ref.rollout.multi_turn.function_tool_path=${function_tool_path}"
             "actor_rollout_ref.rollout.multi_turn.format=hermes"
-            "actor_rollout_ref.rollout.multi_turn.max_assistant_turns=null"
-            "actor_rollout_ref.rollout.multi_turn.max_user_turns=null"
+            "actor_rollout_ref.rollout.multi_turn.max_assistant_turns=${tool_max_assistant_turns}"
+            "actor_rollout_ref.rollout.multi_turn.max_user_turns=${tool_max_user_turns}"
             "actor_rollout_ref.rollout.multi_turn.max_parallel_calls=1"
-            "actor_rollout_ref.rollout.multi_turn.max_tool_response_length=4096"
+            "actor_rollout_ref.rollout.multi_turn.max_tool_response_length=${tool_max_response_chars}"
+            "actor_rollout_ref.rollout.multi_turn.tool_response_truncate_side=${tool_response_truncate_side}"
             "actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=disable"
         )
     fi

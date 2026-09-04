@@ -71,6 +71,7 @@ class MathBenchmarkDataset(Dataset):
         reward_data_source: str = "math_verify",
         max_samples_per_benchmark: int = -1,
         system_prompt_path: str | Path | None = None,
+        user_prompt_suffix_path: str | Path | None = None,
         agent_name: str | None = None,
     ) -> None:
         root = Path(dataset_root).expanduser()
@@ -112,6 +113,16 @@ class MathBenchmarkDataset(Dataset):
             self.system_prompt = expanded_prompt_path.read_text(encoding="utf-8").strip()
             if not self.system_prompt:
                 raise ValueError(f"MathBenchmarkDataset system_prompt_path is empty: {system_prompt_path}")
+        self.user_prompt_suffix = None
+        if user_prompt_suffix_path:
+            expanded_suffix_path = Path(os.path.abspath(os.path.expanduser(str(user_prompt_suffix_path))))
+            if not expanded_suffix_path.is_file():
+                raise FileNotFoundError(
+                    f"MathBenchmarkDataset user_prompt_suffix_path does not exist: {user_prompt_suffix_path}"
+                )
+            self.user_prompt_suffix = expanded_suffix_path.read_text(encoding="utf-8").strip()
+            if not self.user_prompt_suffix:
+                raise ValueError(f"MathBenchmarkDataset user_prompt_suffix_path is empty: {user_prompt_suffix_path}")
         self.records: list[_BenchmarkRecord] = []
 
         max_samples = None if max_samples_per_benchmark < 0 else max_samples_per_benchmark
@@ -166,6 +177,22 @@ class MathBenchmarkDataset(Dataset):
                 raw_prompt[0]["content"] = f"{self.system_prompt}\n\n{existing}" if existing else self.system_prompt
             else:
                 raw_prompt.insert(0, system_message)
+        if self.user_prompt_suffix:
+            for message in reversed(raw_prompt):
+                if message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                if not isinstance(content, str):
+                    raise TypeError(
+                        "MathBenchmarkDataset user_prompt_suffix_path requires the final user message content "
+                        f"to be text, got {type(content).__name__}."
+                    )
+                message["content"] = (
+                    f"{content.rstrip()}\n\n{self.user_prompt_suffix}" if content.rstrip() else self.user_prompt_suffix
+                )
+                break
+            else:
+                raise ValueError("MathBenchmarkDataset user_prompt_suffix_path requires at least one user message.")
         row = {
             "raw_prompt": raw_prompt,
             "data_source": record.benchmark,

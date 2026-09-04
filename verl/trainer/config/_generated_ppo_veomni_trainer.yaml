@@ -463,6 +463,7 @@ data:
   function_tool_path: ${oc.select:actor_rollout_ref.rollout.multi_turn.function_tool_path,
     null}
   system_prompt_path: null
+  user_prompt_suffix_path: null
   return_raw_input_ids: false
   return_raw_chat: true
   return_full_prompt: false

@@ -45,6 +45,21 @@ def _dataset(tmp_path, text: str) -> _NoIOTestDataset:
     return _NoIOTestDataset(["unused.parquet"], _Tokenizer(), config)
 
 
+def _suffix_dataset(tmp_path, text: str, **config_overrides) -> _NoIOTestDataset:
+    suffix_path = tmp_path / "user-suffix.txt"
+    suffix_path.write_text(text, encoding="utf-8")
+    config = OmegaConf.create(
+        {
+            "system_prompt_path": None,
+            "user_prompt_suffix_path": str(suffix_path),
+            "tool_config_path": None,
+            "function_tool_path": None,
+            **config_overrides,
+        }
+    )
+    return _NoIOTestDataset(["unused.parquet"], _Tokenizer(), config)
+
+
 def test_system_prompt_is_prepended_without_mutating_source_on_cpu(tmp_path):
     dataset = _dataset(tmp_path, "Use tools when useful.")
     source = {"prompt": [{"role": "user", "content": "question"}]}
@@ -72,6 +87,45 @@ def test_system_prompt_merges_with_existing_text_system_message_on_cpu(tmp_path)
     assert messages[0] == {"role": "system", "content": "Tool policy\n\nDataset policy"}
 
 
+def test_user_suffix_targets_final_user_message_without_mutating_source_on_cpu(tmp_path):
+    dataset = _suffix_dataset(tmp_path, "Plan first, then use the tool.")
+    source = {
+        "prompt": [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "clarification"},
+            {"role": "user", "content": "final question\n"},
+        ]
+    }
+
+    messages = dataset._build_messages(source, key="prompt")
+
+    assert messages[-1]["content"] == "final question\n\nPlan first, then use the tool."
+    assert messages[0]["content"] == "first question"
+    assert source["prompt"][-1]["content"] == "final question\n"
+
+
+def test_system_prompt_and_user_suffix_can_coexist_on_cpu(tmp_path):
+    system_path = tmp_path / "system.txt"
+    system_path.write_text("System policy", encoding="utf-8")
+    dataset = _suffix_dataset(tmp_path, "User policy", system_prompt_path=str(system_path))
+
+    messages = dataset._build_messages({"prompt": [{"role": "user", "content": "question"}]}, key="prompt")
+
+    assert messages == [
+        {"role": "system", "content": "System policy"},
+        {"role": "user", "content": "question\n\nUser policy"},
+    ]
+
+
+def test_user_suffix_requires_a_text_user_message_on_cpu(tmp_path):
+    dataset = _suffix_dataset(tmp_path, "User policy")
+
+    with pytest.raises(ValueError, match="at least one user message"):
+        dataset._build_messages({"prompt": [{"role": "assistant", "content": "answer"}]}, key="prompt")
+    with pytest.raises(TypeError, match="content to be text"):
+        dataset._build_messages({"prompt": [{"role": "user", "content": [{"type": "text"}]}]}, key="prompt")
+
+
 def test_empty_or_missing_system_prompt_file_fails_fast_on_cpu(tmp_path):
     empty = tmp_path / "empty.txt"
     empty.write_text("  ", encoding="utf-8")
@@ -94,6 +148,25 @@ def test_empty_or_missing_system_prompt_file_fails_fast_on_cpu(tmp_path):
         assert "does not exist" in str(error)
     else:
         raise AssertionError("missing system prompt should fail")
+
+
+def test_empty_or_missing_user_suffix_file_fails_fast_on_cpu(tmp_path):
+    empty = tmp_path / "empty-suffix.txt"
+    empty.write_text("  ", encoding="utf-8")
+    base = {"system_prompt_path": None, "tool_config_path": None, "function_tool_path": None}
+
+    with pytest.raises(ValueError, match="user_prompt_suffix_path is empty"):
+        _NoIOTestDataset(
+            ["unused.parquet"],
+            _Tokenizer(),
+            OmegaConf.create({**base, "user_prompt_suffix_path": str(empty)}),
+        )
+    with pytest.raises(FileNotFoundError, match="user_prompt_suffix_path does not exist"):
+        _NoIOTestDataset(
+            ["unused.parquet"],
+            _Tokenizer(),
+            OmegaConf.create({**base, "user_prompt_suffix_path": str(tmp_path / "missing-suffix.txt")}),
+        )
 
 
 def test_function_tool_schema_is_loaded_for_prompt_length_filter_on_cpu(tmp_path):

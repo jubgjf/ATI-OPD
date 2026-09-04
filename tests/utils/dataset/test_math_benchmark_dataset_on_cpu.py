@@ -100,6 +100,28 @@ def test_math_benchmark_dataset_preserves_tool_agent_and_system_prompt_on_cpu(tm
     assert row["raw_prompt"][1]["role"] == "user"
 
 
+def test_math_benchmark_dataset_appends_user_suffix_and_preserves_system_prompt_on_cpu(tmp_path):
+    dataset_root = tmp_path / "datasets"
+    _write_benchmarks(dataset_root)
+    system_prompt_path = tmp_path / "tool-system.txt"
+    suffix_path = tmp_path / "tool-user-suffix.txt"
+    system_prompt_path.write_text("System policy", encoding="utf-8")
+    suffix_path.write_text("Plan first, then use code_interpreter.", encoding="utf-8")
+
+    dataset = MathBenchmarkDataset(
+        dataset_root=dataset_root,
+        benchmarks=["aime24"],
+        max_samples_per_benchmark=1,
+        system_prompt_path=system_prompt_path,
+        user_prompt_suffix_path=suffix_path,
+        agent_name="tool_agent",
+    )
+
+    row = dataset[0]
+    assert row["raw_prompt"][0] == {"role": "system", "content": "System policy"}
+    assert row["raw_prompt"][1]["content"].endswith("\n\nPlan first, then use code_interpreter.")
+
+
 def test_create_math_benchmark_dataset_uses_training_tool_environment_on_cpu(tmp_path):
     dataset_root = tmp_path / "datasets"
     _write_benchmarks(dataset_root)
@@ -135,6 +157,43 @@ def test_create_math_benchmark_dataset_uses_training_tool_environment_on_cpu(tmp
 
     assert row["agent_name"] == "tool_agent"
     assert row["raw_prompt"][0]["content"] == "Use the configured code tool when useful."
+
+
+def test_create_math_benchmark_dataset_passes_user_suffix_on_cpu(tmp_path):
+    dataset_root = tmp_path / "datasets"
+    _write_benchmarks(dataset_root)
+    suffix_path = tmp_path / "tool-user-suffix.txt"
+    suffix_path.write_text("Plan first, then use code_interpreter.", encoding="utf-8")
+    config = OmegaConf.create(
+        {
+            "trainer": {"test_before_train": False, "test_benchmarks_freq": 20},
+            "data": {
+                "system_prompt_path": None,
+                "user_prompt_suffix_path": str(suffix_path),
+                "test_benchmarks": {
+                    "root": str(dataset_root),
+                    "names": ["aime24"],
+                    "reward_data_source": "math_verify",
+                    "max_samples_per_benchmark": 1,
+                },
+            },
+            "actor_rollout_ref": {
+                "rollout": {
+                    "agent": {"default_agent_loop": "tool_agent"},
+                    "multi_turn": {
+                        "enable": True,
+                        "tool_config_path": None,
+                        "function_tool_path": "verl/tools/sod_code_interpreter_tool.py",
+                    },
+                }
+            },
+        }
+    )
+
+    row = create_math_benchmark_dataset(config)[0]
+
+    assert row["raw_prompt"][0]["role"] == "user"
+    assert row["raw_prompt"][0]["content"].endswith("\n\nPlan first, then use code_interpreter.")
 
 
 def test_create_math_benchmark_dataset_rejects_tool_agent_without_tools_on_cpu(tmp_path):

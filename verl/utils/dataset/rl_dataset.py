@@ -134,6 +134,16 @@ class RLHFDataset(Dataset):
                 self.system_prompt = prompt_file.read().strip()
             if not self.system_prompt:
                 raise ValueError(f"data.system_prompt_path is empty: {self.system_prompt_path}")
+        self.user_prompt_suffix_path = config.get("user_prompt_suffix_path", None)
+        self.user_prompt_suffix = None
+        if self.user_prompt_suffix_path:
+            expanded_suffix_path = os.path.abspath(os.path.expanduser(self.user_prompt_suffix_path))
+            if not os.path.isfile(expanded_suffix_path):
+                raise FileNotFoundError(f"data.user_prompt_suffix_path does not exist: {self.user_prompt_suffix_path}")
+            with open(expanded_suffix_path, encoding="utf-8") as suffix_file:
+                self.user_prompt_suffix = suffix_file.read().strip()
+            if not self.user_prompt_suffix:
+                raise ValueError(f"data.user_prompt_suffix_path is empty: {self.user_prompt_suffix_path}")
 
         # Mirror AgentLoopWorker's tool loading so length filtering sees the
         # same schemas the rollout will.
@@ -355,6 +365,22 @@ class RLHFDataset(Dataset):
                 messages[0]["content"] = f"{self.system_prompt}\n\n{existing}" if existing else self.system_prompt
             else:
                 messages.insert(0, system_message)
+        if self.user_prompt_suffix:
+            for message in reversed(messages):
+                if message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                if not isinstance(content, str):
+                    raise TypeError(
+                        "data.user_prompt_suffix_path requires the final user message content to be text, "
+                        f"got {type(content).__name__}."
+                    )
+                message["content"] = (
+                    f"{content.rstrip()}\n\n{self.user_prompt_suffix}" if content.rstrip() else self.user_prompt_suffix
+                )
+                break
+            else:
+                raise ValueError("data.user_prompt_suffix_path requires at least one user message.")
         # When concatenating multimodal datasets, get will return None for samples without a modality column.
         images = example.get(self.image_key, None) or []
         videos = example.get(self.video_key, None) or []

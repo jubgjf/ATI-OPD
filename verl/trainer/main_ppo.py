@@ -388,6 +388,7 @@ def create_math_benchmark_dataset(config):
         reward_data_source=benchmark_config.get("reward_data_source", "math_verify"),
         max_samples_per_benchmark=int(benchmark_config.get("max_samples_per_benchmark", -1)),
         system_prompt_path=config.data.get("system_prompt_path", None),
+        user_prompt_suffix_path=config.data.get("user_prompt_suffix_path", None),
         agent_name=default_agent_loop,
     )
 

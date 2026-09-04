@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -22,6 +24,23 @@ import pytest
 
 from verl.tools.code_interpreter_tool import code_interpreter, extract_executable_code
 from verl.tools.python_sandbox import SandboxHTTPServer, execute_request
+from verl.tools.python_sandbox_client import PythonSandboxResult
+
+
+@pytest.fixture
+def sod_tool_module():
+    registry_module = importlib.import_module("verl.tools.function_tool")
+    module_name = "verl.tools.sod_code_interpreter_tool"
+    previous = registry_module.FUNCTION_TOOL_REGISTRY.pop("code_interpreter", None)
+    sys.modules.pop(module_name, None)
+    module = importlib.import_module(module_name)
+    try:
+        yield module
+    finally:
+        registry_module.FUNCTION_TOOL_REGISTRY.pop("code_interpreter", None)
+        sys.modules.pop(module_name, None)
+        if previous is not None:
+            registry_module.FUNCTION_TOOL_REGISTRY["code_interpreter"] = previous
 
 
 @pytest.mark.parametrize(
@@ -97,4 +116,45 @@ async def test_code_interpreter_http_contract_on_cpu(monkeypatch):
     assert reward == 0.0
     assert response.text == "[code_interpreter status=success]\n42"
     assert metrics["tool_execution_status"] == "success"
+    assert metrics["tool_markdown_extracted"] == 1.0
+
+
+def test_sod_observation_exposes_raw_output_without_status_prefix_on_cpu(sod_tool_module):
+    success = PythonSandboxResult(
+        payload={"status": "success", "run_result": {"stdout": "42\n", "stderr": "warning\n"}},
+        status="success",
+        markdown_extracted=False,
+    )
+    empty = PythonSandboxResult(
+        payload={"status": "success", "run_result": {"stdout": "", "stderr": ""}},
+        status="success",
+        markdown_extracted=False,
+    )
+    failed = PythonSandboxResult(
+        payload={"status": "failed", "run_result": {"stderr": "traceback"}},
+        status="runtime_error",
+        markdown_extracted=False,
+    )
+
+    assert sod_tool_module._sod_observation(success) == "42\nwarning\n"
+    assert sod_tool_module._sod_observation(empty) == ""
+    assert sod_tool_module._sod_observation(failed) == "no stdout here"
+
+
+@pytest.mark.asyncio
+async def test_sod_tool_preserves_execution_status_as_out_of_band_metrics_on_cpu(monkeypatch, sod_tool_module):
+    async def execute(_code: str) -> PythonSandboxResult:
+        return PythonSandboxResult(
+            payload={"status": "failed", "run_result": {"status": "RuntimeError", "stderr": "boom"}},
+            status="runtime_error",
+            markdown_extracted=True,
+        )
+
+    monkeypatch.setattr(sod_tool_module, "execute_python_sandbox", execute)
+    response, reward, metrics = await sod_tool_module.code_interpreter("raise RuntimeError('boom')")
+
+    assert response.text == "no stdout here"
+    assert reward == 0.0
+    assert metrics["tool_execution_status"] == "runtime_error"
+    assert metrics["tool_status_runtime_error"] == 1.0
     assert metrics["tool_markdown_extracted"] == 1.0
