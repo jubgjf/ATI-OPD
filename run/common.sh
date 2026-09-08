@@ -168,6 +168,18 @@ _configure_in_training_evaluation() {
     esac
 }
 
+_configure_enable_thinking() {
+    enable_thinking=${ENABLE_THINKING:-True}
+    case "$enable_thinking" in
+        True | true | 1) enable_thinking=True ;;
+        False | false | 0) enable_thinking=False ;;
+        *)
+            echo "ENABLE_THINKING must be True or False, got: $enable_thinking" >&2
+            return 2
+            ;;
+    esac
+}
+
 _configure_verl_python_sandbox() {
     local auto_start
     if [[ -n "${AUTO_START_PYTHON_SANDBOX+x}" ]]; then
@@ -293,6 +305,8 @@ run_npu_opd_job() {
     TRAIN_DATASET=${TRAIN_DATASET:-dapo_math_17k}
     model_root=${MODEL_ROOT:-$DATASET_DIR/models}
     dataset_root=${DATASET_ROOT:-$DATASET_DIR/datasets}
+
+    _configure_enable_thinking || exit $?
 
     enable_tool_call=${ENABLE_TOOL_CALL:-False}
     case "$enable_tool_call" in
@@ -571,7 +585,7 @@ run_npu_opd_job() {
     echo "Metric logging: mode=$metric_logging_mode, archive=$metric_logging_archive_enabled, shard_interval=$metric_logging_archive_shard_interval_steps, upload=$metric_logging_archive_upload_to_wandb"
     echo "In-training evaluation: enabled=$in_train_evaluation, val_before=$val_before_train, test_before=$test_before_train, teacher_val_before=$teacher_val_before_train, val_freq=$test_freq, benchmark_freq=$test_benchmarks_freq"
     echo "Sequence lengths: prompt=$max_prompt_length, response=$max_response_length, rollout_model=$rollout_max_model_len, teacher_model=$teacher_max_model_len"
-    echo "Chat template: source=$CHAT_TEMPLATE_MODEL"
+    echo "Chat template: source=$CHAT_TEMPLATE_MODEL, enable_thinking=$enable_thinking"
     echo "Tool style: enabled=$enable_tool_call, sod=$sod_style, function=${function_tool_path:-null}, system_prompt=${tool_system_prompt_path:-null}, user_suffix=${tool_user_prompt_suffix_path:-null}"
     echo "Benchmarks: seed=$test_benchmark_seed, names=$test_benchmarks, suite=${test_benchmark_suite:-legacy}"
     echo "W&B resume: mode=$WANDB_MODE, required=$resume_required, run_id=${WANDB_RUN_ID:-unset}, resume=${WANDB_RESUME:-unset}"
@@ -907,7 +921,6 @@ _submit_npu_verl_job() {
     if [[ "$enable_tool_call" == "True" ]]; then
         hydra_args+=(
             "data.system_prompt_path=${tool_system_prompt_path}"
-            "+data.apply_chat_template_kwargs.enable_thinking=True"
             "actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent"
             "actor_rollout_ref.rollout.multi_turn.enable=True"
             "actor_rollout_ref.rollout.multi_turn.function_tool_path=${function_tool_path}"
@@ -922,6 +935,7 @@ _submit_npu_verl_job() {
     fi
 
     hydra_args+=("${METHOD_HYDRA_OVERRIDES[@]}")
+    hydra_args+=("++data.apply_chat_template_kwargs.enable_thinking=${enable_thinking}")
 
     local runtime_env_json
     if [[ -n "${WANDB_RUN_ID:-}" && -n "${WANDB_RESUME:-}" ]]; then
