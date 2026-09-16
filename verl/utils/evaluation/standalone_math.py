@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Evaluate local HF checkpoints on HMMT with the training legacy math protocol.
+"""Evaluate local HF or FSDP checkpoints on HMMT with the training legacy math protocol.
 
 Run with ``MODEL_PATH=/local/checkpoint python -B -u -m verl.utils.evaluation.standalone_math``
 in an existing vLLM environment. The Ascend launcher is ``run/eval-single.sh``.
-Only stdout is used for evaluation output; framework runtime caches are allowed.
+FSDP inputs are merged into actor/huggingface when weights are missing; set
+EVAL_FORCE_MERGE=True to rebuild existing weights. Evaluation output uses only stdout.
+Framework runtime caches are allowed.
 """
 
 from __future__ import annotations
@@ -24,9 +26,11 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+import subprocess
 import sys
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +43,12 @@ from verl.utils.tokenizer import hf_tokenizer, normalize_token_ids
 
 BENCHMARKS = ("hmmt_feb_2026", "hmmt_nov_2025")
 METRIC_PREFIX = "test-legacy"
+HF_WEIGHT_FILES = (
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "pytorch_model.bin",
+    "pytorch_model.bin.index.json",
+)
 
 
 def _env_value(env: Mapping[str, str], *names: str, default: Any = None) -> Any:
@@ -78,6 +88,7 @@ class EvaluationConfig:
     max_samples: int = -1
     seed: int = 0
     enforce_eager: bool = False
+    force_merge: bool = False
 
     def __post_init__(self) -> None:
         for name in (
@@ -114,7 +125,7 @@ class EvaluationConfig:
         env = os.environ if env is None else env
         model_path = _env_value(env, "MODEL_PATH")
         if not model_path:
-            raise ValueError("MODEL_PATH is required and must name a local Hugging Face checkpoint directory.")
+            raise ValueError("MODEL_PATH is required and must name a local HF or FSDP checkpoint directory.")
         if _env_bool(env, "ENABLE_TOOL_CALL", False) or _env_bool(env, "SOD_STYLE", False):
             raise ValueError("Standalone HMMT evaluation requires ENABLE_TOOL_CALL=False and SOD_STYLE=False.")
         if _env_value(env, "TEST_BENCHMARK_REWARD_DATA_SOURCE", default="math_verify") != "math_verify":
@@ -159,6 +170,7 @@ class EvaluationConfig:
             max_samples=int(_env_value(env, "TEST_BENCHMARK_MAX_SAMPLES", default=-1)),
             seed=int(_env_value(env, "EVAL_SEED", default=0)),
             enforce_eager=_env_bool(env, "ROLLOUT_ENFORCE_EAGER", False),
+            force_merge=_env_bool(env, "EVAL_FORCE_MERGE", False),
         )
 
 
@@ -170,17 +182,13 @@ def validate_checkpoint(model_path: str) -> None:
     config_file = root / "config.json"
     if not config_file.is_file() or not isinstance(json.loads(config_file.read_text(encoding="utf-8")), dict):
         raise ValueError(f"Missing or invalid HF config.json in {root}")
-    for filename in (
-        "model.safetensors",
-        "model.safetensors.index.json",
-        "pytorch_model.bin",
-        "pytorch_model.bin.index.json",
-    ):
+    for filename in HF_WEIGHT_FILES:
         path = root / filename
         if not path.is_file():
             continue
         if filename.endswith(".index.json"):
-            weight_map = json.loads(path.read_text(encoding="utf-8")).get("weight_map")
+            index = json.loads(path.read_text(encoding="utf-8"))
+            weight_map = index.get("weight_map") if isinstance(index, dict) else None
             if not isinstance(weight_map, dict) or not weight_map:
                 raise ValueError(f"Missing or empty weight_map in {path}")
             names = list(weight_map.values())
@@ -194,6 +202,113 @@ def validate_checkpoint(model_path: str) -> None:
             raise ValueError(f"Missing or empty checkpoint weights: {missing}")
         return
     raise ValueError(f"No complete HF weights found in {root}; export/merge the checkpoint before evaluation.")
+
+
+def _resolve_checkpoint_paths(model_path: str) -> tuple[Path, Path | None]:
+    root = Path(model_path).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"MODEL_PATH must be a local checkpoint directory: {root}")
+    if (root / "config.json").is_file() or root.name == "huggingface":
+        actor = None
+        if root.name == "huggingface" and (root.parent.name == "actor" or (root.parent / "fsdp_config.json").is_file()):
+            actor = root.parent
+        return root, actor
+    if (root / "actor").is_dir():
+        actor = root / "actor"
+    elif root.name == "actor" or (root / "fsdp_config.json").is_file() or (root / "huggingface").is_dir():
+        actor = root
+    else:
+        raise ValueError(
+            f"Unrecognized checkpoint directory: {root}. Set MODEL_PATH to a specific global_step_* directory, "
+            "its actor or actor/huggingface directory, or a complete HF model."
+        )
+    return actor / "huggingface", actor
+
+
+def _validate_merge_source(actor: Path, hf_dir: Path) -> None:
+    from transformers import AutoConfig
+
+    config_path = actor / "fsdp_config.json"
+    if not config_path.is_file():
+        raise ValueError(f"Missing FSDP config: {config_path}")
+    fsdp_config = json.loads(config_path.read_text(encoding="utf-8"))
+    world_size = fsdp_config.get("world_size") if isinstance(fsdp_config, dict) else None
+    if type(world_size) is not int or world_size <= 0:
+        raise ValueError(f"Expected a positive integer world_size in {config_path}, got {world_size!r}.")
+    shards = [actor / f"model_world_size_{world_size}_rank_{rank}.pt" for rank in range(world_size)]
+    missing = [str(path) for path in shards if not path.is_file() or path.stat().st_size == 0]
+    if missing:
+        raise ValueError(f"Missing or empty FSDP model shards: {missing}")
+    if not (hf_dir / "config.json").is_file():
+        raise ValueError(f"Missing HF config.json in {hf_dir}")
+    # Validate assets before removing any old HF weights. No model weights are
+    # allocated here, and optimizer / RNG checkpoints are deliberately unused.
+    AutoConfig.from_pretrained(str(hf_dir), local_files_only=True, trust_remote_code=False)
+    hf_tokenizer(str(hf_dir), local_files_only=True, trust_remote_code=False)
+    if not os.access(hf_dir, os.W_OK | os.X_OK):
+        raise PermissionError(f"HF output directory is not writable: {hf_dir}")
+
+
+def _remove_hf_weights(hf_dir: Path) -> None:
+    for path in hf_dir.iterdir():
+        if path.name in HF_WEIGHT_FILES or re.fullmatch(
+            r"(?:model-\d+-of-\d+\.safetensors|pytorch_model-\d+-of-\d+\.bin)", path.name
+        ):
+            path.unlink()
+
+
+def prepare_checkpoint(model_path: str, *, force_merge: bool = False) -> str:
+    """Resolve a local checkpoint, reusing HF weights or merging its FSDP actor in a subprocess."""
+    hf_dir, actor = _resolve_checkpoint_paths(model_path)
+    print(f"[checkpoint] input={model_path}, huggingface={hf_dir}", flush=True)
+    if not force_merge:
+        try:
+            validate_checkpoint(str(hf_dir))
+        except ValueError:
+            if actor is None:
+                raise
+        else:
+            print("[checkpoint] Reusing complete HF weights.", flush=True)
+            return str(hf_dir)
+    if actor is None:
+        raise ValueError(f"EVAL_FORCE_MERGE requires a corresponding FSDP actor directory: {model_path}")
+    _validate_merge_source(actor, hf_dir)
+    print(f"[checkpoint] Merging FSDP model shards from {actor} into {hf_dir}.", flush=True)
+    _remove_hf_weights(hf_dir)
+    command = [
+        sys.executable,
+        "-B",
+        "-u",
+        "-m",
+        "verl.model_merger",
+        "merge",
+        "--backend",
+        "fsdp",
+        "--local_dir",
+        str(actor),
+        "--target_dir",
+        str(hf_dir),
+    ]
+    env = {
+        **os.environ,
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    try:
+        subprocess.run(command, check=True, env=env)
+        validate_checkpoint(str(hf_dir))
+    except BaseException:
+        # A failed save may leave nonempty, truncated weights. Do not let a
+        # subsequent evaluation mistake those files for a completed conversion.
+        try:
+            _remove_hf_weights(hf_dir)
+        except OSError as exc:
+            print(f"[checkpoint] Could not remove incomplete HF weights: {exc}", file=sys.stderr, flush=True)
+        raise
+    print(f"[checkpoint] HF conversion complete: {hf_dir}", flush=True)
+    return str(hf_dir)
 
 
 def load_tokenizer(config: EvaluationConfig):
@@ -398,7 +513,7 @@ def run_evaluation(config: EvaluationConfig) -> dict[str, Any]:
     from math_verify.grader import verify  # noqa: F401
     from math_verify.parser import parse  # noqa: F401
 
-    validate_checkpoint(config.model_path)
+    config = replace(config, model_path=prepare_checkpoint(config.model_path, force_merge=config.force_merge))
     tokenizer = load_tokenizer(config)
     prepared = prepare_samples(config, tokenizer)
     resolved = {
@@ -452,6 +567,12 @@ def run_evaluation(config: EvaluationConfig) -> dict[str, Any]:
 def main() -> int:
     """Read environment configuration and return a nonzero status on any evaluation failure."""
     try:
+        node_rank = _env_value(os.environ, "NODE_RANK", "VC_TASK_INDEX", default="0")
+        if not re.fullmatch(r"[0-9]+", node_rank):
+            raise ValueError(f"NODE_RANK must be a non-negative integer, got {node_rank!r}.")
+        if int(node_rank) != 0:
+            print(f"[eval] Skipping standalone evaluation on NODE_RANK={node_rank}; only node 0 evaluates.", flush=True)
+            return 0
         run_evaluation(EvaluationConfig.from_environment())
     except Exception as exc:
         print(f"[eval] ERROR: {exc}", file=sys.stderr, flush=True)

@@ -18,6 +18,7 @@ import builtins
 import io
 import json
 import os
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -115,6 +116,7 @@ def test_legacy_defaults_match_training_profile_on_cpu():
     assert config.max_model_len == 24577
     assert config.dataset_root == str(REPO_ROOT / "dataset")
     assert config.seed == 0
+    assert not config.force_merge
 
 
 def test_existing_environment_overrides_and_context_precedence_on_cpu():
@@ -142,6 +144,7 @@ def test_existing_environment_overrides_and_context_precedence_on_cpu():
         "TEST_BENCHMARK_MAX_SAMPLES": "1",
         "EVAL_SEED": "17",
         "ROLLOUT_ENFORCE_EAGER": "True",
+        "EVAL_FORCE_MERGE": "True",
     }
     config = evaluation.EvaluationConfig.from_environment(env)
     assert (config.temperature, config.top_p, config.top_k, config.rollout_n) == (0.9, 0.8, 20, 5)
@@ -149,6 +152,7 @@ def test_existing_environment_overrides_and_context_precedence_on_cpu():
     assert (config.max_num_batched_tokens, config.max_num_seqs, config.batch_size, config.max_samples) == (256, 4, 2, 1)
     assert (config.tensor_parallel_size, config.gpu_memory_utilization, config.seed) == (1, 0.8, 17)
     assert config.enforce_eager
+    assert config.force_merge
     for name, expected in [
         ("ROLLOUT_MAX_MODEL_LEN", 1024),
         ("STUDENT_MAX_MODEL_LEN", 2048),
@@ -171,6 +175,7 @@ def test_existing_environment_overrides_and_context_precedence_on_cpu():
         {"TEST_BENCHMARK_N": "0"},
         {"TEST_DO_SAMPLE": "sometimes"},
         {"ENABLE_THINKING": "sometimes"},
+        {"EVAL_FORCE_MERGE": "sometimes"},
         {"STUDENT_TP": "0"},
         {"STUDENT_GPU_MEM_UTIL": "2"},
         {"TEST_BENCHMARK_MAX_SAMPLES": "0"},
@@ -208,6 +213,248 @@ def test_checkpoint_validation_checks_every_indexed_shard_on_cpu(inputs):
     index.write_text(json.dumps({"weight_map": {"x": ["bad shard"]}}))
     with pytest.raises(ValueError, match="Invalid local shard"):
         evaluation.validate_checkpoint(config.model_path)
+
+
+def _fsdp_layout(inputs, world_size=32):
+    config, tokenizer = inputs
+    step = Path(config.model_path).parent / "experiment with spaces" / "global_step_217"
+    actor = step / "actor"
+    actor.mkdir(parents=True)
+    hf_dir = actor / "huggingface"
+    Path(config.model_path).rename(hf_dir)
+    (hf_dir / "model.safetensors").unlink()
+    (actor / "fsdp_config.json").write_text(json.dumps({"FSDP_version": 2, "world_size": world_size}))
+    for rank in range(world_size):
+        (actor / f"model_world_size_{world_size}_rank_{rank}.pt").write_bytes(b"mock model shard")
+    return replace(config, model_path=str(step)), tokenizer, actor, hf_dir
+
+
+def _snapshot(path):
+    return {str(file.relative_to(path)): file.read_bytes() for file in path.rglob("*") if file.is_file()}
+
+
+@pytest.mark.parametrize("path_kind", ["step", "actor", "huggingface", "relative"])
+def test_fsdp_input_paths_merge_once_then_reuse_without_source_shards_on_cpu(inputs, monkeypatch, path_kind, capsys):
+    config, _, actor, hf_dir = _fsdp_layout(inputs)
+    paths = {"step": actor.parent, "actor": actor, "huggingface": hf_dir}
+    if path_kind == "relative":
+        monkeypatch.chdir(actor.parent.parent)
+        path = "global_step_217/actor/huggingface"
+    else:
+        path = str(paths[path_kind])
+    calls = []
+    source_before = {file.name: file.read_bytes() for file in actor.iterdir() if file.is_file()}
+
+    def merge(command, **kwargs):
+        calls.append(command)
+        assert command == [
+            sys.executable,
+            "-B",
+            "-u",
+            "-m",
+            "verl.model_merger",
+            "merge",
+            "--backend",
+            "fsdp",
+            "--local_dir",
+            str(actor),
+            "--target_dir",
+            str(hf_dir),
+        ]
+        assert set(kwargs) == {"check", "env"} and kwargs["check"] is True
+        for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "PYTHONDONTWRITEBYTECODE"):
+            assert kwargs["env"][name] == "1"
+        (hf_dir / "model.safetensors").write_bytes(b"merged mock weights")
+
+    monkeypatch.setattr(evaluation.subprocess, "run", merge)
+    assert evaluation.prepare_checkpoint(path) == str(hf_dir)
+    assert source_before == {file.name: file.read_bytes() for file in actor.iterdir() if file.is_file()}
+    for shard in actor.glob("model_*.pt"):
+        shard.unlink()
+    before = _snapshot(actor)
+    assert evaluation.prepare_checkpoint(path) == str(hf_dir)
+    assert before == _snapshot(actor) and len(calls) == 1
+    assert "Reusing complete HF weights" in capsys.readouterr().out
+
+
+def test_force_merge_removes_only_standard_hf_weights_on_cpu(inputs, monkeypatch):
+    _, _, actor, hf_dir = _fsdp_layout(inputs)
+    weight_names = list(evaluation.HF_WEIGHT_FILES) + [
+        "model-00001-of-00002.safetensors",
+        "pytorch_model-00001-of-00002.bin",
+    ]
+    for name in weight_names:
+        (hf_dir / name).write_bytes(b"old weights")
+    (hf_dir / "model_notes.txt").write_text("keep unrelated files")
+    (hf_dir / "adapter_model.safetensors").write_bytes(b"keep unrelated adapter")
+    (actor / "optim_world_size_32_rank_0.pt").write_bytes(b"keep optimizer")
+    before = _snapshot(actor)
+
+    def merge(*args, **kwargs):
+        assert all(not (hf_dir / name).exists() for name in weight_names)
+        current = _snapshot(actor)
+        for name, contents in before.items():
+            if name not in {f"huggingface/{weight}" for weight in weight_names}:
+                assert current[name] == contents
+        (hf_dir / "model.safetensors").write_bytes(b"new weights")
+
+    monkeypatch.setattr(evaluation.subprocess, "run", merge)
+    assert evaluation.prepare_checkpoint(str(actor), force_merge=True) == str(hf_dir)
+    assert (hf_dir / "model.safetensors").read_bytes() == b"new weights"
+
+
+def test_plain_hf_force_merge_and_experiment_root_are_rejected_on_cpu(inputs, monkeypatch):
+    config, _ = inputs
+    monkeypatch.setattr(evaluation.subprocess, "run", lambda *a, **k: pytest.fail("Unexpected merger"))
+    before = _snapshot(Path(config.model_path))
+    with pytest.raises(ValueError, match="corresponding FSDP actor"):
+        evaluation.prepare_checkpoint(config.model_path, force_merge=True)
+    assert _snapshot(Path(config.model_path)) == before
+    _, _, actor, _ = _fsdp_layout(inputs)
+    with pytest.raises(ValueError, match="specific global_step"):
+        evaluation.prepare_checkpoint(str(actor.parent.parent))
+
+
+def test_incomplete_hf_index_triggers_merge_without_force_on_cpu(inputs, monkeypatch):
+    config, _, _, hf_dir = _fsdp_layout(inputs)
+    index = hf_dir / "model.safetensors.index.json"
+    index.write_text(json.dumps({"weight_map": {"x": "model-00001-of-00002.safetensors"}}))
+    calls = []
+
+    def merge(*args, **kwargs):
+        calls.append(args)
+        assert not index.exists()
+        (hf_dir / "model.safetensors").write_bytes(b"complete mock weights")
+
+    monkeypatch.setattr(evaluation.subprocess, "run", merge)
+    assert evaluation.prepare_checkpoint(config.model_path) == str(hf_dir)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_shard",
+        "empty_shard",
+        "missing_fsdp_config",
+        "bad_json",
+        "bad_world_size",
+        "bool_world_size",
+        "missing_hf_config",
+        "missing_tokenizer",
+        "readonly",
+    ],
+)
+def test_bad_merge_source_preserves_existing_weights_and_stops_evaluation_on_cpu(inputs, monkeypatch, capsys, fault):
+    config, _, actor, hf_dir = _fsdp_layout(inputs)
+    (hf_dir / "model.safetensors").write_bytes(b"old complete weights")
+    if fault == "missing_shard":
+        (actor / "model_world_size_32_rank_31.pt").unlink()
+    elif fault == "empty_shard":
+        (actor / "model_world_size_32_rank_31.pt").write_bytes(b"")
+    elif fault == "missing_fsdp_config":
+        (actor / "fsdp_config.json").unlink()
+    elif fault == "bad_json":
+        (actor / "fsdp_config.json").write_text("{")
+    elif fault in {"bad_world_size", "bool_world_size"}:
+        (actor / "fsdp_config.json").write_text(json.dumps({"world_size": 0 if fault == "bad_world_size" else True}))
+    elif fault == "missing_hf_config":
+        (hf_dir / "config.json").unlink()
+    elif fault == "missing_tokenizer":
+        (hf_dir / "tokenizer.json").unlink()
+    elif fault == "readonly":
+        monkeypatch.setattr(evaluation.os, "access", lambda *a: False)
+    config = replace(config, force_merge=True)
+    monkeypatch.setattr(evaluation.EvaluationConfig, "from_environment", lambda: config)
+    monkeypatch.setattr(evaluation.subprocess, "run", lambda *a, **k: pytest.fail("Unexpected merger"))
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=lambda **k: pytest.fail("Unexpected inference")))
+    before = _snapshot(actor)
+    assert evaluation.main() == 1
+    assert _snapshot(actor) == before
+    output = capsys.readouterr()
+    assert "[eval] ERROR:" in output.err
+    assert "EVAL_RESULT_JSON=" not in output.out and "[result]" not in output.out
+
+
+@pytest.mark.parametrize("failure", ["exit", "incomplete_weights", "invalid_index"])
+def test_failed_conversion_removes_partial_weights_and_can_retry_on_cpu(inputs, monkeypatch, capsys, failure):
+    config, _, actor, hf_dir = _fsdp_layout(inputs)
+    source_before = _snapshot(actor)
+
+    def fail(command, **kwargs):
+        (hf_dir / "model-00001-of-00002.safetensors").write_bytes(b"partial weights")
+        index = {"weight_map": {"x": "model-00001-of-00002.safetensors", "y": "model-00002-of-00002.safetensors"}}
+        (hf_dir / "model.safetensors.index.json").write_text(json.dumps([] if failure == "invalid_index" else index))
+        if failure == "exit":
+            raise subprocess.CalledProcessError(37, command)
+
+    monkeypatch.setattr(evaluation.subprocess, "run", fail)
+    monkeypatch.setattr(evaluation.EvaluationConfig, "from_environment", lambda: config)
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=lambda **k: pytest.fail("Unexpected inference")))
+    assert evaluation.main() == 1
+    assert _snapshot(actor) == source_before
+    assert "EVAL_RESULT_JSON=" not in capsys.readouterr().out
+
+    def succeed(*args, **kwargs):
+        (hf_dir / "model.safetensors").write_bytes(b"complete mock weights")
+
+    monkeypatch.setattr(evaluation.subprocess, "run", succeed)
+    assert evaluation.prepare_checkpoint(config.model_path) == str(hf_dir)
+
+
+@pytest.mark.parametrize("template", [QWEN_TEMPLATE, DEEPSEEK_TEMPLATE], ids=["qwen3", "deepseek"])
+def test_real_qwen_conversion_preserves_weights_templates_and_eos_on_cpu(inputs, template):
+    import torch
+    from transformers import AutoModelForCausalLM, GenerationConfig, Qwen3Config, Qwen3ForCausalLM
+
+    config, _, actor, hf_dir = _fsdp_layout(inputs, world_size=1)
+    tokenizer = _save_tokenizer(hf_dir, template)
+    model_config = Qwen3Config(
+        vocab_size=len(tokenizer),
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        max_position_embeddings=64,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+        tie_word_embeddings=False,
+        architectures=["Qwen3ForCausalLM"],
+    )
+    model = Qwen3ForCausalLM(model_config).to(torch.bfloat16)
+    expected = model.state_dict()
+    model.config.save_pretrained(hf_dir)
+    model.generation_config.eos_token_id = [tokenizer.eos_token_id, tokenizer.bos_token_id]
+    model.generation_config.save_pretrained(hf_dir)
+    torch.save(expected, actor / "model_world_size_1_rank_0.pt")
+    before = {file.name: file.read_bytes() for file in actor.iterdir() if file.is_file()}
+    assert evaluation.prepare_checkpoint(config.model_path) == str(hf_dir)
+    assert before == {file.name: file.read_bytes() for file in actor.iterdir() if file.is_file()}
+    restored = AutoModelForCausalLM.from_pretrained(hf_dir, local_files_only=True, torch_dtype=torch.bfloat16)
+    assert restored.state_dict().keys() == expected.keys()
+    for name, weight in restored.state_dict().items():
+        torch.testing.assert_close(weight, expected[name], rtol=0, atol=0)
+    merged_tokenizer = evaluation.load_tokenizer(replace(config, model_path=str(hf_dir)))
+    assert merged_tokenizer.get_vocab() == tokenizer.get_vocab()
+    assert merged_tokenizer.chat_template == tokenizer.chat_template
+    assert merged_tokenizer.special_tokens_map == tokenizer.special_tokens_map
+    assert GenerationConfig.from_pretrained(hf_dir).eos_token_id == model.generation_config.eos_token_id
+    for thinking in (True, False):
+        prepared = evaluation.prepare_samples(
+            replace(config, model_path=str(hf_dir), enable_thinking=thinking), merged_tokenizer
+        )
+        for rows in prepared.values():
+            for row in rows:
+                original_ids = tokenizer.apply_chat_template(
+                    build_math_chat_messages(row.sample.problem),
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    enable_thinking=thinking,
+                )
+                assert row.prompt_ids == normalize_token_ids(original_ids)
 
 
 @pytest.mark.parametrize("enable_thinking", [True, False])
@@ -420,6 +667,48 @@ def test_full_evaluation_is_stdout_only_with_no_input_mutation_on_cpu(inputs, mo
         assert f"test-legacy-core/{benchmark}/acc/maj@2/mean" in result["metrics"]
     after = {str(path.relative_to(tmp_path)): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
     assert before == after
+
+
+def test_fsdp_evaluation_loads_and_reports_merged_path_on_cpu(inputs, monkeypatch, capsys):
+    config, tokenizer, _, hf_dir = _fsdp_layout(inputs)
+    engine = _Engine(tokenizer)
+    stages = []
+
+    def merge(*args, **kwargs):
+        stages.append("merge")
+        (hf_dir / "model.safetensors").write_bytes(b"complete mock weights")
+
+    def create_engine(**kwargs):
+        assert stages == ["merge"]
+        assert kwargs["model"] == str(hf_dir) and kwargs["tokenizer"] == str(hf_dir)
+        stages.append("inference")
+        return engine
+
+    monkeypatch.setattr(evaluation.subprocess, "run", merge)
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=create_engine, SamplingParams=SimpleNamespace))
+    monkeypatch.setattr(evaluation, "default_compute_score", _score)
+    result = evaluation.run_evaluation(config)
+    assert stages == ["merge", "inference"]
+    assert result["config"]["model_path"] == str(hf_dir)
+    assert result["config"]["force_merge"] is False
+    assert len(engine.calls) == 2
+    for benchmark in evaluation.BENCHMARKS:
+        assert result["benchmarks"][benchmark]["responses"] == 32
+        assert result["metrics"][f"test-legacy-core/{benchmark}/acc/mean@16"] == 1.0
+    output = capsys.readouterr().out
+    assert output.index("[checkpoint] HF conversion complete") < output.index("[eval] config=")
+    final = next(line for line in output.splitlines() if line.startswith("EVAL_RESULT_JSON="))
+    assert json.loads(final.split("=", 1)[1]) == result
+
+
+@pytest.mark.parametrize("rank_key", ["NODE_RANK", "VC_TASK_INDEX"])
+def test_python_entrypoint_skips_other_nodes_before_loading_config_on_cpu(monkeypatch, rank_key, capsys):
+    monkeypatch.delenv("NODE_RANK", raising=False)
+    monkeypatch.delenv("VC_TASK_INDEX", raising=False)
+    monkeypatch.setenv(rank_key, "1")
+    monkeypatch.setattr(evaluation.EvaluationConfig, "from_environment", lambda: pytest.fail("Unexpected config load"))
+    assert evaluation.main() == 0
+    assert "Skipping standalone evaluation" in capsys.readouterr().out
 
 
 def test_failure_in_second_benchmark_prints_no_formal_results_on_cpu(inputs, monkeypatch, capsys):

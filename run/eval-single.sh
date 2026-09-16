@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Standalone, stdout-only HMMT evaluation in the existing Ascend/verl environment.
 #
-# Required: MODEL_PATH=/absolute/path/to/a/complete/huggingface/checkpoint
+# Required: MODEL_PATH=/path/to/global_step_N, its actor or actor/huggingface,
+# or a complete HF model. Relative paths are resolved from the launch directory.
+# FSDP weights are merged into actor/huggingface and reused on later runs.
+# Set EVAL_FORCE_MERGE=True to regenerate existing HF weights from FSDP shards.
 # Optional: TEST_BENCHMARK_ROOT (default: $DATASET_DIR/datasets/MathArena), CHAT_TEMPLATE_MODEL,
 # ENABLE_THINKING=True, TEST_TEMPERATURE=0.7, TEST_TOP_P=0.95, TEST_TOP_K=-1,
 # TEST_BENCHMARK_N=16, TEST_BENCHMARKS_MAX_RESPONSE_LENGTH=23552, STUDENT_TP=2.
 # For a smoke test, set TEST_BENCHMARK_MAX_SAMPLES=1 and TEST_BENCHMARK_N=2.
-# Results are printed only; vLLM/Ascend may still create their own runtime caches.
+# Results are printed only; checkpoint conversion writes actor/huggingface,
+# and vLLM/Ascend may still create their own runtime caches.
 
 set -x
 
@@ -52,9 +56,10 @@ if (( 10#$NODE_RANK != 0 )); then
     exit 0
 fi
 if [[ -z "${MODEL_PATH:-}" || ! -d "$MODEL_PATH" ]]; then
-    echo "MODEL_PATH must name an existing local Hugging Face checkpoint directory." >&2
+    echo "MODEL_PATH must name an existing local HF or FSDP checkpoint directory." >&2
     exit 2
 fi
+MODEL_PATH=$(cd -- "$MODEL_PATH" && pwd -P) || exit 2
 
 export MODEL_PATH WORKSPACE
 export TEST_BENCHMARK_ROOT=${TEST_BENCHMARK_ROOT:-$DATASET_DIR/datasets/MathArena}
@@ -73,7 +78,7 @@ export LD_PRELOAD=/usr/lib64/libjemalloc.so.2:${LD_PRELOAD}
 . "$HOME"/anaconda3/etc/profile.d/conda.sh
 conda activate verl
 
-cd "$WORKSPACE"
+cd "$WORKSPACE" || exit 1
 pip install -e .
 
 export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-3600}
