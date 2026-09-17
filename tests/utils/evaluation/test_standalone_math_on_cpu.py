@@ -31,6 +31,7 @@ from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.utils.dataset.math_benchmark_dataset import MathBenchmarkDataset
 from verl.utils.evaluation import standalone_math as evaluation
 from verl.utils.evaluation.math_benchmark import EvalSample, build_math_chat_messages
 from verl.utils.reward_score import default_compute_score
@@ -48,6 +49,48 @@ DEEPSEEK_TEMPLATE = (
     "{{ bos_token }}{% for message in messages %}{{ '<｜User｜>' + message['content'] }}{% endfor %}"
     "{% if add_generation_prompt %}{{ '<｜Assistant｜><think>\n' }}{% endif %}"
 )
+SUITE_COUNTS = {"hmmt_feb_2026": 33, "hmmt_nov_2025": 30, "aime24": 30, "aime25": 30, "amc23": 40, "AMO-Bench": 39}
+AMO_DESCRIPTION_IDS = {2, 24, 25, 26, 27, 38, 39, 40, 41, 42, 46}
+
+
+def _write_suite(root, layout="flat"):
+    directories = {}
+    for name, count in SUITE_COUNTS.items():
+        provider = "MathArena" if name.startswith("hmmt") else "meituan-longcat" if name == "AMO-Bench" else "math-ai"
+        directory = root / provider / name if layout != "flat" else root / name
+        directory.mkdir(parents=True, exist_ok=True)
+        directories[name] = directory
+        if name == "AMO-Bench":
+            rows = [
+                {
+                    "question_id": qid,
+                    "prompt": f"Official AMO question {qid}. Use the supplied final-answer format.",
+                    "answer": r"\boxed{4}",
+                    "answer_type": (
+                        "description"
+                        if qid in AMO_DESCRIPTION_IDS
+                        else "variable"
+                        if qid in {5, 37}
+                        else "set"
+                        if qid in {43, 44, 45}
+                        else "number"
+                    ),
+                }
+                for qid in range(1, 51)
+            ]
+        else:
+            prompt_key = "question" if name == "amc23" else "problem"
+            rows = [{"id": str(i), prompt_key: f"Question {i}", "answer": "4"} for i in range(count)]
+        if name == "aime25":
+            (directory / "test.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        else:
+            data_dir = directory / "data" if name.startswith("hmmt") or name == "AMO-Bench" else directory
+            data_dir.mkdir(exist_ok=True)
+            split = "train" if name.startswith("hmmt") else "test"
+            pd.DataFrame(rows).to_parquet(data_dir / f"{split}-00000-of-00001.parquet")
+    # An unrelated dataset must never expand the fixed evaluation suite.
+    (root / "math-ai" / "aime26").mkdir(parents=True, exist_ok=True)
+    return directories
 
 
 @pytest.fixture(autouse=True)
@@ -117,6 +160,8 @@ def test_legacy_defaults_match_training_profile_on_cpu():
     assert config.dataset_root == str(REPO_ROOT / "dataset")
     assert config.seed == 0
     assert not config.force_merge
+    assert not config.eval_all
+    assert config.benchmarks == evaluation.BENCHMARKS
 
 
 def test_existing_environment_overrides_and_context_precedence_on_cpu():
@@ -176,6 +221,7 @@ def test_existing_environment_overrides_and_context_precedence_on_cpu():
         {"TEST_DO_SAMPLE": "sometimes"},
         {"ENABLE_THINKING": "sometimes"},
         {"EVAL_FORCE_MERGE": "sometimes"},
+        {"EVAL_ALL": "2"},
         {"STUDENT_TP": "0"},
         {"STUDENT_GPU_MEM_UTIL": "2"},
         {"TEST_BENCHMARK_MAX_SAMPLES": "0"},
@@ -193,6 +239,111 @@ def test_invalid_configuration_fails_on_cpu(override):
 def test_missing_model_environment_fails_on_cpu():
     with pytest.raises(ValueError, match="MODEL_PATH"):
         evaluation.EvaluationConfig.from_environment({})
+
+
+@pytest.mark.parametrize(
+    ("value", "enabled"), [("", False), ("0", False), ("1", True), ("False", False), ("True", True)]
+)
+def test_eval_all_environment_selects_fixed_suite_on_cpu(value, enabled):
+    config = evaluation.EvaluationConfig.from_environment({"MODEL_PATH": "/local/model", "EVAL_ALL": value})
+    assert config.eval_all is enabled
+    assert config.benchmarks == (tuple(SUITE_COUNTS) if enabled else tuple(SUITE_COUNTS)[:2])
+
+
+@pytest.mark.parametrize("layout", ["flat", "provider", "legacy_matharena"])
+@pytest.mark.parametrize("eval_all", [False, True])
+def test_suite_paths_and_prompts_match_training_on_cpu(inputs, layout, eval_all):
+    config, tokenizer = inputs
+    root = Path(config.dataset_root)
+    directories = _write_suite(root, layout)
+    config = replace(
+        config, eval_all=eval_all, dataset_root=str(root / "MathArena" if layout == "legacy_matharena" else root)
+    )
+    paths = evaluation.resolve_benchmark_dirs(config)
+    assert paths == {name: directories[name] for name in config.benchmarks}
+    prepared = evaluation.prepare_samples(config, tokenizer)
+    assert {name: len(rows) for name, rows in prepared.items()} == {
+        name: SUITE_COUNTS[name] for name in config.benchmarks
+    }
+    training = MathBenchmarkDataset(
+        dataset_root=root, benchmarks=[str(path.relative_to(root)) for path in paths.values()]
+    )
+    rows = [row for group in prepared.values() for row in group]
+    assert len(training) == len(rows)
+    for row, reference in zip(rows, training, strict=True):
+        expected_ids = tokenizer.apply_chat_template(
+            reference["raw_prompt"], tokenize=True, add_generation_prompt=True, enable_thinking=True
+        )
+        assert row.prompt_ids == normalize_token_ids(expected_ids)
+        assert row.uid == reference["uid"]
+        assert row.sample.ground_truth == reference["reward_model"]["ground_truth"]
+        assert row.sample.benchmark in config.benchmarks
+        if row.sample.benchmark == "AMO-Bench":
+            assert reference["raw_prompt"] == [{"role": "user", "content": row.sample.problem}]
+            assert row.sample.question_id not in AMO_DESCRIPTION_IDS
+            for name in ("question_id", "answer_type", "grader"):
+                assert getattr(row.sample, name) == reference["extra_info"][name]
+    limited = evaluation.prepare_samples(replace(config, max_samples=1), tokenizer)
+    assert all(len(rows) == 1 for rows in limited.values())
+
+
+def test_provider_directory_with_missing_data_does_not_fall_back_on_cpu(inputs):
+    config, tokenizer = inputs
+    provider_path = Path(config.dataset_root) / "MathArena" / "hmmt_feb_2026"
+    provider_path.mkdir(parents=True)
+    with pytest.raises(FileNotFoundError, match="No local jsonl/parquet"):
+        evaluation.prepare_samples(config, tokenizer)
+
+
+def test_missing_selected_benchmark_stops_before_inference_on_cpu(inputs, monkeypatch, capsys):
+    config, tokenizer = inputs
+    assert tuple(evaluation.prepare_samples(config, tokenizer)) == evaluation.BENCHMARKS
+    monkeypatch.setattr(evaluation.EvaluationConfig, "from_environment", lambda: replace(config, eval_all=True))
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=lambda **k: pytest.fail("Unexpected inference")))
+    assert evaluation.main() == 1
+    captured = capsys.readouterr()
+    assert "Missing benchmark aime24" in captured.err
+    assert "EVAL_RESULT_JSON=" not in captured.out and "[result]" not in captured.out
+
+
+@pytest.mark.parametrize("field", ["question_id", "answer_type", "grader"])
+def test_missing_amo_scoring_metadata_stops_before_inference_on_cpu(inputs, monkeypatch, capsys, field):
+    config, _ = inputs
+    _write_suite(Path(config.dataset_root))
+    loader = evaluation.load_benchmark_samples
+
+    def invalid_metadata(root, benchmark, **kwargs):
+        samples = loader(root, benchmark, **kwargs)
+        if benchmark == "AMO-Bench":
+            samples[0] = replace(samples[0], **{field: None})
+        return samples
+
+    monkeypatch.setattr(evaluation, "load_benchmark_samples", invalid_metadata)
+    monkeypatch.setattr(evaluation.EvaluationConfig, "from_environment", lambda: replace(config, eval_all=True))
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=lambda **k: pytest.fail("Unexpected inference")))
+    assert evaluation.main() == 1
+    captured = capsys.readouterr()
+    assert "AMO-Bench:1 requires" in captured.err
+    assert "EVAL_RESULT_JSON=" not in captured.out
+
+
+def test_local_six_benchmarks_have_expected_counts_and_fit_qwen_budget_on_cpu(inputs):
+    root = REPO_ROOT / "dataset"
+    if not all((root / name).is_dir() for name in SUITE_COUNTS):
+        pytest.skip("The local math benchmark suite is not available.")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", local_files_only=True)
+    except OSError:
+        pytest.skip("Qwen3-0.6B tokenizer is not cached locally.")
+    config, _ = inputs
+    config = replace(config, dataset_root=str(root), eval_all=True)
+    prepared = evaluation.prepare_samples(config, tokenizer)
+    assert {name: len(rows) for name, rows in prepared.items()} == SUITE_COUNTS
+    assert sum(len(rows) for rows in prepared.values()) * config.rollout_n == 3232
+    assert sum(len(prepared[name]) for name in evaluation.BENCHMARKS) * config.rollout_n == 1008
+    amo = [row.sample for row in prepared["AMO-Bench"]]
+    assert {sample.answer_type for sample in amo} == {"number", "set", "variable"}
+    assert all(sample.question_id not in AMO_DESCRIPTION_IDS and sample.grader == "amo_bench" for sample in amo)
 
 
 def test_checkpoint_validation_checks_every_indexed_shard_on_cpu(inputs):
@@ -626,9 +777,11 @@ def test_real_scoring_and_aggregation_match_training_on_cpu():
     assert evaluation.aggregate_metrics(uids, benchmark, infos) == reference_metrics
 
 
-def test_full_evaluation_is_stdout_only_with_no_input_mutation_on_cpu(inputs, monkeypatch, capsys, tmp_path):
+@pytest.mark.parametrize("eval_all", [False, True])
+def test_full_evaluation_is_stdout_only_with_no_input_mutation_on_cpu(inputs, monkeypatch, capsys, tmp_path, eval_all):
     config, tokenizer = inputs
-    config = replace(config, rollout_n=2)
+    config = replace(config, eval_all=eval_all)
+    directories = _write_suite(Path(config.dataset_root))
     engine = _Engine(tokenizer)
     monkeypatch.setitem(
         sys.modules, "vllm", SimpleNamespace(LLM=lambda **kwargs: engine, SamplingParams=SimpleNamespace)
@@ -658,15 +811,64 @@ def test_full_evaluation_is_stdout_only_with_no_input_mutation_on_cpu(inputs, mo
     output = capsys.readouterr().out
     final_lines = [line for line in output.splitlines() if line.startswith("EVAL_RESULT_JSON=")]
     assert len(final_lines) == 1 and json.loads(final_lines[0].split("=", 1)[1]) == result
-    assert len(engine.calls) == 2
+    assert len(engine.calls) == len(config.benchmarks)
     assert result["config"]["bootstrap_seed"] == 42
-    for benchmark in evaluation.BENCHMARKS:
-        assert result["benchmarks"][benchmark]["questions"] == 2
-        assert result["benchmarks"][benchmark]["responses"] == 4
-        assert result["metrics"][f"test-legacy-core/{benchmark}/acc/mean@2"] == 1.0
-        assert f"test-legacy-core/{benchmark}/acc/maj@2/mean" in result["metrics"]
+    assert result["config"]["eval_all"] is eval_all
+    assert result["config"]["benchmarks"] == list(config.benchmarks)
+    assert result["config"]["benchmark_dirs"] == {name: str(directories[name]) for name in config.benchmarks}
+    assert tuple(result["benchmarks"]) == config.benchmarks
+    assert sum(len(prompts) for prompts, _ in engine.calls) == (3232 if eval_all else 1008)
+    for benchmark, (prompts, params) in zip(config.benchmarks, engine.calls, strict=True):
+        assert result["benchmarks"][benchmark]["questions"] == SUITE_COUNTS[benchmark]
+        assert result["benchmarks"][benchmark]["responses"] == len(prompts) == SUITE_COUNTS[benchmark] * 16
+        assert all(param.n == 1 and param.temperature == 0.7 and param.top_p == 0.95 for param in params)
+        assert result["metrics"][f"test-legacy-core/{benchmark}/acc/mean@16"] == 1.0
+        assert f"test-legacy-core/{benchmark}/acc/maj@16/mean" in result["metrics"]
     after = {str(path.relative_to(tmp_path)): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
     assert before == after
+
+
+@pytest.mark.parametrize(
+    ("question_id", "ground_truth", "text", "expected"),
+    [
+        (1, "42", r"### The final answer is: $\boxed{42}$", 1.0),
+        (43, r"\{1,2\}", r"### The final answer is: $\boxed{\{2,1\}}$", 1.0),
+        (5, "n+1", r"### The final answer is: $\boxed{1+n}$", 1.0),
+        (37, "a+b+c", r"### The final answer is: $\boxed{c+b+a}$", 1.0),
+        (1, "42", r"<think>\boxed{42}</think> No final answer.", 0.0),
+    ],
+)
+def test_amo_scoring_matches_training_route_on_cpu(inputs, monkeypatch, question_id, ground_truth, text, expected):
+    config, _ = inputs
+    root = Path(config.dataset_root)
+    _write_suite(root)
+    training = MathBenchmarkDataset(dataset_root=root, benchmarks=["AMO-Bench"])
+    reference_row = next(row for row in training if row["extra_info"]["question_id"] == question_id)
+    metadata = reference_row["extra_info"]
+    sample = EvalSample(
+        "AMO-Bench",
+        str(question_id),
+        reference_row["raw_prompt"][0]["content"],
+        ground_truth,
+        question_id=question_id,
+        answer_type=metadata["answer_type"],
+        grader=metadata["grader"],
+        use_raw_prompt=True,
+    )
+    dispatched = {}
+
+    def score(**kwargs):
+        dispatched.update(kwargs)
+        return default_compute_score(**kwargs)
+
+    monkeypatch.setattr(evaluation, "default_compute_score", score)
+    result = evaluation.score_response(SimpleNamespace(decode=lambda *args, **kwargs: text), [1], sample)
+    reference = default_compute_score(reference_row["data_source"], text, ground_truth, extra_info=metadata)
+    assert dispatched["extra_info"] == {
+        key: metadata[key] for key in ("reward_data_source", "question_id", "answer_type", "grader")
+    }
+    assert result == {**reference, "reward": float(reference["score"])}
+    assert result["score"] == expected
 
 
 def test_fsdp_evaluation_loads_and_reports_merged_path_on_cpu(inputs, monkeypatch, capsys):
@@ -711,17 +913,21 @@ def test_python_entrypoint_skips_other_nodes_before_loading_config_on_cpu(monkey
     assert "Skipping standalone evaluation" in capsys.readouterr().out
 
 
-def test_failure_in_second_benchmark_prints_no_formal_results_on_cpu(inputs, monkeypatch, capsys):
+@pytest.mark.parametrize("eval_all", [False, True])
+def test_failure_in_last_benchmark_prints_no_formal_results_on_cpu(inputs, monkeypatch, capsys, eval_all):
     config, tokenizer = inputs
+    config = replace(config, eval_all=eval_all)
+    if eval_all:
+        _write_suite(Path(config.dataset_root))
     engine = _Engine(tokenizer)
     generate = engine.generate
 
-    def fail_second(*args, **kwargs):
-        if engine.calls:
-            raise RuntimeError("second benchmark failed")
+    def fail_last(*args, **kwargs):
+        if len(engine.calls) == len(config.benchmarks) - 1:
+            raise RuntimeError("last benchmark failed")
         return generate(*args, **kwargs)
 
-    monkeypatch.setattr(engine, "generate", fail_second)
+    monkeypatch.setattr(engine, "generate", fail_last)
     monkeypatch.setitem(
         sys.modules, "vllm", SimpleNamespace(LLM=lambda **kwargs: engine, SamplingParams=SimpleNamespace)
     )
@@ -729,5 +935,5 @@ def test_failure_in_second_benchmark_prints_no_formal_results_on_cpu(inputs, mon
     monkeypatch.setattr(evaluation.EvaluationConfig, "from_environment", lambda: config)
     assert evaluation.main() == 1
     captured = capsys.readouterr()
-    assert "second benchmark failed" in captured.err
+    assert "last benchmark failed" in captured.err
     assert "[result]" not in captured.out and "EVAL_RESULT_JSON=" not in captured.out

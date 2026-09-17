@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Evaluate local HF or FSDP checkpoints on HMMT with the training legacy math protocol.
+"""Evaluate local HF or FSDP checkpoints with the training legacy math protocol.
 
 Run with ``MODEL_PATH=/local/checkpoint python -B -u -m verl.utils.evaluation.standalone_math``
 in an existing vLLM environment. The Ascend launcher is ``run/eval-single.sh``.
 FSDP inputs are merged into actor/huggingface when weights are missing; set
 EVAL_FORCE_MERGE=True to rebuild existing weights. Evaluation output uses only stdout.
 Framework runtime caches are allowed.
+By default only HMMT is evaluated; EVAL_ALL=1 adds AIME24/25, AMC23 and AMO-Bench-P.
 """
 
 from __future__ import annotations
@@ -36,12 +37,25 @@ from typing import Any
 
 from verl.trainer.ppo.metric_utils import process_validation_metrics
 from verl.utils.chat_template import apply_chat_template
-from verl.utils.evaluation.math_benchmark import EvalSample, build_math_chat_messages, load_benchmark_samples
+from verl.utils.evaluation.math_benchmark import (
+    AMO_BENCH_P_ANSWER_TYPES,
+    EvalSample,
+    build_math_chat_messages,
+    load_benchmark_samples,
+)
 from verl.utils.reward_score import default_compute_score
 from verl.utils.reward_score.reward_extra import collate_reward_extra_infos
 from verl.utils.tokenizer import hf_tokenizer, normalize_token_ids
 
 BENCHMARKS = ("hmmt_feb_2026", "hmmt_nov_2025")
+BENCHMARK_PATHS = {
+    "hmmt_feb_2026": "MathArena/hmmt_feb_2026",
+    "hmmt_nov_2025": "MathArena/hmmt_nov_2025",
+    "aime24": "math-ai/aime24",
+    "aime25": "math-ai/aime25",
+    "amc23": "math-ai/amc23",
+    "AMO-Bench": "meituan-longcat/AMO-Bench",
+}
 METRIC_PREFIX = "test-legacy"
 HF_WEIGHT_FILES = (
     "model.safetensors",
@@ -89,6 +103,12 @@ class EvaluationConfig:
     seed: int = 0
     enforce_eager: bool = False
     force_merge: bool = False
+    eval_all: bool = False
+
+    @property
+    def benchmarks(self) -> tuple[str, ...]:
+        """Keep HMMT first, optionally followed by the four training math benchmarks."""
+        return tuple(BENCHMARK_PATHS) if self.eval_all else BENCHMARKS
 
     def __post_init__(self) -> None:
         for name in (
@@ -127,9 +147,9 @@ class EvaluationConfig:
         if not model_path:
             raise ValueError("MODEL_PATH is required and must name a local HF or FSDP checkpoint directory.")
         if _env_bool(env, "ENABLE_TOOL_CALL", False) or _env_bool(env, "SOD_STYLE", False):
-            raise ValueError("Standalone HMMT evaluation requires ENABLE_TOOL_CALL=False and SOD_STYLE=False.")
+            raise ValueError("Standalone math evaluation requires ENABLE_TOOL_CALL=False and SOD_STYLE=False.")
         if _env_value(env, "TEST_BENCHMARK_REWARD_DATA_SOURCE", default="math_verify") != "math_verify":
-            raise ValueError("Standalone HMMT evaluation requires TEST_BENCHMARK_REWARD_DATA_SOURCE=math_verify.")
+            raise ValueError("Standalone math evaluation requires TEST_BENCHMARK_REWARD_DATA_SOURCE=math_verify.")
         prompt_length = int(_env_value(env, "MAX_PROMPT_LENGTH", default=1024))
         response_length = int(_env_value(env, "MAX_RESPONSE_LENGTH", default=23552))
         default_context = prompt_length + response_length + 1
@@ -171,6 +191,7 @@ class EvaluationConfig:
             seed=int(_env_value(env, "EVAL_SEED", default=0)),
             enforce_eager=_env_bool(env, "ROLLOUT_ENFORCE_EAGER", False),
             force_merge=_env_bool(env, "EVAL_FORCE_MERGE", False),
+            eval_all=_env_bool(env, "EVAL_ALL", False),
         )
 
 
@@ -338,17 +359,54 @@ class PreparedSample:
         return f"{self.sample.benchmark}:{self.sample.sample_id}"
 
 
-def prepare_samples(config: EvaluationConfig, tokenizer) -> dict[str, list[PreparedSample]]:
-    """Read and tokenize both datasets before starting the inference engine, without truncating questions."""
+def resolve_benchmark_dirs(config: EvaluationConfig) -> dict[str, Path]:
+    """Resolve selected datasets in provider, flat, or legacy MathArena-root layouts."""
+    root = Path(config.dataset_root).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"TEST_BENCHMARK_ROOT must be a local dataset directory: {root}")
+    # Older standalone launchers pointed directly at datasets/MathArena.
+    common_root = root.parent if root.name == "MathArena" else root
+    directories = {}
+    for benchmark in config.benchmarks:
+        candidates = list(dict.fromkeys((common_root / BENCHMARK_PATHS[benchmark], root / benchmark)))
+        directory = next((path for path in candidates if path.is_dir()), None)
+        if directory is None:
+            raise FileNotFoundError(f"Missing benchmark {benchmark}; tried: {', '.join(map(str, candidates))}")
+        directories[benchmark] = directory
+    return directories
+
+
+def _validate_scoring_metadata(sample: EvalSample) -> None:
+    if sample.benchmark == "AMO-Bench" or sample.grader == "amo_bench":
+        question_id = str(sample.question_id)
+        if (
+            sample.grader != "amo_bench"
+            or sample.answer_type not in AMO_BENCH_P_ANSWER_TYPES
+            or not re.fullmatch(r"[0-9]+", question_id)
+            or int(question_id) <= 0
+        ):
+            raise ValueError(
+                f"AMO-Bench:{sample.sample_id} requires grader='amo_bench', a positive integer question_id "
+                "and answer_type=number/set/variable."
+            )
+
+
+def prepare_samples(
+    config: EvaluationConfig, tokenizer, *, benchmark_dirs: Mapping[str, Path] | None = None
+) -> dict[str, list[PreparedSample]]:
+    """Read and tokenize selected datasets before starting inference, without truncating questions."""
+    benchmark_dirs = resolve_benchmark_dirs(config) if benchmark_dirs is None else benchmark_dirs
     prepared = {}
-    for benchmark in BENCHMARKS:
-        samples = load_benchmark_samples(config.dataset_root, benchmark, max_samples=config.max_samples)
+    for benchmark in config.benchmarks:
+        # Pass the short name to the loader so metrics and question IDs match training.
+        samples = load_benchmark_samples(benchmark_dirs[benchmark].parent, benchmark, max_samples=config.max_samples)
         if not samples:
             raise ValueError(f"No evaluation questions found for {benchmark}.")
         if len({sample.sample_id for sample in samples}) != len(samples):
             raise ValueError(f"Duplicate question IDs in {benchmark}.")
         rows = []
         for index, sample in enumerate(samples):
+            _validate_scoring_metadata(sample)
             messages = build_math_chat_messages(sample.problem, index, use_raw_prompt=sample.use_raw_prompt)
             prompt_ids = normalize_token_ids(
                 apply_chat_template(
@@ -422,11 +480,16 @@ def engine_kwargs(config: EvaluationConfig) -> dict[str, Any]:
 def score_response(tokenizer, token_ids: list[int], sample: EvalSample) -> dict[str, Any]:
     """Score the complete generated text with the same math_verify dispatcher as training."""
     text = tokenizer.decode(token_ids, skip_special_tokens=True)
+    extra_info: dict[str, Any] = {"reward_data_source": "math_verify"}
+    for name in ("question_id", "answer_type", "grader"):
+        value = getattr(sample, name)
+        if value is not None:
+            extra_info[name] = value
     result = default_compute_score(
         data_source=sample.benchmark,
         solution_str=text,
         ground_truth=sample.ground_truth,
-        extra_info={"reward_data_source": "math_verify"},
+        extra_info=extra_info,
     )
     score = float(result["score"])
     if not math.isfinite(score):
@@ -503,7 +566,7 @@ def evaluate_benchmark(
 
 
 def run_evaluation(config: EvaluationConfig) -> dict[str, Any]:
-    """Run both HMMT benchmarks and print a final JSON result only after both complete."""
+    """Evaluate the selected suite and print a final JSON result only after every benchmark completes."""
     for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "VLLM_NO_USAGE_STATS"):
         os.environ[name] = "1"
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -515,9 +578,12 @@ def run_evaluation(config: EvaluationConfig) -> dict[str, Any]:
 
     config = replace(config, model_path=prepare_checkpoint(config.model_path, force_merge=config.force_merge))
     tokenizer = load_tokenizer(config)
-    prepared = prepare_samples(config, tokenizer)
+    benchmark_dirs = resolve_benchmark_dirs(config)
+    prepared = prepare_samples(config, tokenizer, benchmark_dirs=benchmark_dirs)
     resolved = {
         **asdict(config),
+        "benchmarks": list(config.benchmarks),
+        "benchmark_dirs": {name: str(path) for name, path in benchmark_dirs.items()},
         "dtype": "bfloat16",
         "repetition_penalty": 1.0,
         "reward_data_source": "math_verify",

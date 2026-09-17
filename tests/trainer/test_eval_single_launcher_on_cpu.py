@@ -26,7 +26,15 @@ LAUNCHER = REPO_ROOT / "run/eval-single.sh"
 @pytest.fixture
 def launcher_env(tmp_path):
     env = os.environ.copy()
-    for key in ("NODE_RANK", "VC_TASK_INDEX", "MODEL_PATH", "TEST_BENCHMARK_ROOT", "LD_PRELOAD", "BASH_ENV"):
+    for key in (
+        "NODE_RANK",
+        "VC_TASK_INDEX",
+        "MODEL_PATH",
+        "TEST_BENCHMARK_ROOT",
+        "EVAL_ALL",
+        "LD_PRELOAD",
+        "BASH_ENV",
+    ):
         env.pop(key, None)
     env.update(TRAIN_CONFIG_PATH=str(tmp_path / "missing.config"), WORKSPACE=str(tmp_path), ULIMIT_NOFILE="1024")
     return env
@@ -63,15 +71,17 @@ def test_failed_external_configuration_stops_launch_on_cpu(launcher_env, tmp_pat
 
 
 @pytest.mark.parametrize("override", [False, True])
-def test_launcher_matharena_dataset_root_before_npu_setup_on_cpu(launcher_env, tmp_path, override):
+def test_launcher_dataset_root_before_npu_setup_on_cpu(launcher_env, tmp_path, override):
     import pandas as pd
 
     from verl.utils.evaluation.math_benchmark import load_benchmark_samples
+    from verl.utils.evaluation.standalone_math import EvaluationConfig, resolve_benchmark_dirs
 
     dataset_dir = tmp_path / "server mount"
-    expected_root = tmp_path / "custom datasets" if override else dataset_dir / "datasets" / "MathArena"
+    expected_root = tmp_path / "custom datasets" if override else dataset_dir / "datasets"
     for benchmark in ("hmmt_feb_2026", "hmmt_nov_2025"):
-        data_dir = expected_root / benchmark / "data"
+        benchmark_root = expected_root if override else expected_root / "MathArena"
+        data_dir = benchmark_root / benchmark / "data"
         data_dir.mkdir(parents=True)
         pd.DataFrame([{"problem_idx": 1, "problem": benchmark, "answer": "4"}]).to_parquet(
             data_dir / "train-00000-of-00001.parquet"
@@ -92,16 +102,18 @@ def test_launcher_matharena_dataset_root_before_npu_setup_on_cpu(launcher_env, t
     root_line = next(line for line in result.stdout.splitlines() if line.startswith("RESOLVED_ROOT="))
     resolved_root = root_line.split("=", 1)[1]
     assert resolved_root == str(expected_root)
-    for benchmark in ("hmmt_feb_2026", "hmmt_nov_2025"):
-        samples = load_benchmark_samples(resolved_root, benchmark)
+    benchmark_dirs = resolve_benchmark_dirs(EvaluationConfig(str(model), resolved_root))
+    for benchmark, directory in benchmark_dirs.items():
+        samples = load_benchmark_samples(directory.parent, benchmark)
         assert len(samples) == 1
         assert samples[0].benchmark == benchmark
         assert samples[0].problem == benchmark
 
 
 @pytest.mark.parametrize("engine_exit_code", [0, 37])
+@pytest.mark.parametrize("eval_all_source", ["default", "environment", "external_config"])
 def test_launcher_resolves_relative_model_before_cd_and_propagates_status_on_cpu(
-    launcher_env, tmp_path, engine_exit_code
+    launcher_env, tmp_path, engine_exit_code, eval_all_source
 ):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -113,6 +125,7 @@ def test_launcher_resolves_relative_model_before_cd_and_propagates_status_on_cpu
             "  printf 'MODEL_PATH=%s\\nROOT=%s\\nNO_PYC=%s\\nOFFLINE=%s\\nFORCE_MERGE=%s\\nWORKDIR=%s\\n' "
             '"$MODEL_PATH" "$TEST_BENCHMARK_ROOT" "$PYTHONDONTWRITEBYTECODE" "$HF_HUB_OFFLINE" '
             '"$EVAL_FORCE_MERGE" "$PWD"\n'
+            "  printf 'EVAL_ALL=%s\\n' \"$EVAL_ALL\"\n"
             f"  exit {engine_exit_code}\nfi\n"
         ),
         # The user's launch template includes pip; stub it to avoid an actual install.
@@ -144,7 +157,10 @@ def test_launcher_resolves_relative_model_before_cd_and_propagates_status_on_cpu
     train_config.write_text(
         "MODEL_PATH='../model with spaces/global_step_217'\nNODE_RANK=0\nEVAL_FORCE_MERGE=True\n"
         f"WORKSPACE={shlex.quote(str(workspace))}\nDATASET_DIR={shlex.quote(str(tmp_path))}\n"
+        + ("EVAL_ALL=1\n" if eval_all_source == "external_config" else "")
     )
+    if eval_all_source != "default":
+        launcher_env["EVAL_ALL"] = "0" if eval_all_source == "external_config" else "1"
     launcher_env.update(
         PATH=str(bin_dir) + os.pathsep + launcher_env["PATH"],
         BASH_ENV=str(bootstrap),
@@ -157,9 +173,10 @@ def test_launcher_resolves_relative_model_before_cd_and_propagates_status_on_cpu
     assert "CONDA:activate verl" in result.stdout
     assert "PYTHON:-m verl.utils.evaluation.standalone_math" in result.stdout
     assert f"MODEL_PATH={model.resolve()}" in result.stdout
-    assert f"ROOT={tmp_path / 'datasets' / 'MathArena'}" in result.stdout
+    assert f"ROOT={tmp_path / 'datasets'}" in result.stdout
     assert "NO_PYC=1\nOFFLINE=1" in result.stdout
     assert "FORCE_MERGE=True" in result.stdout
+    assert f"EVAL_ALL={0 if eval_all_source == 'default' else 1}" in result.stdout
     assert f"WORKDIR={workspace}" in result.stdout
     assert "ERROR:" not in result.stderr
     after = {str(path.relative_to(tmp_path)): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}

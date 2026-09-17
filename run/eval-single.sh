@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Standalone, stdout-only HMMT evaluation in the existing Ascend/verl environment.
+# Standalone math evaluation in the existing Ascend/verl environment; results use stdout only.
 #
 # Required: MODEL_PATH=/path/to/global_step_N, its actor or actor/huggingface,
 # or a complete HF model. Relative paths are resolved from the launch directory.
 # FSDP weights are merged into actor/huggingface and reused on later runs.
 # Set EVAL_FORCE_MERGE=True to regenerate existing HF weights from FSDP shards.
-# Optional: TEST_BENCHMARK_ROOT (default: $DATASET_DIR/datasets/MathArena), CHAT_TEMPLATE_MODEL,
+# EVAL_ALL=0 (default): HMMT Feb 2026 and Nov 2025. EVAL_ALL=1 additionally evaluates
+# AIME24, AIME25, AMC23 and the 39-question AMO-Bench-P subset, in that order.
+# Optional: TEST_BENCHMARK_ROOT (default: $DATASET_DIR/datasets), CHAT_TEMPLATE_MODEL,
+# Provider directories, flat layouts and the older datasets/MathArena root are supported.
 # ENABLE_THINKING=True, TEST_TEMPERATURE=0.7, TEST_TOP_P=0.95, TEST_TOP_K=-1,
 # TEST_BENCHMARK_N=16, TEST_BENCHMARKS_MAX_RESPONSE_LENGTH=23552, STUDENT_TP=2.
 # For a smoke test, set TEST_BENCHMARK_MAX_SAMPLES=1 and TEST_BENCHMARK_N=2.
@@ -62,7 +65,8 @@ fi
 MODEL_PATH=$(cd -- "$MODEL_PATH" && pwd -P) || exit 2
 
 export MODEL_PATH WORKSPACE
-export TEST_BENCHMARK_ROOT=${TEST_BENCHMARK_ROOT:-$DATASET_DIR/datasets/MathArena}
+export EVAL_ALL=${EVAL_ALL:-0}
+export TEST_BENCHMARK_ROOT=${TEST_BENCHMARK_ROOT:-$DATASET_DIR/datasets}
 export PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 export VLLM_NO_USAGE_STATS=1
