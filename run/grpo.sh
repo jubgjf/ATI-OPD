@@ -224,6 +224,168 @@ print_command() {
     printf '\n'
 }
 
+prepare_deepseek_distill_agent_loop_compat() {
+    local compat_dir=${GRPO_COMPAT_DIR:-$OUTPUT_ROOT/runtime_compat/verl-ea532913-grpo}
+    local module_path=$compat_dir/verl_grpo_deepseek_distill_compat.py
+    local config_path=$compat_dir/deepseek_distill_agent_loop.yaml
+
+    mkdir -p "$compat_dir"
+    python3 - "$module_path" "$config_path" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+module_path = Path(sys.argv[1])
+config_path = Path(sys.argv[2])
+
+module_source = '''\
+"""DeepSeek-R1-Distill-Qwen adapter for verl's Continuous Token dispatch."""
+
+from typing import Any
+
+from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
+
+
+class DeepSeekDistillSingleTurnAgentLoop(SingleTurnAgentLoop):
+    """Select DeepSeek boundaries for a Qwen2-architecture distillation model."""
+
+    def __init__(self, *args: Any, hf_model_type: str | None = None, **kwargs: Any) -> None:
+        del hf_model_type
+        super().__init__(*args, hf_model_type="deepseek_v3", **kwargs)
+'''
+
+config_source = '''\
+- name: deepseek_distill_single_turn_agent
+  _target_: verl_grpo_deepseek_distill_compat.DeepSeekDistillSingleTurnAgentLoop
+'''
+
+
+def write_if_changed(path: Path, content: str) -> None:
+    if path.is_file() and path.read_text(encoding="utf-8") == content:
+        return
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary_path.write_text(content, encoding="utf-8")
+    os.replace(temporary_path, path)
+
+
+write_if_changed(module_path, module_source)
+write_if_changed(config_path, config_source)
+PY
+
+    DEEPSEEK_AGENT_LOOP_CONFIG=$config_path
+    GRPO_RAY_PYTHONPATH=$compat_dir
+    if [[ -n "${PYTHONPATH:-}" ]]; then
+        GRPO_RAY_PYTHONPATH+=":$PYTHONPATH"
+    fi
+    export PYTHONPATH=$GRPO_RAY_PYTHONPATH
+
+    python3 - "$MODEL_PATH" "$config_path" <<'PY'
+import hydra
+import importlib
+import sys
+
+from omegaconf import OmegaConf
+from transformers import AutoTokenizer
+from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
+from verl.utils.tokenizer.continuous_token import DeepSeekContinuousTokenBuilder
+from verl.utils.tokenizer.continuous_token_wiring import create_continuous_token_builder
+
+model_path, agent_loop_config_path = sys.argv[1:]
+compat_module = importlib.import_module("verl_grpo_deepseek_distill_compat")
+loop_cls = compat_module.DeepSeekDistillSingleTurnAgentLoop
+
+captured = {}
+original_init = SingleTurnAgentLoop.__init__
+
+
+def capture_init(self, *args, **kwargs):
+    del self, args
+    captured.update(kwargs)
+
+
+SingleTurnAgentLoop.__init__ = capture_init
+try:
+    agent_loop_configs = OmegaConf.load(agent_loop_config_path)
+    if len(agent_loop_configs) != 1:
+        raise RuntimeError(f"Expected exactly one compatibility agent loop, got {len(agent_loop_configs)}")
+    configured_loop = hydra.utils.instantiate(agent_loop_configs[0], hf_model_type="qwen2")
+finally:
+    SingleTurnAgentLoop.__init__ = original_init
+
+if not isinstance(configured_loop, loop_cls):
+    raise RuntimeError(f"Unexpected compatibility loop class: {type(configured_loop).__name__}")
+if captured.get("hf_model_type") != "deepseek_v3":
+    raise RuntimeError(f"DeepSeek agent-loop adapter did not override builder routing: {captured}")
+
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
+try:
+    create_continuous_token_builder(tokenizer, hf_model_type="qwen2")
+except ValueError as error:
+    if "<|im_end|>" not in str(error):
+        raise
+else:
+    raise RuntimeError("Pinned verl unexpectedly accepted the DeepSeek tokenizer as Qwen ChatML")
+
+builder = create_continuous_token_builder(tokenizer, hf_model_type=captured["hf_model_type"])
+if not isinstance(builder, DeepSeekContinuousTokenBuilder):
+    raise RuntimeError(f"Expected DeepSeekContinuousTokenBuilder, got {type(builder).__name__}")
+
+messages = [{"role": "user", "content": "Continuous-token compatibility probe"}]
+expected = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+if hasattr(expected, "input_ids"):
+    expected = expected.input_ids
+if hasattr(expected, "tolist"):
+    expected = expected.tolist()
+if expected and isinstance(expected[0], list):
+    expected = expected[0]
+actual = builder.build_initial_tokens(messages)
+if actual != list(expected):
+    raise RuntimeError("DeepSeek compatibility builder changed the initial chat-template token ids")
+
+print(
+    "GRPO continuous-token compatibility:",
+    {
+        "agent_loop": "deepseek_distill_single_turn_agent",
+        "builder": type(builder).__name__,
+        "forced_protocol_model_type": captured["hf_model_type"],
+        "prompt_tokens": len(actual),
+    },
+)
+PY
+}
+
+verify_chatml_continuous_token_builder() {
+    python3 - "$MODEL_PATH" <<'PY'
+import sys
+
+from transformers import AutoTokenizer
+from verl.utils.tokenizer.continuous_token import QwenContinuousTokenBuilder
+from verl.utils.tokenizer.continuous_token_wiring import create_continuous_token_builder
+
+tokenizer = AutoTokenizer.from_pretrained(sys.argv[1], trust_remote_code=False)
+builder = create_continuous_token_builder(tokenizer, hf_model_type="qwen2")
+if not isinstance(builder, QwenContinuousTokenBuilder):
+    raise RuntimeError(f"Expected QwenContinuousTokenBuilder, got {type(builder).__name__}")
+
+messages = [{"role": "user", "content": "Continuous-token compatibility probe"}]
+expected = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+if hasattr(expected, "input_ids"):
+    expected = expected.input_ids
+if hasattr(expected, "tolist"):
+    expected = expected.tolist()
+if expected and isinstance(expected[0], list):
+    expected = expected[0]
+actual = builder.build_initial_tokens(messages)
+if actual != list(expected):
+    raise RuntimeError("Qwen compatibility builder changed the initial chat-template token ids")
+
+print(
+    "GRPO continuous-token compatibility:",
+    {"agent_loop": "single_turn_agent", "builder": type(builder).__name__, "prompt_tokens": len(actual)},
+)
+PY
+}
+
 ################################ paths and experiment identity
 
 VERL_ROOT=${VERL_ROOT:-/verl}
@@ -282,7 +444,7 @@ WORLD_SIZE=$((NNODES * NPUS_PER_NODE))
 ACTOR_TP=${ACTOR_TP:-1}
 ACTOR_PP=${ACTOR_PP:-1}
 ACTOR_CP=${ACTOR_CP:-2}
-ROLLOUT_TP=${ROLLOUT_TP:-2}
+ROLLOUT_TP=${ROLLOUT_TP:-1}
 ROLLOUT_PP=${ROLLOUT_PP:-1}
 ROLLOUT_DP=${ROLLOUT_DP:-1}
 
@@ -603,8 +765,16 @@ generation_probe = tokenizer.apply_chat_template(
 )
 if generation_probe.endswith("<｜Assistant｜><think>\n"):
     generation_prefix = "deepseek_native_thinking"
+    protocol_eos = "<｜end▁of▁sentence｜>"
+    protocol_eos_id = tokenizer.convert_tokens_to_ids(protocol_eos)
+    if protocol_eos_id is None or protocol_eos_id == tokenizer.unk_token_id:
+        raise ValueError(f"DeepSeek tokenizer does not define required token {protocol_eos!r}")
 elif generation_probe.endswith("<|im_start|>assistant\n"):
     generation_prefix = "native_chatml"
+    protocol_eos = "<|im_end|>"
+    protocol_eos_id = tokenizer.convert_tokens_to_ids(protocol_eos)
+    if protocol_eos_id is None or protocol_eos_id == tokenizer.unk_token_id:
+        raise ValueError(f"ChatML tokenizer does not define required token {protocol_eos!r}")
 else:
     raise ValueError(f"Unsupported generation prefix: {generation_probe[-200:]!r}")
 
@@ -696,6 +866,8 @@ print(
         "eligible_train_rows": eligible_train_rows,
         "eligible_validation_rows": eligible_val_rows,
         "generation_prefix": generation_prefix,
+        "protocol_eos": protocol_eos,
+        "protocol_eos_id": protocol_eos_id,
         "model_type": config.model_type,
         "architectures": config.architectures,
         "tie_word_embeddings": bool(getattr(config, "tie_word_embeddings", False)),
@@ -714,6 +886,45 @@ print(
     },
 )
 PY
+
+MODEL_CHAT_PROTOCOL=$(python3 - "$MODEL_PATH/tokenizer_config.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+template = config.get("chat_template")
+if not isinstance(template, str):
+    raise RuntimeError("tokenizer_config.json must define a string chat_template")
+if "<｜Assistant｜><think>" in template and "<｜end▁of▁sentence｜>" in template:
+    print("deepseek_distill")
+elif "<|im_start|>assistant" in template and "<|im_end|>" in template:
+    print("chatml")
+else:
+    raise RuntimeError("Unsupported chat-template protocol for this GRPO script")
+PY
+)
+
+AGENT_LOOP_CONFIG_PATH=
+AGENT_LOOP_NAME=
+RAY_RUNTIME_PYTHONPATH=
+# The pinned verl resolves Continuous Token builders from config.model_type. DeepSeek-R1-Distill-Qwen
+# reports qwen2 for its architecture but uses DeepSeek's special-token protocol, so route only its
+# single-turn agent loop through the DeepSeek builder. OpenMath is genuine Qwen/ChatML and stays native.
+case "$MODEL_CHAT_PROTOCOL" in
+    deepseek_distill)
+        prepare_deepseek_distill_agent_loop_compat
+        AGENT_LOOP_CONFIG_PATH=$DEEPSEEK_AGENT_LOOP_CONFIG
+        AGENT_LOOP_NAME=deepseek_distill_single_turn_agent
+        RAY_RUNTIME_PYTHONPATH=$GRPO_RAY_PYTHONPATH
+        ;;
+    chatml)
+        verify_chatml_continuous_token_builder
+        ;;
+    *)
+        die "Unsupported MODEL_CHAT_PROTOCOL=$MODEL_CHAT_PROTOCOL"
+        ;;
+esac
 
 if is_true "$PREPARE_ONLY"; then
     echo "PREPARE_ONLY complete; no GRPO process was launched."
@@ -886,6 +1097,13 @@ COMMAND=(
     "${ROLLOUT_ARGS[@]}"
     "${TRAINER_ARGS[@]}"
 )
+if [[ -n "$AGENT_LOOP_CONFIG_PATH" ]]; then
+    COMMAND+=(
+        "actor_rollout_ref.rollout.agent.agent_loop_config_path=${AGENT_LOOP_CONFIG_PATH}"
+        "actor_rollout_ref.rollout.agent.default_agent_loop=${AGENT_LOOP_NAME}"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH=${RAY_RUNTIME_PYTHONPATH}"
+    )
+fi
 if [[ -n "${RAY_ADDRESS:-}" ]]; then
     COMMAND+=("+ray_kwargs.ray_init.address=${RAY_ADDRESS}")
 fi
