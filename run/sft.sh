@@ -1175,11 +1175,14 @@ if not skip_runtime_preflight:
     from verl.models.mcore.mbridge import AutoBridge
     from verl.utils.device import get_device_name
     from verl.workers.engine.base import EngineRegistry
+    from mbridge.models import Qwen2Bridge
 
-    bridge = AutoBridge.from_config(config, dtype=torch.bfloat16)
-    bridge_name = f"{bridge.__class__.__module__}.{bridge.__class__.__name__}"
-    if "qwen2" not in bridge_name.lower():
-        raise RuntimeError(f"Legacy MBridge did not select a Qwen2 bridge: {bridge_name}")
+    supported_models = AutoBridge.list_supported_models()
+    if config.model_type not in supported_models:
+        raise RuntimeError(
+            f"MBridge does not register model_type={config.model_type!r}; supported={supported_models}"
+        )
+    bridge_name = f"{Qwen2Bridge.__module__}.{Qwen2Bridge.__name__} (registered:{config.model_type})"
 
     engine_cls = EngineRegistry.get_engine_cls(model_type="language_model", backend="megatron")
     engine_name = f"{engine_cls.__module__}.{engine_cls.__name__}"
