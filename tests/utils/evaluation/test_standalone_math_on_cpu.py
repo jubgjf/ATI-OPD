@@ -869,11 +869,13 @@ def test_requests_repeat_sixteen_times_and_preserve_eos_on_cpu(inputs, monkeypat
     assert summary["response_tokens_mean"] == 2  # New tokens include EOS; scoring decode removes it.
     for prompts, params in engine.calls:
         assert all(param.n == 1 and param.ignore_eos is False and param.repetition_penalty == 1.0 for param in params)
+        assert all(param.stop_token_ids == [tokenizer.eos_token_id] and param.detokenize is False for param in params)
         assert all(set(prompt) == {"prompt_token_ids"} for prompt in prompts)
     greedy = evaluation.sampling_kwargs(replace(config, do_sample=False), 64)
     assert (greedy["temperature"], greedy["top_p"], greedy["top_k"], greedy["n"]) == (0.0, 1.0, -1, 1)
     kwargs = evaluation.engine_kwargs(config)
     assert kwargs["load_format"] == "auto" and kwargs["distributed_executor_backend"] == "mp"
+    assert kwargs["skip_tokenizer_init"] is True
     assert kwargs["generation_config"] == "auto" and "eos_token_id" not in kwargs["override_generation_config"]
 
 
@@ -1074,6 +1076,55 @@ def test_megatron_hf_evaluation_reuses_and_reports_exported_path_on_cpu(inputs, 
     assert "Reusing complete HF weights" in output and "Merging FSDP" not in output
     final = next(line for line in output.splitlines() if line.startswith("EVAL_RESULT_JSON="))
     assert json.loads(final.split("=", 1)[1]) == result
+
+
+@pytest.mark.parametrize("override_template", [False, True])
+def test_backend_compatibility_reaches_inference_without_reloading_tokenizer_on_cpu(
+    inputs, monkeypatch, capsys, override_template
+):
+    config, original, hf_dir = _megatron_layout(inputs)
+    metadata_file = hf_dir / "tokenizer_config.json"
+    metadata = json.loads(metadata_file.read_text())
+    metadata["tokenizer_class"] = "TokenizersBackend"
+    metadata_file.write_text(json.dumps(metadata))
+    (hf_dir / "generation_config.json").write_text(
+        json.dumps({"eos_token_id": [original.eos_token_id, original.bos_token_id]})
+    )
+    if override_template:
+        template_path = hf_dir.parent / "template"
+        _save_tokenizer(template_path, DEEPSEEK_TEMPLATE)
+        config = replace(config, chat_template_model=str(template_path))
+        original.chat_template = DEEPSEEK_TEMPLATE
+    expected = evaluation.prepare_samples(config, original)
+    engine = _Engine(original)
+
+    def old_auto_tokenizer(*args, **kwargs):
+        raise ValueError("Tokenizer class TokenizersBackend does not exist or is not currently imported.")
+
+    def create_engine(**kwargs):
+        # A vLLM instance that loads the tokenizer independently would hit the
+        # same AutoTokenizer error, even after our first load succeeds.
+        assert kwargs["skip_tokenizer_init"] is True
+        assert kwargs["generation_config"] == "auto"
+        assert "eos_token_id" not in kwargs["override_generation_config"]
+        return engine
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", old_auto_tokenizer)
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=create_engine, SamplingParams=SimpleNamespace))
+    monkeypatch.setattr(evaluation, "default_compute_score", _score)
+    before = _snapshot(Path(config.model_path))
+    with pytest.warns(UserWarning, match="Loading local TokenizersBackend"):
+        result = evaluation.run_evaluation(config)
+    for benchmark, (prompts, params) in zip(config.benchmarks, engine.calls, strict=True):
+        assert [prompt["prompt_token_ids"] for prompt in prompts] == [
+            row.prompt_ids for row in expected[benchmark] for _ in range(config.rollout_n)
+        ]
+        assert all(param.stop_token_ids == [original.eos_token_id] and param.detokenize is False for param in params)
+        assert result["benchmarks"][benchmark]["accuracy"] == 1.0
+    assert result["config"]["skip_tokenizer_init"] is True
+    assert result["config"]["effective_sampling"]["stop_token_ids"] == [original.eos_token_id]
+    assert _snapshot(Path(config.model_path)) == before
+    assert "EVAL_RESULT_JSON=" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("rank_key", ["NODE_RANK", "VC_TASK_INDEX"])

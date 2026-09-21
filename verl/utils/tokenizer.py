@@ -13,8 +13,10 @@
 # limitations under the License.
 """Utils for tokenization."""
 
+import json
 import types
 import warnings
+from pathlib import Path
 
 __all__ = [
     "hf_tokenizer",
@@ -163,7 +165,7 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
         transformers.PreTrainedTokenizer: The pretrained tokenizer.
 
     """
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
     if correct_gemma2 and isinstance(name_or_path, str) and "gemma-2-2b-it" in name_or_path:
         # the EOS token in gemma2 is ambiguious, which may worsen RL performance.
@@ -173,7 +175,37 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
         )
         kwargs["eos_token"] = "<end_of_turn>"
         kwargs["eos_token_id"] = 107
-    tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+    except ValueError as exc:
+        # Transformers 5 saves generic fast tokenizers with this new class name.
+        # Transformers 4 can still load the serialized backend and its metadata
+        # directly, without changing any checkpoint files or guessing a model class.
+        if (
+            not str(exc).startswith("Tokenizer class TokenizersBackend does not exist")
+            or not Path(name_or_path).is_dir()
+            or kwargs.get("use_fast") is False
+        ):
+            raise
+        tokenizer_file = Path(name_or_path) / kwargs.get("subfolder", "") / "tokenizer.json"
+        if not tokenizer_file.is_file():
+            raise ValueError(
+                f"Cannot load a TokenizersBackend export with this Transformers version without {tokenizer_file}."
+            ) from exc
+        metadata = json.loads((tokenizer_file.parent / "tokenizer_config.json").read_text(encoding="utf-8"))
+        compat_kwargs = dict(kwargs)
+        extra_tokens = compat_kwargs.get("extra_special_tokens", metadata.get("extra_special_tokens"))
+        if isinstance(extra_tokens, list):
+            # In v4 extra_special_tokens is a named-token dict; v5 also uses a
+            # list here for what v4 calls additional_special_tokens.
+            compat_kwargs["extra_special_tokens"] = {}
+            compat_kwargs.setdefault(
+                "additional_special_tokens", (metadata.get("additional_special_tokens") or []) + extra_tokens
+            )
+        warnings.warn(
+            f"Loading local TokenizersBackend export as PreTrainedTokenizerFast: {name_or_path}", stacklevel=2
+        )
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(name_or_path, **compat_kwargs)
     if correct_pad_token:
         set_pad_token_id(tokenizer)
     return tokenizer

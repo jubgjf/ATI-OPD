@@ -484,7 +484,7 @@ def prepare_samples(
     return prepared
 
 
-def sampling_kwargs(config: EvaluationConfig, max_tokens: int) -> dict[str, Any]:
+def sampling_kwargs(config: EvaluationConfig, max_tokens: int, *, eos_token_id: int | None = None) -> dict[str, Any]:
     """Match one training validation request; repeat questions externally for rollout_n answers."""
     return dict(
         n=1,
@@ -496,6 +496,9 @@ def sampling_kwargs(config: EvaluationConfig, max_tokens: int) -> dict[str, Any]
         frequency_penalty=0.0,
         max_tokens=max_tokens,
         ignore_eos=False,
+        # vLLM skips tokenizer loading because requests already contain token IDs.
+        # Keep its usual tokenizer EOS stop in addition to generation_config EOS IDs.
+        stop_token_ids=[] if eos_token_id is None else [eos_token_id],
         logprobs=None,
         detokenize=False,
     )
@@ -506,6 +509,9 @@ def engine_kwargs(config: EvaluationConfig) -> dict[str, Any]:
     return dict(
         model=config.model_path,
         tokenizer=config.model_path,
+        # Input tokenization and output decoding both use our loaded tokenizer.
+        # Otherwise vLLM's AutoTokenizer would repeat cross-version class lookup.
+        skip_tokenizer_init=True,
         load_format="auto",
         dtype="bfloat16",
         trust_remote_code=False,
@@ -577,7 +583,10 @@ def evaluate_benchmark(
     for start in range(0, len(rows), config.batch_size):
         batch = rows[start : start + config.batch_size]
         requests = [row for row in batch for _ in range(config.rollout_n)]
-        params = [sampling_params_cls(**sampling_kwargs(config, row.max_tokens)) for row in requests]
+        params = [
+            sampling_params_cls(**sampling_kwargs(config, row.max_tokens, eos_token_id=tokenizer.eos_token_id))
+            for row in requests
+        ]
         outputs = engine.generate(
             [{"prompt_token_ids": list(row.prompt_ids)} for row in requests],
             params,
@@ -642,7 +651,11 @@ def run_evaluation(config: EvaluationConfig) -> dict[str, Any]:
         "repetition_penalty": 1.0,
         "reward_data_source": "math_verify",
         "bootstrap_seed": 42,
-        "effective_sampling": sampling_kwargs(config, config.generation_max_tokens),
+        "tokenizer_class": type(tokenizer).__name__,
+        "skip_tokenizer_init": True,
+        "effective_sampling": sampling_kwargs(
+            config, config.generation_max_tokens, eos_token_id=tokenizer.eos_token_id
+        ),
     }
     print("[eval] config=" + json.dumps(resolved, sort_keys=True), flush=True)
     for name, rows in prepared.items():
