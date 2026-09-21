@@ -437,11 +437,12 @@ def base_axis(ylabel: str) -> tuple[mpl.figure.Figure, mpl.axes.Axes]:
 
 
 def render_gain(metrics: dict[str, np.ndarray]) -> None:
-    fig, ax = base_axis("Net gain per intervention (pp)")
+    fig, ax = base_axis("Net gain per intervention")
     ax.axhline(0, color="#777777", linestyle="--", linewidth=1.0, zorder=1)
     ax.plot(metrics["step"], metrics["gain"], color=COLORS["gain"], marker="o", markevery=20)
     value_range = float(metrics["gain"].max() - metrics["gain"].min())
     ax.set_ylim(metrics["gain"].min() - 0.1 * value_range, metrics["gain"].max() + 0.1 * value_range)
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=1))
     save_figure(fig, OUTPUT_DIR, "online_conditional_gain_deepseek")
 
 
@@ -465,9 +466,9 @@ def render_rescue_harm(metrics: dict[str, np.ndarray], overall: tuple[float, flo
     ax.text(
         0.97,
         0.96,
-        rf"All: $W\!\to\!C$ {helpful:.2f}%   $C\!\to\!W$ {harmful:.2f}%"
+        rf"$W\!\to\!C$ {helpful:.2f}%"
         "\n"
-        f"Net: {net:+.2f} pp",
+        rf"$C\!\to\!W$ {harmful:.2f}%",
         transform=ax.transAxes,
         ha="right",
         va="top",
@@ -520,9 +521,10 @@ def render_suffix_gate(estimates: Sequence[SuffixGateEstimate]) -> None:
     ax.set_xlim(-0.5, 3.7)
     ax.set_ylim(-2.0, 8.0)
     ax.set_yticks((-2, 0, 2, 4, 6, 8))
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
     ax.set_xticks(positions, [estimate.group.tick_label for estimate in estimates])
     ax.set_xlabel("Future-gap decision")
-    set_panel_title(ax, "Net online gain (pp)", pad=3)
+    set_panel_title(ax, "Net online gain", pad=3)
     ax.grid(axis="y", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.tick_params(direction="out", length=4)

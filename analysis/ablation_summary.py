@@ -312,8 +312,8 @@ RUN_SPECS: dict[str, RunSpec] = {
 LOSS_KEYS = ("no_teacher", "opd_loss", "sft_loss")
 TEACHER_LOSS_BARS = (
     ("no_teacher", "Masked"),
-    ("opd_loss", "OPD loss"),
-    ("sft_loss", "SFT loss"),
+    ("opd_loss", "OPD\nloss"),
+    ("sft_loss", "SFT\nloss"),
 )
 DMPD_VARIANT_BARS = (
     ("opd_loss", "DMPD"),
@@ -701,37 +701,21 @@ def render_teacher_loss_benchmark(results: Mapping[str, BenchmarkResult | None],
             color="#333333",
         )
     ax.set_xlim(-0.65, len(TEACHER_LOSS_BARS) - 0.35)
-    ax.set_xticks([])
+    ax.set_xticks(
+        range(len(TEACHER_LOSS_BARS)),
+        [label for _, label in TEACHER_LOSS_BARS],
+        fontsize=11.5,
+        linespacing=0.9,
+    )
     ax.set_ylim(0, BENCHMARK_AXIS_MAX)
     ax.set_yticks([0, 20, 40])
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
     set_panel_title(ax, "Benchmark Avg.", pad=4)
     ax.grid(axis="y", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
-    ax.tick_params(axis="x", bottom=False)
+    ax.tick_params(axis="x", bottom=False, pad=5)
     ax.tick_params(axis="y", direction="out", length=4)
     save_figure(fig, output_dir, "teacher_segment_loss_benchmark_avg_deepseek")
-
-
-def render_teacher_loss_benchmark_legend(results: Mapping[str, BenchmarkResult | None], output_dir: Path) -> None:
-    handles = [_benchmark_patch(key, label, results[key]) for key, label in TEACHER_LOSS_BARS]
-    fig = plt.figure(figsize=(4.2, 0.38))
-    fig.legend(
-        handles=handles,
-        loc="center",
-        frameon=False,
-        ncol=3,
-        handlelength=1.4,
-        columnspacing=0.9,
-        handletextpad=0.4,
-    )
-    save_figure(
-        fig,
-        output_dir,
-        "teacher_segment_loss_benchmark_legend",
-        export_mode="auxiliary",
-        transparent=True,
-    )
 
 
 def render_dmpd_variants_benchmark(results: Mapping[str, BenchmarkResult | None], output_dir: Path) -> None:
@@ -763,7 +747,7 @@ def render_dmpd_variants_benchmark(results: Mapping[str, BenchmarkResult | None]
     ax.set_xlim(0, FIGURE6_BENCHMARK_AXIS_MAX)
     ax.set_xticks([0, 20, 40])
     ax.xaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
-    ax.set_xlabel("Six-task Avg.")
+    ax.set_xlabel("Performance")
     set_panel_title(ax, "Benchmark Avg.", pad=4)
     ax.grid(axis="x", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
@@ -775,19 +759,28 @@ def render_dmpd_variants_benchmark(results: Mapping[str, BenchmarkResult | None]
 
 def render_dmpd_variants_benchmark_legend(results: Mapping[str, BenchmarkResult | None], output_dir: Path) -> None:
     items = [_benchmark_patch(key, label, results[key]) for key, label in DMPD_VARIANT_BARS]
-    # Matplotlib fills multi-row legends column-first. This input order renders
-    # DMPD / Full M=1 / Full M=4 on the first row and the two provisional
-    # variants on the second row.
-    handles = [items[index] for index in (0, 3, 1, 4, 2)]
     fig = plt.figure(figsize=(6.3, 0.72))
     fig.legend(
-        handles=handles,
+        handles=items[:3],
         loc="center",
+        bbox_to_anchor=(0.5, 0.72),
         frameon=False,
         ncol=3,
         handlelength=1.4,
-        columnspacing=0.9,
+        columnspacing=0.8,
         handletextpad=0.4,
+        alignment="center",
+    )
+    fig.legend(
+        handles=items[3:],
+        loc="center",
+        bbox_to_anchor=(0.5, 0.25),
+        frameon=False,
+        ncol=2,
+        handlelength=1.4,
+        columnspacing=0.8,
+        handletextpad=0.4,
+        alignment="center",
     )
     save_figure(
         fig,
@@ -859,7 +852,6 @@ def main() -> None:
     )
     render_loss_legend(runs, output_dir)
     render_teacher_loss_benchmark(results, output_dir)
-    render_teacher_loss_benchmark_legend(results, output_dir)
     render_dmpd_variants_benchmark(results, output_dir)
     render_dmpd_variants_benchmark_legend(results, output_dir)
 

@@ -22,7 +22,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from analysis import ablation_summary, local_gap_dynamics, online_conditional_dynamics, plot_style, student_uptake
+from analysis import (
+    ablation_summary,
+    local_gap_dynamics,
+    online_conditional_dynamics,
+    plot_style,
+    repair_outcome,
+    student_uptake,
+)
 
 
 def _axes_bounds(fig: plt.Figure) -> tuple[float, float, float, float]:
@@ -86,7 +93,7 @@ def test_panel_export_keeps_exact_canvas(tmp_path) -> None:
         plot_style.DENSE_X_PANEL_MARGINS,
     ],
 )
-@pytest.mark.parametrize("label", ["Mean zlib compression ratio", "Net gain per intervention (pp)"])
+@pytest.mark.parametrize("label", ["Mean zlib compression ratio", "Net gain per intervention"])
 def test_panel_titles_are_centered_on_canvas_and_fit(margins: dict[str, float], label: str) -> None:
     fig, ax = plot_style.create_panel(margins)
     ax.set_xticks([])
@@ -184,6 +191,9 @@ def test_figure5_line_and_bar_panels_share_standard_axes(monkeypatch: pytest.Mon
         assert len(figures) == 2
         assert all(_axes_bounds(fig) == pytest.approx(expected) for fig in figures)
         assert figures[0].axes[0].get_ylim()[0] < 92.0
+        tick_labels = figures[1].axes[0].get_xticklabels()
+        assert [label.get_text() for label in tick_labels] == ["Masked", "OPD\nloss", "SFT\nloss"]
+        assert all(label.get_fontsize() == pytest.approx(11.5) for label in tick_labels)
     finally:
         for fig in figures:
             plt.close(fig)
@@ -229,6 +239,97 @@ def test_figure6_keeps_dense_suffix_axis_separate(monkeypatch: pytest.MonkeyPatc
         assert _axes_bounds(figures[0]) == pytest.approx((0.22, 0.25, 0.75, 0.63))
         assert _axes_bounds(figures[1]) == pytest.approx((0.18, 0.36, 0.81, 0.52))
         assert _axes_bounds(figures[2]) == pytest.approx((0.22, 0.25, 0.75, 0.63))
+        outcome_annotations = [text.get_text() for text in figures[0].axes[0].texts]
+        assert any("Net: +0.50%" in text for text in outcome_annotations)
+        assert all(" pp" not in text for text in outcome_annotations)
+        assert figures[1].axes[0].get_title() == "Net online gain"
+        assert [label.get_text() for label in figures[1].axes[0].get_yticklabels()] == [
+            "−2%",
+            "0%",
+            "2%",
+            "4%",
+            "6%",
+            "8%",
+        ]
+        assert figures[2].axes[0].get_xlabel() == "Performance"
+    finally:
+        for fig in figures:
+            plt.close(fig)
+
+
+def test_figure6_variant_legend_centers_two_independent_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    figures = _capture_figures(monkeypatch, ablation_summary)
+    result = ablation_summary.BenchmarkResult(
+        evaluation_step=217,
+        progress_step=217,
+        four_benchmark_values=(0.3, 0.3, 0.3, 0.3),
+        hmmt_values=(0.3, 0.3),
+        six_benchmark_average_percent=30.0,
+        uses_hmmt_placeholder=False,
+    )
+    ablation_summary.render_dmpd_variants_benchmark_legend(
+        {key: result for key, _label in ablation_summary.DMPD_VARIANT_BARS},
+        ablation_summary.DEFAULT_OUTPUT_DIR,
+    )
+
+    try:
+        assert len(figures) == 1
+        fig = figures[0]
+        assert len(fig.legends) == 2
+        assert [[text.get_text() for text in legend.get_texts()] for legend in fig.legends] == [
+            ["DMPD", r"Full ($M=1$)", r"Full ($M=4$)"],
+            ["Prune", "Skip incorrect"],
+        ]
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        for legend in fig.legends:
+            bounds = legend.get_window_extent(renderer)
+            assert (bounds.x0 + bounds.x1) / 2 == pytest.approx(fig.bbox.width / 2)
+
+        first_row_text = [text.get_window_extent(renderer) for text in fig.legends[0].get_texts()]
+        text_gaps = [first_row_text[index + 1].x0 - first_row_text[index].x1 for index in range(2)]
+        assert text_gaps[0] == pytest.approx(text_gaps[1], abs=1.0)
+    finally:
+        for fig in figures:
+            plt.close(fig)
+
+
+def test_online_gain_units_are_carried_by_axis_ticks(monkeypatch: pytest.MonkeyPatch) -> None:
+    online_figures = _capture_figures(monkeypatch, online_conditional_dynamics)
+    online_conditional_dynamics.render_gain(
+        {
+            "step": np.asarray((1.0, 217.0)),
+            "gain": np.asarray((-1.0, 1.0)),
+        }
+    )
+
+    frame = pd.DataFrame(
+        {
+            "step": (1, 33, 65),
+            "rate": (10.0, 20.0, 15.0),
+            "gain": (-1.0, 2.0, 0.5),
+        }
+    )
+    monkeypatch.setattr(repair_outcome, "load_outcomes", lambda _run_id: frame)
+    repair_figures = _capture_figures(monkeypatch, repair_outcome)
+    repair_outcome.render_panel("test", "run")
+
+    figures = [*online_figures, *repair_figures]
+    try:
+        assert [fig.axes[0].get_title() for fig in figures] == [
+            "Net gain per intervention",
+            "Online gain",
+        ]
+        assert repair_figures[0].axes[0].get_xlabel() == "Intervention rate"
+        for fig in figures:
+            fig.canvas.draw()
+            ax = fig.axes[0]
+            assert "(%)" not in ax.get_title()
+            assert "(%)" not in ax.get_xlabel()
+            assert plot_style.panel_layout_overflow(fig) == ()
+        assert all(label.get_text().endswith("%") for label in online_figures[0].axes[0].get_yticklabels())
+        assert all(label.get_text().endswith("%") for label in repair_figures[0].axes[0].get_xticklabels())
+        assert all(label.get_text().endswith("%") for label in repair_figures[0].axes[0].get_yticklabels())
     finally:
         for fig in figures:
             plt.close(fig)

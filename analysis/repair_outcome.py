@@ -42,6 +42,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.colorbar import ColorbarBase
 from matplotlib.colors import Normalize
+from matplotlib.ticker import PercentFormatter
 
 try:
     from analysis.plot_style import (
@@ -147,7 +148,8 @@ def render_panel(slug: str, run_id: str) -> None:
     centers = phase_centers(frame)
     norm = Normalize(1, 217)
     cmap = training_step_cmap()
-    x_upper = 1.05 * float(frame["rate"].max())
+    # Keep the terminal 100% tick label inside the fixed-width panel.
+    x_upper = max(106.0, 1.05 * float(frame["rate"].max()))
     y_extent = 1.12 * float(frame["gain"].abs().max())
 
     fig, ax = create_panel(STANDARD_PANEL_MARGINS)
@@ -166,8 +168,10 @@ def render_panel(slug: str, run_id: str) -> None:
     ax.axhline(0, color=GRAY, linestyle=":", linewidth=1.1)
     ax.set_xlim(0, x_upper)
     ax.set_ylim(-y_extent, y_extent)
-    ax.set_xlabel("Intervention rate (%)")
-    set_panel_title(ax, "Online gain (pp)")
+    ax.xaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=1))
+    ax.set_xlabel("Intervention rate")
+    set_panel_title(ax, "Online gain")
     ax.grid(color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.tick_params(direction="out", length=4)
