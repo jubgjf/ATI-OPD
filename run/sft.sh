@@ -109,38 +109,12 @@ resolve_cluster_addresses() {
         if [[ -n "${MA_CURRENT_IP:-}" ]]; then
             CURRENT_IP=$MA_CURRENT_IP
         else
-            command -v ifconfig >/dev/null 2>&1 || die \
-                "Cannot discover the local IP: ifconfig is unavailable; set CURRENT_IP explicitly."
-            local ifconfig_output
-            ifconfig_output=$(ifconfig "$SOCKET_IFNAME" 2>/dev/null) || die \
-                "Cannot inspect SOCKET_IFNAME=$SOCKET_IFNAME; set CURRENT_IP or SOCKET_IFNAME explicitly."
-            CURRENT_IP=$(awk '$1 == "inet" {sub(/^addr:/, "", $2); print $2; exit}' <<<"$ifconfig_output")
-            [[ -n "$CURRENT_IP" ]] || die \
-                "No IPv4 address found on SOCKET_IFNAME=$SOCKET_IFNAME; set CURRENT_IP explicitly."
+            CURRENT_IP=$(ifconfig "$SOCKET_IFNAME" | grep -Eo 'inet (addr:)?([0-9]{1,3}\.){3}[0-9]{1,3}' | awk '{print $NF}')
         fi
     fi
-
-    python3 - "$MASTER_ADDR" "$CURRENT_IP" <<'PY'
-import ipaddress
-import socket
-import sys
-
-master_addr, current_ip = sys.argv[1:]
-try:
-    ipaddress.IPv4Address(current_ip)
-except ipaddress.AddressValueError as error:
-    raise ValueError(f"CURRENT_IP must be an IPv4 address, got {current_ip!r}") from error
-
-try:
-    resolved = sorted({item[4][0] for item in socket.getaddrinfo(master_addr, None, socket.AF_INET)})
-except socket.gaierror as error:
-    raise RuntimeError(f"MASTER_ADDR={master_addr!r} cannot be resolved to IPv4") from error
-if not resolved:
-    raise RuntimeError(f"MASTER_ADDR={master_addr!r} resolved to no IPv4 addresses")
-print(f"Cluster network: master={master_addr} resolved={resolved} local={current_ip}")
-PY
-
+    [[ -n "$CURRENT_IP" ]] || die "Failed to discover CURRENT_IP from SOCKET_IFNAME=$SOCKET_IFNAME."
     export MASTER_ADDR CURRENT_IP SOCKET_IFNAME
+    echo "Cluster network: master=$MASTER_ADDR local=$CURRENT_IP interface=$SOCKET_IFNAME"
 }
 
 synchronize_experiment_identity() {
