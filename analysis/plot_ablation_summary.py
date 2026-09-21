@@ -14,7 +14,7 @@
 
 # ruff: noqa: E402
 
-"""Render the four-panel DeepSeek DMPD ablation summary.
+"""Render the DeepSeek DMPD loss and benchmark ablation figures.
 
 The script reads only the local ``jubgjf/DMPD`` mirror. It deliberately pins
 every paper row to a run ID and validates the relevant configuration before
@@ -47,6 +47,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import font_manager
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from matplotlib.ticker import PercentFormatter
 
 EXPECTED_TRAINING_STEPS = 217
@@ -114,7 +115,7 @@ class BenchmarkResult:
 LOSS_STYLES: dict[str, dict[str, str]] = {
     "no_teacher": {
         "color": "#8B8E91",
-        "linestyle": "--",
+        "linestyle": "-",
         "marker": "s",
     },
     "opd_loss": {
@@ -124,7 +125,7 @@ LOSS_STYLES: dict[str, dict[str, str]] = {
     },
     "sft_loss": {
         "color": "#C7785E",
-        "linestyle": ":",
+        "linestyle": "-",
         "marker": "^",
     },
 }
@@ -134,7 +135,7 @@ BAR_COLORS = {
     "opd_loss": "#6689A6",
     "sft_loss": "#C7785E",
     "full_m1": "#8E859D",
-    "full_m4": "#8E859D",
+    "full_m4": "#C3A46E",
     "prune": "#7A9E85",
     "skip_incorrect": "#B97964",
 }
@@ -166,7 +167,7 @@ def _expected(
 RUN_SPECS: dict[str, RunSpec] = {
     "no_teacher": RunSpec(
         key="no_teacher",
-        label="No teacher loss",
+        label="Masked",
         run_id="39ce8dd19e6b4451bd5175609358110d",
         expected=_expected(
             train_on_teacher=False,
@@ -195,7 +196,7 @@ RUN_SPECS: dict[str, RunSpec] = {
     ),
     "sft_loss": RunSpec(
         key="sft_loss",
-        label=r"SFT loss ($\lambda=0.1$)",
+        label="SFT loss",
         run_id="f7c7a430d8de464992d9de225413b3a1",
         expected=_expected(
             train_on_teacher=True,
@@ -290,17 +291,20 @@ RUN_SPECS: dict[str, RunSpec] = {
 }
 
 LOSS_KEYS = ("no_teacher", "opd_loss", "sft_loss")
-BAR_ROWS = (
-    ("no_teacher", "No teacher loss"),
+TEACHER_LOSS_BARS = (
+    ("no_teacher", "Masked"),
     ("opd_loss", "OPD loss"),
     ("sft_loss", "SFT loss"),
+)
+DMPD_VARIANT_BARS = (
     ("opd_loss", "DMPD"),
     ("full_m1", r"Full ($M=1$)"),
     ("full_m4", r"Full ($M=4$)"),
     ("prune", "Prune"),
     ("skip_incorrect", "Skip incorrect"),
 )
-BAR_POSITIONS = (8.0, 7.0, 6.0, 3.0, 2.0, 1.0, 0.0, -1.0)
+DMPD_VARIANT_POSITIONS = (4.0, 3.0, 2.0, 1.0, 0.0)
+BENCHMARK_AXIS_MAX = 41.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -657,13 +661,74 @@ def _bar_color(key: str) -> str:
     return BAR_COLORS[key]
 
 
-def render_benchmark_bars(runs: Mapping[str, LoadedRun], output_dir: Path) -> dict[str, BenchmarkResult | None]:
-    results = {key: benchmark_result(run) for key, run in runs.items()}
-    fig, ax = plt.subplots(figsize=(6.0, 3.0))
-    tick_labels: list[str] = []
-    for (key, label), position in zip(BAR_ROWS, BAR_POSITIONS, strict=True):
+def _benchmark_patch(key: str, label: str, result: BenchmarkResult | None) -> Patch:
+    color = _bar_color(key)
+    provisional = result is not None and result.provisional
+    return Patch(
+        facecolor="white" if provisional else color,
+        edgecolor=color,
+        linewidth=1.5 if provisional else 1.0,
+        label=f"{label}{DAGGER if provisional else ''}",
+    )
+
+
+def render_teacher_loss_benchmark(results: Mapping[str, BenchmarkResult | None], output_dir: Path) -> None:
+    fig, ax = plt.subplots(figsize=(3.0, 3.0))
+    for position, (key, _) in enumerate(TEACHER_LOSS_BARS):
         result = results[key]
-        tick_labels.append(f"{label}{DAGGER if result is not None and result.provisional else ''}")
+        if result is None:
+            continue
+        color = _bar_color(key)
+        bar = ax.bar(
+            position,
+            result.six_benchmark_average_percent,
+            width=0.62,
+            color=color,
+            edgecolor=color,
+            linewidth=1.0,
+        )[0]
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.55,
+            f"{result.six_benchmark_average_percent:.1f}",
+            ha="center",
+            va="bottom",
+            fontsize=13,
+            color="#333333",
+        )
+    ax.set_xlim(-0.65, len(TEACHER_LOSS_BARS) - 0.35)
+    ax.set_xticks([])
+    ax.set_ylim(0, BENCHMARK_AXIS_MAX)
+    ax.set_yticks([0, 20, 40])
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
+    ax.set_title("Benchmark Avg.", pad=4)
+    ax.grid(axis="y", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
+    ax.set_axisbelow(True)
+    ax.tick_params(axis="x", bottom=False)
+    ax.tick_params(axis="y", direction="out", length=4)
+    fig.subplots_adjust(left=0.20, right=0.97, bottom=0.12, top=0.88)
+    _save(fig, output_dir, "teacher_segment_loss_benchmark_avg_deepseek")
+
+
+def render_teacher_loss_benchmark_legend(results: Mapping[str, BenchmarkResult | None], output_dir: Path) -> None:
+    handles = [_benchmark_patch(key, label, results[key]) for key, label in TEACHER_LOSS_BARS]
+    fig = plt.figure(figsize=(4.2, 0.38))
+    fig.legend(
+        handles=handles,
+        loc="center",
+        frameon=False,
+        ncol=3,
+        handlelength=1.4,
+        columnspacing=0.9,
+        handletextpad=0.4,
+    )
+    _save(fig, output_dir, "teacher_segment_loss_benchmark_legend", transparent=True)
+
+
+def render_dmpd_variants_benchmark(results: Mapping[str, BenchmarkResult | None], output_dir: Path) -> None:
+    fig, ax = plt.subplots(figsize=(3.0, 3.0))
+    for (key, _), position in zip(DMPD_VARIANT_BARS, DMPD_VARIANT_POSITIONS, strict=True):
+        result = results[key]
         if result is None:
             continue
         color = _bar_color(key)
@@ -677,7 +742,7 @@ def render_benchmark_bars(runs: Mapping[str, LoadedRun], output_dir: Path) -> di
             linewidth=1.5 if result.provisional else 1.0,
         )[0]
         ax.text(
-            bar.get_width() + 0.7,
+            bar.get_width() + 0.5,
             bar.get_y() + bar.get_height() / 2,
             f"{result.six_benchmark_average_percent:.1f}{DAGGER if result.provisional else ''}",
             ha="left",
@@ -685,22 +750,38 @@ def render_benchmark_bars(runs: Mapping[str, LoadedRun], output_dir: Path) -> di
             fontsize=13,
             color="#333333",
         )
-    ax.set_yticks(BAR_POSITIONS, tick_labels)
-    ax.set_xlim(0, 41)
+    ax.set_yticks([])
+    ax.set_xlim(0, BENCHMARK_AXIS_MAX)
     ax.set_xticks([0, 20, 40])
     ax.xaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
     ax.set_xlabel("Six-task Avg.")
     ax.set_title("Benchmark Avg.", pad=4)
-    ax.text(0, 9.0, "Teacher-segment loss", ha="left", va="bottom", fontsize=12.5, fontstyle="italic")
-    ax.text(0, 4.0, "DMPD variants", ha="left", va="bottom", fontsize=12.5, fontstyle="italic")
     ax.grid(axis="x", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
-    ax.set_ylim(-1.65, 10.25)
-    ax.tick_params(axis="y", length=0, pad=2.0)
+    ax.set_ylim(-0.6, 4.6)
+    ax.tick_params(axis="y", left=False)
     ax.tick_params(axis="x", direction="out", length=4)
-    fig.subplots_adjust(left=0.31, right=0.965, bottom=0.17, top=0.91)
-    _save(fig, output_dir, "ablation_benchmark_avg_deepseek")
-    return results
+    fig.subplots_adjust(left=0.10, right=0.97, bottom=0.18, top=0.88)
+    _save(fig, output_dir, "dmpd_variants_benchmark_avg_deepseek")
+
+
+def render_dmpd_variants_benchmark_legend(results: Mapping[str, BenchmarkResult | None], output_dir: Path) -> None:
+    items = [_benchmark_patch(key, label, results[key]) for key, label in DMPD_VARIANT_BARS]
+    # Matplotlib fills multi-row legends column-first. This input order renders
+    # DMPD / Full M=1 / Full M=4 on the first row and the two provisional
+    # variants on the second row.
+    handles = [items[index] for index in (0, 3, 1, 4, 2)]
+    fig = plt.figure(figsize=(6.3, 0.72))
+    fig.legend(
+        handles=handles,
+        loc="center",
+        frameon=False,
+        ncol=3,
+        handlelength=1.4,
+        columnspacing=0.9,
+        handletextpad=0.4,
+    )
+    _save(fig, output_dir, "dmpd_variants_benchmark_legend", transparent=True)
 
 
 def print_summary(runs: Mapping[str, LoadedRun], results: Mapping[str, BenchmarkResult | None]) -> None:
@@ -765,7 +846,10 @@ def main() -> None:
         threshold=10.0,
     )
     render_loss_legend(runs, output_dir)
-    render_benchmark_bars(runs, output_dir)
+    render_teacher_loss_benchmark(results, output_dir)
+    render_teacher_loss_benchmark_legend(results, output_dir)
+    render_dmpd_variants_benchmark(results, output_dir)
+    render_dmpd_variants_benchmark_legend(results, output_dir)
 
 
 if __name__ == "__main__":
