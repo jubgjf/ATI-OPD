@@ -14,9 +14,6 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 set -Eeuo pipefail
-if [[ "${VERBOSE:-0}" == "1" ]]; then
-    set -x
-fi
 
 die() {
     echo "ERROR: $*" >&2
@@ -38,6 +35,300 @@ check_positive_integer() {
     local name=$1
     local value=$2
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer, got: $value"
+}
+
+check_port() {
+    local name=$1
+    local value=$2
+    [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be an integer TCP port, got: $value"
+    ((value >= 1 && value <= 65535)) || die "$name must be between 1 and 65535, got: $value"
+}
+
+load_external_train_config() {
+    local train_config_path=${TRAIN_CONFIG_PATH:-/opt/huawei/algorithm/train.config}
+    if [[ ! -s "$train_config_path" ]]; then
+        echo "No non-empty train config found at $train_config_path; skip external env loading."
+        return 0
+    fi
+
+    echo "Loading external train config from $train_config_path"
+    local allexport_was_set=0
+    local nounset_was_set=0
+    case "$-" in
+        *a*) allexport_was_set=1 ;;
+    esac
+    case "$-" in
+        *u*)
+            nounset_was_set=1
+            set +u
+            ;;
+    esac
+
+    set -o allexport
+    # shellcheck disable=SC1090
+    if ! source "$train_config_path"; then
+        if ((allexport_was_set == 0)); then
+            set +o allexport
+        fi
+        if ((nounset_was_set == 1)); then
+            set -u
+        fi
+        die "Failed to load external train config: $train_config_path"
+    fi
+    if ((allexport_was_set == 0)); then
+        set +o allexport
+    fi
+    if ((nounset_was_set == 1)); then
+        set -u
+    fi
+}
+
+load_external_train_config
+if [[ "${VERBOSE:-0}" == "1" ]]; then
+    set -x
+fi
+
+resolve_cluster_addresses() {
+    if ((NNODES > 1)); then
+        if [[ -z "${MASTER_ADDR:-}" ]]; then
+            if [[ -n "${MA_VJ_NAME:-}" && -n "${MA_TASK_NAME:-}" ]]; then
+                MASTER_ADDR="${MA_VJ_NAME}-${MA_TASK_NAME}-0.${MA_VJ_NAME}"
+            else
+                die \
+                    "Multi-node launch requires MASTER_ADDR, or both MA_VJ_NAME and MA_TASK_NAME " \
+                    "for the common.sh rank-0 DNS convention."
+            fi
+        fi
+    else
+        MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
+    fi
+
+    SOCKET_IFNAME=${SOCKET_IFNAME:-eth0}
+    if [[ -z "${CURRENT_IP:-}" ]]; then
+        if [[ -n "${MA_CURRENT_IP:-}" ]]; then
+            CURRENT_IP=$MA_CURRENT_IP
+        else
+            command -v ifconfig >/dev/null 2>&1 || die \
+                "Cannot discover the local IP: ifconfig is unavailable; set CURRENT_IP explicitly."
+            local ifconfig_output
+            ifconfig_output=$(ifconfig "$SOCKET_IFNAME" 2>/dev/null) || die \
+                "Cannot inspect SOCKET_IFNAME=$SOCKET_IFNAME; set CURRENT_IP or SOCKET_IFNAME explicitly."
+            CURRENT_IP=$(awk '$1 == "inet" {sub(/^addr:/, "", $2); print $2; exit}' <<<"$ifconfig_output")
+            [[ -n "$CURRENT_IP" ]] || die \
+                "No IPv4 address found on SOCKET_IFNAME=$SOCKET_IFNAME; set CURRENT_IP explicitly."
+        fi
+    fi
+
+    python3 - "$MASTER_ADDR" "$CURRENT_IP" <<'PY'
+import ipaddress
+import socket
+import sys
+
+master_addr, current_ip = sys.argv[1:]
+try:
+    ipaddress.IPv4Address(current_ip)
+except ipaddress.AddressValueError as error:
+    raise ValueError(f"CURRENT_IP must be an IPv4 address, got {current_ip!r}") from error
+
+try:
+    resolved = sorted({item[4][0] for item in socket.getaddrinfo(master_addr, None, socket.AF_INET)})
+except socket.gaierror as error:
+    raise RuntimeError(f"MASTER_ADDR={master_addr!r} cannot be resolved to IPv4") from error
+if not resolved:
+    raise RuntimeError(f"MASTER_ADDR={master_addr!r} resolved to no IPv4 addresses")
+print(f"Cluster network: master={master_addr} resolved={resolved} local={current_ip}")
+PY
+
+    export MASTER_ADDR CURRENT_IP SOCKET_IFNAME
+}
+
+synchronize_experiment_identity() {
+    local method=$1
+    local requested_timestamp=${EXPERIMENT_TIMESTAMP:-}
+    local requested_full_name=${EXPERIMENT_FULL_NAME:-}
+    local identity
+
+    if ((NNODES == 1)) || is_true "$PREPARE_ONLY" || is_true "$DRY_RUN"; then
+        if ((NNODES > 1)) && [[ -z "$requested_timestamp" && -z "$requested_full_name" ]]; then
+            warn \
+                "Multi-node PREPARE_ONLY/DRY_RUN does not contact peer nodes; its generated timestamp is local. " \
+                "Set EXPERIMENT_TIMESTAMP for reproducible dry-run output."
+        fi
+        EXPERIMENT_TIMESTAMP=${requested_timestamp:-$(date +%Y%m%d-%H%M%S)}
+        EXPERIMENT_FULL_NAME=${requested_full_name:-${EXPERIMENT_NAME}-${EXPERIMENT_TIMESTAMP}}
+        export EXPERIMENT_TIMESTAMP EXPERIMENT_FULL_NAME
+        return
+    fi
+
+    identity=$(python3 - \
+        "$method" \
+        "$MODEL_SLUG" \
+        "$MODEL_PATH" \
+        "$EXPERIMENT_SYNC_FINGERPRINT" \
+        "$EXPERIMENT_NAME" \
+        "$PROJECT_NAME" \
+        "$OUTPUT_ROOT" \
+        "$requested_timestamp" \
+        "$requested_full_name" \
+        "${CKPT_DIR:-}" \
+        "$LOG_DIR" \
+        "$NNODES" \
+        "$NODE_RANK" \
+        "$MASTER_ADDR" \
+        "$CURRENT_IP" \
+        "$EXPERIMENT_SYNC_PORT" \
+        "$EXPERIMENT_SYNC_TIMEOUT_SECONDS" <<'PY'
+import json
+import socket
+import sys
+import time
+
+(
+    method,
+    model_slug,
+    model_path,
+    launch_fingerprint,
+    experiment_name,
+    project_name,
+    output_root,
+    requested_timestamp,
+    requested_full_name,
+    checkpoint_override,
+    log_dir,
+    nnodes,
+    node_rank,
+    master_addr,
+    current_ip,
+    sync_port,
+    timeout_seconds,
+) = sys.argv[1:]
+
+nnodes = int(nnodes)
+node_rank = int(node_rank)
+sync_port = int(sync_port)
+timeout_seconds = int(timeout_seconds)
+deadline = time.monotonic() + timeout_seconds
+configuration = {
+    "method": method,
+    "model_slug": model_slug,
+    "model_path": model_path,
+    "launch_fingerprint": launch_fingerprint,
+    "experiment_name": experiment_name,
+    "project_name": project_name,
+    "output_root": output_root,
+    "requested_timestamp": requested_timestamp,
+    "requested_full_name": requested_full_name,
+    "checkpoint_override": checkpoint_override,
+    "log_dir": log_dir,
+    "nnodes": nnodes,
+}
+
+
+def receive_line(connection):
+    chunks = []
+    size = 0
+    while True:
+        chunk = connection.recv(4096)
+        if not chunk:
+            raise RuntimeError("peer closed the experiment-identity connection before sending a newline")
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > 65536:
+            raise RuntimeError("experiment-identity message exceeds 64 KiB")
+        if b"\n" in chunk:
+            return b"".join(chunks).split(b"\n", 1)[0]
+
+
+def send_json(connection, payload):
+    connection.sendall(json.dumps(payload, sort_keys=True).encode("utf-8") + b"\n")
+
+
+if node_rank == 0:
+    timestamp = requested_timestamp or time.strftime("%Y%m%d-%H%M%S")
+    full_name = requested_full_name or f"{experiment_name}-{timestamp}"
+    connections = {}
+    all_connections = []
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server.bind((current_ip, sync_port))
+        server.listen(max(1, nnodes - 1))
+        while len(connections) < nnodes - 1:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                missing = sorted(set(range(1, nnodes)) - set(connections))
+                raise TimeoutError(f"timed out waiting for experiment-identity peers; missing ranks={missing}")
+            server.settimeout(min(1.0, remaining))
+            try:
+                connection, _ = server.accept()
+            except TimeoutError:
+                continue
+            all_connections.append(connection)
+            connection.settimeout(max(1.0, remaining))
+            message = json.loads(receive_line(connection))
+            peer_rank = int(message.pop("node_rank"))
+            if peer_rank <= 0 or peer_rank >= nnodes:
+                raise RuntimeError(f"invalid peer NODE_RANK={peer_rank}")
+            if peer_rank in connections:
+                raise RuntimeError(f"duplicate experiment-identity peer NODE_RANK={peer_rank}")
+            if message != configuration:
+                differing = {
+                    key: {"rank0": configuration.get(key), f"rank{peer_rank}": message.get(key)}
+                    for key in sorted(set(configuration) | set(message))
+                    if configuration.get(key) != message.get(key)
+                }
+                raise RuntimeError(f"distributed launch configuration mismatch: {differing}")
+            connections[peer_rank] = connection
+        response = {"ok": True, "timestamp": timestamp, "full_name": full_name}
+        for connection in connections.values():
+            send_json(connection, response)
+    except Exception as error:
+        response = {"ok": False, "error": f"{type(error).__name__}: {error}"}
+        for connection in all_connections:
+            try:
+                send_json(connection, response)
+            except OSError:
+                pass
+        raise
+    finally:
+        for connection in all_connections:
+            connection.close()
+        server.close()
+else:
+    request = {**configuration, "node_rank": node_rank}
+    last_error = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"timed out connecting to experiment-identity server at {master_addr}:{sync_port}; "
+                f"last_error={last_error!r}"
+            )
+        try:
+            connection = socket.create_connection((master_addr, sync_port), timeout=min(5.0, remaining))
+            break
+        except OSError as error:
+            last_error = error
+            time.sleep(min(1.0, remaining))
+    with connection:
+        connection.settimeout(max(1.0, deadline - time.monotonic()))
+        send_json(connection, request)
+        response = json.loads(receive_line(connection))
+    if not response.get("ok"):
+        raise RuntimeError(response.get("error", "rank 0 rejected experiment-identity request"))
+    timestamp = response["timestamp"]
+    full_name = response["full_name"]
+
+if not timestamp or not full_name or any(character in timestamp + full_name for character in "\r\n\t"):
+    raise RuntimeError(f"invalid synchronized experiment identity: timestamp={timestamp!r}, full_name={full_name!r}")
+print(f"{timestamp}\t{full_name}")
+PY
+    ) || die "Failed to synchronize the multi-node experiment identity."
+
+    IFS=$'\t' read -r EXPERIMENT_TIMESTAMP EXPERIMENT_FULL_NAME <<<"$identity"
+    [[ -n "$EXPERIMENT_TIMESTAMP" && -n "$EXPERIMENT_FULL_NAME" ]] || die \
+        "Experiment identity synchronization returned an invalid result: $identity"
+    export EXPERIMENT_TIMESTAMP EXPERIMENT_FULL_NAME
 }
 
 ALLOW_VERSION_MISMATCH=${ALLOW_VERSION_MISMATCH:-0}
@@ -150,12 +441,22 @@ setup_ascend_environment() {
         warn "CANN environment script not found: $cann_env"
     fi
 
+    export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-3600}
     export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
     export HCCL_HOST_SOCKET_PORT_RANGE=${HCCL_HOST_SOCKET_PORT_RANGE:-auto}
     export HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE:-auto}
     unset HCCL_IF_BASE_PORT || true
+    export HCCL_SOCKET_IFNAME=${HCCL_SOCKET_IFNAME:-$SOCKET_IFNAME}
+    export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-$SOCKET_IFNAME}
+    export TP_SOCKET_IFNAME=${TP_SOCKET_IFNAME:-$SOCKET_IFNAME}
 
     export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+    export RAY_DEDUP_LOGS=${RAY_DEDUP_LOGS:-0}
+    export RAY_USAGE_STATS_ENABLED=${RAY_USAGE_STATS_ENABLED:-0}
+    export RAY_gcs_server_rpc_server_thread_num=${RAY_gcs_server_rpc_server_thread_num:-32}
+    export RAY_gcs_server_request_timeout_seconds=${RAY_gcs_server_request_timeout_seconds:-600}
+    export RAY_timeout_ms=${RAY_timeout_ms:-600000}
+    export RAY_worker_register_timeout_seconds=${RAY_worker_register_timeout_seconds:-600}
     export VLLM_USE_V1=${VLLM_USE_V1:-1}
     export VLLM_ALLREDUCE_USE_SYMM_MEM=${VLLM_ALLREDUCE_USE_SYMM_MEM:-0}
     export VLLM_ASCEND_ENABLE_PREFETCH_MLP=${VLLM_ASCEND_ENABLE_PREFETCH_MLP:-1}
@@ -222,6 +523,305 @@ print_command() {
     printf 'Command:'
     printf ' %q' "$@"
     printf '\n'
+}
+
+RAY_BLOCK_PID=
+RAY_LIFECYCLE_SERVER_PID=
+RAY_LIFECYCLE_DIR=
+RAY_LIFECYCLE_READY_FILE=
+MANAGED_RAY_STARTED=0
+
+cleanup_managed_ray() {
+    if [[ -n "$RAY_LIFECYCLE_SERVER_PID" ]]; then
+        kill "$RAY_LIFECYCLE_SERVER_PID" 2>/dev/null || true
+        wait "$RAY_LIFECYCLE_SERVER_PID" 2>/dev/null || true
+        RAY_LIFECYCLE_SERVER_PID=
+    fi
+    if ((MANAGED_RAY_STARTED == 0)) && [[ -z "$RAY_LIFECYCLE_DIR" ]]; then
+        return
+    fi
+    if ((MANAGED_RAY_STARTED == 1)); then
+        MANAGED_RAY_STARTED=0
+        echo "Stopping the managed Ray runtime on node rank $NODE_RANK..."
+        ray stop --force >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$RAY_BLOCK_PID" ]]; then
+        kill "$RAY_BLOCK_PID" 2>/dev/null || true
+        wait "$RAY_BLOCK_PID" 2>/dev/null || true
+        RAY_BLOCK_PID=
+    fi
+    if [[ -n "$RAY_LIFECYCLE_DIR" ]]; then
+        rm -f "$RAY_LIFECYCLE_READY_FILE"
+        rmdir "$RAY_LIFECYCLE_DIR" 2>/dev/null || true
+        RAY_LIFECYCLE_DIR=
+        RAY_LIFECYCLE_READY_FILE=
+    fi
+}
+
+start_ray_lifecycle_server() {
+    RAY_LIFECYCLE_DIR=$(mktemp -d)
+    RAY_LIFECYCLE_READY_FILE=$RAY_LIFECYCLE_DIR/workers.ready
+    python3 -u - \
+        "$CURRENT_IP" \
+        "$EXPERIMENT_SYNC_PORT" \
+        "$NNODES" \
+        "$EXPERIMENT_FULL_NAME" \
+        "$RAY_WORKER_CONNECT_TIMEOUT_SECONDS" \
+        "$RAY_LIFECYCLE_READY_FILE" <<'PY' &
+import json
+import socket
+import sys
+import time
+from pathlib import Path
+
+bind_ip, port, nnodes, experiment_name, timeout_seconds, ready_file = sys.argv[1:]
+port = int(port)
+nnodes = int(nnodes)
+deadline = time.monotonic() + int(timeout_seconds)
+connections = {}
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind((bind_ip, port))
+server.listen(max(1, nnodes - 1))
+print(f"Ray lifecycle server listening at {bind_ip}:{port}", flush=True)
+
+while len(connections) < nnodes - 1:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        missing = sorted(set(range(1, nnodes)) - set(connections))
+        raise TimeoutError(f"timed out waiting for Ray worker lifecycle clients; missing ranks={missing}")
+    server.settimeout(min(1.0, remaining))
+    try:
+        connection, _ = server.accept()
+    except TimeoutError:
+        continue
+    connection.settimeout(max(1.0, remaining))
+    chunks = []
+    size = 0
+    while True:
+        chunk = connection.recv(4096)
+        if not chunk:
+            raise RuntimeError("Ray worker closed its lifecycle connection before registration")
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > 65536:
+            raise RuntimeError("Ray worker lifecycle registration exceeds 64 KiB")
+        if b"\n" in chunk:
+            break
+    message = json.loads(b"".join(chunks).split(b"\n", 1)[0])
+    worker_rank = int(message.get("node_rank", -1))
+    if worker_rank <= 0 or worker_rank >= nnodes:
+        raise RuntimeError(f"invalid Ray worker lifecycle NODE_RANK={worker_rank}")
+    if worker_rank in connections:
+        raise RuntimeError(f"duplicate Ray worker lifecycle NODE_RANK={worker_rank}")
+    if message.get("experiment_name") != experiment_name:
+        raise RuntimeError(
+            "Ray worker lifecycle experiment mismatch: "
+            f"rank0={experiment_name!r}, rank{worker_rank}={message.get('experiment_name')!r}"
+        )
+    connection.settimeout(None)
+    connections[worker_rank] = connection
+    print(f"Ray worker lifecycle registered: rank={worker_rank}", flush=True)
+
+Path(ready_file).write_text(
+    json.dumps({"experiment_name": experiment_name, "worker_ranks": sorted(connections)}) + "\n",
+    encoding="utf-8",
+)
+print(f"All {nnodes - 1} Ray worker lifecycle clients are registered", flush=True)
+
+# The parent terminates this process during cleanup. Closing these sockets is
+# the shutdown signal that makes every worker stop its own local Ray runtime.
+while True:
+    time.sleep(3600)
+PY
+    RAY_LIFECYCLE_SERVER_PID=$!
+    trap cleanup_managed_ray EXIT
+}
+
+wait_for_ray_lifecycle_workers() {
+    local deadline=$((SECONDS + RAY_WORKER_CONNECT_TIMEOUT_SECONDS))
+    while [[ ! -s "$RAY_LIFECYCLE_READY_FILE" ]]; do
+        if ! kill -0 "$RAY_LIFECYCLE_SERVER_PID" 2>/dev/null; then
+            wait "$RAY_LIFECYCLE_SERVER_PID" || true
+            die "Ray lifecycle server exited before every worker registered."
+        fi
+        ((SECONDS < deadline)) || die "Timed out waiting for Ray worker lifecycle registration."
+        sleep 1
+    done
+    echo "Ray lifecycle workers: $(<"$RAY_LIFECYCLE_READY_FILE")"
+}
+
+wait_for_ray_lifecycle_shutdown() {
+    python3 - \
+        "$MASTER_ADDR" \
+        "$EXPERIMENT_SYNC_PORT" \
+        "$NODE_RANK" \
+        "$EXPERIMENT_FULL_NAME" \
+        "$RAY_WORKER_CONNECT_TIMEOUT_SECONDS" <<'PY'
+import json
+import socket
+import sys
+import time
+
+host, port, node_rank, experiment_name, timeout_seconds = sys.argv[1:]
+port = int(port)
+deadline = time.monotonic() + int(timeout_seconds)
+last_error = None
+while True:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(
+            f"timed out connecting to Ray lifecycle server at {host}:{port}; last_error={last_error!r}"
+        )
+    try:
+        connection = socket.create_connection((host, port), timeout=min(5.0, remaining))
+        break
+    except OSError as error:
+        last_error = error
+        time.sleep(min(1.0, remaining))
+
+with connection:
+    payload = {"node_rank": int(node_rank), "experiment_name": experiment_name}
+    connection.sendall(json.dumps(payload, sort_keys=True).encode("utf-8") + b"\n")
+    connection.settimeout(None)
+    while connection.recv(4096):
+        pass
+print("Ray lifecycle shutdown signal received from rank 0")
+PY
+}
+
+wait_for_tcp_endpoint() {
+    local host=$1
+    local port=$2
+    local timeout_seconds=$3
+    python3 - "$host" "$port" "$timeout_seconds" <<'PY'
+import socket
+import sys
+import time
+
+host, port, timeout_seconds = sys.argv[1:]
+port = int(port)
+deadline = time.monotonic() + int(timeout_seconds)
+last_error = None
+while time.monotonic() < deadline:
+    try:
+        with socket.create_connection((host, port), timeout=min(5.0, max(0.1, deadline - time.monotonic()))):
+            print(f"Ray head endpoint is reachable: {host}:{port}")
+            raise SystemExit(0)
+    except OSError as error:
+        last_error = error
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+raise TimeoutError(f"timed out waiting for {host}:{port}; last_error={last_error!r}")
+PY
+}
+
+wait_for_ray_cluster() {
+    python3 - \
+        "$RAY_GCS_ADDRESS" \
+        "$NNODES" \
+        "$NPUS_PER_NODE" \
+        "$RAY_CLUSTER_READY_TIMEOUT_SECONDS" <<'PY'
+import sys
+import time
+
+import ray
+
+address, expected_nodes, expected_npus_per_node, timeout_seconds = sys.argv[1:]
+expected_nodes = int(expected_nodes)
+expected_npus_per_node = int(expected_npus_per_node)
+timeout_seconds = int(timeout_seconds)
+expected_total_npus = expected_nodes * expected_npus_per_node
+deadline = time.monotonic() + timeout_seconds
+last_report = None
+last_error = None
+
+while time.monotonic() < deadline:
+    try:
+        if not ray.is_initialized():
+            ray.init(address=address, ignore_reinit_error=True, logging_level="ERROR")
+        alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
+        npu_counts = [float(node.get("Resources", {}).get("NPU", 0.0)) for node in alive_nodes]
+        total_npus = sum(npu_counts)
+        report = (len(alive_nodes), tuple(sorted(npu_counts)), total_npus)
+        if report != last_report:
+            print(
+                "Ray cluster resources: "
+                f"nodes={len(alive_nodes)}/{expected_nodes}, "
+                f"per_node_npus={npu_counts}, total_npus={total_npus:g}/{expected_total_npus}"
+            )
+            last_report = report
+        if (
+            len(alive_nodes) == expected_nodes
+            and all(count == expected_npus_per_node for count in npu_counts)
+            and total_npus == expected_total_npus
+        ):
+            ray.shutdown()
+            raise SystemExit(0)
+    except Exception as error:
+        last_error = error
+        if ray.is_initialized():
+            ray.shutdown()
+    time.sleep(2)
+
+if ray.is_initialized():
+    ray.shutdown()
+raise TimeoutError(
+    f"Ray cluster did not reach {expected_nodes} nodes and {expected_total_npus} NPUs "
+    f"within {timeout_seconds}s; last_report={last_report!r}, last_error={last_error!r}"
+)
+PY
+}
+
+start_managed_ray_head() {
+    local ray_resources
+    printf -v ray_resources '{"NPU": %d}' "$NPUS_PER_NODE"
+    echo "Starting managed Ray head at $CURRENT_IP:$MASTER_PORT..."
+    ray start \
+        --head \
+        --node-ip-address="$CURRENT_IP" \
+        --port="$MASTER_PORT" \
+        --dashboard-host=0.0.0.0 \
+        --dashboard-port="$DASHBOARD_PORT" \
+        --resources="$ray_resources" \
+        --disable-usage-stats \
+        --block &
+    RAY_BLOCK_PID=$!
+
+    sleep 1
+    if ! kill -0 "$RAY_BLOCK_PID" 2>/dev/null; then
+        wait "$RAY_BLOCK_PID" || true
+        RAY_BLOCK_PID=
+        die "Managed Ray head exited before the cluster became ready."
+    fi
+    MANAGED_RAY_STARTED=1
+    trap cleanup_managed_ray EXIT
+}
+
+run_managed_ray_worker() {
+    local ray_resources
+    printf -v ray_resources '{"NPU": %d}' "$NPUS_PER_NODE"
+    echo "Waiting for managed Ray head at $RAY_GCS_ADDRESS..."
+    wait_for_tcp_endpoint "$MASTER_ADDR" "$MASTER_PORT" "$RAY_WORKER_CONNECT_TIMEOUT_SECONDS"
+    echo "Starting managed Ray worker rank $NODE_RANK from $CURRENT_IP..."
+    ray start \
+        --address="$RAY_GCS_ADDRESS" \
+        --node-ip-address="$CURRENT_IP" \
+        --resources="$ray_resources" \
+        --disable-usage-stats \
+        --block &
+    RAY_BLOCK_PID=$!
+
+    sleep 1
+    if ! kill -0 "$RAY_BLOCK_PID" 2>/dev/null; then
+        wait "$RAY_BLOCK_PID" || true
+        RAY_BLOCK_PID=
+        die "Managed Ray worker rank $NODE_RANK exited before lifecycle registration."
+    fi
+    MANAGED_RAY_STARTED=1
+    trap cleanup_managed_ray EXIT
+    wait_for_ray_lifecycle_shutdown
+    cleanup_managed_ray
+    trap - EXIT
 }
 
 prepare_deepseek_distill_agent_loop_compat() {
@@ -405,17 +1005,12 @@ MODEL_SLUG=${MODEL_SLUG%-}
 
 OUTPUT_ROOT=${OUTPUT_ROOT:-$DATA_ROOT/outputs/dapo_math_17k_baselines}
 PROJECT_NAME=${PROJECT_NAME:-DMPD}
-EXPERIMENT_TIMESTAMP=${EXPERIMENT_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-${MODEL_SLUG}-grpo-${EXPERIMENT_TIMESTAMP}}
-CKPT_DIR=${CKPT_DIR:-$OUTPUT_ROOT/checkpoints/$PROJECT_NAME/$EXPERIMENT_NAME}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-${MODEL_SLUG}-grpo}
 LOG_DIR=${LOG_DIR:-$OUTPUT_ROOT/logs}
-LOG_FILE=${LOG_FILE:-$LOG_DIR/${EXPERIMENT_NAME}.log}
 
-export WANDB_ENTITY=${WANDB_ENTITY:-jubgjf}
-export WANDB_PROJECT=${WANDB_PROJECT:-$PROJECT_NAME}
-export WANDB_NAME=${WANDB_NAME:-$EXPERIMENT_NAME}
-
-mkdir -p "$CKPT_DIR" "$LOG_DIR"
+unset WANDB_ENTITY WANDB_PROJECT WANDB_NAME WANDB_RUN_ID WANDB_RESUME
+export WANDB_MODE=disabled
+export WANDB_DISABLED=true
 
 [[ -d "$MODEL_PATH" ]] || die "Missing model directory: $MODEL_PATH"
 [[ -f "$TRAIN_FILE" ]] || die "Missing training parquet: $TRAIN_FILE"
@@ -454,19 +1049,50 @@ esac
 NNODES=${NNODES:-${VC_WORKER_NUM:-1}}
 NPUS_PER_NODE=${NPUS_PER_NODE:-8}
 NODE_RANK=${NODE_RANK:-${VC_TASK_INDEX:-0}}
-MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-6167}
-export MASTER_ADDR MASTER_PORT
+DASHBOARD_PORT=${DASHBOARD_PORT:-8191}
+EXPERIMENT_SYNC_TIMEOUT_SECONDS=${EXPERIMENT_SYNC_TIMEOUT_SECONDS:-600}
+RAY_CLUSTER_READY_TIMEOUT_SECONDS=${RAY_CLUSTER_READY_TIMEOUT_SECONDS:-600}
+RAY_WORKER_CONNECT_TIMEOUT_SECONDS=${RAY_WORKER_CONNECT_TIMEOUT_SECONDS:-600}
 
 check_positive_integer NNODES "$NNODES"
 check_positive_integer NPUS_PER_NODE "$NPUS_PER_NODE"
 [[ "$NODE_RANK" =~ ^[0-9]+$ ]] || die "NODE_RANK must be a non-negative integer, got: $NODE_RANK"
 ((NODE_RANK < NNODES)) || die "NODE_RANK=$NODE_RANK must be smaller than NNODES=$NNODES"
+check_port MASTER_PORT "$MASTER_PORT"
+check_port DASHBOARD_PORT "$DASHBOARD_PORT"
+EXPERIMENT_SYNC_PORT=${EXPERIMENT_SYNC_PORT:-$((MASTER_PORT + 1))}
+check_port EXPERIMENT_SYNC_PORT "$EXPERIMENT_SYNC_PORT"
+((EXPERIMENT_SYNC_PORT != MASTER_PORT)) || die "EXPERIMENT_SYNC_PORT must differ from MASTER_PORT."
+((EXPERIMENT_SYNC_PORT != DASHBOARD_PORT)) || die "EXPERIMENT_SYNC_PORT must differ from DASHBOARD_PORT."
+((MASTER_PORT != DASHBOARD_PORT)) || die "MASTER_PORT must differ from DASHBOARD_PORT."
+check_positive_integer EXPERIMENT_SYNC_TIMEOUT_SECONDS "$EXPERIMENT_SYNC_TIMEOUT_SECONDS"
+check_positive_integer RAY_CLUSTER_READY_TIMEOUT_SECONDS "$RAY_CLUSTER_READY_TIMEOUT_SECONDS"
+check_positive_integer RAY_WORKER_CONNECT_TIMEOUT_SECONDS "$RAY_WORKER_CONNECT_TIMEOUT_SECONDS"
 
-if ((NNODES > 1)); then
-    [[ "$NODE_RANK" == "0" ]] || die "Submit multi-node GRPO only once from NODE_RANK=0; workers must already belong to Ray."
-    [[ -n "${RAY_ADDRESS:-}" ]] || die "NNODES=$NNODES requires a pre-existing Ray cluster and RAY_ADDRESS."
+if [[ -n "${RAY_ADDRESS:-}" ]]; then
+    if ! is_true "$PREPARE_ONLY" && ! is_true "$DRY_RUN"; then
+        die "External RAY_ADDRESS is not supported; unset it so grpo.sh can manage the Ray cluster."
+    fi
+    warn "Ignoring external RAY_ADDRESS during PREPARE_ONLY/DRY_RUN."
 fi
+unset RAY_ADDRESS
+
+printf -v EXPERIMENT_SYNC_FINGERPRINT \
+    'data=%s,%s;npus=%s;master_port=%s;socket=%s;tp=%s;pp=%s;cp=%s;rollout_tp=%s;rollout_pp=%s;rollout_dp=%s;batch=%s;prompt=%s;response=%s' \
+    "$TRAIN_FILE" "$VAL_FILE" "$NPUS_PER_NODE" "$MASTER_PORT" "${SOCKET_IFNAME:-eth0}" \
+    "${ACTOR_TP:-1}" "${ACTOR_PP:-1}" "${ACTOR_CP:-2}" \
+    "${ROLLOUT_TP:-1}" "${ROLLOUT_PP:-1}" "${ROLLOUT_DP:-1}" "${TRAIN_BATCH_SIZE:-64}" \
+    "${MAX_PROMPT_LENGTH:-1024}" "${MAX_RESPONSE_LENGTH:-23552}"
+resolve_cluster_addresses
+synchronize_experiment_identity grpo
+
+CKPT_DIR=${CKPT_DIR:-$OUTPUT_ROOT/checkpoints/$PROJECT_NAME/$EXPERIMENT_FULL_NAME}
+LOG_FILE=${LOG_FILE:-$LOG_DIR/${EXPERIMENT_FULL_NAME}.log}
+RAY_GCS_ADDRESS=${MASTER_ADDR}:${MASTER_PORT}
+export MASTER_PORT
+
+mkdir -p "$CKPT_DIR" "$LOG_DIR"
 
 WORLD_SIZE=$((NNODES * NPUS_PER_NODE))
 ACTOR_TP=${ACTOR_TP:-1}
@@ -551,7 +1177,7 @@ setup_ascend_environment
 cd "$VERL_ROOT"
 check_runtime_versions
 
-if [[ "${CLEAN_STALE_RAY:-0}" == "1" ]]; then
+if is_true "${CLEAN_STALE_RAY:-0}" && ! is_true "$PREPARE_ONLY" && ! is_true "$DRY_RUN"; then
     ray stop --force || true
 fi
 
@@ -1107,7 +1733,7 @@ TRAINER_ARGS=(
     "trainer.balance_batch=True"
     'trainer.logger=["console"]'
     "trainer.project_name=${PROJECT_NAME}"
-    "trainer.experiment_name=${EXPERIMENT_NAME}"
+    "trainer.experiment_name=${EXPERIMENT_FULL_NAME}"
     "trainer.total_epochs=${TOTAL_EPOCHS}"
     "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}"
     "trainer.val_before_train=False"
@@ -1137,14 +1763,15 @@ if [[ -n "$AGENT_LOOP_CONFIG_PATH" ]]; then
         "+ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH=${RAY_RUNTIME_PYTHONPATH}"
     )
 fi
-if [[ -n "${RAY_ADDRESS:-}" ]]; then
-    COMMAND+=("+ray_kwargs.ray_init.address=${RAY_ADDRESS}")
+if ((NNODES > 1)); then
+    COMMAND+=("+ray_kwargs.ray_init.address=${RAY_GCS_ADDRESS}")
 fi
 COMMAND+=("$@")
 
-echo "Experiment: $WANDB_ENTITY/$PROJECT_NAME/$EXPERIMENT_NAME"
+echo "Experiment: $PROJECT_NAME/$EXPERIMENT_FULL_NAME (base=$EXPERIMENT_NAME timestamp=$EXPERIMENT_TIMESTAMP)"
 echo "Model: $MODEL_PATH"
 echo "Data: train=$TRAIN_FILE validation=$VAL_FILE"
+echo "Cluster: node_rank=$NODE_RANK nnodes=$NNODES local_ip=$CURRENT_IP master=$MASTER_ADDR:$MASTER_PORT"
 echo "Actor topology: TP=$ACTOR_TP PP=$ACTOR_PP CP=$ACTOR_CP DP=$ACTOR_DP"
 echo "Rollout topology: replicas=$ROLLOUT_REPLICAS TP=$ROLLOUT_TP PP=$ROLLOUT_PP internal-DP=$ROLLOUT_DP"
 echo "Batching: prompts=$TRAIN_BATCH_SIZE rollouts_per_prompt=$ROLLOUT_N responses=$TOTAL_ROLLOUT_SAMPLES ppo_prompt_minibatch=$PPO_MINI_BATCH_SIZE"
@@ -1157,8 +1784,43 @@ echo "Log file: $LOG_FILE"
 print_command "${COMMAND[@]}"
 
 if is_true "$DRY_RUN"; then
+    if ((NNODES > 1)); then
+        ray_resources=$(printf '{"NPU": %d}' "$NPUS_PER_NODE")
+        if ((NODE_RANK == 0)); then
+            print_command ray start \
+                --head \
+                --node-ip-address="$CURRENT_IP" \
+                --port="$MASTER_PORT" \
+                --dashboard-host=0.0.0.0 \
+                --dashboard-port="$DASHBOARD_PORT" \
+                --resources="$ray_resources" \
+                --disable-usage-stats \
+                --block
+        else
+            print_command ray start \
+                --address="$RAY_GCS_ADDRESS" \
+                --node-ip-address="$CURRENT_IP" \
+                --resources="$ray_resources" \
+                --disable-usage-stats \
+                --block
+        fi
+    fi
     echo "DRY_RUN complete; no GRPO process was launched."
     exit 0
 fi
 
-"${COMMAND[@]}" 2>&1 | tee "$LOG_FILE"
+if ((NNODES == 1)); then
+    "${COMMAND[@]}" 2>&1 | tee "$LOG_FILE"
+elif ((NODE_RANK == 0)); then
+    start_ray_lifecycle_server
+    start_managed_ray_head
+    wait_for_ray_cluster
+    wait_for_ray_lifecycle_workers
+    training_exit_code=0
+    "${COMMAND[@]}" 2>&1 | tee "$LOG_FILE" || training_exit_code=$?
+    cleanup_managed_ray
+    trap - EXIT
+    exit "$training_exit_code"
+else
+    run_managed_ray_worker
+fi

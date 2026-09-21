@@ -15,9 +15,6 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 
 set -Eeuo pipefail
-if [[ "${VERBOSE:-0}" == "1" ]]; then
-    set -x
-fi
 
 die() {
     echo "ERROR: $*" >&2
@@ -39,6 +36,300 @@ check_positive_integer() {
     local name=$1
     local value=$2
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer, got: $value"
+}
+
+check_port() {
+    local name=$1
+    local value=$2
+    [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be an integer TCP port, got: $value"
+    ((value >= 1 && value <= 65535)) || die "$name must be between 1 and 65535, got: $value"
+}
+
+load_external_train_config() {
+    local train_config_path=${TRAIN_CONFIG_PATH:-/opt/huawei/algorithm/train.config}
+    if [[ ! -s "$train_config_path" ]]; then
+        echo "No non-empty train config found at $train_config_path; skip external env loading."
+        return 0
+    fi
+
+    echo "Loading external train config from $train_config_path"
+    local allexport_was_set=0
+    local nounset_was_set=0
+    case "$-" in
+        *a*) allexport_was_set=1 ;;
+    esac
+    case "$-" in
+        *u*)
+            nounset_was_set=1
+            set +u
+            ;;
+    esac
+
+    set -o allexport
+    # shellcheck disable=SC1090
+    if ! source "$train_config_path"; then
+        if ((allexport_was_set == 0)); then
+            set +o allexport
+        fi
+        if ((nounset_was_set == 1)); then
+            set -u
+        fi
+        die "Failed to load external train config: $train_config_path"
+    fi
+    if ((allexport_was_set == 0)); then
+        set +o allexport
+    fi
+    if ((nounset_was_set == 1)); then
+        set -u
+    fi
+}
+
+load_external_train_config
+if [[ "${VERBOSE:-0}" == "1" ]]; then
+    set -x
+fi
+
+resolve_cluster_addresses() {
+    if ((NNODES > 1)); then
+        if [[ -z "${MASTER_ADDR:-}" ]]; then
+            if [[ -n "${MA_VJ_NAME:-}" && -n "${MA_TASK_NAME:-}" ]]; then
+                MASTER_ADDR="${MA_VJ_NAME}-${MA_TASK_NAME}-0.${MA_VJ_NAME}"
+            else
+                die \
+                    "Multi-node launch requires MASTER_ADDR, or both MA_VJ_NAME and MA_TASK_NAME " \
+                    "for the common.sh rank-0 DNS convention."
+            fi
+        fi
+    else
+        MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
+    fi
+
+    SOCKET_IFNAME=${SOCKET_IFNAME:-eth0}
+    if [[ -z "${CURRENT_IP:-}" ]]; then
+        if [[ -n "${MA_CURRENT_IP:-}" ]]; then
+            CURRENT_IP=$MA_CURRENT_IP
+        else
+            command -v ifconfig >/dev/null 2>&1 || die \
+                "Cannot discover the local IP: ifconfig is unavailable; set CURRENT_IP explicitly."
+            local ifconfig_output
+            ifconfig_output=$(ifconfig "$SOCKET_IFNAME" 2>/dev/null) || die \
+                "Cannot inspect SOCKET_IFNAME=$SOCKET_IFNAME; set CURRENT_IP or SOCKET_IFNAME explicitly."
+            CURRENT_IP=$(awk '$1 == "inet" {sub(/^addr:/, "", $2); print $2; exit}' <<<"$ifconfig_output")
+            [[ -n "$CURRENT_IP" ]] || die \
+                "No IPv4 address found on SOCKET_IFNAME=$SOCKET_IFNAME; set CURRENT_IP explicitly."
+        fi
+    fi
+
+    python3 - "$MASTER_ADDR" "$CURRENT_IP" <<'PY'
+import ipaddress
+import socket
+import sys
+
+master_addr, current_ip = sys.argv[1:]
+try:
+    ipaddress.IPv4Address(current_ip)
+except ipaddress.AddressValueError as error:
+    raise ValueError(f"CURRENT_IP must be an IPv4 address, got {current_ip!r}") from error
+
+try:
+    resolved = sorted({item[4][0] for item in socket.getaddrinfo(master_addr, None, socket.AF_INET)})
+except socket.gaierror as error:
+    raise RuntimeError(f"MASTER_ADDR={master_addr!r} cannot be resolved to IPv4") from error
+if not resolved:
+    raise RuntimeError(f"MASTER_ADDR={master_addr!r} resolved to no IPv4 addresses")
+print(f"Cluster network: master={master_addr} resolved={resolved} local={current_ip}")
+PY
+
+    export MASTER_ADDR CURRENT_IP SOCKET_IFNAME
+}
+
+synchronize_experiment_identity() {
+    local method=$1
+    local requested_timestamp=${EXPERIMENT_TIMESTAMP:-}
+    local requested_full_name=${EXPERIMENT_FULL_NAME:-}
+    local identity
+
+    if ((NNODES == 1)) || is_true "$PREPARE_ONLY" || is_true "$DRY_RUN"; then
+        if ((NNODES > 1)) && [[ -z "$requested_timestamp" && -z "$requested_full_name" ]]; then
+            warn \
+                "Multi-node PREPARE_ONLY/DRY_RUN does not contact peer nodes; its generated timestamp is local. " \
+                "Set EXPERIMENT_TIMESTAMP for reproducible dry-run output."
+        fi
+        EXPERIMENT_TIMESTAMP=${requested_timestamp:-$(date +%Y%m%d-%H%M%S)}
+        EXPERIMENT_FULL_NAME=${requested_full_name:-${EXPERIMENT_NAME}-${EXPERIMENT_TIMESTAMP}}
+        export EXPERIMENT_TIMESTAMP EXPERIMENT_FULL_NAME
+        return
+    fi
+
+    identity=$(python3 - \
+        "$method" \
+        "$MODEL_SLUG" \
+        "$MODEL_PATH" \
+        "$EXPERIMENT_SYNC_FINGERPRINT" \
+        "$EXPERIMENT_NAME" \
+        "$PROJECT_NAME" \
+        "$OUTPUT_ROOT" \
+        "$requested_timestamp" \
+        "$requested_full_name" \
+        "${CKPT_DIR:-}" \
+        "$LOG_DIR" \
+        "$NNODES" \
+        "$NODE_RANK" \
+        "$MASTER_ADDR" \
+        "$CURRENT_IP" \
+        "$EXPERIMENT_SYNC_PORT" \
+        "$EXPERIMENT_SYNC_TIMEOUT_SECONDS" <<'PY'
+import json
+import socket
+import sys
+import time
+
+(
+    method,
+    model_slug,
+    model_path,
+    launch_fingerprint,
+    experiment_name,
+    project_name,
+    output_root,
+    requested_timestamp,
+    requested_full_name,
+    checkpoint_override,
+    log_dir,
+    nnodes,
+    node_rank,
+    master_addr,
+    current_ip,
+    sync_port,
+    timeout_seconds,
+) = sys.argv[1:]
+
+nnodes = int(nnodes)
+node_rank = int(node_rank)
+sync_port = int(sync_port)
+timeout_seconds = int(timeout_seconds)
+deadline = time.monotonic() + timeout_seconds
+configuration = {
+    "method": method,
+    "model_slug": model_slug,
+    "model_path": model_path,
+    "launch_fingerprint": launch_fingerprint,
+    "experiment_name": experiment_name,
+    "project_name": project_name,
+    "output_root": output_root,
+    "requested_timestamp": requested_timestamp,
+    "requested_full_name": requested_full_name,
+    "checkpoint_override": checkpoint_override,
+    "log_dir": log_dir,
+    "nnodes": nnodes,
+}
+
+
+def receive_line(connection):
+    chunks = []
+    size = 0
+    while True:
+        chunk = connection.recv(4096)
+        if not chunk:
+            raise RuntimeError("peer closed the experiment-identity connection before sending a newline")
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > 65536:
+            raise RuntimeError("experiment-identity message exceeds 64 KiB")
+        if b"\n" in chunk:
+            return b"".join(chunks).split(b"\n", 1)[0]
+
+
+def send_json(connection, payload):
+    connection.sendall(json.dumps(payload, sort_keys=True).encode("utf-8") + b"\n")
+
+
+if node_rank == 0:
+    timestamp = requested_timestamp or time.strftime("%Y%m%d-%H%M%S")
+    full_name = requested_full_name or f"{experiment_name}-{timestamp}"
+    connections = {}
+    all_connections = []
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server.bind((current_ip, sync_port))
+        server.listen(max(1, nnodes - 1))
+        while len(connections) < nnodes - 1:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                missing = sorted(set(range(1, nnodes)) - set(connections))
+                raise TimeoutError(f"timed out waiting for experiment-identity peers; missing ranks={missing}")
+            server.settimeout(min(1.0, remaining))
+            try:
+                connection, _ = server.accept()
+            except TimeoutError:
+                continue
+            all_connections.append(connection)
+            connection.settimeout(max(1.0, remaining))
+            message = json.loads(receive_line(connection))
+            peer_rank = int(message.pop("node_rank"))
+            if peer_rank <= 0 or peer_rank >= nnodes:
+                raise RuntimeError(f"invalid peer NODE_RANK={peer_rank}")
+            if peer_rank in connections:
+                raise RuntimeError(f"duplicate experiment-identity peer NODE_RANK={peer_rank}")
+            if message != configuration:
+                differing = {
+                    key: {"rank0": configuration.get(key), f"rank{peer_rank}": message.get(key)}
+                    for key in sorted(set(configuration) | set(message))
+                    if configuration.get(key) != message.get(key)
+                }
+                raise RuntimeError(f"distributed launch configuration mismatch: {differing}")
+            connections[peer_rank] = connection
+        response = {"ok": True, "timestamp": timestamp, "full_name": full_name}
+        for connection in connections.values():
+            send_json(connection, response)
+    except Exception as error:
+        response = {"ok": False, "error": f"{type(error).__name__}: {error}"}
+        for connection in all_connections:
+            try:
+                send_json(connection, response)
+            except OSError:
+                pass
+        raise
+    finally:
+        for connection in all_connections:
+            connection.close()
+        server.close()
+else:
+    request = {**configuration, "node_rank": node_rank}
+    last_error = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"timed out connecting to experiment-identity server at {master_addr}:{sync_port}; "
+                f"last_error={last_error!r}"
+            )
+        try:
+            connection = socket.create_connection((master_addr, sync_port), timeout=min(5.0, remaining))
+            break
+        except OSError as error:
+            last_error = error
+            time.sleep(min(1.0, remaining))
+    with connection:
+        connection.settimeout(max(1.0, deadline - time.monotonic()))
+        send_json(connection, request)
+        response = json.loads(receive_line(connection))
+    if not response.get("ok"):
+        raise RuntimeError(response.get("error", "rank 0 rejected experiment-identity request"))
+    timestamp = response["timestamp"]
+    full_name = response["full_name"]
+
+if not timestamp or not full_name or any(character in timestamp + full_name for character in "\r\n\t"):
+    raise RuntimeError(f"invalid synchronized experiment identity: timestamp={timestamp!r}, full_name={full_name!r}")
+print(f"{timestamp}\t{full_name}")
+PY
+    ) || die "Failed to synchronize the multi-node experiment identity."
+
+    IFS=$'\t' read -r EXPERIMENT_TIMESTAMP EXPERIMENT_FULL_NAME <<<"$identity"
+    [[ -n "$EXPERIMENT_TIMESTAMP" && -n "$EXPERIMENT_FULL_NAME" ]] || die \
+        "Experiment identity synchronization returned an invalid result: $identity"
+    export EXPERIMENT_TIMESTAMP EXPERIMENT_FULL_NAME
 }
 
 ALLOW_VERSION_MISMATCH=${ALLOW_VERSION_MISMATCH:-0}
@@ -151,10 +442,14 @@ setup_ascend_environment() {
         warn "CANN environment script not found: $cann_env"
     fi
 
+    export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-3600}
     export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
     export HCCL_HOST_SOCKET_PORT_RANGE=${HCCL_HOST_SOCKET_PORT_RANGE:-auto}
     export HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE:-auto}
     unset HCCL_IF_BASE_PORT || true
+    export HCCL_SOCKET_IFNAME=${HCCL_SOCKET_IFNAME:-$SOCKET_IFNAME}
+    export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-$SOCKET_IFNAME}
+    export TP_SOCKET_IFNAME=${TP_SOCKET_IFNAME:-$SOCKET_IFNAME}
     export CPU_AFFINITY_CONF=${CPU_AFFINITY_CONF:-1}
     export TOKENIZERS_PARALLELISM=false
     export HYDRA_FULL_ERROR=1
@@ -239,21 +534,17 @@ MODEL_SLUG=${MODEL_SLUG%-}
 OUTPUT_ROOT=${OUTPUT_ROOT:-$DATA_ROOT/outputs/dapo_math_17k_baselines}
 SFT_CACHE_DIR=${SFT_CACHE_DIR:-$OUTPUT_ROOT/prepared_data/dapo_math_17k_sft}
 PROJECT_NAME=${PROJECT_NAME:-DMPD}
-EXPERIMENT_TIMESTAMP=${EXPERIMENT_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-${MODEL_SLUG}-sft-${EXPERIMENT_TIMESTAMP}}
-CKPT_DIR=${CKPT_DIR:-$OUTPUT_ROOT/checkpoints/$PROJECT_NAME/$EXPERIMENT_NAME}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-${MODEL_SLUG}-sft}
 LOG_DIR=${LOG_DIR:-$OUTPUT_ROOT/logs}
 
-export WANDB_ENTITY=${WANDB_ENTITY:-jubgjf}
-export WANDB_PROJECT=${WANDB_PROJECT:-$PROJECT_NAME}
-export WANDB_NAME=${WANDB_NAME:-$EXPERIMENT_NAME}
+unset WANDB_ENTITY WANDB_PROJECT WANDB_NAME WANDB_RUN_ID WANDB_RESUME
+export WANDB_MODE=disabled
+export WANDB_DISABLED=true
 
 [[ -d "$MODEL_PATH" ]] || die "Missing model directory: $MODEL_PATH"
 [[ -f "$RL_TRAIN_FILE" ]] || die "Missing RL training parquet: $RL_TRAIN_FILE"
 [[ -f "$RL_VAL_FILE" ]] || die "Missing RL validation parquet: $RL_VAL_FILE"
 [[ -f "$SFT_SOURCE_JSON" ]] || die "Missing Yang-Zhou SFT JSON: $SFT_SOURCE_JSON"
-
-mkdir -p "$CKPT_DIR" "$LOG_DIR" "$SFT_CACHE_DIR"
 
 ################################ cluster and parallel topology
 
@@ -261,17 +552,30 @@ NNODES=${NNODES:-${VC_WORKER_NUM:-1}}
 NPUS_PER_NODE=${NPUS_PER_NODE:-8}
 NODE_RANK=${NODE_RANK:-${VC_TASK_INDEX:-0}}
 MASTER_PORT=${MASTER_PORT:-29500}
+EXPERIMENT_SYNC_TIMEOUT_SECONDS=${EXPERIMENT_SYNC_TIMEOUT_SECONDS:-600}
 
 check_positive_integer NNODES "$NNODES"
 check_positive_integer NPUS_PER_NODE "$NPUS_PER_NODE"
 [[ "$NODE_RANK" =~ ^[0-9]+$ ]] || die "NODE_RANK must be a non-negative integer, got: $NODE_RANK"
 ((NODE_RANK < NNODES)) || die "NODE_RANK=$NODE_RANK must be smaller than NNODES=$NNODES"
+check_port MASTER_PORT "$MASTER_PORT"
+EXPERIMENT_SYNC_PORT=${EXPERIMENT_SYNC_PORT:-$((MASTER_PORT + 1))}
+check_port EXPERIMENT_SYNC_PORT "$EXPERIMENT_SYNC_PORT"
+((EXPERIMENT_SYNC_PORT != MASTER_PORT)) || die "EXPERIMENT_SYNC_PORT must differ from MASTER_PORT."
+check_positive_integer EXPERIMENT_SYNC_TIMEOUT_SECONDS "$EXPERIMENT_SYNC_TIMEOUT_SECONDS"
 
-if ((NNODES > 1)); then
-    [[ -n "${MASTER_ADDR:-}" ]] || die "Multi-node SFT requires MASTER_ADDR."
-else
-    MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
-fi
+printf -v EXPERIMENT_SYNC_FINGERPRINT \
+    'data=%s,%s;source=%s;cache=%s;npus=%s;master_port=%s;socket=%s;tp=%s;pp=%s;cp=%s;batch=%s;prompt=%s;response=%s' \
+    "$RL_TRAIN_FILE" "$RL_VAL_FILE" "$SFT_SOURCE_JSON" "$SFT_CACHE_DIR" \
+    "$NPUS_PER_NODE" "$MASTER_PORT" "${SOCKET_IFNAME:-eth0}" \
+    "${ACTOR_TP:-1}" "${ACTOR_PP:-1}" "${ACTOR_CP:-2}" "${TRAIN_BATCH_SIZE:-64}" \
+    "${MAX_PROMPT_LENGTH:-1024}" "${MAX_RESPONSE_LENGTH:-23552}"
+resolve_cluster_addresses
+synchronize_experiment_identity sft
+
+CKPT_DIR=${CKPT_DIR:-$OUTPUT_ROOT/checkpoints/$PROJECT_NAME/$EXPERIMENT_FULL_NAME}
+
+mkdir -p "$CKPT_DIR" "$LOG_DIR" "$SFT_CACHE_DIR"
 
 WORLD_SIZE=$((NNODES * NPUS_PER_NODE))
 ACTOR_TP=${ACTOR_TP:-1}
@@ -1293,7 +1597,7 @@ TRAINER_ARGS=(
     "trainer.nnodes=${NNODES}"
     "trainer.n_gpus_per_node=${NPUS_PER_NODE}"
     "trainer.project_name=${PROJECT_NAME}"
-    "trainer.experiment_name=${EXPERIMENT_NAME}"
+    "trainer.experiment_name=${EXPERIMENT_FULL_NAME}"
     'trainer.logger=["console"]'
     "trainer.seed=${SEED}"
     "trainer.total_epochs=${TOTAL_EPOCHS}"
@@ -1311,6 +1615,7 @@ TORCHRUN_ARGS=(
     --node-rank="$NODE_RANK"
     --master-addr="$MASTER_ADDR"
     --master-port="$MASTER_PORT"
+    --local-addr="$CURRENT_IP"
 )
 
 COMMAND=(
@@ -1327,11 +1632,15 @@ COMMAND=(
     "$@"
 )
 
-LOG_FILE=${LOG_FILE:-$LOG_DIR/${EXPERIMENT_NAME}.node${NODE_RANK}.log}
+if ((NNODES > 1)) && [[ -n "${LOG_FILE:-}" ]]; then
+    die "Multi-node SFT requires per-node log files; set LOG_DIR instead of LOG_FILE."
+fi
+LOG_FILE=${LOG_FILE:-$LOG_DIR/${EXPERIMENT_FULL_NAME}.node${NODE_RANK}.log}
 
-echo "Experiment: $WANDB_ENTITY/$PROJECT_NAME/$EXPERIMENT_NAME"
+echo "Experiment: $PROJECT_NAME/$EXPERIMENT_FULL_NAME (base=$EXPERIMENT_NAME timestamp=$EXPERIMENT_TIMESTAMP)"
 echo "Model: $MODEL_PATH"
 echo "Tokenizer: $TOKENIZER_PATH"
+echo "Cluster: node_rank=$NODE_RANK nnodes=$NNODES local_ip=$CURRENT_IP master=$MASTER_ADDR:$MASTER_PORT"
 echo "Prepared data: train=$SFT_TRAIN_FILE validation=$SFT_VAL_FILE"
 echo "Prepared rows: train=$SFT_TRAIN_ROWS validation=$SFT_VAL_ROWS"
 echo "Topology: TP=$ACTOR_TP PP=$ACTOR_PP CP=$ACTOR_CP DP=$ACTOR_DP"
