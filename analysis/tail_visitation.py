@@ -22,7 +22,6 @@ import gzip
 import json
 import os
 from pathlib import Path
-from typing import Literal
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS_ROOT = REPO_ROOT / "analysis_artifacts" / "jubgjf" / "DMPD" / "runs"
@@ -32,20 +31,37 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ.setdefault("MPLCONFIGDIR", str(CACHE_ROOT / "matplotlib"))
 os.environ.setdefault("XDG_CACHE_HOME", str(CACHE_ROOT / "xdg"))
 
-import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib import font_manager
 from matplotlib.lines import Line2D
 from matplotlib.ticker import PercentFormatter
 
+try:
+    from analysis.plot_style import (
+        GRID_COLOR,
+        STANDARD_PANEL_MARGINS,
+        configure_style,
+        create_panel,
+        save_figure,
+        set_panel_title,
+    )
+except ModuleNotFoundError:  # Support ``python analysis/tail_visitation.py``.
+    from plot_style import (
+        GRID_COLOR,
+        STANDARD_PANEL_MARGINS,
+        configure_style,
+        create_panel,
+        save_figure,
+        set_panel_title,
+    )
+
 LATE_WINDOW = 32
 SURVIVAL_METRICS = (
-    ("4K", "response_length/survival_gt_4k"),
-    ("12K", "response_length/survival_gt_12k"),
-    ("20K", "response_length/survival_gt_20k"),
-    ("23K", "response_length/survival_gt_23k"),
+    (r"$>4\mathrm{K}$", "response_length/survival_gt_4k"),
+    (r"$>12\mathrm{K}$", "response_length/survival_gt_12k"),
+    (r"$>20\mathrm{K}$", "response_length/survival_gt_20k"),
+    (r"$>23\mathrm{K}$", "response_length/survival_gt_23k"),
     ("Max", "response_length/clip_ratio"),
 )
 OPD_RUN_ID = "9bbeb176889b42aa847665d03274fd68"
@@ -54,32 +70,6 @@ METHODS = {
     "opd": {"label": "OPD", "color": "#C7785E", "linestyle": "-", "marker": "^"},
     "dmpd": {"label": "DMPD", "color": "#6689A6", "linestyle": "-", "marker": "o"},
 }
-GRID_COLOR = "#E6E2DD"
-PANEL_MARGINS = {"left": 0.22, "right": 0.97, "bottom": 0.19, "top": 0.88}
-
-
-def configure_style() -> None:
-    times_path = Path("/System/Library/Fonts/Supplemental/Times New Roman.ttf")
-    if times_path.is_file():
-        font_manager.fontManager.addfont(times_path)
-    mpl.rcParams.update(
-        {
-            "font.family": "Times New Roman",
-            "font.size": 15,
-            "axes.titlesize": 15,
-            "axes.labelsize": 15,
-            "axes.linewidth": 1.1,
-            "axes.spines.top": False,
-            "axes.spines.right": False,
-            "xtick.labelsize": 13,
-            "ytick.labelsize": 13,
-            "legend.fontsize": 13,
-            "lines.linewidth": 2.0,
-            "lines.markersize": 6,
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-        }
-    )
 
 
 def load_history(run_id: str) -> pd.DataFrame:
@@ -116,31 +106,9 @@ def late_survival(run_id: str) -> np.ndarray:
     return np.asarray([100 * selected[key].mean() for _, key in SURVIVAL_METRICS])
 
 
-def save(
-    fig: mpl.figure.Figure,
-    stem: str,
-    *,
-    export_mode: Literal["panel", "legend"],
-    transparent: bool = False,
-) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    save_kwargs: dict[str, object] = {"transparent": transparent}
-    if export_mode == "legend":
-        save_kwargs.update({"bbox_inches": "tight", "pad_inches": 0.04})
-    fig.savefig(OUTPUT_DIR / f"{stem}.pdf", **save_kwargs)
-    # fig.savefig(
-    #     OUTPUT_DIR / f"{stem}.png",
-    #     dpi=350,
-    #     bbox_inches="tight",
-    #     pad_inches=0.04,
-    #     transparent=transparent,
-    # )
-    plt.close(fig)
-
-
 def render_panel(slug: str, opd_run: str, dmpd_run: str) -> None:
-    fig, ax = plt.subplots(figsize=(3, 3))
-    positions = np.arange(len(SURVIVAL_METRICS))
+    fig, ax = create_panel(STANDARD_PANEL_MARGINS)
+    positions = np.asarray((0.0, 1.3, 2.6, 3.9, 5.2))
     for method, run_id in (("opd", opd_run), ("dmpd", dmpd_run)):
         style = METHODS[method]
         ax.plot(
@@ -153,15 +121,15 @@ def render_panel(slug: str, opd_run: str, dmpd_run: str) -> None:
             markeredgewidth=1.1,
         )
     ax.set_xticks(positions, [label for label, _ in SURVIVAL_METRICS])
+    ax.set_xlim(-0.25, 5.5)
     ax.set_ylim(0, 100)
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
-    ax.set_xlabel("Response-length threshold")
-    ax.set_title("Survival rate")
+    ax.set_xlabel("Response-length event")
+    set_panel_title(ax, "Response tail / clip rate")
     ax.grid(axis="y", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.tick_params(direction="out", length=4)
-    fig.subplots_adjust(**PANEL_MARGINS)
-    save(fig, f"tail_visitation_{slug}", export_mode="panel")
+    save_figure(fig, OUTPUT_DIR, f"tail_visitation_{slug}")
 
 
 def render_legend() -> None:
@@ -187,7 +155,7 @@ def render_legend() -> None:
         handlelength=2.0,
         columnspacing=1.1,
     )
-    save(fig, "tail_visitation_legend", export_mode="legend", transparent=True)
+    save_figure(fig, OUTPUT_DIR, "tail_visitation_legend", export_mode="auxiliary", transparent=True)
 
 
 def main() -> None:

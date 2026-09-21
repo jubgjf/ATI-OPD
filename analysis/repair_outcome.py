@@ -14,9 +14,9 @@
 
 # ruff: noqa: E402
 
-"""Plot repair-rate versus immediate online outcome for DMPD-Future.
+"""Plot intervention rate versus immediate online outcome for DMPD-Future.
 
-This recreates the DeepSeek repair-to-outcome phase portrait. Raw points are
+This recreates the DeepSeek intervention-to-outcome phase portrait. Raw points are
 training batches, while the black arrowed path joins non-overlapping 32-step
 centroids.
 """
@@ -40,9 +40,27 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib import font_manager
 from matplotlib.colorbar import ColorbarBase
 from matplotlib.colors import Normalize
+
+try:
+    from analysis.plot_style import (
+        GRID_COLOR,
+        STANDARD_PANEL_MARGINS,
+        configure_style,
+        create_panel,
+        save_figure,
+        set_panel_title,
+    )
+except ModuleNotFoundError:  # Support ``python analysis/repair_outcome.py``.
+    from plot_style import (
+        GRID_COLOR,
+        STANDARD_PANEL_MARGINS,
+        configure_style,
+        create_panel,
+        save_figure,
+        set_panel_title,
+    )
 
 RATE = "opd_intervention/rate"
 NET = "opd_intervention/outcome/net_accuracy_delta_all_samples"
@@ -50,28 +68,6 @@ PHASE_WINDOW = 32
 RUN_ID = "802c696019c1449aa3328bca0e1806eb"
 BLACK = "#42464B"
 GRAY = "#92979D"
-GRID_COLOR = "#E6E2DD"
-
-
-def configure_style() -> None:
-    times_path = Path("/System/Library/Fonts/Supplemental/Times New Roman.ttf")
-    if times_path.is_file():
-        font_manager.fontManager.addfont(times_path)
-    mpl.rcParams.update(
-        {
-            "font.family": "Times New Roman",
-            "font.size": 15,
-            "axes.titlesize": 15,
-            "axes.labelsize": 15,
-            "axes.linewidth": 1.1,
-            "axes.spines.top": False,
-            "axes.spines.right": False,
-            "xtick.labelsize": 13,
-            "ytick.labelsize": 13,
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-        }
-    )
 
 
 def load_outcomes(run_id: str) -> pd.DataFrame:
@@ -100,7 +96,7 @@ def load_outcomes(run_id: str) -> pd.DataFrame:
         columns=["step", "rate", "gain"],
     )
     if len(frame) < 200:
-        raise ValueError(f"Run {run_id} has only {len(frame)} complete repair-outcome observations.")
+        raise ValueError(f"Run {run_id} has only {len(frame)} complete intervention-outcome observations.")
     return frame
 
 
@@ -146,24 +142,6 @@ def draw_centroid_path(ax: mpl.axes.Axes, centers: pd.DataFrame, norm: Normalize
         )
 
 
-def save(fig: mpl.figure.Figure, stem: str, *, transparent: bool = False) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    fig.savefig(
-        OUTPUT_DIR / f"{stem}.pdf",
-        bbox_inches="tight",
-        pad_inches=0.04,
-        transparent=transparent,
-    )
-    # fig.savefig(
-    #     OUTPUT_DIR / f"{stem}.png",
-    #     dpi=350,
-    #     bbox_inches="tight",
-    #     pad_inches=0.04,
-    #     transparent=transparent,
-    # )
-    plt.close(fig)
-
-
 def render_panel(slug: str, run_id: str) -> None:
     frame = load_outcomes(run_id)
     centers = phase_centers(frame)
@@ -172,7 +150,7 @@ def render_panel(slug: str, run_id: str) -> None:
     x_upper = 1.05 * float(frame["rate"].max())
     y_extent = 1.12 * float(frame["gain"].abs().max())
 
-    fig, ax = plt.subplots(figsize=(3, 3))
+    fig, ax = create_panel(STANDARD_PANEL_MARGINS)
     ax.scatter(
         frame["rate"],
         frame["gain"],
@@ -189,12 +167,11 @@ def render_panel(slug: str, run_id: str) -> None:
     ax.set_xlim(0, x_upper)
     ax.set_ylim(-y_extent, y_extent)
     ax.set_xlabel("Intervention rate (%)")
-    ax.set_title("Online gain (%)")
+    set_panel_title(ax, "Online gain (pp)")
     ax.grid(color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.tick_params(direction="out", length=4)
-    fig.tight_layout(pad=0.2)
-    save(fig, f"repair_outcome_{slug}")
+    save_figure(fig, OUTPUT_DIR, f"repair_outcome_{slug}")
 
 
 def render_colorbar() -> None:
@@ -208,7 +185,13 @@ def render_colorbar() -> None:
     colorbar.ax.set_title("Step", fontsize=13, pad=3)
     colorbar.set_ticks([1, 109, 217])
     colorbar.ax.tick_params(labelsize=13, pad=1)
-    save(fig, "repair_outcome_training_step_colorbar", transparent=True)
+    save_figure(
+        fig,
+        OUTPUT_DIR,
+        "repair_outcome_training_step_colorbar",
+        export_mode="auxiliary",
+        transparent=True,
+    )
 
 
 def main() -> None:

@@ -16,7 +16,7 @@
 
 """Render independent DeepSeek OPD-vs-DMPD training-diagnostic panels.
 
-This one self-contained script creates the related gap, token-overlap,
+This one self-contained script creates the related gap, token-coverage,
 gradient-norm, entropy, and response-clip figure series. Dense per-step curves
 show faint raw observations plus a 7-step centered mean. Sparse diagnostics are
 shown only at the steps where they were measured; no values are forward-filled.
@@ -28,7 +28,6 @@ import gzip
 import json
 import os
 from pathlib import Path
-from typing import Literal
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS_ROOT = REPO_ROOT / "analysis_artifacts" / "jubgjf" / "DMPD" / "runs"
@@ -42,9 +41,27 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib import font_manager
 from matplotlib.lines import Line2D
 from matplotlib.ticker import PercentFormatter
+
+try:
+    from analysis.plot_style import (
+        GRID_COLOR,
+        STANDARD_PANEL_MARGINS,
+        configure_style,
+        create_panel,
+        save_figure,
+        set_panel_title,
+    )
+except ModuleNotFoundError:  # Support ``python analysis/training_diagnostics.py``.
+    from plot_style import (
+        GRID_COLOR,
+        STANDARD_PANEL_MARGINS,
+        configure_style,
+        create_panel,
+        save_figure,
+        set_panel_title,
+    )
 
 PAIR_SLUG = "deepseek"
 OPD_RUN_ID = "9bbeb176889b42aa847665d03274fd68"
@@ -53,8 +70,6 @@ METHODS = {
     "opd": {"label": "OPD", "color": "#C7785E", "linestyle": "-", "marker": "^"},
     "dmpd": {"label": "DMPD", "color": "#6689A6", "linestyle": "-", "marker": "o"},
 }
-GRID_COLOR = "#E6E2DD"
-PANEL_MARGINS = {"left": 0.22, "right": 0.97, "bottom": 0.19, "top": 0.88}
 DIAGNOSTICS = {
     "gap_abs": {
         "metric": "opd/gap_abs/mean",
@@ -95,30 +110,6 @@ DIAGNOSTICS = {
 SMOOTH_WINDOW = 7
 
 
-def configure_style() -> None:
-    times_path = Path("/System/Library/Fonts/Supplemental/Times New Roman.ttf")
-    if times_path.is_file():
-        font_manager.fontManager.addfont(times_path)
-    mpl.rcParams.update(
-        {
-            "font.family": "Times New Roman",
-            "font.size": 15,
-            "axes.titlesize": 15,
-            "axes.labelsize": 15,
-            "axes.linewidth": 1.1,
-            "axes.spines.top": False,
-            "axes.spines.right": False,
-            "xtick.labelsize": 13,
-            "ytick.labelsize": 13,
-            "legend.fontsize": 13,
-            "lines.linewidth": 2.0,
-            "lines.markersize": 5.5,
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-        }
-    )
-
-
 def load_metric(run_id: str, metric: str, *, minimum_rows: int) -> pd.DataFrame:
     run_dir = ARTIFACTS_ROOT / run_id
     metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
@@ -146,28 +137,6 @@ def time_average(frame: pd.DataFrame) -> float:
     if len(frame) < 2 or span <= 0:
         raise ValueError("A gap AUC needs at least two strictly ordered observations.")
     return float(np.trapz(values, x=steps)) / span
-
-
-def save(
-    fig: mpl.figure.Figure,
-    stem: str,
-    *,
-    export_mode: Literal["panel", "legend"],
-    transparent: bool = False,
-) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    save_kwargs: dict[str, object] = {"transparent": transparent}
-    if export_mode == "legend":
-        save_kwargs.update({"bbox_inches": "tight", "pad_inches": 0.04})
-    fig.savefig(OUTPUT_DIR / f"{stem}.pdf", **save_kwargs)
-    # fig.savefig(
-    #     OUTPUT_DIR / f"{stem}.png",
-    #     dpi=350,
-    #     bbox_inches="tight",
-    #     pad_inches=0.04,
-    #     transparent=transparent,
-    # )
-    plt.close(fig)
 
 
 def draw_series(
@@ -221,7 +190,7 @@ def render_panel(
         "dmpd": load_metric(dmpd_run, metric, minimum_rows=minimum_rows),
     }
 
-    fig, ax = plt.subplots(figsize=(3, 3))
+    fig, ax = create_panel(STANDARD_PANEL_MARGINS)
     for method, frame in frames.items():
         draw_series(ax, frame, method=method, dense=dense, scale=scale)
     if diagnostic == "gap_abs":
@@ -231,7 +200,7 @@ def render_panel(
         ax.text(
             0.96,
             0.94,
-            f"Gap AUC ↓ {decrease:.1f}%",
+            f"Gap AUC $\\downarrow$ {decrease:.1f}%",
             transform=ax.transAxes,
             ha="right",
             va="top",
@@ -254,12 +223,11 @@ def render_panel(
     ax.set_xlim(1, 217)
     ax.set_xticks([1, 50, 100, 150, 200])
     ax.set_xlabel("Training step")
-    ax.set_title(str(spec["ylabel"]))
+    set_panel_title(ax, str(spec["ylabel"]))
     ax.grid(axis="y", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.tick_params(direction="out", length=4)
-    fig.subplots_adjust(**PANEL_MARGINS)
-    save(fig, f"{diagnostic}_{slug}", export_mode="panel")
+    save_figure(fig, OUTPUT_DIR, f"{diagnostic}_{slug}")
 
 
 def render_legend() -> None:
@@ -285,7 +253,13 @@ def render_legend() -> None:
         handlelength=2.0,
         columnspacing=1.1,
     )
-    save(fig, "training_diagnostics_legend", export_mode="legend", transparent=True)
+    save_figure(
+        fig,
+        OUTPUT_DIR,
+        "training_diagnostics_legend",
+        export_mode="auxiliary",
+        transparent=True,
+    )
 
 
 def main() -> None:

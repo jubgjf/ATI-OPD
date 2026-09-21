@@ -45,17 +45,36 @@ os.environ.setdefault("XDG_CACHE_HOME", str(CACHE_ROOT / "xdg"))
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib import font_manager
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.ticker import PercentFormatter
+
+try:
+    from analysis.plot_style import (
+        FIGURE6_REGULAR_PANEL_MARGINS,
+        GRID_COLOR,
+        STANDARD_PANEL_MARGINS,
+        configure_style,
+        create_panel,
+        save_figure,
+        set_panel_title,
+    )
+except ModuleNotFoundError:  # Support ``python analysis/ablation_summary.py``.
+    from plot_style import (
+        FIGURE6_REGULAR_PANEL_MARGINS,
+        GRID_COLOR,
+        STANDARD_PANEL_MARGINS,
+        configure_style,
+        create_panel,
+        save_figure,
+        set_panel_title,
+    )
 
 EXPECTED_TRAINING_STEPS = 217
 EXPECTED_STUDENT_SUFFIX = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 EXPECTED_TEACHER_SUFFIX = "hbx/JustRL-DeepSeek-1.5B"
 EXPECTED_TRAIN_FILE_SUFFIX = "DAPO-Math-17k-Processed-verl--qwen3/train.parquet"
 DAGGER = "\N{DAGGER}"
-GRID_COLOR = "#E6E2DD"
 BENCHMARK_KEYS = (
     "test-legacy-core/aime24/acc/mean@16",
     "test-legacy-core/aime25/acc/mean@16",
@@ -305,6 +324,7 @@ DMPD_VARIANT_BARS = (
 )
 DMPD_VARIANT_POSITIONS = (4.0, 3.0, 2.0, 1.0, 0.0)
 BENCHMARK_AXIS_MAX = 41.0
+FIGURE6_BENCHMARK_AXIS_MAX = 45.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -327,30 +347,6 @@ def parse_args() -> argparse.Namespace:
         help="Validate pinned runs and print the extracted values without rendering figures.",
     )
     return parser.parse_args()
-
-
-def configure_style() -> None:
-    times_path = Path("/System/Library/Fonts/Supplemental/Times New Roman.ttf")
-    if times_path.is_file():
-        font_manager.fontManager.addfont(times_path)
-    mpl.rcParams.update(
-        {
-            "font.family": "Times New Roman",
-            "font.size": 15,
-            "axes.titlesize": 15,
-            "axes.labelsize": 15,
-            "axes.linewidth": 1.1,
-            "axes.spines.top": False,
-            "axes.spines.right": False,
-            "xtick.labelsize": 13,
-            "ytick.labelsize": 13,
-            "legend.fontsize": 13,
-            "lines.linewidth": 2.0,
-            "lines.markersize": 5.5,
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-        }
-    )
 
 
 def read_run_record(run_dir: Path) -> dict[str, Any]:
@@ -536,19 +532,6 @@ def centered_rolling_mean(values: np.ndarray, window: int = 7) -> np.ndarray:
     return smoothed
 
 
-def _save(fig: mpl.figure.Figure, output_dir: Path, stem: str, *, transparent: bool = False) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    # Keep the declared physical canvas so the three equal-width line panels use
-    # identical scaling even though their title and tick extents differ.
-    fig.savefig(output_dir / f"{stem}.pdf", transparent=transparent)
-    # fig.savefig(
-    #     output_dir / f"{stem}.png",
-    #     dpi=400,
-    #     transparent=transparent,
-    # )
-    plt.close(fig)
-
-
 def _style_axes(ax: mpl.axes.Axes) -> None:
     ax.set_xlim(1, EXPECTED_TRAINING_STEPS)
     ax.set_xticks([1, 50, 100, 150, 200])
@@ -556,6 +539,26 @@ def _style_axes(ax: mpl.axes.Axes) -> None:
     ax.grid(axis="y", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.tick_params(direction="out", length=4)
+
+
+def dynamic_percent_axis(
+    observed: Sequence[float],
+    *,
+    tick_step: float = 2.0,
+    upper: float = 100.0,
+) -> tuple[tuple[float, float], tuple[float, ...]]:
+    """Choose a readable percentage range without clipping the lowest point."""
+    finite = [float(value) for value in observed if math.isfinite(float(value))]
+    if not finite:
+        raise ValueError("Cannot derive a percentage axis without finite observations.")
+    if tick_step <= 0:
+        raise ValueError(f"tick_step must be positive, got {tick_step}.")
+    if max(finite) > upper:
+        raise ValueError(f"Observed percentage exceeds the configured upper bound {upper}: {max(finite)}.")
+    first_tick = tick_step * math.floor(min(finite) / tick_step)
+    lower = max(0.0, first_tick - 0.25 * tick_step)
+    ticks = tuple(float(value) for value in np.arange(first_tick, upper + 0.5 * tick_step, tick_step))
+    return (lower, upper), ticks
 
 
 def render_loss_metric(
@@ -570,9 +573,9 @@ def render_loss_metric(
     percent: bool = False,
     ylim: tuple[float, float] | None = None,
     yticks: Sequence[float] | None = None,
-    threshold: float | None = None,
+    dynamic_percent_range: bool = False,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(3.0, 3.0))
+    fig, ax = create_panel(STANDARD_PANEL_MARGINS)
     observed: list[float] = []
     for key in LOSS_KEYS:
         run = runs[key]
@@ -607,12 +610,14 @@ def render_loss_metric(
             )
     if not observed:
         raise ValueError(f"No finite observations found for {metric}.")
-    if threshold is not None:
-        ax.axhline(threshold, color="#626970", linestyle="--", linewidth=1.1, zorder=0)
     _style_axes(ax)
-    ax.set_title(title, pad=3)
+    set_panel_title(ax, title, pad=3)
     if percent:
         ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
+    if dynamic_percent_range:
+        if not percent:
+            raise ValueError("dynamic_percent_range requires percent=True.")
+        ylim, yticks = dynamic_percent_axis(observed)
     if ylim is not None:
         ax.set_ylim(*ylim)
     else:
@@ -620,8 +625,7 @@ def render_loss_metric(
         ax.set_ylim(0, max(2.0, math.ceil(upper + 0.5)))
     if yticks is not None:
         ax.set_yticks(yticks)
-    fig.tight_layout(pad=0.2)
-    _save(fig, output_dir, stem)
+    save_figure(fig, output_dir, stem)
 
 
 def render_loss_legend(runs: Mapping[str, LoadedRun], output_dir: Path) -> None:
@@ -654,7 +658,7 @@ def render_loss_legend(runs: Mapping[str, LoadedRun], output_dir: Path) -> None:
         columnspacing=0.9,
         handletextpad=0.4,
     )
-    _save(fig, output_dir, "ablation_loss_legend", transparent=True)
+    save_figure(fig, output_dir, "ablation_loss_legend", export_mode="auxiliary", transparent=True)
 
 
 def _bar_color(key: str) -> str:
@@ -673,7 +677,7 @@ def _benchmark_patch(key: str, label: str, result: BenchmarkResult | None) -> Pa
 
 
 def render_teacher_loss_benchmark(results: Mapping[str, BenchmarkResult | None], output_dir: Path) -> None:
-    fig, ax = plt.subplots(figsize=(3.0, 3.0))
+    fig, ax = create_panel(STANDARD_PANEL_MARGINS)
     for position, (key, _) in enumerate(TEACHER_LOSS_BARS):
         result = results[key]
         if result is None:
@@ -701,13 +705,12 @@ def render_teacher_loss_benchmark(results: Mapping[str, BenchmarkResult | None],
     ax.set_ylim(0, BENCHMARK_AXIS_MAX)
     ax.set_yticks([0, 20, 40])
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
-    ax.set_title("Benchmark Avg.", pad=4)
+    set_panel_title(ax, "Benchmark Avg.", pad=4)
     ax.grid(axis="y", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.tick_params(axis="x", bottom=False)
     ax.tick_params(axis="y", direction="out", length=4)
-    fig.subplots_adjust(left=0.20, right=0.97, bottom=0.12, top=0.88)
-    _save(fig, output_dir, "teacher_segment_loss_benchmark_avg_deepseek")
+    save_figure(fig, output_dir, "teacher_segment_loss_benchmark_avg_deepseek")
 
 
 def render_teacher_loss_benchmark_legend(results: Mapping[str, BenchmarkResult | None], output_dir: Path) -> None:
@@ -722,11 +725,17 @@ def render_teacher_loss_benchmark_legend(results: Mapping[str, BenchmarkResult |
         columnspacing=0.9,
         handletextpad=0.4,
     )
-    _save(fig, output_dir, "teacher_segment_loss_benchmark_legend", transparent=True)
+    save_figure(
+        fig,
+        output_dir,
+        "teacher_segment_loss_benchmark_legend",
+        export_mode="auxiliary",
+        transparent=True,
+    )
 
 
 def render_dmpd_variants_benchmark(results: Mapping[str, BenchmarkResult | None], output_dir: Path) -> None:
-    fig, ax = plt.subplots(figsize=(3.0, 3.0))
+    fig, ax = create_panel(FIGURE6_REGULAR_PANEL_MARGINS)
     for (key, _), position in zip(DMPD_VARIANT_BARS, DMPD_VARIANT_POSITIONS, strict=True):
         result = results[key]
         if result is None:
@@ -751,18 +760,17 @@ def render_dmpd_variants_benchmark(results: Mapping[str, BenchmarkResult | None]
             color="#333333",
         )
     ax.set_yticks([])
-    ax.set_xlim(0, BENCHMARK_AXIS_MAX)
+    ax.set_xlim(0, FIGURE6_BENCHMARK_AXIS_MAX)
     ax.set_xticks([0, 20, 40])
     ax.xaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
     ax.set_xlabel("Six-task Avg.")
-    ax.set_title("Benchmark Avg.", pad=4)
+    set_panel_title(ax, "Benchmark Avg.", pad=4)
     ax.grid(axis="x", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.set_ylim(-0.6, 4.6)
     ax.tick_params(axis="y", left=False)
     ax.tick_params(axis="x", direction="out", length=4)
-    fig.subplots_adjust(left=0.10, right=0.97, bottom=0.18, top=0.88)
-    _save(fig, output_dir, "dmpd_variants_benchmark_avg_deepseek")
+    save_figure(fig, output_dir, "dmpd_variants_benchmark_avg_deepseek")
 
 
 def render_dmpd_variants_benchmark_legend(results: Mapping[str, BenchmarkResult | None], output_dir: Path) -> None:
@@ -781,7 +789,13 @@ def render_dmpd_variants_benchmark_legend(results: Mapping[str, BenchmarkResult 
         columnspacing=0.9,
         handletextpad=0.4,
     )
-    _save(fig, output_dir, "dmpd_variants_benchmark_legend", transparent=True)
+    save_figure(
+        fig,
+        output_dir,
+        "dmpd_variants_benchmark_legend",
+        export_mode="auxiliary",
+        transparent=True,
+    )
 
 
 def print_summary(runs: Mapping[str, LoadedRun], results: Mapping[str, BenchmarkResult | None]) -> None:
@@ -818,8 +832,7 @@ def main() -> None:
         scale=100.0,
         sparse=True,
         percent=True,
-        ylim=(94.0, 100.0),
-        yticks=(94.0, 96.0, 98.0, 100.0),
+        dynamic_percent_range=True,
     )
     render_loss_metric(
         runs,
@@ -843,7 +856,6 @@ def main() -> None:
         sparse=False,
         ylim=(6.0, 10.25),
         yticks=(6.0, 7.0, 8.0, 9.0, 10.0),
-        threshold=10.0,
     )
     render_loss_legend(runs, output_dir)
     render_teacher_loss_benchmark(results, output_dir)
