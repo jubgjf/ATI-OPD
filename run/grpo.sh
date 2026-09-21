@@ -421,6 +421,34 @@ mkdir -p "$CKPT_DIR" "$LOG_DIR"
 [[ -f "$TRAIN_FILE" ]] || die "Missing training parquet: $TRAIN_FILE"
 [[ -f "$VAL_FILE" ]] || die "Missing validation parquet: $VAL_FILE"
 
+# mbridge's memory-efficient HF export reuses the source checkpoint's shard
+# layout and therefore requires model.safetensors.index.json.  Both supported
+# 1.5B models are distributed as a single model.safetensors file, so default to
+# the regular export path for them.  An explicit opt-in fails here instead of
+# wasting training time before failing at the first checkpoint.
+MBRIDGE_MEMORY_EFFICIENT_SAVE=${MBRIDGE_MEMORY_EFFICIENT_SAVE:-auto}
+MBRIDGE_SAFETENSORS_INDEX=$MODEL_PATH/model.safetensors.index.json
+case "$MBRIDGE_MEMORY_EFFICIENT_SAVE" in
+    auto | Auto | AUTO)
+        if [[ -f "$MBRIDGE_SAFETENSORS_INDEX" ]]; then
+            MBRIDGE_MEMORY_EFFICIENT_SAVE_ENABLED=True
+        else
+            MBRIDGE_MEMORY_EFFICIENT_SAVE_ENABLED=False
+        fi
+        ;;
+    1 | true | True | TRUE | yes | Yes | YES)
+        [[ -f "$MBRIDGE_SAFETENSORS_INDEX" ]] || die \
+            "MBRIDGE_MEMORY_EFFICIENT_SAVE=1 requires $MBRIDGE_SAFETENSORS_INDEX."
+        MBRIDGE_MEMORY_EFFICIENT_SAVE_ENABLED=True
+        ;;
+    0 | false | False | FALSE | no | No | NO)
+        MBRIDGE_MEMORY_EFFICIENT_SAVE_ENABLED=False
+        ;;
+    *)
+        die "MBRIDGE_MEMORY_EFFICIENT_SAVE must be auto, 0, or 1; got: $MBRIDGE_MEMORY_EFFICIENT_SAVE"
+        ;;
+esac
+
 ################################ cluster and parallel topology
 
 NNODES=${NNODES:-${VC_WORKER_NUM:-1}}
@@ -1005,9 +1033,14 @@ ACTOR_ARGS=(
     "actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform"
     "actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full"
     "actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1"
-    "+actor_rollout_ref.actor.checkpoint.mbridge_config.distributed_filesystem=True"
-    "+actor_rollout_ref.actor.checkpoint.mbridge_config.memory_efficient=True"
 )
+
+if is_true "$MBRIDGE_MEMORY_EFFICIENT_SAVE_ENABLED"; then
+    ACTOR_ARGS+=(
+        "+actor_rollout_ref.actor.checkpoint.mbridge_config.distributed_filesystem=True"
+        "+actor_rollout_ref.actor.checkpoint.mbridge_config.memory_efficient=True"
+    )
+fi
 
 REF_ARGS=(
     "actor_rollout_ref.ref.strategy=megatron"
@@ -1072,7 +1105,7 @@ TRAINER_ARGS=(
     "trainer.nnodes=${NNODES}"
     "trainer.n_gpus_per_node=${NPUS_PER_NODE}"
     "trainer.balance_batch=True"
-    'trainer.logger=["console","wandb"]'
+    'trainer.logger=["console"]'
     "trainer.project_name=${PROJECT_NAME}"
     "trainer.experiment_name=${EXPERIMENT_NAME}"
     "trainer.total_epochs=${TOTAL_EPOCHS}"
@@ -1116,6 +1149,7 @@ echo "Actor topology: TP=$ACTOR_TP PP=$ACTOR_PP CP=$ACTOR_CP DP=$ACTOR_DP"
 echo "Rollout topology: replicas=$ROLLOUT_REPLICAS TP=$ROLLOUT_TP PP=$ROLLOUT_PP internal-DP=$ROLLOUT_DP"
 echo "Batching: prompts=$TRAIN_BATCH_SIZE rollouts_per_prompt=$ROLLOUT_N responses=$TOTAL_ROLLOUT_SAMPLES ppo_prompt_minibatch=$PPO_MINI_BATCH_SIZE"
 echo "Sequence lengths: prompt=$MAX_PROMPT_LENGTH response=$MAX_RESPONSE_LENGTH total=$MAX_MODEL_LEN"
+echo "Checkpoint export: mbridge_memory_efficient=$MBRIDGE_MEMORY_EFFICIENT_SAVE_ENABLED source_index=$MBRIDGE_SAFETENSORS_INDEX"
 echo "Schedule: epochs=$TOTAL_EPOCHS explicit_steps=$TOTAL_TRAINING_STEPS save_every=$SAVE_FREQ validate_every=$TEST_FREQ"
 echo "Audited eligible rows: train=$EXPECTED_ELIGIBLE_TRAIN_ROWS validation=$EXPECTED_ELIGIBLE_VAL_ROWS expected_steps_per_epoch=$EXPECTED_STEPS_PER_EPOCH"
 echo "Checkpoint directory: $CKPT_DIR"
