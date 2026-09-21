@@ -18,6 +18,7 @@ Run with ``MODEL_PATH=/local/checkpoint python -B -u -m verl.utils.evaluation.st
 in an existing vLLM environment. The Ascend launcher is ``run/eval-single.sh``.
 FSDP inputs are merged into actor/huggingface when weights are missing; set
 EVAL_FORCE_MERGE=True to rebuild existing weights. Evaluation output uses only stdout.
+Megatron checkpoints already exported under model/huggingface are loaded directly.
 Framework runtime caches are allowed.
 By default only HMMT is evaluated; EVAL_ALL=1 adds AIME24/25, AMC23 and AMO-Bench-P.
 """
@@ -195,21 +196,67 @@ class EvaluationConfig:
         )
 
 
+def _read_checkpoint_json(path: Path) -> dict[str, Any]:
+    """Read checkpoint metadata with enough context to identify a damaged file."""
+    try:
+        contents = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"Cannot read checkpoint JSON {path}: {exc}") from exc
+    try:
+        value = json.loads(contents.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        detail = " Empty file." if not contents else " Whitespace-only file." if not contents.strip() else ""
+        raise ValueError(f"Invalid checkpoint JSON {path} ({len(contents)} bytes): {exc}.{detail}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"Invalid checkpoint JSON {path} ({len(contents)} bytes): "
+            f"expected a JSON object, got {type(value).__name__}."
+        )
+    return value
+
+
+def _validate_hf_metadata(root: Path) -> None:
+    """Check JSON assets before Transformers loads them or the merger replaces weights."""
+    _read_checkpoint_json(root / "config.json")
+    for filename in (
+        "generation_config.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "added_tokens.json",
+        "vocab.json",
+    ):
+        path = root / filename
+        if path.exists():
+            _read_checkpoint_json(path)
+
+
+def _check_readable_weights(paths: list[Path]) -> None:
+    """Check read access without loading tensors, before inference or destructive merge cleanup."""
+    for path in paths:
+        try:
+            with path.open("rb") as stream:
+                stream.read(1)
+        except OSError as exc:
+            raise OSError(
+                f"Cannot read checkpoint weights {path}: {exc}. "
+                "Check file ownership and read permissions for the evaluation user."
+            ) from exc
+
+
 def validate_checkpoint(model_path: str) -> None:
-    """Require local HF config and complete, nonempty weights, including indexed shards."""
+    """Require valid local HF metadata and complete, nonempty weights, including indexed shards."""
     root = Path(model_path)
     if not root.is_dir():
         raise ValueError(f"MODEL_PATH must be a local checkpoint directory: {root}")
-    config_file = root / "config.json"
-    if not config_file.is_file() or not isinstance(json.loads(config_file.read_text(encoding="utf-8")), dict):
-        raise ValueError(f"Missing or invalid HF config.json in {root}")
+    _validate_hf_metadata(root)
     for filename in HF_WEIGHT_FILES:
         path = root / filename
         if not path.is_file():
             continue
         if filename.endswith(".index.json"):
-            index = json.loads(path.read_text(encoding="utf-8"))
-            weight_map = index.get("weight_map") if isinstance(index, dict) else None
+            index = _read_checkpoint_json(path)
+            weight_map = index.get("weight_map")
             if not isinstance(weight_map, dict) or not weight_map:
                 raise ValueError(f"Missing or empty weight_map in {path}")
             names = list(weight_map.values())
@@ -221,6 +268,7 @@ def validate_checkpoint(model_path: str) -> None:
         missing = [str(weight) for weight in weights if not weight.is_file() or weight.stat().st_size == 0]
         if missing:
             raise ValueError(f"Missing or empty checkpoint weights: {missing}")
+        _check_readable_weights(weights)
         return
     raise ValueError(f"No complete HF weights found in {root}; export/merge the checkpoint before evaluation.")
 
@@ -236,12 +284,18 @@ def _resolve_checkpoint_paths(model_path: str) -> tuple[Path, Path | None]:
         return root, actor
     if (root / "actor").is_dir():
         actor = root / "actor"
+    elif (root / "model" / "huggingface").is_dir():
+        # Megatron SFT can export complete HF weights alongside its distributed checkpoint.
+        return root / "model" / "huggingface", None
+    elif root.name == "model" and (root / "huggingface").is_dir() and not (root / "fsdp_config.json").is_file():
+        return root / "huggingface", None
     elif root.name == "actor" or (root / "fsdp_config.json").is_file() or (root / "huggingface").is_dir():
         actor = root
     else:
         raise ValueError(
             f"Unrecognized checkpoint directory: {root}. Set MODEL_PATH to a specific global_step_* directory, "
-            "its actor or actor/huggingface directory, or a complete HF model."
+            "its actor or actor/huggingface directory, a Megatron model or model/huggingface directory "
+            "with exported HF weights, or a complete HF model."
         )
     return actor / "huggingface", actor
 
@@ -252,18 +306,18 @@ def _validate_merge_source(actor: Path, hf_dir: Path) -> None:
     config_path = actor / "fsdp_config.json"
     if not config_path.is_file():
         raise ValueError(f"Missing FSDP config: {config_path}")
-    fsdp_config = json.loads(config_path.read_text(encoding="utf-8"))
-    world_size = fsdp_config.get("world_size") if isinstance(fsdp_config, dict) else None
+    fsdp_config = _read_checkpoint_json(config_path)
+    world_size = fsdp_config.get("world_size")
     if type(world_size) is not int or world_size <= 0:
         raise ValueError(f"Expected a positive integer world_size in {config_path}, got {world_size!r}.")
     shards = [actor / f"model_world_size_{world_size}_rank_{rank}.pt" for rank in range(world_size)]
     missing = [str(path) for path in shards if not path.is_file() or path.stat().st_size == 0]
     if missing:
         raise ValueError(f"Missing or empty FSDP model shards: {missing}")
-    if not (hf_dir / "config.json").is_file():
-        raise ValueError(f"Missing HF config.json in {hf_dir}")
+    _check_readable_weights(shards)
     # Validate assets before removing any old HF weights. No model weights are
     # allocated here, and optimizer / RNG checkpoints are deliberately unused.
+    _validate_hf_metadata(hf_dir)
     AutoConfig.from_pretrained(str(hf_dir), local_files_only=True, trust_remote_code=False)
     hf_tokenizer(str(hf_dir), local_files_only=True, trust_remote_code=False)
     if not os.access(hf_dir, os.W_OK | os.X_OK):

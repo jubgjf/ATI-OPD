@@ -380,8 +380,139 @@ def _fsdp_layout(inputs, world_size=32):
     return replace(config, model_path=str(step)), tokenizer, actor, hf_dir
 
 
+def _megatron_layout(inputs):
+    config, tokenizer = inputs
+    step = Path(config.model_path).parent / "Megatron run with spaces" / "global_step_190"
+    model_dir = step / "model"
+    model_dir.mkdir(parents=True)
+    hf_dir = model_dir / "huggingface"
+    Path(config.model_path).rename(hf_dir)
+    (model_dir / "dist_ckpt").mkdir()
+    (step / "ckpt_contents.json").write_text("{}")
+    (step / "transformer_config.json").write_text("{}")
+    return replace(config, model_path=str(step)), tokenizer, hf_dir
+
+
 def _snapshot(path):
     return {str(file.relative_to(path)): file.read_bytes() for file in path.rglob("*") if file.is_file()}
+
+
+@pytest.mark.parametrize(
+    ("contents", "detail"),
+    [
+        (b"", "Empty file"),
+        (b" \n\t", "Whitespace-only file"),
+        (b"<html>error</html>", "line 1 column 1"),
+        (b'{"model_type":\n}', "line 2 column 1"),
+        (b"\xff", "decode"),
+        (b"[]", "expected a JSON object"),
+    ],
+)
+def test_invalid_checkpoint_json_reports_file_size_and_parse_detail_on_cpu(inputs, contents, detail):
+    config, _ = inputs
+    path = Path(config.model_path) / "tokenizer_config.json"
+    path.write_bytes(contents)
+    with pytest.raises(ValueError) as error:
+        evaluation.prepare_checkpoint(config.model_path)
+    message = str(error.value)
+    assert str(path) in message and f"({len(contents)} bytes)" in message and detail in message
+
+
+@pytest.mark.parametrize("filename", ["model.safetensors.index.json", "pytorch_model.bin.index.json"])
+def test_empty_hf_weight_index_reports_its_path_on_cpu(inputs, filename):
+    config, _ = inputs
+    root = Path(config.model_path)
+    (root / "model.safetensors").unlink()
+    index = root / filename
+    index.write_bytes(b"")
+    with pytest.raises(ValueError) as error:
+        evaluation.prepare_checkpoint(config.model_path)
+    assert str(index) in str(error.value) and "(0 bytes)" in str(error.value)
+
+
+@pytest.mark.parametrize("force_merge", [False, True])
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "fsdp_config.json",
+        "huggingface/config.json",
+        "huggingface/generation_config.json",
+        "huggingface/tokenizer_config.json",
+        "huggingface/special_tokens_map.json",
+        "huggingface/tokenizer.json",
+        "huggingface/added_tokens.json",
+        "huggingface/vocab.json",
+    ],
+)
+def test_empty_metadata_is_identified_before_modifying_weights_or_inference_on_cpu(
+    inputs, monkeypatch, capsys, filename, force_merge
+):
+    config, _, actor, hf_dir = _fsdp_layout(inputs)
+    if force_merge:
+        (hf_dir / "model.safetensors").write_bytes(b"preserve existing weights")
+    path = actor / filename
+    path.write_bytes(b"")
+    monkeypatch.setattr(
+        evaluation.EvaluationConfig, "from_environment", lambda: replace(config, force_merge=force_merge)
+    )
+    monkeypatch.setattr(evaluation.subprocess, "run", lambda *a, **k: pytest.fail("Unexpected merger"))
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=lambda **k: pytest.fail("Unexpected inference")))
+    before = _snapshot(actor)
+    assert evaluation.main() == 1
+    assert _snapshot(actor) == before
+    output = capsys.readouterr()
+    assert str(path) in output.err and "(0 bytes)" in output.err and "Empty file" in output.err
+    assert "Merging FSDP" not in output.out and "Reusing complete HF" not in output.out
+    assert "EVAL_RESULT_JSON=" not in output.out and "[result]" not in output.out
+
+
+def test_complete_hf_reuse_does_not_require_valid_fsdp_metadata_on_cpu(inputs, monkeypatch):
+    config, _, actor, hf_dir = _fsdp_layout(inputs)
+    (hf_dir / "model.safetensors").write_bytes(b"complete mock weights")
+    (actor / "fsdp_config.json").write_bytes(b"")
+    before = _snapshot(actor)
+    monkeypatch.setattr(evaluation.subprocess, "run", lambda *a, **k: pytest.fail("Unexpected merger"))
+    assert evaluation.prepare_checkpoint(config.model_path) == str(hf_dir)
+    assert _snapshot(actor) == before
+
+
+@pytest.mark.parametrize("weight_kind", ["hf", "indexed_hf", "fsdp", "existing_hf_in_actor"])
+def test_unreadable_weights_stop_before_merging_or_inference_on_cpu(inputs, monkeypatch, capsys, weight_kind):
+    config, _ = inputs
+    if weight_kind in {"fsdp", "existing_hf_in_actor"}:
+        config, _, actor, hf_dir = _fsdp_layout(inputs)
+        (hf_dir / "model.safetensors").write_bytes(b"preserve existing weights")
+        config = replace(config, force_merge=weight_kind == "fsdp")
+        denied = actor / "model_world_size_32_rank_31.pt" if config.force_merge else hf_dir / "model.safetensors"
+    else:
+        hf_dir = Path(config.model_path)
+        denied = hf_dir / "model.safetensors"
+        if weight_kind == "indexed_hf":
+            denied.rename(hf_dir / "part1.safetensors")
+            denied = hf_dir / "part2.safetensors"
+            denied.write_bytes(b"unreadable weights")
+            (hf_dir / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"x": "part1.safetensors", "y": denied.name}})
+            )
+    root = Path(config.model_path)
+    before = _snapshot(root)
+    original_open = Path.open
+
+    def open_with_denied_weight(path, *args, **kwargs):
+        if path == denied:
+            raise PermissionError(13, "Permission denied", str(path))
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(evaluation.EvaluationConfig, "from_environment", lambda: config)
+    monkeypatch.setattr(evaluation.subprocess, "run", lambda *a, **k: pytest.fail("Unexpected merger"))
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=lambda **k: pytest.fail("Unexpected inference")))
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", open_with_denied_weight)
+        assert evaluation.main() == 1
+    assert _snapshot(root) == before
+    output = capsys.readouterr()
+    assert str(denied) in output.err and "read permissions" in output.err
+    assert "Merging FSDP" not in output.out and "EVAL_RESULT_JSON=" not in output.out
 
 
 @pytest.mark.parametrize("path_kind", ["step", "actor", "huggingface", "relative"])
@@ -464,6 +595,18 @@ def test_plain_hf_force_merge_and_experiment_root_are_rejected_on_cpu(inputs, mo
     _, _, actor, _ = _fsdp_layout(inputs)
     with pytest.raises(ValueError, match="specific global_step"):
         evaluation.prepare_checkpoint(str(actor.parent.parent))
+
+
+@pytest.mark.parametrize("force_merge", [False, True])
+def test_megatron_without_hf_weights_does_not_run_fsdp_merger_on_cpu(inputs, monkeypatch, force_merge):
+    config, _, hf_dir = _megatron_layout(inputs)
+    (hf_dir / "model.safetensors").unlink()
+    before = _snapshot(Path(config.model_path))
+    monkeypatch.setattr(evaluation.subprocess, "run", lambda *a, **k: pytest.fail("Unexpected FSDP merger"))
+    message = "corresponding FSDP actor" if force_merge else "No complete HF weights"
+    with pytest.raises(ValueError, match=message):
+        evaluation.prepare_checkpoint(config.model_path, force_merge=force_merge)
+    assert _snapshot(Path(config.model_path)) == before
 
 
 def test_incomplete_hf_index_triggers_merge_without_force_on_cpu(inputs, monkeypatch):
@@ -899,6 +1042,36 @@ def test_fsdp_evaluation_loads_and_reports_merged_path_on_cpu(inputs, monkeypatc
         assert result["metrics"][f"test-legacy-core/{benchmark}/acc/mean@16"] == 1.0
     output = capsys.readouterr().out
     assert output.index("[checkpoint] HF conversion complete") < output.index("[eval] config=")
+    final = next(line for line in output.splitlines() if line.startswith("EVAL_RESULT_JSON="))
+    assert json.loads(final.split("=", 1)[1]) == result
+
+
+@pytest.mark.parametrize("path_kind", ["step", "model", "huggingface", "relative"])
+def test_megatron_hf_evaluation_reuses_and_reports_exported_path_on_cpu(inputs, monkeypatch, capsys, path_kind):
+    config, tokenizer, hf_dir = _megatron_layout(inputs)
+    step = Path(config.model_path)
+    paths = {"step": step, "model": hf_dir.parent, "huggingface": hf_dir}
+    if path_kind == "relative":
+        monkeypatch.chdir(step.parent)
+        path = "global_step_190/model"
+    else:
+        path = str(paths[path_kind])
+    engine = _Engine(tokenizer)
+
+    def create_engine(**kwargs):
+        assert kwargs["model"] == str(hf_dir) and kwargs["tokenizer"] == str(hf_dir)
+        return engine
+
+    monkeypatch.setattr(evaluation.subprocess, "run", lambda *a, **k: pytest.fail("Unexpected merger"))
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=create_engine, SamplingParams=SimpleNamespace))
+    monkeypatch.setattr(evaluation, "default_compute_score", _score)
+    before = _snapshot(step)
+    result = evaluation.run_evaluation(replace(config, model_path=path))
+    assert _snapshot(step) == before
+    assert result["config"]["model_path"] == str(hf_dir)
+    assert len(engine.calls) == 2
+    output = capsys.readouterr().out
+    assert "Reusing complete HF weights" in output and "Merging FSDP" not in output
     final = next(line for line in output.splitlines() if line.startswith("EVAL_RESULT_JSON="))
     assert json.loads(final.split("=", 1)[1]) == result
 

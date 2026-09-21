@@ -3,6 +3,8 @@
 #
 # Required: MODEL_PATH=/path/to/global_step_N, its actor or actor/huggingface,
 # or a complete HF model. Relative paths are resolved from the launch directory.
+# Megatron exports at global_step_N/model/huggingface also accept the step or model directory.
+# These exports require complete HF weights readable by the evaluation user; no Megatron merge is run.
 # FSDP weights are merged into actor/huggingface and reused on later runs.
 # Set EVAL_FORCE_MERGE=True to regenerate existing HF weights from FSDP shards.
 # EVAL_ALL=0 (default): HMMT Feb 2026 and Nov 2025. EVAL_ALL=1 additionally evaluates
