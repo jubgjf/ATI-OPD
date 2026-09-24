@@ -21,6 +21,7 @@ By default this script downloads ``jubgjf/DMPD`` into
 * ``run.json``: run metadata, config, and summary;
 * ``history/steps_<start>_<end>.jsonl.gz``: complete, unsampled history;
 * ``files/``: files attached directly to the W&B run;
+* optionally, raw Parquet shards from logged ``training-diagnostics`` artifacts;
 * ``sync.json`` and ``files-manifest.json``: local incremental-sync state.
 
 W&B's public API supports step-bounded history scans. Existing runs therefore
@@ -57,6 +58,8 @@ METADATA_FILE_NAMES = {
     "wandb-metadata.json",
     "wandb-summary.json",
 }
+TRAINING_DIAGNOSTICS_TYPE = "training-diagnostics"
+TRAINING_DIAGNOSTICS_SHARD_PREFIX = "shards/"
 
 
 def utc_now() -> str:
@@ -489,6 +492,119 @@ def sync_run_files(run: Any, api: Any, run_dir: Path, *, mode: str) -> tuple[int
     return downloaded_count, skipped_count
 
 
+def artifact_entry_signature(entry: Any) -> dict[str, Any]:
+    """Return the stable fields needed to validate one artifact entry."""
+    return {
+        "size": int(getattr(entry, "size", 0) or 0),
+        "digest": getattr(entry, "digest", None),
+    }
+
+
+def local_artifact_entry_matches(path: Path, signature: dict[str, Any]) -> bool:
+    """Check a local artifact file against its W&B manifest entry."""
+    if not path.is_file():
+        return False
+    expected_size = int(signature.get("size") or 0)
+    if expected_size > 0 and path.stat().st_size != expected_size:
+        return False
+    digest = signature.get("digest")
+    return not digest or local_md5_base64(path) == digest
+
+
+def training_diagnostics_artifacts(run: Any) -> list[Any]:
+    """Return this run's diagnostics artifacts in numeric version order."""
+    expected_name = f"{run.id}-{TRAINING_DIAGNOSTICS_TYPE}"
+    artifacts = []
+    for artifact in run.logged_artifacts():
+        if str(getattr(artifact, "type", "")) != TRAINING_DIAGNOSTICS_TYPE:
+            continue
+        name = str(getattr(artifact, "name", ""))
+        if name.split(":", maxsplit=1)[0] != expected_name:
+            raise RuntimeError(f"Unexpected {TRAINING_DIAGNOSTICS_TYPE} artifact for run {run.id}: {name!r}")
+        version = str(getattr(artifact, "version", ""))
+        if re.fullmatch(r"v\d+", version) is None:
+            raise RuntimeError(f"Invalid artifact version for {name!r}: {version!r}")
+        artifacts.append(artifact)
+    return sorted(artifacts, key=lambda artifact: int(str(artifact.version)[1:]))
+
+
+def download_artifact_entry(artifact: Any, entry_name: str, destination_root: Path) -> None:
+    """Download one artifact entry and atomically place it under destination_root."""
+    relative_path = safe_remote_path(entry_name)
+    destination = destination_root / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_root = Path(tempfile.mkdtemp(prefix=".artifact-download-", dir=destination_root.parent))
+    try:
+        entry = artifact.get_entry(entry_name)
+        downloaded_path = Path(entry.download(root=str(temporary_root)))
+        if not downloaded_path.is_file():
+            downloaded_path = temporary_root / relative_path
+        if not downloaded_path.is_file():
+            raise RuntimeError(f"W&B reported a successful download but {downloaded_path} is missing.")
+        downloaded_path.replace(destination)
+    finally:
+        shutil.rmtree(temporary_root, ignore_errors=True)
+
+
+def sync_training_diagnostics_shards(
+    run: Any,
+    run_dir: Path,
+    *,
+    force: bool,
+    dry_run: bool,
+) -> tuple[int, int, dict[str, Any]]:
+    """Mirror only raw Parquet shards from logged diagnostics artifacts."""
+    root = run_dir / "logged_artifacts" / TRAINING_DIAGNOSTICS_TYPE
+    versions: list[dict[str, Any]] = []
+    downloaded_count = 0
+    skipped_count = 0
+    artifacts = training_diagnostics_artifacts(run)
+    if not artifacts:
+        raise RuntimeError(f"Run {run.id} has no logged {TRAINING_DIAGNOSTICS_TYPE} artifacts.")
+
+    for artifact in artifacts:
+        entries = [
+            (name, entry)
+            for name, entry in sorted(artifact.manifest.entries.items())
+            if name.startswith(TRAINING_DIAGNOSTICS_SHARD_PREFIX) and name.endswith(".parquet")
+        ]
+        if not entries:
+            raise RuntimeError(f"Artifact {artifact.name} contains no Parquet metric shards.")
+        version_record: dict[str, Any] = {
+            "name": str(artifact.name),
+            "version": str(artifact.version),
+            "digest": str(artifact.digest),
+            "entries": {},
+        }
+        version_root = root / str(artifact.version)
+        for entry_name, entry in entries:
+            relative_path = safe_remote_path(entry_name)
+            signature = artifact_entry_signature(entry)
+            destination = version_root / relative_path
+            if not force and local_artifact_entry_matches(destination, signature):
+                skipped_count += 1
+            elif dry_run:
+                downloaded_count += 1
+            else:
+                download_artifact_entry(artifact, entry_name, version_root)
+                if not local_artifact_entry_matches(destination, signature):
+                    raise RuntimeError(f"Downloaded artifact entry failed validation: {destination}")
+                downloaded_count += 1
+            version_record["entries"][str(relative_path)] = signature
+        versions.append(version_record)
+
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": TRAINING_DIAGNOSTICS_TYPE,
+        "run_id": str(run.id),
+        "versions": versions,
+        "updated_at": utc_now(),
+    }
+    if not dry_run:
+        write_json_atomic(root / "manifest.json", manifest)
+    return downloaded_count, skipped_count, manifest
+
+
 def file_mode_covers(previous_mode: str | None, requested_mode: str) -> bool:
     order = {"none": 0, "metadata": 1, "all": 2}
     return order.get(str(previous_mode), -1) >= order[requested_mode]
@@ -505,6 +621,7 @@ def sync_one_run(
     files_mode: str,
     force: bool,
     dry_run: bool,
+    training_diagnostics_shards: bool = False,
 ) -> dict[str, Any]:
     run_dir = project_dir / "runs" / str(run.id)
     previous_sync = read_json(run_dir / "sync.json", {})
@@ -512,7 +629,7 @@ def sync_one_run(
     same_probe = previous_sync.get("remote_probe") == probe
     files_covered = file_mode_covers(previous_sync.get("files_mode"), files_mode)
 
-    if same_probe and files_covered and not force:
+    if same_probe and files_covered and not training_diagnostics_shards and not force:
         print(f"[skip] {entity}/{project}/{run.id} {run.name}: unchanged")
         return {
             "id": str(run.id),
@@ -526,6 +643,18 @@ def sync_one_run(
     if dry_run:
         action = "new" if not previous_sync else "update"
         print(f"[dry-run:{action}] {entity}/{project}/{run.id} {run.name} probe={canonical_json(probe)}")
+        if training_diagnostics_shards:
+            diagnostics_downloaded, diagnostics_skipped, _ = sync_training_diagnostics_shards(
+                run,
+                run_dir,
+                force=force,
+                dry_run=True,
+            )
+            print(
+                f"[dry-run:artifacts] {entity}/{project}/{run.id}: "
+                f"diagnostic_shards_download={diagnostics_downloaded}, "
+                f"diagnostic_shards_unchanged={diagnostics_skipped}"
+            )
         return {
             "id": str(run.id),
             "name": str(run.name),
@@ -546,6 +675,16 @@ def sync_one_run(
         force=force,
     )
     files_downloaded, files_skipped = sync_run_files(run, api, run_dir, mode=files_mode)
+    diagnostics_downloaded = 0
+    diagnostics_skipped = 0
+    diagnostics_manifest = previous_sync.get("training_diagnostics")
+    if training_diagnostics_shards:
+        diagnostics_downloaded, diagnostics_skipped, diagnostics_manifest = sync_training_diagnostics_shards(
+            run,
+            run_dir,
+            force=force,
+            dry_run=False,
+        )
     write_json_atomic(
         run_dir / "sync.json",
         {
@@ -553,12 +692,15 @@ def sync_one_run(
             "remote_probe": probe,
             "files_mode": files_mode,
             "history": history_manifest,
+            "training_diagnostics": diagnostics_manifest,
             "synced_at": utc_now(),
         },
     )
     print(
         f"[sync] {entity}/{project}/{run.id} {run.name}: history={history_action}, "
-        f"files_downloaded={files_downloaded}, files_unchanged={files_skipped}"
+        f"files_downloaded={files_downloaded}, files_unchanged={files_skipped}, "
+        f"diagnostic_shards_downloaded={diagnostics_downloaded}, "
+        f"diagnostic_shards_unchanged={diagnostics_skipped}"
     )
     return {
         "id": str(run.id),
@@ -613,6 +755,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--page-size", type=int, default=1000, help="W&B history scan page size (default: 1000).")
     parser.add_argument("--timeout", type=int, default=60, help="W&B API timeout in seconds (default: 60).")
     parser.add_argument("--run-id", action="append", default=[], help="Only sync a run ID; repeatable.")
+    parser.add_argument(
+        "--training-diagnostics-shards",
+        action="store_true",
+        help="Also mirror raw Parquet shards from logged training-diagnostics artifacts.",
+    )
     parser.add_argument("--max-runs", type=int, default=None, help="Limit runs per project, primarily for smoke tests.")
     parser.add_argument("--force", action="store_true", help="Refresh history and re-check all selected run files.")
     parser.add_argument("--dry-run", action="store_true", help="List new/changed runs without writing files.")
@@ -680,6 +827,7 @@ def main() -> int:
                         project=project,
                         page_size=args.page_size,
                         files_mode=args.files,
+                        training_diagnostics_shards=args.training_diagnostics_shards,
                         force=args.force,
                         dry_run=args.dry_run,
                     )
