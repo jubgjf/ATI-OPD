@@ -41,7 +41,6 @@ try:
         GRID_COLOR,
         STANDARD_PANEL_MARGINS,
         configure_style,
-        create_panel,
         save_figure,
         set_panel_title,
     )
@@ -50,7 +49,6 @@ except ModuleNotFoundError:  # Support ``python analysis/cross_paper_opd_gain.py
         GRID_COLOR,
         STANDARD_PANEL_MARGINS,
         configure_style,
-        create_panel,
         save_figure,
         set_panel_title,
     )
@@ -59,15 +57,24 @@ DAGGER = "\N{DAGGER}"
 BENCHMARKS = ("AIME24", "AIME25", "AMC23")
 MODEL_GROUPS = ("JustRL-DeepSeek", "JustRL-Nemotron")
 GROUP_CENTERS = np.asarray((0.0, 1.2))
-BAR_CENTER_STEP = 0.15
-BAR_WIDTH = 0.135
+BAR_CENTER_STEP = 0.21
+BAR_WIDTH = 0.17
 Y_LIMITS = (-0.38, 1.68)
 Y_TICKS = (0.0, 0.5, 1.0, 1.5)
-VALUE_LABEL_OFFSET = 0.06
+# Small horizontal offsets separate close labels while keeping them over their bars.
+VALUE_LABEL_X_OFFSETS = (
+    (-0.02, 0.02, 0.06, 0.0, 0.0),  # JustRL-DeepSeek
+    (-0.02, -0.06, -0.02, -0.02, 0.02),  # JustRL-Nemotron
+)
+VALUE_LABEL_OFFSETS = (
+    (0.06, 0.06, 0.06, 0.06, 0.06),  # JustRL-DeepSeek
+    (0.06, 0.02, 0.06, 0.06, 0.02),  # JustRL-Nemotron
+)
 TRUNCATION_THRESHOLD = -0.5
 TRUNCATED_BAR_HEIGHT = -0.24
 TRUNCATED_LABEL_Y = 0.04
-MODEL_TICK_FONT_SIZE = 11
+MAIN_FIGSIZE = (4.0, 3.0)
+MODEL_TICK_FONT_SIZE = 13
 
 MAIN_OUTPUT_STEM = "cross_paper_opd_gain"
 LEGEND_OUTPUT_STEM = "cross_paper_opd_gain_legend"
@@ -174,11 +181,13 @@ def _draw_bar_break(ax: mpl.axes.Axes, position: float, displayed_value: float) 
 
 
 def create_gain_figure() -> mpl.figure.Figure:
-    """Create the fixed-size grouped gain panel."""
+    """Create the 4:3 grouped gain panel."""
     values = average_gains()
     displayed_values, truncated = display_gains(values)
     positions = bar_positions()
-    fig, ax = create_panel(STANDARD_PANEL_MARGINS)
+    fig, ax = plt.subplots(figsize=MAIN_FIGSIZE)
+    # Preserve the shared panels' physical left margin on the wider canvas.
+    fig.subplots_adjust(**{**STANDARD_PANEL_MARGINS, "left": 0.165, "right": 0.975})
 
     for model_index, _model in enumerate(MODEL_GROUPS):
         for method_index, method in enumerate(METHODS):
@@ -199,30 +208,28 @@ def create_gain_figure() -> mpl.figure.Figure:
                 # The signed annotation, rather than the compressed bar length,
                 # is authoritative for a truncated outlier.
                 label_y = TRUNCATED_LABEL_Y
+                label_x = position
                 vertical_alignment = "bottom"
             elif value >= 0:
-                label_y = value + VALUE_LABEL_OFFSET
+                label_y = value + VALUE_LABEL_OFFSETS[model_index][method_index]
+                label_x = position + VALUE_LABEL_X_OFFSETS[model_index][method_index]
                 vertical_alignment = "bottom"
             else:
-                label_y = value - VALUE_LABEL_OFFSET
+                label_y = value - 0.06
+                label_x = position
                 vertical_alignment = "top"
             ax.text(
-                position,
+                label_x,
                 label_y,
                 f"{value:+.2f}",
                 ha="center",
                 va=vertical_alignment,
-                rotation=90,
-                # Align the already-rotated bounding box so its lower edge is
-                # wholly outside the bar instead of rotating it back across
-                # the bar top.
-                rotation_mode="default",
                 fontsize=9,
                 color="#333333",
                 zorder=4,
             )
 
-    ax.set_xlim(-0.52, 1.72)
+    ax.set_xlim(-0.56, 1.76)
     ax.set_ylim(*Y_LIMITS)
     ax.set_xticks(GROUP_CENTERS, MODEL_GROUPS)
     ax.set_yticks(Y_TICKS)
@@ -237,13 +244,13 @@ def create_gain_figure() -> mpl.figure.Figure:
 
 
 def create_legend_figure() -> mpl.figure.Figure:
-    """Create the compact standalone three-row method legend."""
-    fig = plt.figure(figsize=(3.4, 0.88))
+    """Create the standalone two-row method legend."""
+    fig = plt.figure(figsize=(4.0, 0.65))
     handles = [
         Patch(facecolor=method.color, edgecolor=method.color, linewidth=1.0, label=method.legend_label)
         for method in METHODS
     ]
-    for row_handles, row_y in zip((handles[:2], handles[2:4], handles[4:]), (0.82, 0.50, 0.18), strict=True):
+    for row_handles, row_y in zip((handles[:3], handles[3:]), (0.74, 0.26), strict=True):
         fig.legend(
             handles=row_handles,
             loc="center",
@@ -251,7 +258,7 @@ def create_legend_figure() -> mpl.figure.Figure:
             frameon=False,
             ncol=len(row_handles),
             handlelength=1.3,
-            columnspacing=0.55,
+            columnspacing=0.6,
             handletextpad=0.3,
             borderaxespad=0.0,
         )

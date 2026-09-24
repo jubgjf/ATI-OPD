@@ -51,7 +51,7 @@ def test_grouped_bar_figure_uses_expected_layout_labels_and_units() -> None:
     figure = gain_plot.create_gain_figure()
     try:
         axis = figure.axes[0]
-        assert tuple(figure.get_size_inches()) == pytest.approx((3.0, 3.0))
+        assert tuple(figure.get_size_inches()) == pytest.approx(gain_plot.MAIN_FIGSIZE)
         assert axis.get_title() == "Avg. accuracy gain"
         assert "%" not in axis.get_title()
         assert [label.get_text() for label in axis.get_xticklabels()] == list(gain_plot.MODEL_GROUPS)
@@ -65,7 +65,13 @@ def test_grouped_bar_figure_uses_expected_layout_labels_and_units() -> None:
         observed_heights = np.asarray([patch.get_height() for patch in axis.patches])
         assert observed_heights == pytest.approx(expected_displayed.ravel())
         assert [text.get_text() for text in axis.texts] == [f"{value:+.2f}" for value in expected_values.ravel()]
-        assert {text.get_rotation() for text in axis.texts} == {90.0}
+        assert {text.get_rotation() for text in axis.texts} == {0.0}
+        for value, position, label in zip(
+            expected_values.ravel(), gain_plot.bar_positions().ravel(), axis.texts, strict=True
+        ):
+            if value >= 0:
+                assert 0 < label.get_position()[1] - value <= 0.06 + 1e-10
+                assert abs(label.get_position()[0] - position) < gain_plot.BAR_WIDTH / 2
         assert expected_truncated.sum() == 1
         assert expected_truncated[0, 3]
         assert observed_heights[3] == pytest.approx(gain_plot.TRUNCATED_BAR_HEIGHT)
@@ -76,12 +82,21 @@ def test_grouped_bar_figure_uses_expected_layout_labels_and_units() -> None:
         within_group_step = np.diff(positions, axis=1)
         between_group_gap = positions[1, 0] - positions[0, -1]
         assert within_group_step == pytest.approx(gain_plot.BAR_CENTER_STEP)
-        assert between_group_gap > 3 * gain_plot.BAR_WIDTH
+        assert between_group_gap > 2 * gain_plot.BAR_WIDTH
 
         figure.canvas.draw()
         renderer = figure.canvas.get_renderer()
         for patch, label in zip(axis.patches, axis.texts, strict=True):
             assert label.get_window_extent(renderer).y0 > patch.get_window_extent(renderer).y1
+        label_bounds = [label.get_window_extent(renderer).padded(2) for label in axis.texts]
+        assert all(
+            not first.overlaps(second)
+            for index, first in enumerate(label_bounds)
+            for second in label_bounds[index + 1 :]
+        )
+        assert all(
+            not label.overlaps(patch.get_window_extent(renderer)) for label in label_bounds for patch in axis.patches
+        )
         model_label_bounds = [label.get_window_extent(renderer) for label in axis.get_xticklabels()]
         assert model_label_bounds[0].x1 < model_label_bounds[1].x0
         assert all(label.get_text().endswith("%") for label in axis.get_yticklabels())
@@ -94,10 +109,10 @@ def test_standalone_legend_matches_method_order_and_dagger_status() -> None:
     configure_style()
     figure = gain_plot.create_legend_figure()
     try:
-        assert len(figure.legends) == 3
+        assert len(figure.legends) == 2
         legend_labels = [text.get_text() for legend in figure.legends for text in legend.get_texts()]
         assert legend_labels == [method.legend_label for method in gain_plot.METHODS]
-        assert [len(legend.get_texts()) for legend in figure.legends] == [2, 2, 1]
+        assert [len(legend.get_texts()) for legend in figure.legends] == [3, 2]
         assert [method.legend_label.endswith(gain_plot.DAGGER) for method in gain_plot.METHODS] == [
             True,
             True,
@@ -137,4 +152,4 @@ def test_pdf_outputs_use_fixed_main_canvas(tmp_path: Path) -> None:
         main_pdf.read_bytes(),
     )
     assert media_box is not None
-    assert (float(media_box.group(1)), float(media_box.group(2))) == pytest.approx((216.0, 216.0))
+    assert (float(media_box.group(1)), float(media_box.group(2))) == pytest.approx((288.0, 216.0))
