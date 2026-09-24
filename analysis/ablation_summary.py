@@ -267,6 +267,9 @@ RUN_SPECS: dict[str, RunSpec] = {
             prune_mode="teacher_end",
             max_interventions=1,
         ),
+        hmmt_feb_2026=0.21022727,
+        hmmt_nov_2025=0.18958333,
+        hmmt_source="single-eval_19",
     ),
     "skip_incorrect": RunSpec(
         key="skip_incorrect",
@@ -279,6 +282,9 @@ RUN_SPECS: dict[str, RunSpec] = {
             max_interventions=1,
             skip_correct=True,
         ),
+        hmmt_feb_2026=0.23674242,
+        hmmt_nov_2025=0.2375,
+        hmmt_source="single-eval_20",
     ),
     "teacher_len_512": RunSpec(
         key="teacher_len_512",
@@ -316,7 +322,7 @@ TEACHER_LOSS_BARS = (
     ("sft_loss", "SFT\nloss"),
 )
 DMPD_VARIANT_BARS = (
-    ("opd_loss", "DMPD"),
+    ("opd_loss", "ATI-OPD"),
     ("full_m1", r"Full ($M=1$)"),
     ("full_m4", r"Full ($M=4$)"),
     ("prune", "Prune"),
@@ -324,7 +330,8 @@ DMPD_VARIANT_BARS = (
 )
 DMPD_VARIANT_POSITIONS = (4.0, 3.0, 2.0, 1.0, 0.0)
 BENCHMARK_AXIS_MAX = 41.0
-FIGURE6_BENCHMARK_AXIS_MAX = 45.0
+FIGURE6_BENCHMARK_AXIS_MIN = 34.0
+FIGURE6_BENCHMARK_AXIS_MAX = 37.6
 
 
 def parse_args() -> argparse.Namespace:
@@ -413,8 +420,12 @@ def validate_run_config(record: Mapping[str, Any], spec: RunSpec) -> None:
         )
     if configured_steps != EXPECTED_TRAINING_STEPS:
         mismatches.append(f"configured training steps: expected {EXPECTED_TRAINING_STEPS}, got {configured_steps!r}")
-    if record.get("state") != "finished":
-        mismatches.append(f"run state: expected 'finished', got {record.get('state')!r}")
+    # W&B marks the Skip incorrect run as crashed even though it logged all
+    # 217 training steps and the complete step-217 benchmark row. Completion
+    # is therefore validated from the history boundary below, while terminal
+    # and post-terminal W&B states are both accepted here.
+    if record.get("state") not in {"finished", "crashed"}:
+        mismatches.append(f"run state: expected 'finished' or 'crashed', got {record.get('state')!r}")
     if record.get("last_history_step") != EXPECTED_TRAINING_STEPS:
         mismatches.append(
             f"last history step: expected {EXPECTED_TRAINING_STEPS}, got {record.get('last_history_step')!r}"
@@ -724,18 +735,24 @@ def render_dmpd_variants_benchmark(results: Mapping[str, BenchmarkResult | None]
         result = results[key]
         if result is None:
             continue
+        if result.six_benchmark_average_percent < FIGURE6_BENCHMARK_AXIS_MIN:
+            raise ValueError(
+                f"Benchmark average for {key} ({result.six_benchmark_average_percent:.2f}%) is below "
+                f"the truncated axis minimum ({FIGURE6_BENCHMARK_AXIS_MIN:.2f}%)."
+            )
         color = _bar_color(key)
         facecolor = "white" if result.provisional else color
         bar = ax.barh(
             position,
-            result.six_benchmark_average_percent,
+            result.six_benchmark_average_percent - FIGURE6_BENCHMARK_AXIS_MIN,
+            left=FIGURE6_BENCHMARK_AXIS_MIN,
             height=0.58,
             color=facecolor,
             edgecolor=color,
             linewidth=1.5 if result.provisional else 1.0,
         )[0]
         ax.text(
-            bar.get_width() + 0.5,
+            bar.get_x() + bar.get_width() + 0.05,
             bar.get_y() + bar.get_height() / 2,
             f"{result.six_benchmark_average_percent:.1f}{DAGGER if result.provisional else ''}",
             ha="left",
@@ -744,8 +761,8 @@ def render_dmpd_variants_benchmark(results: Mapping[str, BenchmarkResult | None]
             color="#333333",
         )
     ax.set_yticks([])
-    ax.set_xlim(0, FIGURE6_BENCHMARK_AXIS_MAX)
-    ax.set_xticks([0, 20, 40])
+    ax.set_xlim(FIGURE6_BENCHMARK_AXIS_MIN, FIGURE6_BENCHMARK_AXIS_MAX)
+    ax.set_xticks([34, 35, 36, 37])
     ax.xaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
     ax.set_xlabel("Performance")
     set_panel_title(ax, "Benchmark Avg.", pad=4)
@@ -754,6 +771,9 @@ def render_dmpd_variants_benchmark(results: Mapping[str, BenchmarkResult | None]
     ax.set_ylim(-0.6, 4.6)
     ax.tick_params(axis="y", left=False)
     ax.tick_params(axis="x", direction="out", length=4)
+    break_style = {"color": "#222222", "clip_on": False, "linewidth": 1.1, "transform": ax.transAxes}
+    for center in (0.025, 0.055):
+        ax.plot((center - 0.012, center + 0.012), (-0.018, 0.018), **break_style)
     save_figure(fig, output_dir, "dmpd_variants_benchmark_avg_deepseek")
 
 

@@ -225,7 +225,7 @@ def test_figure6_keeps_dense_suffix_axis_separate(monkeypatch: pytest.MonkeyPatc
         progress_step=217,
         four_benchmark_values=(0.3, 0.3, 0.3, 0.3),
         hmmt_values=(0.3, 0.3),
-        six_benchmark_average_percent=30.0,
+        six_benchmark_average_percent=36.0,
         uses_hmmt_placeholder=False,
     )
     ablation_summary.render_dmpd_variants_benchmark(
@@ -240,8 +240,7 @@ def test_figure6_keeps_dense_suffix_axis_separate(monkeypatch: pytest.MonkeyPatc
         assert _axes_bounds(figures[1]) == pytest.approx((0.18, 0.36, 0.81, 0.52))
         assert _axes_bounds(figures[2]) == pytest.approx((0.22, 0.25, 0.75, 0.63))
         outcome_annotations = [text.get_text() for text in figures[0].axes[0].texts]
-        assert any("Net: +0.50%" in text for text in outcome_annotations)
-        assert all(" pp" not in text for text in outcome_annotations)
+        assert outcome_annotations == [r"$W\!\to\!C$ 2.00%" "\n" r"$C\!\to\!W$ 1.50%"]
         assert figures[1].axes[0].get_title() == "Net online gain"
         assert [label.get_text() for label in figures[1].axes[0].get_yticklabels()] == [
             "−2%",
@@ -252,9 +251,49 @@ def test_figure6_keeps_dense_suffix_axis_separate(monkeypatch: pytest.MonkeyPatc
             "8%",
         ]
         assert figures[2].axes[0].get_xlabel() == "Performance"
+        assert figures[2].axes[0].get_xlim() == pytest.approx((34.0, 37.6))
+        assert [bar.get_x() for bar in figures[2].axes[0].patches] == pytest.approx([34.0] * 5)
     finally:
         for fig in figures:
             plt.close(fig)
+
+
+@pytest.mark.parametrize(
+    ("key", "four_benchmarks", "expected_average"),
+    [
+        (
+            "prune",
+            (0.47708333333333336, 0.36666666666666664, 0.8765625, 0.009615384615384616),
+            35.49564141025641,
+        ),
+        (
+            "skip_incorrect",
+            (0.47291666666666665, 0.3729166666666667, 0.875, 0.022435897435897436),
+            36.95852751282051,
+        ),
+    ],
+)
+def test_completed_variant_hmmt_results_replace_layout_placeholders(
+    key: str,
+    four_benchmarks: tuple[float, ...],
+    expected_average: float,
+) -> None:
+    row = {
+        "training/global_step": ablation_summary.EXPECTED_TRAINING_STEPS,
+        **dict(zip(ablation_summary.BENCHMARK_KEYS, four_benchmarks, strict=True)),
+    }
+    run = ablation_summary.LoadedRun(
+        spec=ablation_summary.RUN_SPECS[key],
+        rows=(row,),
+        progress_step=ablation_summary.EXPECTED_TRAINING_STEPS,
+    )
+
+    result = ablation_summary.benchmark_result(run)
+
+    assert result is not None
+    assert result.uses_hmmt_placeholder is False
+    assert result.provisional is False
+    assert result.six_benchmark_average_percent == pytest.approx(expected_average)
 
 
 def test_figure6_variant_legend_centers_two_independent_rows(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -277,7 +316,7 @@ def test_figure6_variant_legend_centers_two_independent_rows(monkeypatch: pytest
         fig = figures[0]
         assert len(fig.legends) == 2
         assert [[text.get_text() for text in legend.get_texts()] for legend in fig.legends] == [
-            ["DMPD", r"Full ($M=1$)", r"Full ($M=4$)"],
+            ["ATI-OPD", r"Full ($M=1$)", r"Full ($M=4$)"],
             ["Prune", "Skip incorrect"],
         ]
         fig.canvas.draw()

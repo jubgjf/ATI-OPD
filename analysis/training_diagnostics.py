@@ -14,7 +14,7 @@
 
 # ruff: noqa: E402
 
-"""Render independent DeepSeek OPD-vs-DMPD training-diagnostic panels.
+"""Render independent DeepSeek OPD-vs-ATI-OPD training-diagnostic panels.
 
 This one self-contained script creates the related gap, token-coverage,
 gradient-norm, entropy, and response-clip figure series. Dense per-step curves
@@ -65,10 +65,10 @@ except ModuleNotFoundError:  # Support ``python analysis/training_diagnostics.py
 
 PAIR_SLUG = "deepseek"
 OPD_RUN_ID = "9bbeb176889b42aa847665d03274fd68"
-DMPD_RUN_ID = "802c696019c1449aa3328bca0e1806eb"
+ATI_OPD_RUN_ID = "802c696019c1449aa3328bca0e1806eb"
 METHODS = {
     "opd": {"label": "OPD", "color": "#C7785E", "linestyle": "-", "marker": "^"},
-    "dmpd": {"label": "DMPD", "color": "#6689A6", "linestyle": "-", "marker": "o"},
+    "ati_opd": {"label": "ATI-OPD", "color": "#6689A6", "linestyle": "-", "marker": "o"},
 }
 DIAGNOSTICS = {
     "gap_abs": {
@@ -179,7 +179,7 @@ def render_panel(
     spec: dict[str, str | bool | float],
     slug: str,
     opd_run: str,
-    dmpd_run: str,
+    ati_opd_run: str,
 ) -> None:
     metric = str(spec["metric"])
     dense = bool(spec["dense"])
@@ -187,7 +187,7 @@ def render_panel(
     minimum_rows = 190 if dense else 18
     frames = {
         "opd": load_metric(opd_run, metric, minimum_rows=minimum_rows),
-        "dmpd": load_metric(dmpd_run, metric, minimum_rows=minimum_rows),
+        "ati_opd": load_metric(ati_opd_run, metric, minimum_rows=minimum_rows),
     }
 
     fig, ax = create_panel(STANDARD_PANEL_MARGINS)
@@ -195,8 +195,8 @@ def render_panel(
         draw_series(ax, frame, method=method, dense=dense, scale=scale)
     if diagnostic == "gap_abs":
         opd_auc = time_average(frames["opd"])
-        dmpd_auc = time_average(frames["dmpd"])
-        decrease = 100 * (opd_auc - dmpd_auc) / opd_auc
+        ati_opd_auc = time_average(frames["ati_opd"])
+        decrease = 100 * (opd_auc - ati_opd_auc) / opd_auc
         ax.text(
             0.96,
             0.94,
@@ -265,7 +265,7 @@ def render_legend() -> None:
 def main() -> None:
     configure_style()
     for diagnostic, spec in DIAGNOSTICS.items():
-        render_panel(diagnostic, spec, PAIR_SLUG, OPD_RUN_ID, DMPD_RUN_ID)
+        render_panel(diagnostic, spec, PAIR_SLUG, OPD_RUN_ID, ATI_OPD_RUN_ID)
     render_legend()
 
 
