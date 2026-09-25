@@ -33,7 +33,7 @@ os.environ.setdefault("XDG_CACHE_HOME", str(CACHE_ROOT / "xdg"))
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Patch
+from matplotlib.patches import Rectangle
 from matplotlib.ticker import FuncFormatter
 
 try:
@@ -56,25 +56,31 @@ except ModuleNotFoundError:  # Support ``python analysis/cross_paper_opd_gain.py
 DAGGER = "\N{DAGGER}"
 BENCHMARKS = ("AIME24", "AIME25", "AMC23")
 MODEL_GROUPS = ("JustRL-DeepSeek", "JustRL-Nemotron")
-GROUP_CENTERS = np.asarray((0.0, 1.2))
+GROUP_CENTERS = np.asarray((0.0, 1.5))
 BAR_CENTER_STEP = 0.21
 BAR_WIDTH = 0.17
-Y_LIMITS = (-0.38, 1.68)
+Y_LIMITS = (-0.58, 1.68)
 Y_TICKS = (0.0, 0.5, 1.0, 1.5)
 # Small horizontal offsets separate close labels while keeping them over their bars.
 VALUE_LABEL_X_OFFSETS = (
-    (-0.02, 0.02, 0.06, 0.0, 0.0),  # JustRL-DeepSeek
-    (-0.02, -0.06, -0.02, -0.02, 0.02),  # JustRL-Nemotron
+    (0.0, -0.04, 0.0, 0.07, 0.0, 0.0),  # JustRL-DeepSeek
+    (0.0, -0.03, -0.04, -0.03, -0.06, 0.06),  # JustRL-Nemotron
 )
 VALUE_LABEL_OFFSETS = (
-    (0.06, 0.06, 0.06, 0.06, 0.06),  # JustRL-DeepSeek
-    (0.06, 0.02, 0.06, 0.06, 0.02),  # JustRL-Nemotron
+    (0.04, 0.04, 0.13, 0.04, 0.04, 0.04),  # JustRL-DeepSeek
+    (0.04, 0.04, 0.03, 0.08, 0.04, 0.04),  # JustRL-Nemotron
 )
-TRUNCATION_THRESHOLD = -0.5
-TRUNCATED_BAR_HEIGHT = -0.24
-TRUNCATED_LABEL_Y = 0.04
+TRUNCATED_BAR_ASYMPTOTE = 0.47
+TRUNCATED_BAR_HALF_SCALE = 2.5
+TRUNCATED_LABEL_GAP = 0.05
 MAIN_FIGSIZE = (4.0, 3.0)
 MODEL_TICK_FONT_SIZE = 13
+LEGEND_COLUMN_LEFTS = (0.01, 0.34, 0.67)
+LEGEND_ROW_CENTERS = (0.74, 0.26)
+LEGEND_SWATCH_WIDTH = 0.05
+LEGEND_SWATCH_HEIGHT = 0.30
+LEGEND_TEXT_GAP = 0.015
+LEGEND_FONT_SIZE = 13
 
 MAIN_OUTPUT_STEM = "cross_paper_opd_gain"
 LEGEND_OUTPUT_STEM = "cross_paper_opd_gain_legend"
@@ -95,6 +101,7 @@ class MethodSpec:
 
 
 METHODS = (
+    MethodSpec("esr", "ESR", "#A19D98", False),
     MethodSpec("popd", "POPD", "#B97964", True),
     MethodSpec("topd_050", "TOPD-0.50", "#8E859D", True),
     MethodSpec("topd_025", "TOPD-0.25", "#C3A46E", True),
@@ -102,11 +109,37 @@ METHODS = (
     MethodSpec("ati_opd", "ATI-OPD", "#6689A6", False),
 )
 
+# ESR was logged as topd--horizon_100 in W&B; both runs finished at step 217.
+# DeepSeek: 48b5708e981c4d17aacc398ffa8d043c, OPD: 9bbeb176889b42aa847665d03274fd68.
+# Nemotron: 8ea23b41d0ef497abe3ead9d05413655, OPD: 040b92fbe33a41e6be75ffcaf8f07f27.
+ESR_STEP217_ACCURACY = {
+    "JustRL-DeepSeek": (0.3458333333333333, 0.28541666666666665, 0.78125),
+    "JustRL-Nemotron": (0.6416666666666667, 0.5625, 0.946875),
+}
+VANILLA_OPD_STEP217_ACCURACY = {
+    "JustRL-DeepSeek": (0.4625, 0.33958333333333335, 0.8703125),
+    "JustRL-Nemotron": (0.6708333333333333, 0.59375, 0.95),
+}
+
+
+def _gain_from_accuracy(
+    trained: tuple[float, float, float], baseline: tuple[float, float, float]
+) -> tuple[float, float, float]:
+    return (
+        100 * (trained[0] - baseline[0]),
+        100 * (trained[1] - baseline[1]),
+        100 * (trained[2] - baseline[2]),
+    )
+
+
 # Absolute accuracy differences on the three common benchmarks. Published
-# POPD/TOPD values are transcribed from the comparison source cited by the
-# paper; ATI-OPD values are the paper's own matched-benchmark results.
+# POPD/TOPD values come from the appendix source; ESR and ATI-OPD use this
+# paper's own matched benchmark runs.
 BENCHMARK_DELTAS: dict[str, dict[str, tuple[float, float, float]]] = {
     "JustRL-DeepSeek": {
+        "esr": _gain_from_accuracy(
+            ESR_STEP217_ACCURACY["JustRL-DeepSeek"], VANILLA_OPD_STEP217_ACCURACY["JustRL-DeepSeek"]
+        ),
         "popd": (1.70, 0.50, -1.40),
         "topd_050": (1.00, 0.80, -0.70),
         "topd_025": (2.00, -0.10, -1.20),
@@ -114,6 +147,9 @@ BENCHMARK_DELTAS: dict[str, dict[str, tuple[float, float, float]]] = {
         "ati_opd": (2.92, -0.42, 1.56),
     },
     "JustRL-Nemotron": {
+        "esr": _gain_from_accuracy(
+            ESR_STEP217_ACCURACY["JustRL-Nemotron"], VANILLA_OPD_STEP217_ACCURACY["JustRL-Nemotron"]
+        ),
         "popd": (1.30, 0.40, -0.20),
         "topd_050": (1.30, 0.70, 0.30),
         "topd_025": (1.40, 0.60, 0.70),
@@ -155,11 +191,12 @@ def bar_positions() -> np.ndarray:
 
 
 def display_gains(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Compress negative outliers for display and return their truncation mask."""
+    """Compress negative bars monotonically; their exact values remain in labels."""
     values = np.asarray(values, dtype=float)
-    truncated = values < TRUNCATION_THRESHOLD
+    truncated = values < 0
     displayed = values.copy()
-    displayed[truncated] = TRUNCATED_BAR_HEIGHT
+    magnitudes = -values[truncated]
+    displayed[truncated] = -(TRUNCATED_BAR_ASYMPTOTE * magnitudes / (TRUNCATED_BAR_HALF_SCALE + magnitudes))
     return displayed, truncated
 
 
@@ -207,17 +244,13 @@ def create_gain_figure() -> mpl.figure.Figure:
                 _draw_bar_break(ax, position, displayed_value)
                 # The signed annotation, rather than the compressed bar length,
                 # is authoritative for a truncated outlier.
-                label_y = TRUNCATED_LABEL_Y
+                label_y = displayed_value - TRUNCATED_LABEL_GAP
                 label_x = position
-                vertical_alignment = "bottom"
-            elif value >= 0:
+                vertical_alignment = "top"
+            else:
                 label_y = value + VALUE_LABEL_OFFSETS[model_index][method_index]
                 label_x = position + VALUE_LABEL_X_OFFSETS[model_index][method_index]
                 vertical_alignment = "bottom"
-            else:
-                label_y = value - 0.06
-                label_x = position
-                vertical_alignment = "top"
             ax.text(
                 label_x,
                 label_y,
@@ -229,7 +262,7 @@ def create_gain_figure() -> mpl.figure.Figure:
                 zorder=4,
             )
 
-    ax.set_xlim(-0.56, 1.76)
+    ax.set_xlim(-0.72, 2.22)
     ax.set_ylim(*Y_LIMITS)
     ax.set_xticks(GROUP_CENTERS, MODEL_GROUPS)
     ax.set_yticks(Y_TICKS)
@@ -244,24 +277,33 @@ def create_gain_figure() -> mpl.figure.Figure:
 
 
 def create_legend_figure() -> mpl.figure.Figure:
-    """Create the standalone two-row method legend."""
+    """Create a fixed three-column legend with vertically aligned swatches."""
     fig = plt.figure(figsize=(4.0, 0.65))
-    handles = [
-        Patch(facecolor=method.color, edgecolor=method.color, linewidth=1.0, label=method.legend_label)
-        for method in METHODS
-    ]
-    for row_handles, row_y in zip((handles[:3], handles[3:]), (0.74, 0.26), strict=True):
-        fig.legend(
-            handles=row_handles,
-            loc="center",
-            bbox_to_anchor=(0.5, row_y),
-            frameon=False,
-            ncol=len(row_handles),
-            handlelength=1.3,
-            columnspacing=0.6,
-            handletextpad=0.3,
-            borderaxespad=0.0,
-        )
+    ax = fig.add_axes((0.0, 0.0, 1.0, 1.0))
+    ax.set_axis_off()
+    for row_index, row_y in enumerate(LEGEND_ROW_CENTERS):
+        for column_index, left_x in enumerate(LEGEND_COLUMN_LEFTS):
+            method = METHODS[row_index * len(LEGEND_COLUMN_LEFTS) + column_index]
+            ax.add_patch(
+                Rectangle(
+                    (left_x, row_y - LEGEND_SWATCH_HEIGHT / 2),
+                    LEGEND_SWATCH_WIDTH,
+                    LEGEND_SWATCH_HEIGHT,
+                    facecolor=method.color,
+                    edgecolor=method.color,
+                    linewidth=1.0,
+                    transform=ax.transAxes,
+                )
+            )
+            ax.text(
+                left_x + LEGEND_SWATCH_WIDTH + LEGEND_TEXT_GAP,
+                row_y,
+                method.legend_label,
+                ha="left",
+                va="center",
+                fontsize=LEGEND_FONT_SIZE,
+                transform=ax.transAxes,
+            )
     return fig
 
 

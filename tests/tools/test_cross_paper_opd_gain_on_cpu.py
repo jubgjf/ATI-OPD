@@ -31,8 +31,8 @@ plt.switch_backend("Agg")
 def test_average_gains_match_appendix_three_benchmark_means() -> None:
     expected = np.asarray(
         (
-            (0.27, 0.37, 0.23, -1.50, 1.35),
-            (0.50, 0.77, 0.90, 1.13, 1.11),
+            (-8.66, 0.27, 0.37, 0.23, -1.50, 1.35),
+            (-2.12, 0.50, 0.77, 0.90, 1.13, 1.11),
         )
     )
 
@@ -41,9 +41,17 @@ def test_average_gains_match_appendix_three_benchmark_means() -> None:
     assert observed.shape == (len(gain_plot.MODEL_GROUPS), len(gain_plot.METHODS))
     assert np.round(observed, decimals=2) == pytest.approx(expected)
     negative_indices = np.argwhere(observed < 0)
-    assert negative_indices.tolist() == [[0, 3]]
+    assert [method.key for method in gain_plot.METHODS] == [
+        "esr",
+        "popd",
+        "topd_050",
+        "topd_025",
+        "topd_010",
+        "ati_opd",
+    ]
+    assert negative_indices.tolist() == [[0, 0], [0, 4], [1, 0]]
     assert gain_plot.MODEL_GROUPS[negative_indices[0, 0]] == "JustRL-DeepSeek"
-    assert gain_plot.METHODS[negative_indices[0, 1]].label == "TOPD-0.10"
+    assert gain_plot.METHODS[negative_indices[0, 1]].label == "ESR"
 
 
 def test_grouped_bar_figure_uses_expected_layout_labels_and_units() -> None:
@@ -70,13 +78,17 @@ def test_grouped_bar_figure_uses_expected_layout_labels_and_units() -> None:
             expected_values.ravel(), gain_plot.bar_positions().ravel(), axis.texts, strict=True
         ):
             if value >= 0:
-                assert 0 < label.get_position()[1] - value <= 0.06 + 1e-10
+                assert 0 < label.get_position()[1] - value <= 0.13 + 1e-10
                 assert abs(label.get_position()[0] - position) < gain_plot.BAR_WIDTH / 2
-        assert expected_truncated.sum() == 1
-        assert expected_truncated[0, 3]
-        assert observed_heights[3] == pytest.approx(gain_plot.TRUNCATED_BAR_HEIGHT)
-        assert observed_heights[3] != pytest.approx(expected_values[0, 3])
-        assert sum(line.get_gid() == "truncated-bar-break" for line in axis.lines) == 2
+            else:
+                assert label.get_position()[0] == pytest.approx(position)
+        assert expected_truncated.sum() == 3
+        assert expected_truncated[0, 0]
+        assert expected_truncated[0, 4]
+        assert expected_truncated[1, 0]
+        assert abs(observed_heights[4]) < abs(observed_heights[6]) < abs(observed_heights[0])
+        assert observed_heights[0] != pytest.approx(expected_values[0, 0])
+        assert sum(line.get_gid() == "truncated-bar-break" for line in axis.lines) == 6
 
         positions = gain_plot.bar_positions()
         within_group_step = np.diff(positions, axis=1)
@@ -86,8 +98,13 @@ def test_grouped_bar_figure_uses_expected_layout_labels_and_units() -> None:
 
         figure.canvas.draw()
         renderer = figure.canvas.get_renderer()
-        for patch, label in zip(axis.patches, axis.texts, strict=True):
-            assert label.get_window_extent(renderer).y0 > patch.get_window_extent(renderer).y1
+        for value, patch, label in zip(expected_values.ravel(), axis.patches, axis.texts, strict=True):
+            label_box = label.get_window_extent(renderer)
+            patch_box = patch.get_window_extent(renderer)
+            if value >= 0:
+                assert label_box.y0 > patch_box.y1
+            else:
+                assert label_box.y1 < patch_box.y0
         label_bounds = [label.get_window_extent(renderer).padded(2) for label in axis.texts]
         assert all(
             not first.overlaps(second)
@@ -109,25 +126,36 @@ def test_standalone_legend_matches_method_order_and_dagger_status() -> None:
     configure_style()
     figure = gain_plot.create_legend_figure()
     try:
-        assert len(figure.legends) == 2
-        legend_labels = [text.get_text() for legend in figure.legends for text in legend.get_texts()]
+        assert len(figure.legends) == 0
+        axis = figure.axes[0]
+        legend_labels = [text.get_text() for text in axis.texts]
         assert legend_labels == [method.legend_label for method in gain_plot.METHODS]
-        assert [len(legend.get_texts()) for legend in figure.legends] == [3, 2]
+        assert len(axis.patches) == 6
         assert [method.legend_label.endswith(gain_plot.DAGGER) for method in gain_plot.METHODS] == [
+            False,
             True,
             True,
             True,
             True,
             False,
         ]
-        observed_colors = [handle.get_facecolor() for legend in figure.legends for handle in legend.legend_handles]
+        observed_colors = [handle.get_facecolor() for handle in axis.patches]
         expected_colors = [mcolors.to_rgba(method.color) for method in gain_plot.METHODS]
         assert observed_colors == pytest.approx(expected_colors)
         figure.canvas.draw()
         renderer = figure.canvas.get_renderer()
-        for legend in figure.legends:
-            bounds = legend.get_window_extent(renderer)
-            assert (bounds.x0 + bounds.x1) / 2 == pytest.approx(figure.bbox.width / 2)
+        for column in range(3):
+            assert axis.patches[column].get_x() == pytest.approx(axis.patches[column + 3].get_x())
+            assert axis.texts[column].get_position()[0] == pytest.approx(axis.texts[column + 3].get_position()[0])
+        patch_bounds = [patch.get_window_extent(renderer) for patch in axis.patches]
+        text_bounds = [text.get_window_extent(renderer) for text in axis.texts]
+        assert all(bounds.width == pytest.approx(bounds.height, abs=1.0) for bounds in patch_bounds)
+        assert all(figure.bbox.contains(*bounds.get_points()[0]) for bounds in text_bounds)
+        assert all(figure.bbox.contains(*bounds.get_points()[1]) for bounds in text_bounds)
+        assert all(
+            not first.overlaps(second) for index, first in enumerate(text_bounds) for second in text_bounds[index + 1 :]
+        )
+        assert all(not label.overlaps(patch) for label in text_bounds for patch in patch_bounds)
     finally:
         plt.close(figure)
 
