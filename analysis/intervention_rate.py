@@ -49,7 +49,6 @@ try:
         configure_style,
         create_panel,
         save_figure,
-        set_panel_title,
     )
 except ModuleNotFoundError:  # Support ``python analysis/intervention_rate.py``.
     from plot_style import (
@@ -58,7 +57,6 @@ except ModuleNotFoundError:  # Support ``python analysis/intervention_rate.py``.
         configure_style,
         create_panel,
         save_figure,
-        set_panel_title,
     )
 
 METRIC = "opd_intervention/rate"
@@ -100,7 +98,7 @@ def finish_axis(ax: mpl.axes.Axes) -> None:
     ax.set_xticks([1, 50, 100, 150, 200])
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
     ax.set_xlabel("Training step")
-    set_panel_title(ax, "Intervention rate")
+    ax.set_ylabel("Intervention rate")
     ax.grid(axis="y", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.tick_params(direction="out", length=4)

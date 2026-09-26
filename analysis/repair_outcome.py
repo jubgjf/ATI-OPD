@@ -51,7 +51,6 @@ try:
         configure_style,
         create_panel,
         save_figure,
-        set_panel_title,
     )
 except ModuleNotFoundError:  # Support ``python analysis/repair_outcome.py``.
     from plot_style import (
@@ -60,7 +59,6 @@ except ModuleNotFoundError:  # Support ``python analysis/repair_outcome.py``.
         configure_style,
         create_panel,
         save_figure,
-        set_panel_title,
     )
 
 RATE = "opd_intervention/rate"
@@ -171,7 +169,7 @@ def render_panel(slug: str, run_id: str) -> None:
     ax.xaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=1))
     ax.set_xlabel("Intervention rate")
-    set_panel_title(ax, "Online gain")
+    ax.set_ylabel("Online gain")
     ax.grid(color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.tick_params(direction="out", length=4)
@@ -186,7 +184,7 @@ def render_colorbar() -> None:
         norm=Normalize(1, 217),
         orientation="vertical",
     )
-    colorbar.ax.set_title("Step", fontsize=13, pad=3)
+    colorbar.set_label("Training step", fontsize=13, labelpad=3)
     colorbar.set_ticks([1, 109, 217])
     colorbar.ax.tick_params(labelsize=13, pad=1)
     save_figure(

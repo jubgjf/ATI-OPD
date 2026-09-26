@@ -50,10 +50,10 @@ def _capture_figures(monkeypatch: pytest.MonkeyPatch, module: object) -> list[pl
 @pytest.mark.parametrize(
     ("margins", "expected"),
     [
-        (plot_style.STANDARD_PANEL_MARGINS, (0.22, 0.19, 0.75, 0.69)),
-        (plot_style.SQUARE_PANEL_MARGINS, (0.22, 0.19, 0.69, 0.69)),
-        (plot_style.FIGURE6_REGULAR_PANEL_MARGINS, (0.22, 0.25, 0.75, 0.63)),
-        (plot_style.DENSE_X_PANEL_MARGINS, (0.18, 0.36, 0.81, 0.52)),
+        (plot_style.STANDARD_PANEL_MARGINS, (0.29, 0.19, 0.68, 0.69)),
+        (plot_style.SQUARE_PANEL_MARGINS, (0.29, 0.19, 0.69, 0.69)),
+        (plot_style.FIGURE6_REGULAR_PANEL_MARGINS, (0.29, 0.25, 0.68, 0.63)),
+        (plot_style.DENSE_X_PANEL_MARGINS, (0.26, 0.36, 0.73, 0.52)),
     ],
 )
 def test_shared_panel_layouts_have_fixed_bounds(
@@ -94,15 +94,15 @@ def test_panel_export_keeps_exact_canvas(tmp_path) -> None:
     ],
 )
 @pytest.mark.parametrize("label", ["Mean zlib compression ratio", "Net gain per intervention"])
-def test_panel_titles_are_centered_on_canvas_and_fit(margins: dict[str, float], label: str) -> None:
+def test_panel_ylabels_fit_fixed_canvas(margins: dict[str, float], label: str) -> None:
     fig, ax = plot_style.create_panel(margins)
     ax.set_xticks([])
     ax.set_yticks([])
-    title = plot_style.set_panel_title(ax, label)
+    ax.set_ylabel(label)
     try:
         fig.canvas.draw()
-        title_box = title.get_window_extent(fig.canvas.get_renderer())
-        assert (title_box.x0 + title_box.x1) / 2 == pytest.approx(fig.bbox.width / 2)
+        assert ax.get_title() == ""
+        assert ax.get_ylabel() == label
         assert plot_style.panel_layout_overflow(fig) == ()
     finally:
         plt.close(fig)
@@ -145,13 +145,55 @@ def test_figure4_panels_share_square_axes(monkeypatch: pytest.MonkeyPatch) -> No
 
     figures = [*local_figures, *uptake_figures]
     try:
-        expected = (0.22, 0.19, 0.69, 0.69)
+        expected = (0.29, 0.19, 0.69, 0.69)
         assert len(figures) == 3
         assert all(_axes_bounds(fig) == pytest.approx(expected) for fig in figures)
         assert figures[-1].axes[0].get_aspect() == pytest.approx(1.0)
     finally:
         for fig in figures:
             plt.close(fig)
+
+
+def _paired_gap_rows(step_count: int = 3) -> pd.DataFrame:
+    rows: list[dict[str, float | int | str]] = []
+    for step in range(1, step_count + 1):
+        before = 0.20 + 0.01 * step
+        after = 0.08 + 0.005 * step
+        rows.extend(
+            [
+                {"global_step": step, "metric_key": local_gap_dynamics.BEFORE, "value": before},
+                {"global_step": step, "metric_key": local_gap_dynamics.AFTER, "value": after},
+                {
+                    "global_step": step,
+                    "metric_key": local_gap_dynamics.REDUCTION,
+                    "value": before - after,
+                },
+            ]
+        )
+    return pd.DataFrame(rows)
+
+
+def test_figure5_paired_gap_loader_uses_direct_matched_metrics() -> None:
+    frame = local_gap_dynamics.paired_gap_frame(_paired_gap_rows(), expected_steps=3)
+
+    assert frame["step"].tolist() == [1, 2, 3]
+    assert frame["k3_before_intervention"].tolist() == pytest.approx([0.21, 0.22, 0.23])
+    assert frame["k3_after_intervention"].tolist() == pytest.approx([0.085, 0.09, 0.095])
+    assert np.allclose(
+        frame["k3_before_intervention"] - frame["k3_after_intervention"],
+        frame["k3_reduction"],
+    )
+
+
+def test_figure5_paired_gap_loader_rejects_mixed_population_reconstruction() -> None:
+    rows = _paired_gap_rows()
+    rows.loc[
+        (rows["global_step"] == 2) & (rows["metric_key"] == local_gap_dynamics.REDUCTION),
+        "value",
+    ] = 0.5
+
+    with pytest.raises(ValueError, match="logged reduction does not equal before - after"):
+        local_gap_dynamics.paired_gap_frame(rows, expected_steps=3)
 
 
 def test_figure5_line_and_bar_panels_share_standard_axes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -165,7 +207,7 @@ def test_figure5_line_and_bar_panels_share_standard_axes(monkeypatch: pytest.Mon
     ablation_summary.render_loss_metric(
         runs,
         metric=metric,
-        title="Top-16 token coverage",
+        ylabel="Top-16 token coverage",
         stem="coverage",
         output_dir=ablation_summary.DEFAULT_OUTPUT_DIR,
         scale=100.0,
@@ -177,8 +219,8 @@ def test_figure5_line_and_bar_panels_share_standard_axes(monkeypatch: pytest.Mon
         evaluation_step=217,
         progress_step=217,
         four_benchmark_values=(0.3, 0.3, 0.3, 0.3),
-        hmmt_values=(0.3, 0.3),
-        six_benchmark_average_percent=30.0,
+        hmmt_feb_2026_value=0.3,
+        five_benchmark_average_percent=39.0,
         uses_hmmt_placeholder=False,
     )
     ablation_summary.render_teacher_loss_benchmark(
@@ -187,13 +229,22 @@ def test_figure5_line_and_bar_panels_share_standard_axes(monkeypatch: pytest.Mon
     )
 
     try:
-        expected = (0.22, 0.19, 0.75, 0.69)
+        expected = (0.29, 0.19, 0.68, 0.69)
         assert len(figures) == 2
         assert all(_axes_bounds(fig) == pytest.approx(expected) for fig in figures)
         assert figures[0].axes[0].get_ylim()[0] < 92.0
         tick_labels = figures[1].axes[0].get_xticklabels()
         assert [label.get_text() for label in tick_labels] == ["Masked", "OPD\nloss", "SFT\nloss"]
         assert all(label.get_fontsize() == pytest.approx(11.5) for label in tick_labels)
+        assert figures[1].axes[0].get_ylim() == pytest.approx(
+            (
+                ablation_summary.TEACHER_LOSS_BENCHMARK_AXIS_MIN,
+                ablation_summary.TEACHER_LOSS_BENCHMARK_AXIS_MAX,
+            )
+        )
+        assert [bar.get_y() for bar in figures[1].axes[0].patches] == pytest.approx(
+            [ablation_summary.TEACHER_LOSS_BENCHMARK_AXIS_MIN] * 3
+        )
     finally:
         for fig in figures:
             plt.close(fig)
@@ -224,8 +275,8 @@ def test_figure6_keeps_dense_suffix_axis_separate(monkeypatch: pytest.MonkeyPatc
         evaluation_step=217,
         progress_step=217,
         four_benchmark_values=(0.3, 0.3, 0.3, 0.3),
-        hmmt_values=(0.3, 0.3),
-        six_benchmark_average_percent=36.0,
+        hmmt_feb_2026_value=0.3,
+        five_benchmark_average_percent=39.0,
         uses_hmmt_placeholder=False,
     )
     ablation_summary.render_dmpd_variants_benchmark(
@@ -236,12 +287,13 @@ def test_figure6_keeps_dense_suffix_axis_separate(monkeypatch: pytest.MonkeyPatc
     figures = [*online_figures, *benchmark_figures]
     try:
         assert len(figures) == 3
-        assert _axes_bounds(figures[0]) == pytest.approx((0.22, 0.25, 0.75, 0.63))
-        assert _axes_bounds(figures[1]) == pytest.approx((0.18, 0.36, 0.81, 0.52))
-        assert _axes_bounds(figures[2]) == pytest.approx((0.22, 0.25, 0.75, 0.63))
+        assert _axes_bounds(figures[0]) == pytest.approx((0.29, 0.25, 0.68, 0.63))
+        assert _axes_bounds(figures[1]) == pytest.approx((0.26, 0.36, 0.73, 0.52))
+        assert _axes_bounds(figures[2]) == pytest.approx((0.29, 0.25, 0.68, 0.63))
         outcome_annotations = [text.get_text() for text in figures[0].axes[0].texts]
         assert outcome_annotations == [r"$W\!\to\!C$ 2.00%" "\n" r"$C\!\to\!W$ 1.50%"]
-        assert figures[1].axes[0].get_title() == "Net online gain"
+        assert figures[1].axes[0].get_title() == ""
+        assert figures[1].axes[0].get_ylabel() == "Net online gain"
         assert [label.get_text() for label in figures[1].axes[0].get_yticklabels()] == [
             "−2%",
             "0%",
@@ -251,8 +303,9 @@ def test_figure6_keeps_dense_suffix_axis_separate(monkeypatch: pytest.MonkeyPatc
             "8%",
         ]
         assert figures[2].axes[0].get_xlabel() == "Performance"
-        assert figures[2].axes[0].get_xlim() == pytest.approx((34.0, 37.6))
-        assert [bar.get_x() for bar in figures[2].axes[0].patches] == pytest.approx([34.0] * 5)
+        assert figures[2].axes[0].get_ylabel() == "5-task benchmark avg."
+        assert figures[2].axes[0].get_xlim() == pytest.approx((38.0, 40.2))
+        assert [bar.get_x() for bar in figures[2].axes[0].patches] == pytest.approx([38.0] * 5)
     finally:
         for fig in figures:
             plt.close(fig)
@@ -264,16 +317,16 @@ def test_figure6_keeps_dense_suffix_axis_separate(monkeypatch: pytest.MonkeyPatc
         (
             "prune",
             (0.47708333333333336, 0.36666666666666664, 0.8765625, 0.009615384615384616),
-            35.49564141025641,
+            38.803103092307694,
         ),
         (
             "skip_incorrect",
             (0.47291666666666665, 0.3729166666666667, 0.875, 0.022435897435897436),
-            36.95852751282051,
+            39.60023301538461,
         ),
     ],
 )
-def test_completed_variant_hmmt_results_replace_layout_placeholders(
+def test_completed_variant_five_benchmark_results_use_hmmt_feb_only(
     key: str,
     four_benchmarks: tuple[float, ...],
     expected_average: float,
@@ -293,7 +346,8 @@ def test_completed_variant_hmmt_results_replace_layout_placeholders(
     assert result is not None
     assert result.uses_hmmt_placeholder is False
     assert result.provisional is False
-    assert result.six_benchmark_average_percent == pytest.approx(expected_average)
+    assert result.five_benchmark_average_percent == pytest.approx(expected_average)
+    assert result.hmmt_feb_2026_value == pytest.approx(run.spec.hmmt_feb_2026)
 
 
 def test_figure6_variant_legend_centers_two_independent_rows(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -302,8 +356,8 @@ def test_figure6_variant_legend_centers_two_independent_rows(monkeypatch: pytest
         evaluation_step=217,
         progress_step=217,
         four_benchmark_values=(0.3, 0.3, 0.3, 0.3),
-        hmmt_values=(0.3, 0.3),
-        six_benchmark_average_percent=30.0,
+        hmmt_feb_2026_value=0.3,
+        five_benchmark_average_percent=30.0,
         uses_hmmt_placeholder=False,
     )
     ablation_summary.render_dmpd_variants_benchmark_legend(
@@ -355,7 +409,7 @@ def test_online_gain_units_are_carried_by_axis_ticks(monkeypatch: pytest.MonkeyP
 
     figures = [*online_figures, *repair_figures]
     try:
-        assert [fig.axes[0].get_title() for fig in figures] == [
+        assert [fig.axes[0].get_ylabel() for fig in figures] == [
             "Net gain per intervention",
             "Online gain",
         ]
@@ -363,7 +417,8 @@ def test_online_gain_units_are_carried_by_axis_ticks(monkeypatch: pytest.MonkeyP
         for fig in figures:
             fig.canvas.draw()
             ax = fig.axes[0]
-            assert "(%)" not in ax.get_title()
+            assert ax.get_title() == ""
+            assert "(%)" not in ax.get_ylabel()
             assert "(%)" not in ax.get_xlabel()
             assert plot_style.panel_layout_overflow(fig) == ()
         assert all(label.get_text().endswith("%") for label in online_figures[0].axes[0].get_yticklabels())

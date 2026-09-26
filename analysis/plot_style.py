@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Literal, Mapping
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -29,25 +29,25 @@ PANEL_DPI = 350
 # Fixed axes positions prevent independently rendered panels from changing
 # width when tick labels have different extents.
 STANDARD_PANEL_MARGINS = {
-    "left": 0.22,
+    "left": 0.29,
     "right": 0.97,
     "bottom": 0.19,
     "top": 0.88,
 }
 SQUARE_PANEL_MARGINS = {
-    "left": 0.22,
-    "right": 0.91,
+    "left": 0.29,
+    "right": 0.98,
     "bottom": 0.19,
     "top": 0.88,
 }
 FIGURE6_REGULAR_PANEL_MARGINS = {
-    "left": 0.22,
+    "left": 0.29,
     "right": 0.97,
     "bottom": 0.25,
     "top": 0.88,
 }
 DENSE_X_PANEL_MARGINS = {
-    "left": 0.18,
+    "left": 0.26,
     "right": 0.99,
     "bottom": 0.36,
     "top": 0.88,
@@ -105,13 +105,6 @@ def create_panel(
     fig, ax = plt.subplots(figsize=PANEL_FIGSIZE)
     fig.subplots_adjust(**margins)
     return fig, ax
-
-
-def set_panel_title(ax: mpl.axes.Axes, label: str, **kwargs: Any) -> mpl.text.Text:
-    """Center a panel title on the fixed canvas instead of the shifted axes."""
-    axes_box = ax.get_position()
-    canvas_center_in_axes = (0.5 - axes_box.x0) / axes_box.width
-    return ax.set_title(label, x=canvas_center_in_axes, **kwargs)
 
 
 def panel_layout_overflow(fig: mpl.figure.Figure, *, tolerance_points: float = 0.25) -> tuple[str, ...]:

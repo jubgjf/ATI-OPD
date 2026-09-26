@@ -58,7 +58,6 @@ try:
         configure_style,
         create_panel,
         save_figure,
-        set_panel_title,
     )
 except ModuleNotFoundError:  # Support ``python analysis/online_conditional_dynamics.py``.
     from plot_style import (
@@ -68,7 +67,6 @@ except ModuleNotFoundError:  # Support ``python analysis/online_conditional_dyna
         configure_style,
         create_panel,
         save_figure,
-        set_panel_title,
     )
 
 WINDOW = 32
@@ -429,7 +427,7 @@ def base_axis(ylabel: str) -> tuple[mpl.figure.Figure, mpl.axes.Axes]:
     ax.set_xlim(1, 217)
     ax.set_xticks([1, 50, 100, 150, 200])
     ax.set_xlabel("Training step")
-    set_panel_title(ax, ylabel)
+    ax.set_ylabel(ylabel)
     ax.grid(axis="y", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.tick_params(direction="out", length=4)
@@ -524,7 +522,7 @@ def render_suffix_gate(estimates: Sequence[SuffixGateEstimate]) -> None:
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
     ax.set_xticks(positions, [estimate.group.tick_label for estimate in estimates])
     ax.set_xlabel("Future-gap decision")
-    set_panel_title(ax, "Net online gain", pad=3)
+    ax.set_ylabel("Net online gain")
     ax.grid(axis="y", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.tick_params(direction="out", length=4)

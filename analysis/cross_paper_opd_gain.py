@@ -42,7 +42,6 @@ try:
         STANDARD_PANEL_MARGINS,
         configure_style,
         save_figure,
-        set_panel_title,
     )
 except ModuleNotFoundError:  # Support ``python analysis/cross_paper_opd_gain.py``.
     from plot_style import (
@@ -50,7 +49,6 @@ except ModuleNotFoundError:  # Support ``python analysis/cross_paper_opd_gain.py
         STANDARD_PANEL_MARGINS,
         configure_style,
         save_figure,
-        set_panel_title,
     )
 
 DAGGER = "\N{DAGGER}"
@@ -64,7 +62,7 @@ Y_TICKS = (0.0, 0.5, 1.0, 1.5)
 # Small horizontal offsets separate close labels while keeping them over their bars.
 VALUE_LABEL_X_OFFSETS = (
     (0.0, -0.04, 0.0, 0.07, 0.0, 0.0),  # JustRL-DeepSeek
-    (0.0, -0.03, -0.04, -0.03, -0.06, 0.06),  # JustRL-Nemotron
+    (0.0, -0.08, -0.04, -0.08, -0.06, 0.06),  # JustRL-Nemotron
 )
 VALUE_LABEL_OFFSETS = (
     (0.04, 0.04, 0.13, 0.04, 0.04, 0.04),  # JustRL-DeepSeek
@@ -110,11 +108,13 @@ METHODS = (
 )
 
 # ESR was logged as topd--horizon_100 in W&B; both runs finished at step 217.
-# DeepSeek: 48b5708e981c4d17aacc398ffa8d043c, OPD: 9bbeb176889b42aa847665d03274fd68.
-# Nemotron: 8ea23b41d0ef497abe3ead9d05413655, OPD: 040b92fbe33a41e6be75ffcaf8f07f27.
+# ESR uses the later standalone evaluations single-eval_21/22, while the OPD
+# values are the canonical step-217 evaluations used by the paper.
+# DeepSeek ESR: 48b5708e981c4d17aacc398ffa8d043c; OPD: 9bbeb176889b42aa847665d03274fd68.
+# Nemotron ESR: 8ea23b41d0ef497abe3ead9d05413655; OPD: 040b92fbe33a41e6be75ffcaf8f07f27.
 ESR_STEP217_ACCURACY = {
-    "JustRL-DeepSeek": (0.3458333333333333, 0.28541666666666665, 0.78125),
-    "JustRL-Nemotron": (0.6416666666666667, 0.5625, 0.946875),
+    "JustRL-DeepSeek": (0.37916666666666665, 0.2875, 0.784375),
+    "JustRL-Nemotron": (0.6395833333333333, 0.5479166666666667, 0.9390625),
 }
 VANILLA_OPD_STEP217_ACCURACY = {
     "JustRL-DeepSeek": (0.4625, 0.33958333333333335, 0.8703125),
@@ -224,7 +224,7 @@ def create_gain_figure() -> mpl.figure.Figure:
     positions = bar_positions()
     fig, ax = plt.subplots(figsize=MAIN_FIGSIZE)
     # Preserve the shared panels' physical left margin on the wider canvas.
-    fig.subplots_adjust(**{**STANDARD_PANEL_MARGINS, "left": 0.165, "right": 0.975})
+    fig.subplots_adjust(**{**STANDARD_PANEL_MARGINS, "left": 0.19, "right": 0.975})
 
     for model_index, _model in enumerate(MODEL_GROUPS):
         for method_index, method in enumerate(METHODS):
@@ -267,7 +267,7 @@ def create_gain_figure() -> mpl.figure.Figure:
     ax.set_xticks(GROUP_CENTERS, MODEL_GROUPS)
     ax.set_yticks(Y_TICKS)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _position: f"{value:g}%"))
-    set_panel_title(ax, "Avg. accuracy gain", pad=4)
+    ax.set_ylabel("Avg. accuracy gain")
     ax.grid(axis="y", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.axhline(0.0, color="#777777", linewidth=1.0, zorder=2)
     ax.set_axisbelow(True)

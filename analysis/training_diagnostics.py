@@ -51,7 +51,6 @@ try:
         configure_style,
         create_panel,
         save_figure,
-        set_panel_title,
     )
 except ModuleNotFoundError:  # Support ``python analysis/training_diagnostics.py``.
     from plot_style import (
@@ -60,7 +59,6 @@ except ModuleNotFoundError:  # Support ``python analysis/training_diagnostics.py
         configure_style,
         create_panel,
         save_figure,
-        set_panel_title,
     )
 
 PAIR_SLUG = "deepseek"
@@ -223,7 +221,7 @@ def render_panel(
     ax.set_xlim(1, 217)
     ax.set_xticks([1, 50, 100, 150, 200])
     ax.set_xlabel("Training step")
-    set_panel_title(ax, str(spec["ylabel"]))
+    ax.set_ylabel(str(spec["ylabel"]))
     ax.grid(axis="y", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.tick_params(direction="out", length=4)

@@ -44,7 +44,6 @@ try:
         configure_style,
         create_panel,
         save_figure,
-        set_panel_title,
     )
 except ModuleNotFoundError:  # Support ``python analysis/tail_visitation.py``.
     from plot_style import (
@@ -53,7 +52,6 @@ except ModuleNotFoundError:  # Support ``python analysis/tail_visitation.py``.
         configure_style,
         create_panel,
         save_figure,
-        set_panel_title,
     )
 
 LATE_WINDOW = 32
@@ -125,7 +123,7 @@ def render_panel(slug: str, opd_run: str, dmpd_run: str) -> None:
     ax.set_ylim(0, 100)
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
     ax.set_xlabel("Response-length event")
-    set_panel_title(ax, "Response tail / clip rate")
+    ax.set_ylabel("Response tail / clip rate")
     ax.grid(axis="y", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.tick_params(direction="out", length=4)

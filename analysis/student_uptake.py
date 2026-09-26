@@ -14,23 +14,20 @@
 
 # ruff: noqa: E402
 
-"""Plot Student uptake immediately after a DMPD-Future teacher intervention.
+"""Plot Student uptake immediately after an ATI-OPD teacher intervention.
 
-Each point is one training step. The x-axis reconstructs first-16 K3 before
-intervention as ``gap_after + gap_reduction``; the y-axis is first-16 K3 after
-intervention. Points below y=x therefore indicate positive uptake. The black arrowed path
-joins non-overlapping 32-step centroids, matching the earlier preferred style.
+Each point is one training step. Both axes use direct ``local_effect_v2``
+statistics from the same matched intervention pairs and the same first-16
+Student-token windows. Points below y=x therefore indicate positive uptake.
+The black arrowed path joins non-overlapping 32-step centroids.
 """
 
 from __future__ import annotations
 
-import gzip
-import json
 import os
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-ARTIFACTS_ROOT = REPO_ROOT / "analysis_artifacts" / "jubgjf" / "DMPD" / "runs"
 OUTPUT_DIR = REPO_ROOT / "analysis" / "figures"
 CACHE_ROOT = REPO_ROOT / ".analysis_cache"
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -39,19 +36,17 @@ os.environ.setdefault("XDG_CACHE_HOME", str(CACHE_ROOT / "xdg"))
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 from matplotlib.colorbar import ColorbarBase
 from matplotlib.colors import Normalize
 
 try:
-    from analysis.plot_style import SQUARE_PANEL_MARGINS, configure_style, create_panel, save_figure, set_panel_title
+    from analysis.local_gap_dynamics import load_gap_series
+    from analysis.plot_style import SQUARE_PANEL_MARGINS, configure_style, create_panel, save_figure
 except ModuleNotFoundError:  # Support ``python analysis/student_uptake.py``.
-    from plot_style import SQUARE_PANEL_MARGINS, configure_style, create_panel, save_figure, set_panel_title
+    from local_gap_dynamics import load_gap_series
+    from plot_style import SQUARE_PANEL_MARGINS, configure_style, create_panel, save_figure
 
-# Legacy W&B schema keys retained for compatibility with downloaded artifacts.
-AFTER = "opd_intervention/repair_boundary/exit/active_gap_after_first16_mean"
-REDUCTION = "opd_intervention/local_effect_v2/active_gap/reduction_first16_mean"
 PHASE_WINDOW = 32
 RUN_ID = "802c696019c1449aa3328bca0e1806eb"
 BLACK = "#262626"
@@ -60,34 +55,13 @@ GRAY = "#7A8491"
 
 
 def load_uptake(run_id: str) -> pd.DataFrame:
-    run_dir = ARTIFACTS_ROOT / run_id
-    metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-    if metadata.get("entity") != "jubgjf" or metadata.get("project") != "DMPD":
-        raise ValueError(f"Run {run_id} is not from jubgjf/DMPD.")
-    rows_by_step: dict[int, tuple[float, float]] = {}
-    for shard in sorted((run_dir / "history").glob("steps_*.jsonl.gz")):
-        with gzip.open(shard, "rt", encoding="utf-8") as handle:
-            for line in handle:
-                row = json.loads(line)
-                step = row.get("training/global_step")
-                after = row.get(AFTER)
-                reduction = row.get(REDUCTION)
-                if (
-                    isinstance(step, int | float)
-                    and isinstance(after, int | float)
-                    and isinstance(reduction, int | float)
-                    and np.isfinite(float(after))
-                    and np.isfinite(float(reduction))
-                ):
-                    rows_by_step[int(step)] = (float(after) + float(reduction), float(after))
-    frame = pd.DataFrame(
-        [(step, *values) for step, values in sorted(rows_by_step.items())],
-        columns=["step", "before_intervention", "after_intervention"],
-    )
-    frame = frame.loc[(frame["before_intervention"] >= 0) & (frame["after_intervention"] >= 0)].reset_index(drop=True)
-    if len(frame) < 200:
-        raise ValueError(f"Run {run_id} has only {len(frame)} valid uptake observations.")
-    return frame
+    frame = load_gap_series(run_id)
+    return frame.rename(
+        columns={
+            "k3_before_intervention": "before_intervention",
+            "k3_after_intervention": "after_intervention",
+        }
+    )[["step", "before_intervention", "after_intervention"]]
 
 
 def phase_centers(frame: pd.DataFrame) -> pd.DataFrame:
@@ -184,7 +158,7 @@ def render_panel(slug: str, run_id: str) -> None:
     ax.set_ylim(0, upper)
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("K3 before intervention")
-    set_panel_title(ax, "K3 after intervention")
+    ax.set_ylabel("K3 after intervention")
     ax.grid(color="#D9DEE5", linewidth=0.7, alpha=0.8)
     ax.set_axisbelow(True)
     ax.tick_params(direction="out", length=4)
@@ -199,7 +173,7 @@ def render_colorbar() -> None:
         norm=Normalize(1, 217),
         orientation="vertical",
     )
-    colorbar.ax.set_title("Step", fontsize=13, pad=3)
+    colorbar.set_label("Training step", fontsize=13, labelpad=3)
     colorbar.set_ticks([1, 109, 217])
     colorbar.ax.tick_params(labelsize=13, pad=1)
     save_figure(

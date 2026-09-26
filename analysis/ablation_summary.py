@@ -18,9 +18,10 @@
 
 The script reads only the local ``jubgjf/DMPD`` mirror. It deliberately pins
 every paper row to a run ID and validates the relevant configuration before
-using any data. Missing HMMT results are replaced with zeros solely to size
-provisional layout bars; such bars are marked with a dagger and must not be
-reported as final six-benchmark results.
+using any data. The benchmark average covers the four W&B benchmarks and
+HMMT Feb 2026; HMMT Nov 2025 is excluded. Missing HMMT Feb results are
+replaced with zeros solely to size provisional layout bars; such bars are
+marked with a dagger and must not be reported as final five-benchmark results.
 """
 
 from __future__ import annotations
@@ -57,7 +58,6 @@ try:
         configure_style,
         create_panel,
         save_figure,
-        set_panel_title,
     )
 except ModuleNotFoundError:  # Support ``python analysis/ablation_summary.py``.
     from plot_style import (
@@ -67,7 +67,6 @@ except ModuleNotFoundError:  # Support ``python analysis/ablation_summary.py``.
         configure_style,
         create_panel,
         save_figure,
-        set_panel_title,
     )
 
 EXPECTED_TRAINING_STEPS = 217
@@ -102,7 +101,6 @@ class RunSpec:
     run_id: str
     expected: ExpectedIntervention
     hmmt_feb_2026: float | None = None
-    hmmt_nov_2025: float | None = None
     hmmt_source: str | None = None
 
 
@@ -118,8 +116,8 @@ class BenchmarkResult:
     evaluation_step: int
     progress_step: int
     four_benchmark_values: tuple[float, ...]
-    hmmt_values: tuple[float, float]
-    six_benchmark_average_percent: float
+    hmmt_feb_2026_value: float
+    five_benchmark_average_percent: float
     uses_hmmt_placeholder: bool
 
     @property
@@ -195,7 +193,6 @@ RUN_SPECS: dict[str, RunSpec] = {
             max_interventions=1,
         ),
         hmmt_feb_2026=0.22159091,
-        hmmt_nov_2025=0.20416667,
         hmmt_source="single-eval_11",
     ),
     "opd_loss": RunSpec(
@@ -210,7 +207,6 @@ RUN_SPECS: dict[str, RunSpec] = {
         ),
         # Standalone evaluations already reported in the current main-results table.
         hmmt_feb_2026=0.2424,
-        hmmt_nov_2025=0.2083,
         hmmt_source="existing canonical standalone evaluation",
     ),
     "sft_loss": RunSpec(
@@ -226,7 +222,6 @@ RUN_SPECS: dict[str, RunSpec] = {
             max_interventions=1,
         ),
         hmmt_feb_2026=0.19696970,
-        hmmt_nov_2025=0.18333333,
         hmmt_source="single-eval_12",
     ),
     "full_m1": RunSpec(
@@ -240,7 +235,6 @@ RUN_SPECS: dict[str, RunSpec] = {
             max_interventions=1,
         ),
         hmmt_feb_2026=0.21401515,
-        hmmt_nov_2025=0.20416667,
         hmmt_source="single-eval_10",
     ),
     "full_m4": RunSpec(
@@ -254,7 +248,6 @@ RUN_SPECS: dict[str, RunSpec] = {
             max_interventions=4,
         ),
         hmmt_feb_2026=0.23674242,
-        hmmt_nov_2025=0.20416667,
         hmmt_source="single-eval_9",
     ),
     "prune": RunSpec(
@@ -268,7 +261,6 @@ RUN_SPECS: dict[str, RunSpec] = {
             max_interventions=1,
         ),
         hmmt_feb_2026=0.21022727,
-        hmmt_nov_2025=0.18958333,
         hmmt_source="single-eval_19",
     ),
     "skip_incorrect": RunSpec(
@@ -283,7 +275,6 @@ RUN_SPECS: dict[str, RunSpec] = {
             skip_correct=True,
         ),
         hmmt_feb_2026=0.23674242,
-        hmmt_nov_2025=0.2375,
         hmmt_source="single-eval_20",
     ),
     "teacher_len_512": RunSpec(
@@ -310,7 +301,6 @@ RUN_SPECS: dict[str, RunSpec] = {
             teacher_segment_length=1024,
         ),
         hmmt_feb_2026=0.22916667,
-        hmmt_nov_2025=0.2125,
         hmmt_source="single-eval_13",
     ),
 }
@@ -329,9 +319,10 @@ DMPD_VARIANT_BARS = (
     ("skip_incorrect", "Skip incorrect"),
 )
 DMPD_VARIANT_POSITIONS = (4.0, 3.0, 2.0, 1.0, 0.0)
-BENCHMARK_AXIS_MAX = 41.0
-FIGURE6_BENCHMARK_AXIS_MIN = 34.0
-FIGURE6_BENCHMARK_AXIS_MAX = 37.6
+TEACHER_LOSS_BENCHMARK_AXIS_MIN = 36.0
+TEACHER_LOSS_BENCHMARK_AXIS_MAX = 40.2
+FIGURE6_BENCHMARK_AXIS_MIN = 38.0
+FIGURE6_BENCHMARK_AXIS_MAX = 40.2
 
 
 def parse_args() -> argparse.Namespace:
@@ -504,16 +495,15 @@ def benchmark_result(run: LoadedRun) -> BenchmarkResult | None:
     if latest is None:
         return None
     evaluation_step, four_values = latest
-    hmmt_raw = (run.spec.hmmt_feb_2026, run.spec.hmmt_nov_2025)
-    uses_placeholder = any(value is None for value in hmmt_raw)
-    hmmt_values = tuple(0.0 if value is None else float(value) for value in hmmt_raw)
-    average = 100.0 * (sum(four_values) + sum(hmmt_values)) / 6.0
+    uses_placeholder = run.spec.hmmt_feb_2026 is None
+    hmmt_feb_2026_value = 0.0 if uses_placeholder else float(run.spec.hmmt_feb_2026)
+    average = 100.0 * (sum(four_values) + hmmt_feb_2026_value) / 5.0
     return BenchmarkResult(
         evaluation_step=evaluation_step,
         progress_step=run.progress_step,
         four_benchmark_values=four_values,
-        hmmt_values=(hmmt_values[0], hmmt_values[1]),
-        six_benchmark_average_percent=average,
+        hmmt_feb_2026_value=hmmt_feb_2026_value,
+        five_benchmark_average_percent=average,
         uses_hmmt_placeholder=uses_placeholder,
     )
 
@@ -576,7 +566,7 @@ def render_loss_metric(
     runs: Mapping[str, LoadedRun],
     *,
     metric: str,
-    title: str,
+    ylabel: str,
     stem: str,
     output_dir: Path,
     scale: float,
@@ -622,7 +612,7 @@ def render_loss_metric(
     if not observed:
         raise ValueError(f"No finite observations found for {metric}.")
     _style_axes(ax)
-    set_panel_title(ax, title, pad=3)
+    ax.set_ylabel(ylabel)
     if percent:
         ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
     if dynamic_percent_range:
@@ -693,10 +683,21 @@ def render_teacher_loss_benchmark(results: Mapping[str, BenchmarkResult | None],
         result = results[key]
         if result is None:
             continue
+        if result.five_benchmark_average_percent < TEACHER_LOSS_BENCHMARK_AXIS_MIN:
+            raise ValueError(
+                f"Benchmark average for {key} ({result.five_benchmark_average_percent:.2f}%) is below "
+                f"the truncated axis minimum ({TEACHER_LOSS_BENCHMARK_AXIS_MIN:.2f}%)."
+            )
+        if result.five_benchmark_average_percent > TEACHER_LOSS_BENCHMARK_AXIS_MAX:
+            raise ValueError(
+                f"Benchmark average for {key} ({result.five_benchmark_average_percent:.2f}%) exceeds "
+                f"the truncated axis maximum ({TEACHER_LOSS_BENCHMARK_AXIS_MAX:.2f}%)."
+            )
         color = _bar_color(key)
         bar = ax.bar(
             position,
-            result.six_benchmark_average_percent,
+            result.five_benchmark_average_percent - TEACHER_LOSS_BENCHMARK_AXIS_MIN,
+            bottom=TEACHER_LOSS_BENCHMARK_AXIS_MIN,
             width=0.62,
             color=color,
             edgecolor=color,
@@ -704,8 +705,8 @@ def render_teacher_loss_benchmark(results: Mapping[str, BenchmarkResult | None],
         )[0]
         ax.text(
             bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + 0.55,
-            f"{result.six_benchmark_average_percent:.1f}",
+            bar.get_y() + bar.get_height() + 0.08,
+            f"{result.five_benchmark_average_percent:.1f}",
             ha="center",
             va="bottom",
             fontsize=13,
@@ -718,14 +719,17 @@ def render_teacher_loss_benchmark(results: Mapping[str, BenchmarkResult | None],
         fontsize=11.5,
         linespacing=0.9,
     )
-    ax.set_ylim(0, BENCHMARK_AXIS_MAX)
-    ax.set_yticks([0, 20, 40])
+    ax.set_ylim(TEACHER_LOSS_BENCHMARK_AXIS_MIN, TEACHER_LOSS_BENCHMARK_AXIS_MAX)
+    ax.set_yticks([37, 38, 39, 40])
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
-    set_panel_title(ax, "Benchmark Avg.", pad=4)
+    ax.set_ylabel("5-task benchmark avg.")
     ax.grid(axis="y", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.tick_params(axis="x", bottom=False, pad=5)
     ax.tick_params(axis="y", direction="out", length=4)
+    break_style = {"color": "#222222", "clip_on": False, "linewidth": 1.1, "transform": ax.transAxes}
+    for center in (0.025, 0.055):
+        ax.plot((-0.018, 0.018), (center - 0.012, center + 0.012), **break_style)
     save_figure(fig, output_dir, "teacher_segment_loss_benchmark_avg_deepseek")
 
 
@@ -735,16 +739,16 @@ def render_dmpd_variants_benchmark(results: Mapping[str, BenchmarkResult | None]
         result = results[key]
         if result is None:
             continue
-        if result.six_benchmark_average_percent < FIGURE6_BENCHMARK_AXIS_MIN:
+        if result.five_benchmark_average_percent < FIGURE6_BENCHMARK_AXIS_MIN:
             raise ValueError(
-                f"Benchmark average for {key} ({result.six_benchmark_average_percent:.2f}%) is below "
+                f"Benchmark average for {key} ({result.five_benchmark_average_percent:.2f}%) is below "
                 f"the truncated axis minimum ({FIGURE6_BENCHMARK_AXIS_MIN:.2f}%)."
             )
         color = _bar_color(key)
         facecolor = "white" if result.provisional else color
         bar = ax.barh(
             position,
-            result.six_benchmark_average_percent - FIGURE6_BENCHMARK_AXIS_MIN,
+            result.five_benchmark_average_percent - FIGURE6_BENCHMARK_AXIS_MIN,
             left=FIGURE6_BENCHMARK_AXIS_MIN,
             height=0.58,
             color=facecolor,
@@ -754,7 +758,7 @@ def render_dmpd_variants_benchmark(results: Mapping[str, BenchmarkResult | None]
         ax.text(
             bar.get_x() + bar.get_width() + 0.05,
             bar.get_y() + bar.get_height() / 2,
-            f"{result.six_benchmark_average_percent:.1f}{DAGGER if result.provisional else ''}",
+            f"{result.five_benchmark_average_percent:.1f}{DAGGER if result.provisional else ''}",
             ha="left",
             va="center",
             fontsize=13,
@@ -762,10 +766,10 @@ def render_dmpd_variants_benchmark(results: Mapping[str, BenchmarkResult | None]
         )
     ax.set_yticks([])
     ax.set_xlim(FIGURE6_BENCHMARK_AXIS_MIN, FIGURE6_BENCHMARK_AXIS_MAX)
-    ax.set_xticks([34, 35, 36, 37])
+    ax.set_xticks([38, 39, 40])
     ax.xaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=0))
     ax.set_xlabel("Performance")
-    set_panel_title(ax, "Benchmark Avg.", pad=4)
+    ax.set_ylabel("5-task benchmark avg.")
     ax.grid(axis="x", color=GRID_COLOR, linewidth=0.7, alpha=0.85)
     ax.set_axisbelow(True)
     ax.set_ylim(-0.6, 4.6)
@@ -819,7 +823,7 @@ def print_summary(runs: Mapping[str, LoadedRun], results: Mapping[str, Benchmark
             benchmark_text = "benchmark=missing"
         else:
             benchmark_text = (
-                f"benchmark_step={result.evaluation_step}, avg6={result.six_benchmark_average_percent:.2f}%, "
+                f"benchmark_step={result.evaluation_step}, avg5={result.five_benchmark_average_percent:.2f}%, "
                 f"hmmt_placeholder={result.uses_hmmt_placeholder}, hmmt_source={run.spec.hmmt_source or 'missing'}"
             )
         print(f"  {key}: run={run.spec.run_id}, progress={run.progress_step}, {benchmark_text}")
@@ -839,7 +843,7 @@ def main() -> None:
     render_loss_metric(
         runs,
         metric="opd/overlap/top16_rate",
-        title="Top-16 token coverage",
+        ylabel="Top-16 token coverage",
         stem="loss_top16_coverage_deepseek",
         output_dir=output_dir,
         scale=100.0,
@@ -850,7 +854,7 @@ def main() -> None:
     render_loss_metric(
         runs,
         metric="rollout/repetition_rate_token_zlib",
-        title="Token-zlib repetition rate",
+        ylabel="Token-zlib repetition rate",
         stem="loss_token_zlib_repetition_rate_deepseek",
         output_dir=output_dir,
         scale=100.0,
@@ -862,7 +866,7 @@ def main() -> None:
     render_loss_metric(
         runs,
         metric="rollout/repetition_comp_ratio_token_zlib/mean",
-        title="Mean zlib compression ratio",
+        ylabel="Mean zlib compression ratio",
         stem="loss_token_zlib_compression_ratio_deepseek",
         output_dir=output_dir,
         scale=1.0,

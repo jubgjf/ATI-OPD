@@ -31,8 +31,8 @@ plt.switch_backend("Agg")
 def test_average_gains_match_appendix_three_benchmark_means() -> None:
     expected = np.asarray(
         (
-            (-8.66, 0.27, 0.37, 0.23, -1.50, 1.35),
-            (-2.12, 0.50, 0.77, 0.90, 1.13, 1.11),
+            (-7.38, 0.27, 0.37, 0.23, -1.50, 1.35),
+            (-2.93, 0.50, 0.77, 0.90, 1.13, 1.11),
         )
     )
 
@@ -60,8 +60,9 @@ def test_grouped_bar_figure_uses_expected_layout_labels_and_units() -> None:
     try:
         axis = figure.axes[0]
         assert tuple(figure.get_size_inches()) == pytest.approx(gain_plot.MAIN_FIGSIZE)
-        assert axis.get_title() == "Avg. accuracy gain"
-        assert "%" not in axis.get_title()
+        assert axis.get_title() == ""
+        assert axis.get_ylabel() == "Avg. accuracy gain"
+        assert "%" not in axis.get_ylabel()
         assert [label.get_text() for label in axis.get_xticklabels()] == list(gain_plot.MODEL_GROUPS)
         assert {label.get_fontsize() for label in axis.get_xticklabels()} == {gain_plot.MODEL_TICK_FONT_SIZE}
         assert axis.get_ylim() == pytest.approx(gain_plot.Y_LIMITS)
