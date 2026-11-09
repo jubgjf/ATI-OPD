@@ -27,7 +27,7 @@ import os
 import shlex
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pprint import pprint
@@ -105,7 +105,10 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
+from verl.workers.rollout.request_usage import collect_request_usage
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+PRUNE_CALIBRATION_FILENAME = "opd_prune_future_calibration.json"
 
 
 @auto_await
@@ -114,6 +117,7 @@ async def _execute_teacher_target_scoring_requests(
     requests,
     *,
     request_id_prefix: str,
+    usage_metrics: dict[str, int] | None = None,
 ):
     tasks = [
         teacher_scorer.compute_teacher_logprobs_for_target_ids_single(
@@ -126,7 +130,32 @@ async def _execute_teacher_target_scoring_requests(
         )
         for sample_index, request in enumerate(requests)
     ]
-    return await asyncio.gather(*tasks)
+    with collect_request_usage(usage_metrics is not None) as usage:
+        results = await asyncio.gather(*tasks)
+    if usage is not None:
+        usage_metrics.update(usage.metrics)
+    return results
+
+
+def _rollout_cost_metrics(batch: DataProto) -> dict[str, int]:
+    counters = Counter(batch.meta_info.pop("opd_target_request_usage", {}))
+    for usage in batch.non_tensor_batch.pop("opd_request_usage"):
+        counters.update(usage)
+    # Generation requests are counted before any suffix is discarded. Compare
+    # their output with the actual student-owned tokens in the training batch.
+    spans = batch.non_tensor_batch.get("teacher_interventions", ())
+    teacher_tokens = sum(int(span["teacher_tokens"]) for row in spans for span in (row or ()))
+    counters["opd_cost/trajectory/teacher_tokens"] = teacher_tokens
+    student_kinds = ("opd_cost/student_initial/", "opd_cost/student_suffix/")
+    if all(counters[kind + "requests"] == counters[kind + "output_known_requests"] for kind in student_kinds):
+        response_width = batch.batch["responses"].shape[1]
+        final_tokens = int(batch.batch["attention_mask"][:, -response_width:].sum().item())
+        student_generated = sum(counters[kind + "output_tokens"] for kind in student_kinds)
+        discarded = student_generated - (final_tokens - teacher_tokens)
+        if discarded < 0:
+            raise RuntimeError("Rollout cost accounting found more retained student tokens than generated tokens.")
+        counters["opd_cost/trajectory/discarded_student_tokens"] = discarded
+    return dict(counters)
 
 
 def _with_reward_data_source(
@@ -1068,6 +1097,39 @@ def apply_distillation_horizon_mask(
     }
 
 
+def _apply_selection_only_mask(data: DataProto) -> dict[str, float]:
+    response_mask = data.batch["response_mask"]
+    width = response_mask.shape[-1]
+    attention_mask = data.batch["attention_mask"][:, -width:]
+    if not torch.equal(attention_mask.bool(), response_mask.bool()):
+        raise ValueError("Selection-only expects a fully student-generated response.")
+    lengths = response_mask.bool().sum(dim=-1)
+    raw_cutoffs = data.non_tensor_batch.get("opd_selection_cutoff")
+    if (
+        raw_cutoffs is None
+        or len(raw_cutoffs) != len(lengths)
+        or any(isinstance(cutoff, bool) or not isinstance(cutoff, int | np.integer) for cutoff in raw_cutoffs)
+    ):
+        raise ValueError("Selection-only requires one integer opd_selection_cutoff per response.")
+    cutoffs = torch.as_tensor(list(raw_cutoffs), device=response_mask.device, dtype=torch.long)
+    if ((cutoffs < 0) | (cutoffs > lengths)).any().item():
+        raise ValueError("Selection-only cutoff is outside the physical response.")
+    mask = response_mask.bool() & (torch.arange(width, device=response_mask.device) < cutoffs[:, None])
+    data.batch["distillation_loss_mask"] = mask.to(dtype=response_mask.dtype)
+    kept = int(mask.sum().item())
+    total = int(lengths.sum().item())
+    metrics = {
+        "distillation/selection_only/excluded_tokens": float(total - kept),
+        "distillation/selection_only/retained_fraction": kept / total if total else 1.0,
+        "distillation/selection_only/cut_fraction": (cutoffs < lengths).float().mean().item(),
+    }
+    if "opd_selection_threshold" in data.non_tensor_batch:
+        metrics["distillation/selection_only/threshold"] = float(
+            np.mean(data.non_tensor_batch["opd_selection_threshold"])
+        )
+    return metrics
+
+
 def apply_intervention_prune_mask(
     data: DataProto,
     intervention_config: Any,
@@ -1075,9 +1137,11 @@ def apply_intervention_prune_mask(
     """Apply hard or rollout-provided adaptive intervention supervision cutoffs."""
     if not bool(_get_config_value(intervention_config, "prune", False)):
         return {}
+    prune_mode = str(_get_config_value(intervention_config, "prune_mode", "teacher_end"))
+    if prune_mode == "selection_only":
+        return _apply_selection_only_mask(data)
     if not bool(_get_config_value(intervention_config, "enabled", False)):
         raise ValueError("distillation.intervention.prune=true requires intervention.enabled=true.")
-    prune_mode = str(_get_config_value(intervention_config, "prune_mode", "teacher_end"))
     if prune_mode not in {"teacher_end", "adaptive_future"}:
         raise ValueError(f"Unsupported distillation.intervention.prune_mode={prune_mode!r}.")
     if "teacher_interventions" not in data.non_tensor_batch:
@@ -1707,8 +1771,11 @@ class RayPPOTrainer:
 
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
 
-        if self.config.trainer.total_training_steps is not None:
-            total_training_steps = self.config.trainer.total_training_steps
+        configured_steps = self.config.trainer.total_training_steps
+        if configured_steps is not None:
+            if type(configured_steps) is not int or configured_steps <= 0:
+                raise ValueError("trainer.total_training_steps must be a positive integer.")
+            total_training_steps = configured_steps
 
         self.total_training_steps = total_training_steps
         print(f"Total training steps: {self.total_training_steps}")
@@ -2828,6 +2895,11 @@ class RayPPOTrainer:
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
+        intervention = getattr(getattr(self, "distillation_config", None), "intervention", None)
+        if getattr(intervention, "prune_mode", None) in {"adaptive_future", "selection_only"}:
+            calibration = self.async_rollout_manager.export_prune_future_calibration()
+            with open(os.path.join(local_global_step_folder, PRUNE_CALIBRATION_FILENAME), "w") as calibration_file:
+                json.dump(calibration, calibration_file, allow_nan=False)
         return local_global_step_folder
 
     def _commit_checkpoint_tracker(self, checkpoint_step: int) -> None:
@@ -2981,11 +3053,16 @@ class RayPPOTrainer:
 
         # load dataloader,
         # TODO: from remote not implemented yet
+        calibration_path = os.path.join(global_step_folder, PRUNE_CALIBRATION_FILENAME)
+        has_calibration_state = os.path.isfile(calibration_path)
+        if has_calibration_state:
+            with open(calibration_path) as calibration_file:
+                self.async_rollout_manager.restore_prune_future_calibration(json.load(calibration_file))
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
             steps_per_epoch = len(self.train_dataloader)
             at_epoch_boundary = steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
-            if at_epoch_boundary:
+            if at_epoch_boundary and not has_calibration_state:
                 print(
                     f"Skipping dataloader state restore: global_steps={self.global_steps} "
                     f"is at an epoch boundary (steps_per_epoch={steps_per_epoch}). "
@@ -2995,6 +3072,16 @@ class RayPPOTrainer:
             else:
                 dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
                 self.train_dataloader.load_state_dict(dataloader_state_dict)
+                if at_epoch_boundary and not dataloader_state_dict.get("_iterator_finished", False):
+                    # Saved within the last batch, before the iterator had
+                    # observed StopIteration. Restore its RNG state, then
+                    # exhaust it so the next for-loop starts a fresh epoch.
+                    try:
+                        next(iter(self.train_dataloader))
+                    except StopIteration:
+                        pass
+                    else:
+                        raise RuntimeError("A checkpoint at the epoch boundary has unconsumed training data.")
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
@@ -3291,7 +3378,10 @@ class RayPPOTrainer:
 
         intervention_config = getattr(distillation_config, "intervention", None)
         intervention_enabled = bool(_get_config_value(intervention_config, "enabled", False))
-        prune_enabled = intervention_enabled and bool(_get_config_value(intervention_config, "prune", False))
+        selection_only = _get_config_value(intervention_config, "prune_mode", "teacher_end") == "selection_only"
+        prune_enabled = (intervention_enabled or selection_only) and bool(
+            _get_config_value(intervention_config, "prune", False)
+        )
 
         loss_config = distillation_config.distillation_loss
         horizon_mode = str(_get_horizon_config_value(loss_config.horizon, "mode", "full")).lower()
@@ -3406,11 +3496,17 @@ class RayPPOTrainer:
             multi_modal_data=None if raw_multi_modal_data is None else list(raw_multi_modal_data),
             mm_processor_kwargs=None if raw_mm_processor_kwargs is None else list(raw_mm_processor_kwargs),
         )
+        usage_metrics = None
+        if getattr(getattr(self.distillation_config, "diagnostics", None), "collect_rollout_costs", False):
+            usage_metrics = {}
         scoring_results = _execute_teacher_target_scoring_requests(
             target_scorer,
             requests,
             request_id_prefix=f"only-stu-rethinking-step-{getattr(self, 'global_steps', -1)}",
+            **({"usage_metrics": usage_metrics} if usage_metrics is not None else {}),
         )
+        if usage_metrics is not None:
+            batch.meta_info["opd_target_request_usage"] = usage_metrics
         return assemble_teacher_target_logprobs(
             requests=requests,
             scoring_results=scoring_results,
@@ -3656,6 +3752,7 @@ class RayPPOTrainer:
         collect_topk_diagnostics = (
             diagnostics_config.collect_topk_overlap
             or getattr(diagnostics_config, "collect_rethinking_opd_metrics", False)
+            or getattr(diagnostics_config, "collect_source_position_metrics", False)
         ) and global_steps % diagnostics_config.topk_log_interval == 0
         collect_boundary_diagnostics = bool(
             diagnostics_config.collect_intervention_metrics
@@ -3665,6 +3762,15 @@ class RayPPOTrainer:
         teacher_response_topk_ids, teacher_response_topk_logprobs = (
             self._extract_teacher_response_topk_for_diagnostics(batch) if collect_topk_diagnostics else (None, None)
         )
+        collect_student_only = getattr(diagnostics_config, "collect_source_position_metrics", False)
+        if collect_student_only and (
+            teacher_response_logprobs is None
+            or (
+                collect_topk_diagnostics
+                and (teacher_response_topk_ids is None or teacher_response_topk_ids.shape[-1] < 16)
+            )
+        ):
+            raise RuntimeError("Student-only diagnostics require sampled teacher logprobs and true teacher top-16.")
         teacher_logprob_nonfinite_positions = None
         if "teacher_logprob_nonfinite_positions" in batch.non_tensor_batch:
             teacher_logprob_nonfinite_positions = self._non_tensor_to_list(
@@ -3726,6 +3832,11 @@ class RayPPOTrainer:
             "bad_tail_reward_threshold": diagnostics_config.bad_tail_reward_threshold,
             "bad_tail_entropy_threshold": diagnostics_config.bad_tail_entropy_threshold,
         }
+        if collect_student_only:
+            spans = batch.non_tensor_batch.get("teacher_interventions")
+            diagnostics_kwargs["student_only_interventions"] = (
+                self._non_tensor_to_list(spans) if spans is not None else [None] * len(batch)
+            )
         intervention_kwargs = None
         boundary_kwargs = None
 
@@ -4921,6 +5032,11 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
+                        if "opd_request_usage" in batch.non_tensor_batch:
+                            metrics["opd_cost/actor/update_tokens"] = (
+                                sum(batch.meta_info["global_token_num"])
+                                * self.config.actor_rollout_ref.actor.ppo_epochs
+                            )
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
@@ -5030,6 +5146,14 @@ class RayPPOTrainer:
                             metrics[f"gdpo/{key}/max"] = float(np.max(vals))
                             metrics[f"gdpo/{key}/min"] = float(np.min(vals))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                if "opd_request_usage" in batch.non_tensor_batch:
+                    metrics.update(_rollout_cost_metrics(batch))
+                    metrics["opd_cost/allocated_devices"] = (
+                        self.config.trainer.nnodes * self.config.trainer.n_gpus_per_node
+                        + self.config.distillation.nnodes * self.config.distillation.n_gpus_per_node
+                    )
+                    if not bypass_recomputing_logprobs:
+                        metrics["opd_cost/actor/old_logprob_tokens"] = sum(batch.meta_info["global_token_num"])
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))

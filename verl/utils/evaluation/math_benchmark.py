@@ -42,6 +42,7 @@ ANSWER_FIELDS = ("answer", "solution", "ground_truth", "final_answer")
 THINK_END_TAGS = ("</think>", "<|end_of_thought|>")
 AMO_BENCH_P_SIZE = 39
 AMO_BENCH_P_ANSWER_TYPES = frozenset({"number", "set", "variable"})
+MATH5_BENCHMARKS = ("aime24", "aime25", "amc23", "AMO-Bench", "hmmt_feb_2026")
 
 
 @dataclass(frozen=True)

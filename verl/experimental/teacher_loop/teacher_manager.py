@@ -248,6 +248,7 @@ class AsyncTeacherLLMServerManager:
             request_id=resolved_request_id,
             prompt_ids=sequence_ids,
             sampling_params=sampling_params,
+            usage_kind="teacher_score",
             image_data=multi_modal_data.get("images"),
             video_data=multi_modal_data.get("videos"),
             audio_data=multi_modal_data.get("audios"),
@@ -440,6 +441,7 @@ class AsyncTeacherLLMServerManager:
             request_id=resolved_request_id,
             prompt_ids=sequence_ids,
             sampling_params=sampling_params,
+            usage_kind="teacher_target_score",
             image_data=multi_modal_data.get("images"),
             video_data=multi_modal_data.get("videos"),
             audio_data=multi_modal_data.get("audios"),
@@ -551,6 +553,7 @@ class AsyncTeacherLLMServerManager:
         teacher_output = await client.generate(
             request_id=resolved_request_id,
             prompt_ids=prefix_ids,
+            usage_kind="teacher_generate",
             sampling_params=_get_teacher_generation_sampling_params(
                 self.distillation_config.intervention,
                 max_tokens=max_tokens,

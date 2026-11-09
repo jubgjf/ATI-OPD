@@ -51,6 +51,13 @@ from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
+from verl.experimental.agent_loop.relay import (
+    RELAY_MAX_ADDITIONAL_TOKENS,
+    RELAY_TRIGGER_TOPK,
+    first_reflection_trigger,
+    reflection_token_ids,
+    teacher_paragraph_end,
+)
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.experimental.teacher_loop.teacher_manager import (
     DEFAULT_NONFINITE_LOGPROB_REPLACEMENT,
@@ -83,6 +90,7 @@ from verl.workers.config import (
     RolloutConfig,
 )
 from verl.workers.rollout.llm_server import LLMServerClient
+from verl.workers.rollout.request_usage import collect_request_usage
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -314,6 +322,21 @@ class _GlobalPruneFutureCalibration:
             self.history.extend(updates)
             self.version += 1
         return self.snapshot()
+
+    def state_dict(self) -> dict[str, Any]:
+        """Save the ordered calibration history and its batch version."""
+        return {"version": self.version, "history": list(self.history)}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore the calibration from a committed training checkpoint."""
+        history, version = state["history"], state["version"]
+        if type(version) is not int or version < 0 or len(history) > self.history.maxlen:
+            raise ValueError("Invalid prune-future calibration checkpoint.")
+        if not all(math.isfinite(value) for value in history):
+            raise ValueError("Prune-future calibration checkpoint contains non-finite gaps.")
+        self.history.clear()
+        self.history.extend(history)
+        self.version = version
 
 
 def _as_single_float(value: Any, *, context: str) -> float:
@@ -2285,7 +2308,7 @@ class AgentLoopWorker:
                     count=0,
                     version=0,
                 )
-            if self.teacher_intervention_config.prune_mode == "adaptive_future":
+            if self.teacher_intervention_config.prune_mode in {"adaptive_future", "selection_only"}:
                 configured_initial = self.teacher_intervention_config.prune_future_initial_threshold
                 self._prune_future_calibration_snapshot = _PruneFutureCalibrationSnapshot(
                     threshold=float(
@@ -2443,6 +2466,8 @@ class AgentLoopWorker:
             or getattr(diagnostics_config, "collect_rethinking_opd_metrics", False)
         ):
             prompt_logprobs = max(prompt_logprobs, int(getattr(diagnostics_config, "topk", 64) or 64))
+        if getattr(diagnostics_config, "collect_source_position_metrics", False):
+            prompt_logprobs = max(prompt_logprobs, 16)
         return prompt_logprobs
 
     def _intervention_prompt_logprobs(self) -> int:
@@ -2723,12 +2748,13 @@ class AgentLoopWorker:
         config = self.rollout_config
         validate = bool(batch.meta_info.get("validate", False))
         intervention_active = self.teacher_intervention_enabled and not validate
+        selection_only = getattr(self.teacher_intervention_config, "prune_mode", None) == "selection_only"
         sampling_params = dict(
             temperature=config.temperature,
             top_p=config.top_p,
             top_k=config.top_k,
             repetition_penalty=1.0,
-            logprobs=config.calculate_log_probs or intervention_active,
+            logprobs=config.calculate_log_probs or intervention_active or (selection_only and not validate),
         )
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
@@ -2840,13 +2866,18 @@ class AgentLoopWorker:
         trace: bool = True,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
-        with rollout_trace_attr(
-            step=trajectory["step"],
-            sample_index=trajectory["sample_index"],
-            rollout_n=trajectory["rollout_n"],
-            validate=trajectory["validate"],
-            name="agent_loop",
-            trace=trace,
+        diagnostics = getattr(getattr(self, "distillation_config", None), "diagnostics", None)
+        collect_usage = not trajectory["validate"] and getattr(diagnostics, "collect_rollout_costs", False)
+        with (
+            rollout_trace_attr(
+                step=trajectory["step"],
+                sample_index=trajectory["sample_index"],
+                rollout_n=trajectory["rollout_n"],
+                validate=trajectory["validate"],
+                name="agent_loop",
+                trace=trace,
+            ),
+            collect_request_usage(collect_usage) as request_usage,
         ):
             assert agent_name in _agent_loop_registry, (
                 f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
@@ -2864,13 +2895,16 @@ class AgentLoopWorker:
                 tools=ToolListWrap(self.tools),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(
+            processed = await self._agent_loop_postprocess(
                 output,
                 trajectory["validate"],
                 agent_loop=agent_loop,
                 sampling_params=sampling_params,
                 **kwargs,
             )
+            if request_usage is not None:
+                processed.extra_fields["opd_request_usage"] = dict(request_usage.metrics)
+            return processed
 
     async def _agent_loop_postprocess(
         self,
@@ -2902,6 +2936,12 @@ class AgentLoopWorker:
                 f"{response_pad_length}."
             )
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        intervention_config = getattr(self, "teacher_intervention_config", None)
+        if not validate and getattr(intervention_config, "prune_mode", None) == "selection_only":
+            await self._compute_score([output], kwargs=kwargs)
+            await self._select_student_supervision(output, sample_kwargs=kwargs)
+            if not self.rollout_config.calculate_log_probs:
+                output.response_logprobs = None
         if getattr(self, "teacher_intervention_enabled", False) and not validate:
             skip_correct = bool(
                 self.teacher_intervention_config is not None and self.teacher_intervention_config.skip_correct
@@ -3425,6 +3465,63 @@ class AgentLoopWorker:
                 routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
         return routing_key
 
+    async def _select_student_supervision(self, output: AgentLoopOutput, *, sample_kwargs: dict[str, Any]) -> None:
+        config = self.teacher_intervention_config
+        response_ids = output.response_ids
+        response_len = len(response_ids)
+        calibration = self._prune_future_calibration_state()
+        output.extra_fields["opd_selection_cutoff"] = response_len
+        output.extra_fields["opd_selection_threshold"] = calibration.threshold
+        if not response_len:
+            return
+        if output.response_mask != [1] * response_len or len(output.response_logprobs or []) != response_len:
+            raise RuntimeError("Selection-only needs a single-turn rollout with one logprob per response token.")
+        prompt_len = len(output.prompt_ids)
+        result = await self._score_sequence_for_intervention(
+            request_id=f"{output.extra_fields.get('rollout_request_id') or uuid4().hex}:selection-score",
+            prompt_ids=output.prompt_ids,
+            response_ids=response_ids,
+            output=output,
+            routing_key=self._teacher_routing_key(sample_kwargs),
+        )
+        _store_teacher_scoring_result(output, result, prompt_len=prompt_len, response_len=response_len)
+        teacher_logprobs = _teacher_response_logprobs(_teacher_gap_logprobs(result), prompt_len, response_len)
+        student_logprobs = torch.tensor(output.response_logprobs, dtype=torch.float32)
+        valid = (
+            torch.isfinite(student_logprobs)
+            & torch.isfinite(teacher_logprobs)
+            & (student_logprobs <= 1e-6)
+            & (teacher_logprobs <= 1e-6)
+        )
+        nonfinite = output.extra_fields["teacher_logprob_nonfinite_positions"]
+        valid[nonfinite] = False
+        eligible = valid.int().tolist()
+        gap = _compute_intervention_gap(student_logprobs, teacher_logprobs, config.gap_metric)
+        gap = torch.where(valid, gap, 0)
+        raw_correct, _ = _extract_outcome_correctness(output, config)
+        if raw_correct:
+            values, _ = _collect_prune_future_calibration_values(
+                scores=gap, eligibility_mask=eligible, intervention_config=config, nonfinite_positions=nonfinite
+            )
+            self._queue_prune_future_calibration_updates(values)
+
+        trigger = _select_intervention_segment(gap, eligible, config)
+        if trigger is not None:
+            start, end, _ = trigger
+            positions = [position for position in range(start, end) if eligible[position]]
+            _, anchor = self._expand_teacher_intervention_segment_for_token_patterns(
+                response_ids, positions[0], positions[-1] + 1
+            )
+            metadata = _compute_prune_future_horizon_metadata(
+                scores=gap,
+                eligibility_mask=eligible,
+                teacher_end=anchor,
+                intervention_config=config,
+                calibration=calibration,
+                nonfinite_positions=nonfinite,
+            )
+            output.extra_fields["opd_selection_cutoff"] = metadata["prune_future_cutoff"]
+
     async def _score_sequence_for_intervention(
         self,
         *,
@@ -3433,6 +3530,7 @@ class AgentLoopWorker:
         response_ids: list[int],
         output: AgentLoopOutput,
         routing_key: Optional[str],
+        prompt_logprobs: Optional[int] = None,
     ) -> TeacherLogprobScoringResult:
         result = await self.teacher_server_manager.compute_teacher_logprobs_single(
             sequence_ids=prompt_ids + response_ids,
@@ -3440,7 +3538,9 @@ class AgentLoopWorker:
             mm_processor_kwargs=output.mm_processor_kwargs,
             routing_key=routing_key,
             request_id=request_id,
-            prompt_logprobs=AgentLoopWorker._intervention_prompt_logprobs(self),
+            prompt_logprobs=(
+                AgentLoopWorker._intervention_prompt_logprobs(self) if prompt_logprobs is None else prompt_logprobs
+            ),
         )
         return _coerce_teacher_logprob_scoring_result(result)
 
@@ -3451,15 +3551,18 @@ class AgentLoopWorker:
         prompt_ids: list[int],
         response_ids: list[int],
         output: AgentLoopOutput,
+        prompt_logprobs: Optional[int] = None,
     ) -> TeacherLogprobScoringResult:
         sequence_ids = prompt_ids + response_ids
-        prompt_logprobs = AgentLoopWorker._intervention_prompt_logprobs(self)
+        if prompt_logprobs is None:
+            prompt_logprobs = AgentLoopWorker._intervention_prompt_logprobs(self)
         if prompt_logprobs < 0:
             raise ValueError(f"Student intervention scoring requires prompt_logprobs >= 0, got {prompt_logprobs}.")
         multi_modal_data = output.multi_modal_data or {}
         student_output = await self.llm_client.generate(
             request_id=request_id,
             prompt_ids=sequence_ids,
+            usage_kind="student_score",
             sampling_params={
                 "max_tokens": 1,
                 "temperature": 1.0,
@@ -3958,6 +4061,7 @@ class AgentLoopWorker:
             request_id=request_id,
             prompt_ids=prefix_ids,
             sampling_params=repair_sampling_params,
+            usage_kind="student_suffix",
             image_data=multi_modal_data.get("images"),
             video_data=multi_modal_data.get("videos"),
             audio_data=multi_modal_data.get("audios"),
@@ -4033,6 +4137,152 @@ class AgentLoopWorker:
             nonfinite_logprob_replacement=nonfinite_logprob_replacement,
         )
 
+    async def _relay_with_teacher(
+        self, output: AgentLoopOutput, *, sampling_params: dict[str, Any] | None, sample_kwargs: dict[str, Any] | None
+    ) -> None:
+        """Apply Relay using full candidate suffixes and the existing token-ID servers."""
+        candidate = output.response_ids
+        if output.response_mask != [1] * len(candidate):
+            raise RuntimeError("Relay expects a single-turn, student-generated response.")
+        interventions = []
+        output.extra_fields.update(
+            teacher_intervention_count=0, teacher_interventions=interventions, teacher_intervention_skipped=[]
+        )
+        finish_reason = output.extra_fields.get("finish_reason")
+        if _is_abort_reason(finish_reason):
+            raise RuntimeError("Relay's initial student generation aborted.")
+        if not candidate:
+            return
+
+        if not hasattr(self, "_relay_reflection_ids"):
+            self._relay_reflection_ids = reflection_token_ids(self.tokenizer)
+            self._relay_paragraph_cache = {}
+        config = self.teacher_intervention_config
+        response_limit = self.rollout_config.response_length
+        budget = min(response_limit, int((sampling_params or {}).get("max_tokens", response_limit)))
+        routing_key = self._teacher_routing_key(sample_kwargs)
+        base_id = output.extra_fields.get("rollout_request_id") or uuid4().hex
+        eos_ids = _tokenizer_eos_token_ids(self.tokenizer)
+        committed: list[int] = []
+
+        for attempt in range(config.max_interventions_per_sample):
+            prefix = output.prompt_ids + committed
+            teacher, student = await asyncio.gather(
+                self._score_sequence_for_intervention(
+                    request_id=f"{base_id}:relay-teacher-score:{attempt}",
+                    prompt_ids=prefix,
+                    response_ids=candidate,
+                    output=output,
+                    routing_key=routing_key,
+                    prompt_logprobs=1,
+                ),
+                self._score_student_sequence_for_intervention(
+                    request_id=f"{base_id}:relay-student-score:{attempt}",
+                    prompt_ids=prefix,
+                    response_ids=candidate,
+                    output=output,
+                    prompt_logprobs=RELAY_TRIGGER_TOPK,
+                ),
+            )
+            trigger = first_reflection_trigger(
+                teacher=teacher,
+                student=student,
+                prefix_len=len(prefix),
+                candidate=candidate,
+                reflection_ids=self._relay_reflection_ids,
+            )
+            keep = len(candidate) if trigger is None else trigger[0]
+            committed.extend(candidate[:keep])
+            if interventions:
+                interventions[-1]["student_suffix_tokens"] = keep
+                interventions[-1]["student_suffix_finish_reason"] = finish_reason if trigger is None else None
+            if trigger is None:
+                if AgentLoopWorker._teacher_prompt_logprobs(self) == 0:
+                    # The scorer already returned the actual-token scores on
+                    # exactly the final sequence as a separate field.
+                    _store_teacher_scoring_result(
+                        output,
+                        TeacherLogprobScoringResult(
+                            ids=teacher.sampled_ids,
+                            logprobs=teacher.sampled_logprobs,
+                            nonfinite_count=teacher.nonfinite_count,
+                            nonfinite_sequence_positions=teacher.nonfinite_sequence_positions,
+                            replacement_value=teacher.replacement_value,
+                        ),
+                        prompt_len=len(output.prompt_ids),
+                        response_len=len(committed),
+                    )
+                break
+
+            starter = trigger[1]
+            teacher_start = len(committed)
+            committed.append(starter)
+            remaining = min(RELAY_MAX_ADDITIONAL_TOKENS, budget - len(committed))
+            finish_reason = "length"
+            teacher_terminal = starter in eos_ids
+            if remaining > 0 and not teacher_terminal:
+                generated = _coerce_teacher_generation_result(
+                    await self.teacher_server_manager.generate_teacher_segment_single(
+                        prefix_ids=output.prompt_ids + committed,
+                        max_tokens=remaining,
+                        routing_key=routing_key,
+                        request_id=f"{base_id}:relay-teacher:{attempt}",
+                    )
+                )
+                if _generation_was_aborted(stop_reason=generated.stop_reason, finish_reason=generated.finish_reason):
+                    raise RuntimeError("Relay teacher generation aborted.")
+                tokens, _, has_eos = _truncate_generation_at_eos(
+                    generated.token_ids[:remaining], None, eos_token_ids=eos_ids
+                )
+                end = teacher_paragraph_end(self.tokenizer, tokens, self._relay_paragraph_cache, starter=starter)
+                committed.extend(tokens[:end])
+                teacher_terminal = end == len(tokens) and _generation_is_terminal(
+                    token_ids=tokens,
+                    max_tokens=remaining,
+                    stop_reason=generated.stop_reason,
+                    finish_reason=generated.finish_reason,
+                    eos_truncated=has_eos,
+                )
+            interventions.append(
+                {
+                    "attempt": attempt,
+                    "start": teacher_start,
+                    "end": teacher_start + 1,
+                    "teacher_tokens": len(committed) - teacher_start,
+                    "student_suffix_tokens": 0,
+                    "teacher_finish_reason": "stop" if teacher_terminal else "length",
+                    "teacher_terminal": teacher_terminal,
+                }
+            )
+            if teacher_terminal:
+                finish_reason = "stop"
+                break
+            if len(committed) == budget or len(interventions) == config.max_interventions_per_sample:
+                break
+
+            suffix = await self._generate_student_suffix(
+                request_id=f"{base_id}:relay-student:{attempt}",
+                prefix_ids=output.prompt_ids + committed,
+                max_tokens=budget - len(committed),
+                sampling_params=sampling_params,
+                output=output,
+            )
+            if _generation_was_aborted(stop_reason=suffix.stop_reason, finish_reason=suffix.finish_reason):
+                raise RuntimeError("Relay student continuation aborted.")
+            candidate, finish_reason = suffix.token_ids, suffix.finish_reason
+            if not candidate:
+                break
+
+        if interventions:
+            output.response_ids = committed
+            output.response_mask = [1] * len(committed)
+            output.response_logprobs = None
+            output.reward_score = None
+            output.extra_fields.pop("reward_extra_info", None)
+            output.extra_fields.pop("reward_response_ids", None)
+            output.extra_fields["finish_reason"] = finish_reason
+            output.extra_fields["teacher_intervention_count"] = len(interventions)
+
     async def _maybe_repair_with_teacher(
         self,
         output: AgentLoopOutput,
@@ -4044,6 +4294,9 @@ class AgentLoopWorker:
     ) -> None:
         """Repair high-gap response segments with teacher generation before padding/training."""
         if not self.teacher_intervention_enabled or validate:
+            return
+        if getattr(self.teacher_intervention_config, "strategy", "segment_gap") == "relay":
+            await self._relay_with_teacher(output, sampling_params=sampling_params, sample_kwargs=sample_kwargs)
             return
 
         AgentLoopWorker._maybe_reset_teacher_intervention_log_counter(self, sample_kwargs)
@@ -5576,7 +5829,7 @@ class AgentLoopManager:
             )
             if intervention_config.outcome_aware_candidate_selection_enabled:
                 self._global_teacher_nll_calibration = _GlobalTeacherNLLCalibration(intervention_config)
-            if intervention_config.prune_mode == "adaptive_future":
+            if intervention_config.prune_mode in {"adaptive_future", "selection_only"}:
                 self._global_prune_future_calibration = _GlobalPruneFutureCalibration(intervention_config)
 
         if not hasattr(self, "agent_loop_workers_class"):
@@ -5616,6 +5869,20 @@ class AgentLoopManager:
             await asyncio.gather(
                 *[worker.set_prune_future_calibration_state.remote(snapshot) for worker in self.agent_loop_workers]
             )
+
+    @auto_await
+    async def export_prune_future_calibration(self) -> dict[str, Any]:
+        """Flush worker updates before saving the manager-owned calibration."""
+        # Include the most recent completed batch, which workers normally
+        # drain at the beginning of the next generation.
+        await self._refresh_global_teacher_nll_calibration()
+        return self._global_prune_future_calibration.state_dict()
+
+    def restore_prune_future_calibration(self, state: dict[str, Any]) -> None:
+        """Restore the history that the next rollout will broadcast to workers."""
+        if self._global_prune_future_calibration is None:
+            raise ValueError("This checkpoint has prune-future calibration; resume with its supervision mode.")
+        self._global_prune_future_calibration.load_state_dict(state)
 
     def _cap_intervention_outcome_cases(self, output: DataProto) -> None:
         """Apply the configured global per-transition full-text case cap."""

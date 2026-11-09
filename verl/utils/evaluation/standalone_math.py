@@ -17,20 +17,23 @@
 Run with ``MODEL_PATH=/local/checkpoint python -B -u -m verl.utils.evaluation.standalone_math``
 in an existing vLLM environment. The Ascend launcher is ``run/eval-single.sh``.
 FSDP inputs are merged into actor/huggingface when weights are missing; set
-EVAL_FORCE_MERGE=True to rebuild existing weights. Evaluation output uses only stdout.
+EVAL_FORCE_MERGE=True to rebuild existing weights.
 Megatron checkpoints already exported under model/huggingface are loaded directly.
 Framework runtime caches are allowed.
 By default only HMMT is evaluated; EVAL_ALL=1 adds AIME24/25, AMC23 and AMO-Bench-P.
+EVAL_SUITE=math5 selects the five math benchmarks. EVAL_RECORDS_PATH exports per-draw scores.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -40,10 +43,12 @@ from verl.trainer.ppo.metric_utils import process_validation_metrics
 from verl.utils.chat_template import apply_chat_template
 from verl.utils.evaluation.math_benchmark import (
     AMO_BENCH_P_ANSWER_TYPES,
+    MATH5_BENCHMARKS,
     EvalSample,
     build_math_chat_messages,
     load_benchmark_samples,
 )
+from verl.utils.evaluation.multi_domain_benchmark import stable_int_seed
 from verl.utils.reward_score import default_compute_score
 from verl.utils.reward_score.reward_extra import collate_reward_extra_infos
 from verl.utils.tokenizer import hf_tokenizer, normalize_token_ids
@@ -105,10 +110,14 @@ class EvaluationConfig:
     enforce_eager: bool = False
     force_merge: bool = False
     eval_all: bool = False
+    suite: str | None = None
+    records_path: str | None = None
 
     @property
     def benchmarks(self) -> tuple[str, ...]:
         """Keep HMMT first, optionally followed by the four training math benchmarks."""
+        if self.suite == "math5":
+            return MATH5_BENCHMARKS
         return tuple(BENCHMARK_PATHS) if self.eval_all else BENCHMARKS
 
     def __post_init__(self) -> None:
@@ -139,6 +148,8 @@ class EvaluationConfig:
             raise ValueError("TEST_BENCHMARK_MAX_SAMPLES must be -1 (all questions) or positive.")
         if not 0 <= self.seed < 2**32:
             raise ValueError("EVAL_SEED must be in [0, 2**32).")
+        if self.suite not in {None, "math5"} or (self.suite is not None and self.eval_all):
+            raise ValueError("EVAL_SUITE supports 'math5' and cannot be combined with EVAL_ALL.")
 
     @classmethod
     def from_environment(cls, env: Mapping[str, str] | None = None) -> EvaluationConfig:
@@ -193,6 +204,8 @@ class EvaluationConfig:
             enforce_eager=_env_bool(env, "ROLLOUT_ENFORCE_EAGER", False),
             force_merge=_env_bool(env, "EVAL_FORCE_MERGE", False),
             eval_all=_env_bool(env, "EVAL_ALL", False),
+            suite=_env_value(env, "EVAL_SUITE"),
+            records_path=_env_value(env, "EVAL_RECORDS_PATH"),
         )
 
 
@@ -574,7 +587,13 @@ def aggregate_metrics(uids: list[str], benchmark: str, infos: list[dict[str, Any
 
 
 def evaluate_benchmark(
-    config: EvaluationConfig, tokenizer, engine, sampling_params_cls, rows: list[PreparedSample]
+    config: EvaluationConfig,
+    tokenizer,
+    engine,
+    sampling_params_cls,
+    rows: list[PreparedSample],
+    *,
+    records: list[dict[str, Any]] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
     """Generate and score in memory; reject incomplete, reordered, or aborted engine responses."""
     benchmark = rows[0].sample.benchmark
@@ -582,19 +601,21 @@ def evaluate_benchmark(
     length_finishes = 0
     for start in range(0, len(rows), config.batch_size):
         batch = rows[start : start + config.batch_size]
-        requests = [row for row in batch for _ in range(config.rollout_n)]
-        params = [
-            sampling_params_cls(**sampling_kwargs(config, row.max_tokens, eos_token_id=tokenizer.eos_token_id))
-            for row in requests
-        ]
+        requests = [(row, draw) for row in batch for draw in range(config.rollout_n)]
+        params = []
+        for row, draw in requests:
+            sampling = sampling_kwargs(config, row.max_tokens, eos_token_id=tokenizer.eos_token_id)
+            if config.suite == "math5":
+                sampling["seed"] = stable_int_seed(config.seed, row.uid, draw, config.suite)
+            params.append(sampling_params_cls(**sampling))
         outputs = engine.generate(
-            [{"prompt_token_ids": list(row.prompt_ids)} for row in requests],
+            [{"prompt_token_ids": list(row.prompt_ids)} for row, _ in requests],
             params,
             use_tqdm=False,
         )
         if len(outputs) != len(requests):
             raise RuntimeError(f"{benchmark}: expected {len(requests)} request outputs, got {len(outputs)}.")
-        for row, output in zip(requests, outputs, strict=True):
+        for (row, draw), output in zip(requests, outputs, strict=True):
             if output.prompt_token_ids != row.prompt_ids or not output.finished or len(output.outputs) != 1:
                 raise RuntimeError(f"Invalid or mismatched generation output for {row.uid}.")
             completion = output.outputs[0]
@@ -603,7 +624,22 @@ def evaluate_benchmark(
             token_ids = normalize_token_ids(completion.token_ids)
             if len(token_ids) > row.max_tokens:
                 raise RuntimeError(f"Generation exceeded its token budget for {row.uid}.")
-            infos.append(score_response(tokenizer, token_ids, row.sample))
+            info = score_response(tokenizer, token_ids, row.sample)
+            infos.append(info)
+            if records is not None:
+                acc = info["acc"]
+                if acc not in (0, 1):
+                    raise ValueError(f"Expected binary math accuracy for {row.uid}, got {acc!r}.")
+                records.append(
+                    dict(
+                        benchmark=benchmark,
+                        uid=row.uid,
+                        draw=draw,
+                        acc=int(acc),
+                        response_tokens=len(token_ids),
+                        finish_reason=completion.finish_reason,
+                    )
+                )
             uids.append(row.uid)
             lengths.append(len(token_ids))
             length_finishes += completion.finish_reason == "length"
@@ -628,6 +664,44 @@ def evaluate_benchmark(
     )
 
 
+def _write_evaluation_records(
+    config: EvaluationConfig, checkpoint: str, prepared, tokenizer, records: list[dict[str, Any]]
+) -> None:
+    # Include the rendered inputs and grading metadata in the protocol identity,
+    # independent of local dataset paths or checkpoint filenames.
+    question_hashes = {}
+    for rows in prepared.values():
+        for row in rows:
+            material = json.dumps([asdict(row.sample), row.prompt_ids, row.max_tokens], sort_keys=True, default=str)
+            if row.uid in question_hashes:
+                raise ValueError(f"Duplicate evaluation question {row.uid!r}.")
+            question_hashes[row.uid] = hashlib.sha256(material.encode()).hexdigest()
+    protocol = dict(
+        suite=config.suite,
+        benchmarks=list(config.benchmarks),
+        rollout_n=config.rollout_n,
+        seed=config.seed,
+        enable_thinking=config.enable_thinking,
+        grader="math_verify",
+        sampling=sampling_kwargs(config, config.generation_max_tokens, eos_token_id=tokenizer.eos_token_id),
+        question_hashes=question_hashes,
+    )
+    path = Path(config.records_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, encoding="utf-8", delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            json.dump(
+                dict(schema_version=1, checkpoint=checkpoint, protocol=protocol, records=records),
+                output,
+                allow_nan=False,
+            )
+            output.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def run_evaluation(config: EvaluationConfig) -> dict[str, Any]:
     """Evaluate the selected suite and print a final JSON result only after every benchmark completes."""
     for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "VLLM_NO_USAGE_STATS"):
@@ -639,7 +713,8 @@ def run_evaluation(config: EvaluationConfig) -> dict[str, Any]:
     from math_verify.grader import verify  # noqa: F401
     from math_verify.parser import parse  # noqa: F401
 
-    config = replace(config, model_path=prepare_checkpoint(config.model_path, force_merge=config.force_merge))
+    checkpoint = config.model_path
+    config = replace(config, model_path=prepare_checkpoint(checkpoint, force_merge=config.force_merge))
     tokenizer = load_tokenizer(config)
     benchmark_dirs = resolve_benchmark_dirs(config)
     prepared = prepare_samples(config, tokenizer, benchmark_dirs=benchmark_dirs)
@@ -670,9 +745,13 @@ def run_evaluation(config: EvaluationConfig) -> dict[str, Any]:
 
     engine = LLM(**engine_kwargs(config))
     scores = {}
+    records = [] if config.records_path is not None else None
     try:
         for name, rows in prepared.items():
-            scores[name] = evaluate_benchmark(config, tokenizer, engine, SamplingParams, rows)
+            if records is None:
+                scores[name] = evaluate_benchmark(config, tokenizer, engine, SamplingParams, rows)
+            else:
+                scores[name] = evaluate_benchmark(config, tokenizer, engine, SamplingParams, rows, records=records)
     finally:
         del engine
 
@@ -693,6 +772,8 @@ def run_evaluation(config: EvaluationConfig) -> dict[str, Any]:
         for key, value in sorted(result["metrics"].items()):
             if key.startswith(f"{METRIC_PREFIX}-core/{name}/acc/"):
                 print(f"{key} = {value:.8f}", flush=True)
+    if records is not None:
+        _write_evaluation_records(config, checkpoint, prepared, tokenizer, records)
     print("EVAL_RESULT_JSON=" + json.dumps(result, sort_keys=True, allow_nan=False), flush=True)
     return result
 

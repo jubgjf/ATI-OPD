@@ -234,6 +234,7 @@ class DistillationInterventionConfig(BaseConfig):
     """
 
     enabled: bool = False
+    strategy: str = "segment_gap"
     segment_method: str = "fixed_tokens"
     student_segment_length: int = 128
     teacher_segment_length: int = 128
@@ -310,6 +311,19 @@ class DistillationInterventionConfig(BaseConfig):
     log_examples_per_worker: int = 2
 
     def __post_init__(self):
+        if self.strategy not in {"segment_gap", "relay"}:
+            raise ValueError(f"Unknown distillation intervention strategy {self.strategy!r}.")
+        if self.strategy == "relay" and (
+            not self.enabled
+            or self.prune
+            or self.skip_correct
+            or self.confirmation_mode != "none"
+            or self.outcome_aware_candidate_selection_enabled
+            or not self.train_on_teacher_segments
+            or self.teacher_segment_loss_mode != "opd"
+            or self.max_interventions_per_sample <= 0
+        ):
+            raise ValueError("Relay requires enabled OPD supervision on teacher spans, without ATI gates or pruning.")
         if self.segment_method != "fixed_tokens":
             raise NotImplementedError(
                 f"Only fixed_tokens teacher intervention segments are currently supported, "
@@ -327,12 +341,22 @@ class DistillationInterventionConfig(BaseConfig):
             )
         if self.skip_correct and not self.enabled:
             raise ValueError("skip_correct=true requires distillation.intervention.enabled=true.")
-        if self.prune and not self.enabled:
+        if self.prune and not self.enabled and self.prune_mode != "selection_only":
             raise ValueError("prune=true requires distillation.intervention.enabled=true.")
-        if self.prune_mode not in {"teacher_end", "adaptive_future"}:
+        if self.prune_mode not in {"teacher_end", "adaptive_future", "selection_only"}:
             raise ValueError(
-                f"prune_mode must be one of {{'teacher_end', 'adaptive_future'}}, got {self.prune_mode!r}."
+                f"prune_mode must be 'teacher_end', 'adaptive_future', or 'selection_only', got {self.prune_mode!r}."
             )
+        if self.prune_mode == "selection_only" and (
+            not self.prune
+            or self.enabled
+            or self.train_on_teacher_segments
+            or self.confirmation_mode != "none"
+            or self.outcome_aware_candidate_selection_enabled
+            or self.teacher_rejection_persistence_enabled
+            or self.gap_metric.lower() not in {"k3", "low_var_kl"}
+        ):
+            raise ValueError("Selection-only requires prune=true, enabled=false, and K3 scoring on the raw rollout.")
         if self.prune_mode == "adaptive_future":
             if not self.enabled or not self.prune:
                 raise ValueError("prune_mode='adaptive_future' requires intervention.enabled=true and prune=true.")
@@ -513,6 +537,8 @@ class DistillationDiagnosticsConfig(BaseConfig):
     outcome_case_samples_per_transition: int = 8
     collect_topk_overlap: bool = False
     collect_rethinking_opd_metrics: bool = False
+    collect_rollout_costs: bool = False
+    collect_source_position_metrics: bool = False
     collect_repetition_metrics: bool = True
     collect_train_text_zlib_repetition: bool = True
     topk: Optional[int] = None
@@ -751,6 +777,8 @@ class DistillationConfig(BaseConfig):
             logprob_topk = max(int(logprob_topk or 0), int(self.distillation_loss.teacher_topk))
         if self.diagnostics.collect_topk_overlap or self.diagnostics.collect_rethinking_opd_metrics:
             logprob_topk = max(int(logprob_topk or 0), int(self.diagnostics.topk))
+        if self.diagnostics.collect_source_position_metrics:
+            logprob_topk = max(int(logprob_topk or 0), 16)
         for teacher_model in self.teacher_models.values():
             teacher_model.validate_and_prepare_for_distillation(
                 use_topk=logprob_topk is not None and logprob_topk > 0,

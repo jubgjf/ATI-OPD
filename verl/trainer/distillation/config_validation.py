@@ -35,8 +35,14 @@ def validate_distillation_intervention_training_config(config: Any) -> None:
     intervention_enabled = bool(_get_nested(distillation_config, "intervention", "enabled", default=False))
     prune = bool(_get_nested(distillation_config, "intervention", "prune", default=False))
     prune_mode = str(_get_nested(distillation_config, "intervention", "prune_mode", default="teacher_end"))
-    if prune and not intervention_enabled:
+    selection_only = prune_mode == "selection_only"
+    relay = _get_nested(distillation_config, "intervention", "strategy", default="segment_gap") == "relay"
+    if prune and not intervention_enabled and not selection_only:
         raise ValueError("distillation.intervention.prune=true requires distillation.intervention.enabled=true.")
+    if selection_only and (intervention_enabled or not prune):
+        raise ValueError("prune_mode='selection_only' requires intervention.enabled=false and prune=true.")
+    if relay and not intervention_enabled:
+        raise ValueError("strategy='relay' requires intervention.enabled=true.")
     if prune_mode == "adaptive_future" and (not intervention_enabled or not prune):
         raise ValueError(
             "distillation.intervention.prune_mode='adaptive_future' requires intervention.enabled=true and prune=true."
@@ -67,6 +73,8 @@ def validate_distillation_intervention_training_config(config: Any) -> None:
                 "outcome_aware_candidate_selection_enabled=true."
             )
     if not is_distillation_enabled(distillation_config):
+        if selection_only or relay:
+            raise ValueError("Selection-only and Relay require distillation.enabled=true.")
         return
     diagnostics_enabled = bool(_get_nested(distillation_config, "diagnostics", "enabled", default=False))
     collect_intervention_metrics = bool(
@@ -105,6 +113,27 @@ def validate_distillation_intervention_training_config(config: Any) -> None:
     multi_turn_enabled = bool(
         _get_nested(config, "actor_rollout_ref", "rollout", "multi_turn", "enable", default=False)
     )
+    collect_rollout_costs = _get_nested(distillation_config, "diagnostics", "collect_rollout_costs", default=False)
+    collect_source_metrics = _get_nested(
+        distillation_config, "diagnostics", "collect_source_position_metrics", default=False
+    )
+    if collect_source_metrics and not diagnostics_enabled:
+        raise ValueError("Student-only position metrics require distillation.diagnostics.enabled=true.")
+    if collect_rollout_costs or selection_only or relay:
+        rollout = _get_nested(config, "actor_rollout_ref", "rollout")
+        if (
+            multi_turn_enabled
+            or _get_nested(rollout, "name", default="vllm") != "vllm"
+            or _get_nested(rollout, "agent", "default_agent_loop", default="single_turn_agent") != "single_turn_agent"
+        ):
+            raise ValueError("Rollout cost collection, Selection-only, and Relay require single-turn vLLM rollouts.")
+        teachers = _get_nested(distillation_config, "teacher_models", default={}) or {}
+        if any(_get_nested(teacher, "inference", "name", default="vllm") != "vllm" for teacher in teachers.values()):
+            raise ValueError("Rollout cost collection, Selection-only, and Relay require a vLLM teacher.")
+    if collect_rollout_costs or collect_source_metrics:
+        logging = _get_nested(config, "trainer", "metric_logging")
+        if _get_nested(logging, "mode") != "balanced" or not _get_nested(logging, "archive", "enabled", default=False):
+            raise ValueError("Rollout costs and student-only position metrics require balanced metric archival.")
     if prune_mode == "adaptive_future" and multi_turn_enabled:
         raise ValueError(
             "distillation.intervention.prune_mode='adaptive_future' currently supports only single-turn, non-tool "
@@ -159,6 +188,25 @@ def validate_distillation_intervention_training_config(config: Any) -> None:
     adv_estimator = getattr(adv_estimator, "value", adv_estimator)
     use_task_rewards = bool(_get_nested(distillation_config, "distillation_loss", "use_task_rewards", default=True))
     use_actor_loss = bool(_get_nested(distillation_config, "use_actor_loss", default=True))
+    loss_config = _get_nested(distillation_config, "distillation_loss")
+    horizon_mode = _get_nested(loss_config, "horizon", "mode", default="full")
+    if selection_only and (
+        str(adv_estimator) != "token_reward_direct" or use_actor_loss or use_task_rewards or horizon_mode != "full"
+    ):
+        raise ValueError("Selection-only requires token_reward_direct with full horizon and no actor or task loss.")
+    if relay and (
+        str(adv_estimator) != "grpo"
+        or not use_actor_loss
+        or use_task_rewards
+        or _get_nested(loss_config, "loss_mode") != "k1"
+        or not _get_nested(loss_config, "use_policy_gradient", default=False)
+        or _get_nested(loss_config, "loss_max_clamp") is not None
+        or _get_nested(loss_config, "top_k_strategy", default="only_stu") != "only_stu"
+        or _get_nested(config, "algorithm", "use_kl_in_reward", default=False)
+        or _get_nested(config, "actor_rollout_ref", "actor", "use_kl_loss", default=False)
+        or float(_get_nested(config, "actor_rollout_ref", "actor", "entropy_coeff", default=0.0)) != 0.0
+    ):
+        raise ValueError("Relay requires emitted-token K1/PPO actor distillation without clamping or task rewards.")
     joint_token_reward_rlvr = str(adv_estimator) == "token_reward_direct" and use_task_rewards
     if joint_token_reward_rlvr:
         if use_actor_loss:

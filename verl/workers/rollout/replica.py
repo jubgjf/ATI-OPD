@@ -27,6 +27,7 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, Ra
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import is_torch_npu_available
 from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.rollout.request_usage import RequestTokenUsage
 
 logger = logging.getLogger(__file__)
 
@@ -47,6 +48,7 @@ class TokenOutput(BaseModel):
     """stop reason: 'completed', 'aborted', or None for unknown"""
     num_preempted: Optional[int] = None
     """number of preempted times for metric calculation"""
+    request_usage: Optional[RequestTokenUsage] = None
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
 

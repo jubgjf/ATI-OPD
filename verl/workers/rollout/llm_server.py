@@ -32,6 +32,7 @@ from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import RolloutReplica, TokenOutput, get_rollout_replica_class
+from verl.workers.rollout.request_usage import active_request_usage
 from verl.workers.rollout.utils import update_prometheus_config
 
 logger = logging.getLogger(__file__)
@@ -208,6 +209,7 @@ class LLMServerClient:
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        usage_kind: str = "student_initial",
         **kwargs: Any,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
@@ -226,6 +228,9 @@ class LLMServerClient:
         if mm_processor_kwargs:
             multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
 
+        usage = active_request_usage.get()
+        if usage is not None:
+            kwargs["collect_request_usage"] = True
         for failover_attempt in range(MAX_TERMINAL_SERVER_FAILOVER_RETRIES + 1):
             server_id, server = await self._acquire_server(request_id)
             try:
@@ -238,8 +243,16 @@ class LLMServerClient:
                     **multimodal_kwargs,
                     **kwargs,
                 )
+                if usage is not None:
+                    usage.record(usage_kind, output.request_usage, failed=output.stop_reason == "aborted")
                 return output
+            except asyncio.CancelledError:
+                if usage is not None:
+                    usage.record(usage_kind, None, failed=True)
+                raise
             except Exception as exc:
+                if usage is not None:
+                    usage.record(usage_kind, None, failed=True)
                 if not _is_terminal_server_failure(exc):
                     raise
 

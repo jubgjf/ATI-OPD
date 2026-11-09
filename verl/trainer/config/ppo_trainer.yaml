@@ -118,8 +118,8 @@ trainer:
   # Number of epochs in training
   total_epochs: 30
 
-  # Total training steps (can be set explicitly or derived from epochs)
-  total_training_steps: null
+  # Total training steps. Null derives the step count from epochs.
+  total_training_steps: ${oc.decode:${oc.env:TOTAL_TRAINING_STEPS,null}}
 
   # Project name for experiment tracking (e.g., wandb)
   project_name: verl_examples

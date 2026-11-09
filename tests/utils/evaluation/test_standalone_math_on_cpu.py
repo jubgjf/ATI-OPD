@@ -53,6 +53,39 @@ SUITE_COUNTS = {"hmmt_feb_2026": 33, "hmmt_nov_2025": 30, "aime24": 30, "aime25"
 AMO_DESCRIPTION_IDS = {2, 24, 25, 26, 27, 38, 39, 40, 41, 42, 46}
 
 
+def test_math5_records_have_stable_per_question_draw_seeds(tmp_path, monkeypatch):
+    config = evaluation.EvaluationConfig(
+        model_path="/checkpoint", dataset_root="/data", suite="math5", records_path=str(tmp_path / "eval.json")
+    )
+    assert config.benchmarks == ("aime24", "aime25", "amc23", "AMO-Bench", "hmmt_feb_2026")
+    sample = EvalSample(benchmark="aime24", sample_id="1", problem="1+1", ground_truth="2")
+    row = evaluation.PreparedSample(sample, prompt_ids=[4, 5], max_tokens=16)
+    monkeypatch.setattr(evaluation, "score_response", lambda *args: {"reward": 1.0, "acc": True})
+    tokenizer = SimpleNamespace(eos_token_id=99)
+
+    class Engine:
+        def generate(self, requests, params, **kwargs):
+            self.seeds = [params_row["seed"] for params_row in params]
+            completion = SimpleNamespace(token_ids=[20, 99], finish_reason="stop")
+            return [SimpleNamespace(**request, finished=True, outputs=[completion]) for request in requests]
+
+    engine = Engine()
+    records = []
+    evaluation.evaluate_benchmark(config, tokenizer, engine, dict, [row], records=records)
+    seeds = engine.seeds.copy()
+    evaluation.evaluate_benchmark(config, tokenizer, engine, dict, [row])
+    assert len(set(seeds)) == 16
+    assert engine.seeds == seeds
+    assert [record["draw"] for record in records] == list(range(16))
+    assert records[0] == dict(
+        benchmark="aime24", uid="aime24:1", draw=0, acc=1, response_tokens=2, finish_reason="stop"
+    )
+    evaluation._write_evaluation_records(config, "/checkpoint", {"aime24": [row]}, tokenizer, records)
+    saved = json.loads((tmp_path / "eval.json").read_text())
+    assert saved["records"] == records
+    assert set(saved["protocol"]["question_hashes"]) == {"aime24:1"}
+
+
 def _write_suite(root, layout="flat"):
     directories = {}
     for name, count in SUITE_COUNTS.items():

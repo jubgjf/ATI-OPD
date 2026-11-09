@@ -105,6 +105,7 @@ intervention:
   _target_: verl.workers.config.DistillationInterventionConfig
 
   enabled: false
+  strategy: segment_gap
   segment_method: fixed_tokens
   student_segment_length: 128
   teacher_segment_length: 128
@@ -145,6 +146,7 @@ intervention:
   # teacher_end preserves hard prune. adaptive_future scans the repaired student
   # suffix in fixed windows and truncates only the distillation loss mask after
   # a persistent departure from the rolling raw-correct gap distribution.
+  # selection_only applies this rule to the raw student trajectory.
   prune_mode: teacher_end
   prune_future_window_tokens: 64
   prune_future_min_valid_tokens: 32
@@ -229,6 +231,8 @@ diagnostics:
   outcome_case_samples_per_transition: 8
   collect_topk_overlap: false
   collect_rethinking_opd_metrics: false
+  collect_rollout_costs: ${oc.decode:${oc.env:OPD_DIAGNOSTICS_COLLECT_ROLLOUT_COSTS,false}}
+  collect_source_position_metrics: ${oc.decode:${oc.env:OPD_DIAGNOSTICS_COLLECT_SOURCE_POSITION,false}}
   collect_repetition_metrics: true
   collect_train_text_zlib_repetition: true
   # null: follow distillation_loss.topk; set explicitly to request a wider/narrower diagnostics top-k.

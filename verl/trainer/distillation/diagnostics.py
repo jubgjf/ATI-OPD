@@ -1929,6 +1929,37 @@ def compute_repetition_advantage_metrics(
     return metrics
 
 
+def _student_source_mask(response_mask: torch.Tensor, interventions: list[Any]) -> torch.Tensor:
+    """Keep original response positions, excluding only inserted teacher spans."""
+    mask = response_mask.detach().bool().cpu().clone()
+    if len(interventions) != mask.size(0):
+        raise ValueError("Student-only diagnostics require intervention spans aligned to the batch.")
+    for row, spans in enumerate(interventions):
+        end = 0
+        for span in spans or ():
+            start = int(span["start"])
+            length = int(span["teacher_tokens"])
+            if length <= 0 or not end <= start < start + length <= mask.size(1):
+                raise ValueError(f"Invalid teacher span for student-only diagnostics: {span!r}.")
+            end = start + length
+            mask[row, start:end] = False
+    return mask
+
+
+def _student_position_totals(
+    values: torch.Tensor, valid_mask: torch.Tensor, *, name: str, bin_size: int
+) -> dict[str, float]:
+    position_counts = valid_mask.sum(dim=0)
+    position_sums = torch.where(valid_mask, values, 0).sum(dim=0, dtype=torch.float64)
+    metrics = {}
+    for start in range(0, valid_mask.size(1), bin_size):
+        end = start + bin_size
+        prefix = f"opd/student_only/{name}_bin/{start}_{end}"
+        metrics[prefix + "/sum"] = position_sums[start:end].sum().item()
+        metrics[prefix + "/count"] = position_counts[start:end].sum().item()
+    return metrics
+
+
 def compute_opd_diagnostics_metrics(
     *,
     student_logprobs: torch.Tensor,
@@ -1951,6 +1982,7 @@ def compute_opd_diagnostics_metrics(
     response_attention_mask: Optional[torch.Tensor] = None,
     allow_multiple_thinking_blocks: bool = False,
     trajectory_spans: Optional[list[Any]] = None,
+    student_only_interventions: Optional[list[Any]] = None,
     collect_repetition_metrics: bool = True,
     collect_train_text_zlib_repetition: bool = False,
     repetition_tail_chars: int = 10000,
@@ -2069,12 +2101,17 @@ def compute_opd_diagnostics_metrics(
     student_entropy_for_bad_tail: torch.Tensor | None = None
     teacher_entropy_for_bad_tail: torch.Tensor | None = None
 
+    student_only_mask = None
+    if student_only_interventions is not None:
+        student_only_mask = _student_source_mask(response_mask, student_only_interventions)
     if teacher_logprob_nonfinite_positions is not None:
         nonfinite_event_mask = positions_to_event_mask(
             teacher_logprob_nonfinite_positions,
             response_mask,
             context="teacher_logprob_nonfinite",
         )
+        if student_only_mask is not None:
+            student_only_mask &= ~nonfinite_event_mask.cpu()
         metrics.update(
             compute_event_position_metrics(
                 event_mask=nonfinite_event_mask,
@@ -2109,6 +2146,12 @@ def compute_opd_diagnostics_metrics(
             valid_gap_response_mask = response_mask_cpu & gap_value_mask
             token_reward = teacher_logprobs_cpu - student_logprobs_cpu
             abs_gap = token_reward.abs()
+            if student_only_mask is not None:
+                metrics.update(
+                    _student_position_totals(
+                        abs_gap, student_only_mask & gap_value_mask, name="gap_abs", bin_size=bin_size
+                    )
+                )
             abs_gap_for_bad_tail = abs_gap
             token_reward_for_bad_tail = token_reward
             teacher_prob_for_bad_tail = teacher_logprobs_cpu.exp()
@@ -2222,6 +2265,16 @@ def compute_opd_diagnostics_metrics(
             )
             if token_reward_for_bad_tail is None:
                 token_reward_for_bad_tail = scalar_reward_cpu
+
+    if student_only_mask is not None and teacher_topk_ids is not None:
+        if response_ids is None or teacher_topk_logprobs is None or teacher_topk_ids.size(-1) < 16:
+            raise ValueError("Student-only coverage requires response IDs and true teacher top-16 scores.")
+        top16 = teacher_topk_ids[..., :16].detach().cpu()
+        finite = torch.isfinite(teacher_topk_logprobs[..., :16].detach().cpu())
+        hits = ((top16 == response_ids.detach().cpu().unsqueeze(-1)) & finite).any(dim=-1)
+        metrics.update(
+            _student_position_totals(hits, student_only_mask & finite.all(dim=-1), name="top16", bin_size=bin_size)
+        )
 
     if (
         overlap_topk is not None

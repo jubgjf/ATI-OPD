@@ -42,6 +42,7 @@ from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
+from verl.workers.rollout.request_usage import RequestTokenUsage
 from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
@@ -466,6 +467,7 @@ class vLLMHttpServer:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
         target_prompt_token_ids: Optional[list[list[int]]] = None,
+        collect_request_usage: bool = False,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         prompt_ids = normalize_token_ids(prompt_ids)
@@ -582,6 +584,19 @@ class vLLMHttpServer:
             final_res = output
         assert final_res is not None
 
+        request_usage = None
+        if collect_request_usage:
+            returned_prompt_ids = getattr(final_res, "prompt_token_ids", None)
+            input_tokens = len(prompt_ids if returned_prompt_ids is None else returned_prompt_ids)
+            cached_tokens = getattr(final_res, "num_cached_tokens", None)
+            if cached_tokens is not None and not 0 <= cached_tokens <= input_tokens:
+                cached_tokens = None
+            request_usage = RequestTokenUsage(
+                input_tokens=input_tokens,
+                output_tokens=sum(len(output.token_ids) for output in final_res.outputs) if final_res.outputs else None,
+                cached_input_tokens=cached_tokens,
+            )
+
         # Handle abort case: when the request is aborted by pause_generation(abort),
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".
@@ -591,6 +606,7 @@ class vLLMHttpServer:
                 log_probs=None,
                 routed_experts=None,
                 stop_reason="aborted",
+                request_usage=request_usage,
                 extra_fields={"global_steps": self.global_steps, "finish_reason": "abort"},
             )
 
@@ -629,6 +645,7 @@ class vLLMHttpServer:
             routed_experts=routed_experts,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
+            request_usage=request_usage,
             extra_fields=extra_fields,
         )
 

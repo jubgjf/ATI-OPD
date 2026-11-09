@@ -819,6 +819,7 @@ distillation:
   intervention:
     _target_: verl.workers.config.DistillationInterventionConfig
     enabled: false
+    strategy: segment_gap
     segment_method: fixed_tokens
     student_segment_length: 128
     teacher_segment_length: 128
@@ -890,6 +891,8 @@ distillation:
     outcome_case_samples_per_transition: 8
     collect_topk_overlap: false
     collect_rethinking_opd_metrics: false
+    collect_rollout_costs: ${oc.decode:${oc.env:OPD_DIAGNOSTICS_COLLECT_ROLLOUT_COSTS,false}}
+    collect_source_position_metrics: ${oc.decode:${oc.env:OPD_DIAGNOSTICS_COLLECT_SOURCE_POSITION,false}}
     collect_repetition_metrics: true
     collect_train_text_zlib_repetition: true
     topk: null
@@ -940,7 +943,7 @@ distillation:
 trainer:
   balance_batch: true
   total_epochs: 30
-  total_training_steps: null
+  total_training_steps: ${oc.decode:${oc.env:TOTAL_TRAINING_STEPS,null}}
   project_name: verl_examples
   experiment_name: gsm8k
   logger:

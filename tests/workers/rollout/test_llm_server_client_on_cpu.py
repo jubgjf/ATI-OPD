@@ -20,6 +20,7 @@ from omegaconf import OmegaConf
 
 from verl.workers.rollout.llm_server import LLMServerClient
 from verl.workers.rollout.replica import TokenOutput
+from verl.workers.rollout.request_usage import RequestTokenUsage, collect_request_usage
 
 
 class EngineDeadError(RuntimeError):
@@ -85,6 +86,34 @@ def _wrapped_engine_dead_error() -> ray.exceptions.RayTaskError:
         traceback_str="Traceback (most recent call last):\nEngineDeadError: EngineCore encountered an issue",
         cause=cause,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached", [None, 0, 2])
+async def test_request_usage_separates_failover_attempts_from_observed_tokens(cached):
+    dead = _FakeServer(error=_wrapped_engine_dead_error())
+    success = _FakeServer(
+        output=TokenOutput(token_ids=[3], request_usage=RequestTokenUsage(4, 1, cached), stop_reason="completed")
+    )
+    client = LLMServerClient(
+        config=OmegaConf.create({}), load_balancer_handle=_FakeLoadBalancer({"dead": dead, "ok": success})
+    )
+    with collect_request_usage(True) as usage:
+        await client.generate(
+            request_id="score", prompt_ids=[1, 2, 3, 4], sampling_params={}, usage_kind="teacher_score"
+        )
+    prefix = "opd_cost/teacher_score/"
+    assert usage.metrics[prefix + "requests"] == 2
+    assert usage.metrics[prefix + "failed_requests"] == 1
+    assert usage.metrics[prefix + "input_known_requests"] == 1
+    assert usage.metrics[prefix + "output_tokens"] == 1
+    assert "usage_kind" not in success.calls[0]
+    assert success.calls[0]["collect_request_usage"] is True
+    if cached is None:
+        assert prefix + "cached_input_tokens" not in usage.metrics
+    else:
+        assert usage.metrics[prefix + "cached_input_tokens"] == cached
+        assert usage.metrics[prefix + "uncached_input_tokens"] == 4 - cached
 
 
 @pytest.mark.asyncio

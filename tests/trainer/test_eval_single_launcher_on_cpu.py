@@ -32,6 +32,9 @@ def launcher_env(tmp_path):
         "MODEL_PATH",
         "TEST_BENCHMARK_ROOT",
         "EVAL_ALL",
+        "EVAL_SUITE",
+        "EVAL_RECORDS_PATH",
+        "CHAT_TEMPLATE_MODEL",
         "LD_PRELOAD",
         "BASH_ENV",
     ):
@@ -68,6 +71,30 @@ def test_failed_external_configuration_stops_launch_on_cpu(launcher_env, tmp_pat
     result = _run(launcher_env)
     assert result.returncode == 1
     assert "Failed to load external train config" in result.stderr
+
+
+def test_math5_evaluation_reads_suite_and_records_from_platform_config(launcher_env, tmp_path):
+    config = tmp_path / "train.config"
+    model = tmp_path / "checkpoint"
+    model.mkdir()
+    records = tmp_path / "shared storage" / "eval.json"
+    template = tmp_path / "hbx" / "JustRL-DeepSeek-1.5B"
+    config.write_text(
+        f"MODEL_PATH={shlex.quote(str(model))}\nCHAT_TEMPLATE_MODEL={shlex.quote(str(template))}\n"
+        f"EVAL_SUITE=math5\nEVAL_RECORDS_PATH={shlex.quote(str(records))}\n"
+    )
+    bootstrap = tmp_path / "bootstrap.sh"
+    bootstrap.write_text(
+        """npu-smi() {
+    bash -c 'printf "%s\\n" "$EVAL_SUITE" "$EVAL_RECORDS_PATH" "$CHAT_TEMPLATE_MODEL"'
+    exit 0
+}
+"""
+    )
+    launcher_env.update(TRAIN_CONFIG_PATH=str(config), BASH_ENV=str(bootstrap))
+    result = _run(launcher_env)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-3:] == ["math5", str(records), str(template)]
 
 
 @pytest.mark.parametrize("override", [False, True])

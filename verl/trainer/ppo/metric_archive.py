@@ -1576,6 +1576,8 @@ def _coerce_numeric(value: Any) -> tuple[float, str] | None:
 
 
 def _should_archive_metric(metric_key: str, configured_topk: int | None) -> bool:
+    if metric_key.startswith(("opd_cost/", "opd/student_only/")):
+        return True
     if metric_key.startswith("opd_intervention/"):
         return metric_key not in _LIVE_INTERVENTION_KEYS
     if metric_key.startswith(_ALWAYS_ARCHIVE_PREFIXES):
