@@ -33,7 +33,7 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 SHARED_MOUNT = Path("/opt/huawei/dataset/jnguan")
-DEFAULT_ROOT = Path.home() / "work/dataset/jnguan/code/DMPD"
+DEFAULT_ROOT = Path("/home/ma-user/work/dataset/jnguan/code/DMPD")
 DEFAULT_MIRROR = Path(__file__).resolve().parents[1] / "analysis_artifacts/jubgjf/DMPD/runs"
 DEFAULT_SINCE = dt.date(2026, 11, 1)
 TRAINING_STEP = "training/global_step"
