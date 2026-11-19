@@ -21,14 +21,17 @@ This trainer supports model-agonistic model initialization with huggingface
 import asyncio
 import copy
 import hashlib
+import io
 import json
 import math
 import os
 import shlex
+import tempfile
 import time
 import uuid
 from collections import Counter, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pprint import pprint
 from typing import Any, Optional
@@ -63,6 +66,7 @@ from verl.trainer.distillation.diagnostics import (
 )
 from verl.trainer.distillation.losses import is_distillation_enabled, is_teacher_segment_sft_enabled
 from verl.trainer.distillation.teacher_target_scoring import (
+    DEFERRED_INTERVENTION_SCORE_KEY,
     assemble_teacher_target_logprobs,
     build_teacher_target_scoring_requests,
 )
@@ -104,6 +108,7 @@ from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
+from verl.workers.config.distillation import teacher_prompt_logprobs
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.rollout.request_usage import collect_request_usage
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
@@ -118,7 +123,9 @@ async def _execute_teacher_target_scoring_requests(
     *,
     request_id_prefix: str,
     usage_metrics: dict[str, int] | None = None,
+    teacher_prompt_topk: int | None = None,
 ):
+    options = {} if teacher_prompt_topk is None else {"teacher_prompt_topk": teacher_prompt_topk}
     tasks = [
         teacher_scorer.compute_teacher_logprobs_for_target_ids_single(
             sequence_ids=request.sequence_ids,
@@ -127,6 +134,7 @@ async def _execute_teacher_target_scoring_requests(
             mm_processor_kwargs=request.mm_processor_kwargs,
             routing_key=request.routing_key,
             request_id=f"{request_id_prefix}-{sample_index}-{uuid.uuid4().hex}",
+            **options,
         )
         for sample_index, request in enumerate(requests)
     ]
@@ -135,6 +143,72 @@ async def _execute_teacher_target_scoring_requests(
     if usage is not None:
         usage_metrics.update(usage.metrics)
     return results
+
+
+def _attach_final_teacher_scores(
+    batch: DataProto,
+    requests,
+    scoring_results,
+    *,
+    pad_token_id: int,
+    intervention_config,
+    deferred_intervention_scores: np.ndarray | None,
+) -> None:
+    """Recreate the rollout diagnostic fields using the fused teacher outputs."""
+    from verl.experimental.agent_loop.agent_loop import finalize_deferred_intervention_score, teacher_scoring_metadata
+    from verl.experimental.teacher_loop.teacher_manager import _pad_teacher_outputs
+
+    if not requests:
+        return
+    if deferred_intervention_scores is not None and len(deferred_intervention_scores) != len(requests):
+        raise RuntimeError("Deferred intervention scores must have one entry per teacher scoring request.")
+    prompt_width = batch.batch["prompts"].shape[1]
+    response_width = batch.batch["responses"].shape[1]
+    teacher_ids, teacher_logprobs, sampled_ids, sampled_logprobs, metadata = [], [], [], [], []
+    for sample_index, (request, result) in enumerate(zip(requests, scoring_results, strict=True)):
+        scores = result.ordinary_scores
+        if scores is None:
+            raise RuntimeError(f"Fused teacher scoring did not return ordinary scores for sample {sample_index}.")
+        response_length = len(request.response_row_mapping)
+        prompt_length = len(request.sequence_ids) - response_length
+        padding = {
+            "prompt_width": prompt_width,
+            "response_width": response_width,
+            "prompt_length": prompt_length,
+            "response_length": response_length,
+            "pad_token_id": pad_token_id,
+        }
+        ids, logprobs = _pad_teacher_outputs(scores.ids, scores.logprobs, **padding)
+        sampled_row_ids, sampled_row_logprobs = _pad_teacher_outputs(
+            scores.sampled_ids, scores.sampled_logprobs, **padding
+        )
+        teacher_ids.append(ids)
+        teacher_logprobs.append(logprobs)
+        sampled_ids.append(sampled_row_ids)
+        sampled_logprobs.append(sampled_row_logprobs)
+        metadata.append(teacher_scoring_metadata(scores, prompt_len=prompt_length, response_len=response_length))
+        if deferred_intervention_scores is not None and deferred_intervention_scores[sample_index] is not None:
+            finalize_deferred_intervention_score(
+                deferred_intervention_scores[sample_index],
+                scores,
+                batch.non_tensor_batch["teacher_interventions"][sample_index],
+                intervention_config,
+                prompt_len=prompt_length,
+                response_len=response_length,
+            )
+
+    batch.batch.update(
+        {
+            "teacher_ids": torch.cat(teacher_ids),
+            "teacher_logprobs": torch.cat(teacher_logprobs),
+            "teacher_sampled_ids": torch.cat(sampled_ids),
+            "teacher_sampled_logprobs": torch.cat(sampled_logprobs),
+        }
+    )
+    for key in metadata[0]:
+        values = np.empty(len(metadata), dtype=object)
+        values[:] = [row[key] for row in metadata]
+        batch.non_tensor_batch[key] = values
 
 
 def _rollout_cost_metrics(batch: DataProto) -> dict[str, int]:
@@ -3467,7 +3541,9 @@ class RayPPOTrainer:
             context="teacher_logprobs",
         )
 
-    def _compute_rethinking_teacher_on_student_topk(self, batch: DataProto) -> torch.Tensor:
+    def _compute_rethinking_teacher_on_student_topk(
+        self, batch: DataProto, *, deferred_intervention_scores: np.ndarray | None = None
+    ) -> torch.Tensor:
         from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 
         target_scorer = getattr(self, "_rethinking_teacher_target_scorer", None)
@@ -3499,21 +3575,47 @@ class RayPPOTrainer:
         usage_metrics = None
         if getattr(getattr(self.distillation_config, "diagnostics", None), "collect_rollout_costs", False):
             usage_metrics = {}
+        options = {}
+        if getattr(self.distillation_config, "fuse_final_teacher_scoring", False):
+            options["teacher_prompt_topk"] = teacher_prompt_logprobs(self.distillation_config, "token_reward_direct")
         scoring_results = _execute_teacher_target_scoring_requests(
             target_scorer,
             requests,
             request_id_prefix=f"only-stu-rethinking-step-{getattr(self, 'global_steps', -1)}",
             **({"usage_metrics": usage_metrics} if usage_metrics is not None else {}),
+            **options,
         )
         if usage_metrics is not None:
             batch.meta_info["opd_target_request_usage"] = usage_metrics
-        return assemble_teacher_target_logprobs(
+        teacher_on_student = assemble_teacher_target_logprobs(
             requests=requests,
             scoring_results=scoring_results,
             student_topk_ids=batch.batch["student_topk_ids"],
         )
+        if options:
+            _attach_final_teacher_scores(
+                batch,
+                requests,
+                scoring_results,
+                pad_token_id=self.tokenizer.pad_token_id,
+                intervention_config=self.distillation_config.intervention,
+                deferred_intervention_scores=deferred_intervention_scores,
+            )
+        return teacher_on_student
 
-    def _compute_token_reward_direct_scores(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, float]]:
+    def _defers_adaptive_prune_mask(self) -> bool:
+        return (
+            getattr(self.distillation_config, "fuse_final_teacher_scoring", False)
+            and self.distillation_config.intervention.prune_mode == "adaptive_future"
+        )
+
+    def _compute_token_reward_direct_scores(
+        self,
+        batch: DataProto,
+        *,
+        deferred_intervention_scores: np.ndarray | None = None,
+        timing_raw: dict[str, float] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         topk = self._token_reward_direct_topk()
         missing_keys = {
             key for key in ("student_topk_ids", "student_topk_logprobs", "response_mask") if key not in batch.batch
@@ -3569,7 +3671,16 @@ class RayPPOTrainer:
                 position_bin_size=position_bin_size,
             )
         elif loss_config.top_k_strategy == "only_stu_rethinking_style":
-            teacher_on_student_topk_logprobs = self._compute_rethinking_teacher_on_student_topk(batch)
+            with marked_timer("teacher_final_score", timing_raw) if timing_raw is not None else nullcontext():
+                options = {}
+                if deferred_intervention_scores is not None:
+                    options["deferred_intervention_scores"] = deferred_intervention_scores
+                teacher_on_student_topk_logprobs = self._compute_rethinking_teacher_on_student_topk(batch, **options)
+            prune_metrics = {}
+            if self._defers_adaptive_prune_mask():
+                prune_metrics = apply_intervention_prune_mask(
+                    data=batch, intervention_config=self.distillation_config.intervention
+                )
             token_rewards, reward_metrics = compute_rethinking_only_student_topk_token_reward(
                 student_topk_logprobs=batch.batch["student_topk_logprobs"],
                 teacher_on_student_topk_logprobs=teacher_on_student_topk_logprobs,
@@ -3579,6 +3690,7 @@ class RayPPOTrainer:
                 reward_weight_mode=loss_config.reward_weight_mode,
                 log_prob_min_clamp=loss_config.log_prob_min_clamp,
             )
+            reward_metrics.update(prune_metrics)
         else:
             raise AssertionError(f"Unexpected top_k_strategy after validation: {loss_config.top_k_strategy!r}.")
         return token_rewards, reward_metrics
@@ -3614,15 +3726,33 @@ class RayPPOTrainer:
         response_mask: torch.Tensor,
     ) -> dict[str, Any]:
         diagnostics_config = self._distillation_diagnostics_config()
-        if diagnostics_config is None or not diagnostics_config.log_wandb_heatmap:
+        if diagnostics_config is None:
             return {}
         if global_steps % diagnostics_config.heatmap_interval != 0:
             return {}
-        if getattr(self, "logger", None) is None or "wandb" not in getattr(self.logger, "logger", {}):
+        log_to_wandb = diagnostics_config.log_wandb_heatmap and "wandb" in getattr(
+            getattr(self, "logger", None), "logger", {}
+        )
+        archive_locally = (
+            getattr(diagnostics_config, "archive_heatmaps", False)
+            and getattr(self, "_metric_archive_writer", None) is not None
+        )
+        if not (log_to_wandb or archive_locally):
             return {}
 
         import matplotlib.pyplot as plt
-        import wandb
+
+        def encode_heatmap(fig):
+            try:
+                if log_to_wandb:
+                    import wandb
+
+                    return wandb.Image(fig)
+                with io.BytesIO() as buffer:
+                    fig.savefig(buffer, format="png")
+                    return buffer.getvalue()
+            finally:
+                plt.close(fig)
 
         metrics: dict[str, Any] = {}
 
@@ -3640,10 +3770,7 @@ class RayPPOTrainer:
             self.opd_entropy_tracker.add_entropy_row(global_steps, entropy_row)
             fig = self.opd_entropy_tracker.render_entropy_heatmap()
             if fig is not None:
-                try:
-                    metrics["opd/entropy_heatmap"] = wandb.Image(fig)
-                finally:
-                    plt.close(fig)
+                metrics["opd/entropy_heatmap"] = encode_heatmap(fig)
 
         if teacher_logprobs is not None:
             if self.opd_gap_tracker is None:
@@ -3660,10 +3787,7 @@ class RayPPOTrainer:
             self.opd_gap_tracker.add_gap_row(global_steps, gap_row)
             fig = self.opd_gap_tracker.render_gap_heatmap()
             if fig is not None:
-                try:
-                    metrics["opd/gap_abs_heatmap"] = wandb.Image(fig)
-                finally:
-                    plt.close(fig)
+                metrics["opd/gap_abs_heatmap"] = encode_heatmap(fig)
 
             if self.opd_gap_high_tracker is None:
                 self.opd_gap_high_tracker = OpdDiagnosticsTracker(
@@ -3680,10 +3804,7 @@ class RayPPOTrainer:
             self.opd_gap_high_tracker.add_gap_high_row(global_steps, gap_high_row)
             fig = self.opd_gap_high_tracker.render_gap_high_heatmap()
             if fig is not None:
-                try:
-                    metrics["opd/gap_abs_high_heatmap"] = wandb.Image(fig)
-                finally:
-                    plt.close(fig)
+                metrics["opd/gap_abs_high_heatmap"] = encode_heatmap(fig)
 
         if teacher_logprob_nonfinite_positions is not None:
             if self.opd_teacher_logprob_nonfinite_tracker is None:
@@ -3699,10 +3820,7 @@ class RayPPOTrainer:
             self.opd_teacher_logprob_nonfinite_tracker.add_teacher_logprob_nonfinite_row(global_steps, nonfinite_row)
             fig = self.opd_teacher_logprob_nonfinite_tracker.render_teacher_logprob_nonfinite_heatmap()
             if fig is not None:
-                try:
-                    metrics["opd/teacher_logprob_nonfinite_heatmap"] = wandb.Image(fig)
-                finally:
-                    plt.close(fig)
+                metrics["opd/teacher_logprob_nonfinite_heatmap"] = encode_heatmap(fig)
 
         return metrics
 
@@ -4216,7 +4334,7 @@ class RayPPOTrainer:
                     "The tracker must point to the last fully committed checkpoint."
                 )
 
-        environment_run_id = os.environ.get("WANDB_RUN_ID")
+        environment_run_id = os.environ.get("WANDB_RUN_ID") if self._uses_wandb_backend() else None
         manifest_run_id = (
             str(existing_manifest["logical_run_id"])
             if existing_manifest is not None and existing_manifest.get("logical_run_id")
@@ -4411,7 +4529,16 @@ class RayPPOTrainer:
         if self._metric_archive_writer is None:
             return
         for metric_key in _OPD_HEATMAP_METRIC_KEYS & metrics.keys():
-            media_path = getattr(metrics[metric_key], "_path", None)
+            media = metrics[metric_key]
+            if isinstance(media, bytes):
+                with tempfile.NamedTemporaryFile(suffix=".png", dir=self._metric_archive_writer.root_dir) as handle:
+                    handle.write(media)
+                    handle.flush()
+                    self._metric_archive_writer.add_event_file(
+                        handle.name, global_step=global_step, metric_key=metric_key
+                    )
+                continue
+            media_path = getattr(media, "_path", None)
             if media_path and os.path.isfile(media_path):
                 self._metric_archive_writer.add_event_file(
                     media_path,
@@ -4507,6 +4634,11 @@ class RayPPOTrainer:
             self._metric_artifact_uploader.drain_completed()
 
         routed_input = dict(metrics)
+        local_heatmaps = {
+            key: routed_input.pop(key)
+            for key in _OPD_HEATMAP_METRIC_KEYS & routed_input.keys()
+            if isinstance(routed_input[key], bytes)
+        }
         routed_input.update(self._metric_archive_writer.health_metrics())
         future_gap_serialization_seconds = getattr(
             self,
@@ -4527,7 +4659,7 @@ class RayPPOTrainer:
             event_kind=event_kind,
             checkpoint_step=self.global_steps if checkpoint_payload_path is not None else None,
         )
-        self._archive_metric_event_files(route.live_metrics, global_step=self.global_steps)
+        self._archive_metric_event_files({**route.live_metrics, **local_heatmaps}, global_step=self.global_steps)
         self._archive_pending_event_records(global_step=self.global_steps)
 
         if checkpoint_payload_path is not None:
@@ -4767,6 +4899,7 @@ class RayPPOTrainer:
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
 
+                    deferred_intervention_scores = batch.non_tensor_batch.pop(DEFERRED_INTERVENTION_SCORE_KEY, None)
                     distillation_enabled = self.distillation_config is not None and is_distillation_enabled(
                         self.config.get("distillation")
                     )
@@ -4778,12 +4911,13 @@ class RayPPOTrainer:
                                 global_steps=self.global_steps,
                             )
                         )
-                        metrics.update(
-                            apply_intervention_prune_mask(
-                                data=batch,
-                                intervention_config=self.distillation_config.intervention,
+                        if not self._defers_adaptive_prune_mask():
+                            metrics.update(
+                                apply_intervention_prune_mask(
+                                    data=batch,
+                                    intervention_config=self.distillation_config.intervention,
+                                )
                             )
-                        )
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -4888,7 +5022,11 @@ class RayPPOTrainer:
                                     "which is incompatible with sampled-token in-reward KL. This matches the "
                                     "OPD paper setting where KL coefficient is 0; set algorithm.use_kl_in_reward=False."
                                 )
-                            token_reward_tensor, token_reward_metrics = self._compute_token_reward_direct_scores(batch)
+                            token_reward_tensor, token_reward_metrics = self._compute_token_reward_direct_scores(
+                                batch,
+                                deferred_intervention_scores=deferred_intervention_scores,
+                                timing_raw=timing_raw,
+                            )
                             metrics.update(token_reward_metrics)
                             loss_config = self.distillation_config.distillation_loss
                             if loss_config.use_task_rewards:

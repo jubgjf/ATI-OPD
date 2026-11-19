@@ -569,7 +569,7 @@ Trainer
      total_epochs: 30
      project_name: verl_examples
      experiment_name: gsm8k
-     logger: ['console', 'wandb']
+     logger: ['console']
      log_val_generations: 0
      nnodes: 1
      n_gpus_per_node: 8
@@ -588,7 +588,7 @@ Trainer
 - ``trainer.total_epochs``: Number of epochs in training.
 - ``trainer.project_name``: For wandb, swanlab, mlflow
 - ``trainer.experiment_name``: For wandb, swanlab, mlflow
-- ``trainer.logger``: Support console and wandb, swanlab, mlflow, tensorboard, trackio
+- ``trainer.logger`` defaults to ``['console']`` and also accepts wandb, swanlab, mlflow, tensorboard and trackio.
 - ``trainer.log_val_generations``: The number of logged generation during validation (default ``0``)
 - ``trainer.nnodes``: Number of nodes used in the training.
 - ``trainer.n_gpus_per_node``: Number of GPUs per node.
@@ -618,6 +618,38 @@ This figure illustrates how the configurations affect the training.
 https://excalidraw.com/#json=pfhkRmiLm1jnnRli9VFhb,Ut4E8peALlgAUpr7E5pPCA
 
 .. image:: https://github.com/user-attachments/assets/16aebad1-0da6-4eb3-806d-54a74e712c2d
+
+
+OPD experiment logs
+~~~~~~~~~~~~~~~~~~~
+
+The project OPD launchers use SwanLab in offline mode. Each experiment writes
+SwanLab logs to ``swanlog/`` and detailed metrics, heatmaps and other attachments
+to ``diagnostics/`` inside the experiment output directory. They enable fused
+teacher scoring for the vLLM ``token_reward_direct`` path with exact student
+Top-K candidates. Set ``FUSE_FINAL_TEACHER_SCORING=False`` to run an unfused baseline.
+When resuming an existing experiment, use the ``PROJECT_NAME`` recorded as
+``project`` in its archive manifest.
+
+The NPU launcher installs SwanLab 0.10.3 for offline logging. The sync script
+supports the same version. After the training session exits, run the sync
+command from a machine with access to the experiment output and both services.
+Authenticate with ``swanlab login`` and ``hf auth login`` before upload.
+
+.. code-block:: bash
+
+   uv pip install -e '.[swanlab]' 'swanlab==0.10.3'
+   python run/upload.py
+   python run/upload.py download --run LOGICAL_RUN_ID --dest /path/to/downloads
+
+By default, upload discovers all experiment archives under ``outputs/``. Use
+``--run /path/to/outputs/experiment`` to limit the upload to one experiment.
+Upload appends new dashboard scalars to ``jubgjf/ATI-OPD`` and syncs changed
+archive files to the private dataset ``jubgjf/ATI-OPD-logs``. Download restores
+changed files under ``runs/LOGICAL_RUN_ID/`` from that dataset, including the
+offline logs. The logical run ID is in ``diagnostics/manifest.json``.
+Use ``--dry-run`` with either command to preview the transfer, or
+``--target hf`` to sync just the archive.
 
 
 evaluation.yaml

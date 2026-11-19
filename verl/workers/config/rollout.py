@@ -191,6 +191,7 @@ class RolloutConfig(BaseConfig):
     dtype: str = "bfloat16"
     gpu_memory_utilization: float = 0.5
     ignore_eos: bool = False
+    stop_token_ids: list[int] = field(default_factory=list)
     enforce_eager: bool = True
     cudagraph_capture_sizes: Optional[list] = None
     free_cache_engine: bool = True
@@ -289,6 +290,8 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
+        if any(type(token_id) is not int or token_id < 0 for token_id in self.stop_token_ids):
+            raise ValueError("rollout.stop_token_ids must contain non-negative integer token IDs.")
         # Deprecation warning for mode field - only async mode is supported
         if self.mode == "sync":
             raise ValueError(

@@ -40,6 +40,9 @@ gpu_memory_utilization: 0.5
 # Whether to ignore EOS and continue generating after EOS is hit.
 ignore_eos: False
 
+# Additional token IDs that terminate generation, e.g. the chat template's turn terminator.
+stop_token_ids: []
+
 # Whether to disable CUDA graph. Default False to best performance.
 enforce_eager: False
 

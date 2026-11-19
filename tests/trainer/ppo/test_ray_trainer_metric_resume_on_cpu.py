@@ -17,6 +17,7 @@ import json
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pyarrow.parquet as pq
 import pytest
@@ -245,10 +246,20 @@ def test_existing_archive_rejects_conflicting_wandb_run_id_before_logger_init_on
     )
     archive.close()
     monkeypatch.setenv("WANDB_RUN_ID", "other-run")
-    trainer = _metric_logging_trainer(_trainer_config(tmp_path))
+    trainer = _metric_logging_trainer(_trainer_config(tmp_path, logger=["wandb"]))
 
     with pytest.raises(RuntimeError, match="identity mismatch"):
         trainer._initialize_metric_logging()
+
+
+def test_stale_wandb_environment_does_not_set_swanlab_archive_identity_on_cpu(tmp_path, monkeypatch):
+    monkeypatch.setenv("WANDB_RUN_ID", "other-run")
+    trainer = _metric_logging_trainer(_trainer_config(tmp_path, logger=["console", "swanlab"]))
+
+    trainer._initialize_metric_logging()
+    with trainer._metric_archive_writer as archive:
+        assert archive.logical_run_id == trainer._logical_run_id
+        assert archive.logical_run_id != "other-run"
 
 
 def test_checkpoint_payload_does_not_advance_tracker_until_explicit_commit_on_cpu(tmp_path):
@@ -464,6 +475,27 @@ def test_balanced_checkpoint_event_commits_ledger_before_tracker_and_replays_com
     session = trainer._metric_archive_writer.manifest["sessions"][trainer._metric_archive_writer.session_id]
     assert session["wandb_committed_ranges"] == [{"step_start": 2, "step_end": 2}]
     trainer._metric_archive_writer.close()
+
+
+def test_swanlab_logs_scalars_and_keeps_heatmaps_in_the_metric_archive_on_cpu(tmp_path):
+    trainer = _metric_logging_trainer(_trainer_config(tmp_path, logger=["console", "swanlab"]))
+    trainer._initialize_metric_logging()
+    trainer._metric_artifact_uploader = None
+    trainer.global_steps = 1
+    logger = SimpleNamespace(wandb_run_info=None, log=Mock())
+    heatmap = b"png content"
+
+    with trainer._metric_archive_writer as archive:
+        trainer._record_metric_event(logger, {"actor/loss": 1.0, "opd/entropy_heatmap": heatmap}, event_kind="train")
+        shard = archive.close_shard()
+        (event_file,) = shard.event_files
+        assert event_file.metric_key == "opd/entropy_heatmap"
+        assert Path(event_file.path).suffix == ".png"
+        assert Path(event_file.path).read_bytes() == heatmap
+    logger.log.assert_called_once()
+    logged = logger.log.call_args.kwargs["data"]
+    assert logged["actor/loss"] == 1.0
+    assert "opd/entropy_heatmap" not in logged
 
 
 def test_full_metric_mode_warns_once_when_detailed_event_archive_is_unavailable_on_cpu(capsys):

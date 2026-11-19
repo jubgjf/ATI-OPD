@@ -42,6 +42,7 @@ from verl.experimental.agent_loop.agent_loop import (
     _PruneFutureCalibrationSnapshot,
     _select_intervention_segment,
     _TeacherNLLCalibrationSnapshot,
+    finalize_deferred_intervention_score,
 )
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
 from verl.experimental.teacher_loop.teacher_manager import (
@@ -50,6 +51,7 @@ from verl.experimental.teacher_loop.teacher_manager import (
     TeacherLogprobScoringResult,
 )
 from verl.protocol import DataProto
+from verl.trainer.distillation.teacher_target_scoring import DEFERRED_INTERVENTION_SCORE_KEY
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.utils.rollout_trace import RolloutTraceConfig
 from verl.workers.config import DistillationInterventionConfig
@@ -477,12 +479,14 @@ async def test_agent_loop_generate_sequences_applies_raw_benchmark_sampling_over
                     "top_p": 0.95,
                     "top_k": -1,
                     "calculate_log_probs": False,
+                    "stop_token_ids": [151643, 151645],
                     "val_kwargs": {"top_p": 1.0, "top_k": -1, "temperature": 0.0},
                     "test_kwargs": {"top_p": 0.95, "top_k": -1, "temperature": 0.7, "do_sample": True},
                     "agent": {"default_agent_loop": "single_turn_agent"},
                 }
             )
             self.teacher_intervention_enabled = True
+            self.teacher_intervention_config = None
             self.seen_kwargs: list[dict[str, Any]] = []
             self.seen_sampling_params: list[dict[str, Any]] = []
             self.seen_trajectories: list[dict[str, Any]] = []
@@ -555,6 +559,7 @@ async def test_agent_loop_generate_sequences_applies_raw_benchmark_sampling_over
             "top_k": -1,
             "repetition_penalty": 1.0,
             "logprobs": False,
+            "stop_token_ids": [151643, 151645],
             "seed": 7,
         },
         {
@@ -563,6 +568,7 @@ async def test_agent_loop_generate_sequences_applies_raw_benchmark_sampling_over
             "top_k": -1,
             "repetition_penalty": 1.0,
             "logprobs": False,
+            "stop_token_ids": [151643, 151645],
             "seed": 8,
         },
     ]
@@ -746,8 +752,9 @@ class _FakeRepairStudentClient:
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        usage_kind: str = "student_suffix",
     ) -> TokenOutput:
-        del image_data, video_data, audio_data, mm_processor_kwargs
+        del image_data, video_data, audio_data, mm_processor_kwargs, usage_kind
         self.calls.append(
             {"request_id": request_id, "prompt_ids": list(prompt_ids), "sampling_params": sampling_params}
         )
@@ -769,8 +776,9 @@ class _SequencedRepairStudentClient(_FakeRepairStudentClient):
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        usage_kind: str = "student_suffix",
     ) -> TokenOutput:
-        del image_data, video_data, audio_data, mm_processor_kwargs
+        del image_data, video_data, audio_data, mm_processor_kwargs, usage_kind
         self.calls.append(
             {"request_id": request_id, "prompt_ids": list(prompt_ids), "sampling_params": sampling_params}
         )
@@ -790,8 +798,9 @@ class _NonfiniteRepairStudentClient(_FakeRepairStudentClient):
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        usage_kind: str = "student_suffix",
     ) -> TokenOutput:
-        del image_data, video_data, audio_data, mm_processor_kwargs
+        del image_data, video_data, audio_data, mm_processor_kwargs, usage_kind
         self.calls.append(
             {"request_id": request_id, "prompt_ids": list(prompt_ids), "sampling_params": sampling_params}
         )
@@ -813,6 +822,7 @@ class _CandidateSelectionStudentClient(_FakeRepairStudentClient):
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        usage_kind: str = "student_suffix",
     ) -> TokenOutput:
         if "prompt_logprobs" not in sampling_params:
             return await super().generate(
@@ -823,6 +833,7 @@ class _CandidateSelectionStudentClient(_FakeRepairStudentClient):
                 video_data=video_data,
                 audio_data=audio_data,
                 mm_processor_kwargs=mm_processor_kwargs,
+                usage_kind=usage_kind,
             )
         del image_data, video_data, audio_data, mm_processor_kwargs
         self.calls.append(
@@ -970,6 +981,7 @@ class _DistributionGapStudentClient(_FakeRepairStudentClient):
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        usage_kind: str = "student_suffix",
     ) -> TokenOutput:
         if "prompt_logprobs" not in sampling_params:
             return await super().generate(
@@ -980,6 +992,7 @@ class _DistributionGapStudentClient(_FakeRepairStudentClient):
                 video_data=video_data,
                 audio_data=audio_data,
                 mm_processor_kwargs=mm_processor_kwargs,
+                usage_kind=usage_kind,
             )
         self.calls.append(
             {"request_id": request_id, "prompt_ids": list(prompt_ids), "sampling_params": sampling_params}
@@ -2426,12 +2439,28 @@ async def test_teacher_intervention_prune_ignores_generated_suffix_for_min_train
 
 
 @pytest.mark.asyncio
-async def test_teacher_intervention_teacher_stop_prevents_student_suffix_on_cpu():
+@pytest.mark.parametrize("eos_token_id", [None, 151643, 151645])
+async def test_teacher_intervention_teacher_stop_prevents_student_suffix_on_cpu(eos_token_id):
+    class _Qwen3Tokenizer(_FakeTokenizer):
+        eos_token_id = 151643
+
+        def __len__(self) -> int:
+            return 151669
+
+    teacher_tokens = [30] if eos_token_id is None else [30, eos_token_id]
     teacher_manager = _FixedGapTeacherManager(
-        TeacherGenerationResult(token_ids=[30], stop_reason="completed", finish_reason="stop"),
+        TeacherGenerationResult(
+            token_ids=teacher_tokens,
+            stop_reason="completed",
+            finish_reason="stop" if eos_token_id is None else "length",
+        ),
         high_gap_start=2,
     )
     worker = _DirectInterventionWorker(teacher_manager=teacher_manager, response_length=6)
+    if eos_token_id is not None:
+        worker.tokenizer = _Qwen3Tokenizer()
+        worker.rollout_config.stop_token_ids = [151643, 151645]
+        worker.distillation_config.fuse_final_teacher_scoring = True
     output = AgentLoopOutput(
         prompt_ids=[101, 102],
         response_ids=[1, 2, 3, 4, 5, 6],
@@ -2449,9 +2478,11 @@ async def test_teacher_intervention_teacher_stop_prevents_student_suffix_on_cpu(
         sample_kwargs={"data_source": "openai/gsm8k"},
     )
 
-    assert output.response_ids == [1, 2, 30]
-    assert output.response_mask == [1, 1, 0]
+    assert output.response_ids == [1, 2, *teacher_tokens]
+    assert output.response_mask == [1, 1] + [0] * len(teacher_tokens)
     assert worker.llm_client.calls == []
+    assert teacher_manager.generated_prefixes == [[101, 102, 1, 2]]
+    assert len(teacher_manager.scored_sequences) == 1
     assert output.extra_fields["teacher_intervention_count"] == 1
     assert output.extra_fields["teacher_interventions"][0]["terminated"] is True
     assert output.extra_fields["teacher_interventions"][0]["student_suffix_tokens"] == 0
@@ -2493,6 +2524,43 @@ async def test_teacher_intervention_length_stop_allows_student_suffix_on_cpu():
         }
     ]
     assert output.extra_fields["teacher_interventions"][0]["terminated"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prefix_thinking", "generated", "expected", "terminal"),
+    [
+        ([151667, 5], [151668, 40, 151645, 41], [151668, 40, 151645], True),
+        ([151667, 151668], [40, 151643, 42, 43], [40, 151643], True),
+        ([151667, 5], [151668, 40, 41, 42], [151668, 40, 41, 42], False),
+    ],
+)
+async def test_qwen3_base_resumes_exact_tokens_and_uses_shared_eos_on_cpu(
+    prefix_thinking, generated, expected, terminal
+):
+    worker = _DirectInterventionWorker(teacher_manager=_AdaptivePruneTeacherManager())
+    worker.tokenizer.eos_token_id = 151643
+    worker.rollout_config.stop_token_ids = [151643, 151645]
+    worker.llm_client = _SequencedRepairStudentClient(
+        [TokenOutput(token_ids=generated, log_probs=[-0.2] * len(generated), extra_fields={"finish_reason": "length"})]
+    )
+    # Includes the user's turn terminator, then the open assistant turn.
+    prompt_ids = [151644, 872, 198, 42, 151645, 198, 151644, 77091, 198]
+    prefix_ids = prompt_ids + prefix_thinking + [30, 31]
+    output = AgentLoopOutput(prompt_ids=prompt_ids, response_ids=[], response_mask=[], metrics=AgentLoopMetrics())
+    suffix = await worker._generate_student_suffix(
+        request_id="qwen3-base-continued",
+        prefix_ids=prefix_ids,
+        max_tokens=4,
+        sampling_params={"stop_token_ids": [151643, 151645]},
+        output=output,
+    )
+
+    assert worker.llm_client.calls[0]["prompt_ids"] == prefix_ids
+    assert worker.llm_client.calls[0]["sampling_params"]["stop_token_ids"] == [151643, 151645]
+    assert suffix.token_ids == expected
+    assert len(suffix.logprobs) == len(expected)
+    assert suffix.terminal == suffix.eos_truncated == terminal
 
 
 @pytest.mark.asyncio
@@ -3429,8 +3497,10 @@ async def test_teacher_manager_rejects_missing_prompt_logprobs_on_cpu():
             video_data: Optional[list[Any]] = None,
             audio_data: Optional[list[Any]] = None,
             mm_processor_kwargs: Optional[dict[str, Any]] = None,
+            usage_kind: str = "teacher_score",
         ) -> TokenOutput:
-            del request_id, prompt_ids, sampling_params, image_data, video_data, audio_data, mm_processor_kwargs
+            del request_id, prompt_ids, sampling_params, image_data, video_data, audio_data
+            del mm_processor_kwargs, usage_kind
             return TokenOutput(token_ids=[1], extra_fields={})
 
     manager = object.__new__(AsyncTeacherLLMServerManager)
@@ -3466,8 +3536,9 @@ async def test_teacher_manager_sanitizes_nonfinite_prompt_logprobs_on_cpu(caplog
             video_data: Optional[list[Any]] = None,
             audio_data: Optional[list[Any]] = None,
             mm_processor_kwargs: Optional[dict[str, Any]] = None,
+            usage_kind: str = "teacher_score",
         ) -> TokenOutput:
-            del request_id, image_data, video_data, audio_data, mm_processor_kwargs
+            del request_id, image_data, video_data, audio_data, mm_processor_kwargs, usage_kind
             assert prompt_ids == [101, 102, 1, 2]
             assert sampling_params["prompt_logprobs"] == 0
             return TokenOutput(
@@ -3525,8 +3596,9 @@ async def test_teacher_manager_parses_topk_and_sampled_prompt_logprobs_on_cpu():
             video_data: Optional[list[Any]] = None,
             audio_data: Optional[list[Any]] = None,
             mm_processor_kwargs: Optional[dict[str, Any]] = None,
+            usage_kind: str = "teacher_score",
         ) -> TokenOutput:
-            del request_id, image_data, video_data, audio_data, mm_processor_kwargs
+            del request_id, image_data, video_data, audio_data, mm_processor_kwargs, usage_kind
             assert prompt_ids == [101, 102, 1, 2]
             assert sampling_params["prompt_logprobs"] == 2
             return TokenOutput(
@@ -3590,8 +3662,9 @@ async def test_teacher_manager_scores_exact_per_position_target_ids_on_cpu():
             audio_data: Optional[list[Any]] = None,
             mm_processor_kwargs: Optional[dict[str, Any]] = None,
             target_prompt_token_ids: Optional[list[list[int]]] = None,
+            usage_kind: str = "teacher_target_score",
         ) -> TokenOutput:
-            del request_id, image_data, video_data, audio_data, mm_processor_kwargs
+            del request_id, image_data, video_data, audio_data, mm_processor_kwargs, usage_kind
             assert prompt_ids == [101, 102, 1, 2]
             assert sampling_params["prompt_logprobs"] == 2
             assert target_prompt_token_ids == target_ids
@@ -3912,7 +3985,8 @@ async def test_future_gap_acceptance_preserves_teacher_segment_training_mode_on_
 
 
 @pytest.mark.asyncio
-async def test_future_gap_rejection_restores_exact_raw_state_and_teacher_score_on_cpu():
+@pytest.mark.parametrize("fused", [False, True])
+async def test_future_gap_rejection_restores_exact_raw_state_and_teacher_score_on_cpu(fused):
     teacher_manager = _FutureGapTeacherManager(improved=False)
     worker = _DirectInterventionWorker(
         teacher_manager=teacher_manager,
@@ -3928,6 +4002,7 @@ async def test_future_gap_rejection_restores_exact_raw_state_and_teacher_score_o
         teacher_segment_loss_mode="sft",
     )
     output = _future_gap_output("future-gap-reject")
+    worker.distillation_config.fuse_final_teacher_scoring = fused
     original_ids = list(output.response_ids)
     original_mask = list(output.response_mask)
     original_logprobs = list(output.response_logprobs)
@@ -3954,6 +4029,7 @@ async def test_future_gap_rejection_restores_exact_raw_state_and_teacher_score_o
     assert len(teacher_manager.scored_sequences) == 2
     assert len(teacher_manager.generated_prefixes) == 1
     assert len(worker.llm_client.calls) == 1
+    assert DEFERRED_INTERVENTION_SCORE_KEY not in output.extra_fields
 
 
 @pytest.mark.asyncio
@@ -4066,7 +4142,8 @@ async def test_future_gap_rejects_candidate_with_too_few_matched_tokens_on_cpu()
 
 
 @pytest.mark.asyncio
-async def test_future_gap_adds_continuation_only_after_short_horizon_gate_accepts_on_cpu():
+@pytest.mark.parametrize("fused", [False, True])
+async def test_future_gap_adds_continuation_only_after_short_horizon_gate_accepts_on_cpu(fused):
     call_counts = {}
     for confirmation_mode in ("none", "future_gap"):
         teacher_manager = _FutureGapTeacherManager(improved=True)
@@ -4079,6 +4156,7 @@ async def test_future_gap_adds_continuation_only_after_short_horizon_gate_accept
             future_gap_window_tokens=2,
             future_gap_min_valid_tokens=2,
         )
+        worker.distillation_config.fuse_final_teacher_scoring = fused
         output = _future_gap_output(f"call-count-{confirmation_mode}")
         await AgentLoopWorker._maybe_repair_with_teacher(
             worker,
@@ -4093,7 +4171,7 @@ async def test_future_gap_adds_continuation_only_after_short_horizon_gate_accept
             len(worker.llm_client.calls),
         )
 
-    assert call_counts == {"none": (2, 1, 1), "future_gap": (2, 1, 2)}
+    assert call_counts == {"none": (1 if fused else 2, 1, 1), "future_gap": (2, 1, 2)}
 
 
 @pytest.mark.asyncio
@@ -4207,7 +4285,8 @@ async def test_adaptive_prune_skip_correct_calibrates_raw_correct_without_duplic
 
 
 @pytest.mark.asyncio
-async def test_adaptive_prune_non_skip_forces_raw_correctness_and_contributes_healthy_calibration_on_cpu():
+@pytest.mark.parametrize("fused", [False, True])
+async def test_adaptive_prune_non_skip_forces_raw_correctness_and_contributes_healthy_calibration_on_cpu(fused):
     teacher_manager = _FixedGapTeacherManager(
         TeacherGenerationResult(token_ids=[30], finish_reason="length"),
         high_gap_width=0,
@@ -4225,6 +4304,7 @@ async def test_adaptive_prune_non_skip_forces_raw_correctness_and_contributes_he
         prune_future_calibration_min_blocks=2,
     )
     reward_handle = _SequenceAwareRewardHandle()
+    worker.distillation_config.fuse_final_teacher_scoring = fused
     worker.reward_loop_worker_handles = [reward_handle]
     output = _future_gap_output("adaptive-prune-non-skip-correct")
     output.response_ids[1] = 31
@@ -4243,11 +4323,14 @@ async def test_adaptive_prune_non_skip_forces_raw_correctness_and_contributes_he
     assert reward_handle.compute_score.responses == [[1, 31, 3, 4, 5, 6]]
     assert len(teacher_manager.scored_sequences) == 1
     assert len(AgentLoopWorker.drain_prune_future_calibration_updates(worker)) == 3
-    assert internal.teacher_logprobs is not None
+    assert (internal.teacher_logprobs is None) == fused
+    assert internal.extra_fields.get(DEFERRED_INTERVENTION_SCORE_KEY) is None
+    assert ("teacher_logprob_nonfinite_positions" in internal.extra_fields) != fused
 
 
 @pytest.mark.asyncio
-async def test_adaptive_prune_scores_full_repaired_suffix_once_and_only_writes_cutoff_metadata_on_cpu():
+@pytest.mark.parametrize("fused", [False, True])
+async def test_adaptive_prune_scores_full_repaired_suffix_once_and_only_writes_cutoff_metadata_on_cpu(fused):
     teacher_manager = _AdaptivePruneTeacherManager()
     worker = _DirectInterventionWorker(
         teacher_manager=teacher_manager,
@@ -4262,6 +4345,7 @@ async def test_adaptive_prune_scores_full_repaired_suffix_once_and_only_writes_c
         train_on_teacher_segments=True,
         teacher_segment_loss_mode="opd",
     )
+    worker.distillation_config.fuse_final_teacher_scoring = fused
     worker.llm_client = _SequencedRepairStudentClient(
         [
             TokenOutput(
@@ -4300,11 +4384,25 @@ async def test_adaptive_prune_scores_full_repaired_suffix_once_and_only_writes_c
     assert output.response_mask == [1] * 8
     assert output.extra_fields["teacher_intervention_count"] == 1
     intervention = output.extra_fields["teacher_interventions"][0]
+    assert score_calls_after_intervention == (1 if fused else 2)
+    assert len(teacher_manager.scored_sequences) == score_calls_after_intervention
+    if fused:
+        assert "prune_future_cutoff" not in intervention
+        assert "teacher_logprobs" not in output.extra_fields
+        pending = output.extra_fields[DEFERRED_INTERVENTION_SCORE_KEY]
+        scores = await teacher_manager.compute_teacher_logprobs_single(output.prompt_ids + output.response_ids)
+        finalize_deferred_intervention_score(
+            pending,
+            scores,
+            output.extra_fields["teacher_interventions"],
+            worker.teacher_intervention_config,
+            prompt_len=len(output.prompt_ids),
+            response_len=len(output.response_ids),
+        )
     assert intervention["prune_future_cutoff"] == 2
     assert intervention["prune_future_horizon_tokens"] == 0
     assert intervention["prune_future_persistent_bad"] is True
-    assert score_calls_after_intervention == 2
-    assert len(teacher_manager.scored_sequences) == 2
+    assert intervention["local_effect_pair_available"] is True
     assert worker.llm_client.calls[0]["sampling_params"]["max_tokens"] == 6
     assert AgentLoopWorker.drain_prune_future_calibration_updates(worker) == []
 

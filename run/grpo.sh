@@ -982,9 +982,6 @@ PROJECT_NAME=${PROJECT_NAME:-DMPD}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-${MODEL_SLUG}-grpo}
 LOG_DIR=${LOG_DIR:-$OUTPUT_ROOT/logs}
 
-unset WANDB_ENTITY WANDB_PROJECT WANDB_NAME WANDB_RUN_ID WANDB_RESUME
-export WANDB_MODE=disabled
-export WANDB_DISABLED=true
 
 [[ -d "$MODEL_PATH" ]] || die "Missing model directory: $MODEL_PATH"
 [[ -f "$TRAIN_FILE" ]] || die "Missing training parquet: $TRAIN_FILE"

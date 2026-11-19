@@ -21,6 +21,8 @@ from typing import Any, Optional
 
 import torch
 
+DEFERRED_INTERVENTION_SCORE_KEY = "_deferred_final_intervention_score"
+
 
 @dataclass(frozen=True)
 class TeacherTargetScoringRequest:
@@ -87,7 +89,7 @@ def build_teacher_target_scoring_requests(
     for batch_index in range(batch_size):
         row_attention = attention_mask[batch_index].bool()
         prompt_positions = torch.nonzero(row_attention[:prompt_width], as_tuple=False).flatten()
-        response_positions = torch.nonzero(row_attention[prompt_width:], as_tuple=False).flatten()
+        response_positions = torch.nonzero(row_attention[prompt_width:], as_tuple=False).flatten().tolist()
         if prompt_positions.numel() == 0:
             raise ValueError(f"Teacher target scoring sample {batch_index} has no valid prompt tokens.")
         sequence_ids = input_ids[batch_index, row_attention].detach().cpu().long().tolist()
@@ -101,8 +103,10 @@ def build_teacher_target_scoring_requests(
         target_rows = [dummy_target_ids.copy() for _ in sequence_ids]
         response_row_mapping = []
 
-        for response_ordinal, padded_response_position_tensor in enumerate(response_positions):
-            padded_response_position = int(padded_response_position_tensor.item())
+        candidate_rows = student_topk_ids[batch_index, response_positions].detach().cpu().long().tolist()
+        for response_ordinal, (padded_response_position, candidates) in enumerate(
+            zip(response_positions, candidate_rows, strict=True)
+        ):
             score_row = unpadded_prompt_len - 1 + response_ordinal
             if score_row < 0 or score_row >= len(sequence_ids) - 1:
                 raise RuntimeError(
@@ -110,7 +114,6 @@ def build_teacher_target_scoring_requests(
                     f"sample={batch_index}, response_position={padded_response_position}, "
                     f"score_row={score_row}, sequence_len={len(sequence_ids)}."
                 )
-            candidates = student_topk_ids[batch_index, padded_response_position].detach().cpu().long().tolist()
             target_rows[score_row] = candidates
             response_row_mapping.append((padded_response_position, score_row))
 
@@ -143,7 +146,7 @@ def assemble_teacher_target_logprobs(
             f"got requests={len(requests)}, results={len(scoring_results)}, "
             f"student_batch={student_topk_ids.shape[0]}."
         )
-    teacher_on_student = torch.zeros_like(student_topk_ids, dtype=torch.float32)
+    teacher_on_student = torch.zeros_like(student_topk_ids, dtype=torch.float32, device="cpu")
     for batch_index, (request, result) in enumerate(zip(requests, scoring_results, strict=True)):
         result_ids = result.ids.detach().cpu()
         result_logprobs = result.logprobs.detach().cpu().float()
@@ -154,15 +157,17 @@ def assemble_teacher_target_logprobs(
                 f"sample={batch_index}, expected={expected_shape}, ids={tuple(result_ids.shape)}, "
                 f"logprobs={tuple(result_logprobs.shape)}."
             )
-        for padded_response_position, score_row in request.response_row_mapping:
-            expected_ids = student_topk_ids[batch_index, padded_response_position].detach().cpu().long()
-            returned_ids = result_ids[score_row].long()
-            if not torch.equal(returned_ids, expected_ids):
-                mismatch = int(torch.nonzero(returned_ids != expected_ids, as_tuple=False)[0].item())
-                raise RuntimeError(
-                    "Teacher target result ids do not match student Top-K candidates: "
-                    f"sample={batch_index}, response_position={padded_response_position}, candidate={mismatch}, "
-                    f"expected_id={int(expected_ids[mismatch])}, returned_id={int(returned_ids[mismatch])}."
-                )
-            teacher_on_student[batch_index, padded_response_position] = result_logprobs[score_row]
+        if not request.response_row_mapping:
+            continue
+        response_positions, score_rows = map(list, zip(*request.response_row_mapping, strict=True))
+        expected_ids = student_topk_ids[batch_index, response_positions].detach().cpu()
+        returned_ids = result_ids[score_rows]
+        if not torch.equal(returned_ids, expected_ids):
+            row, column = (returned_ids != expected_ids).nonzero(as_tuple=False)[0].tolist()
+            raise RuntimeError(
+                "Teacher target result ids do not match student Top-K candidates: "
+                f"sample={batch_index}, response_position={response_positions[row]}, candidate={column}, "
+                f"expected_id={int(expected_ids[row, column])}, returned_id={int(returned_ids[row, column])}."
+            )
+        teacher_on_student[batch_index, response_positions] = result_logprobs[score_rows]
     return teacher_on_student.to(device=student_topk_ids.device)

@@ -247,6 +247,7 @@ actor_rollout_ref:
     dtype: bfloat16
     gpu_memory_utilization: 0.5
     ignore_eos: false
+    stop_token_ids: []
     enforce_eager: false
     cudagraph_capture_sizes: null
     free_cache_engine: true
@@ -817,6 +818,7 @@ distillation:
   _target_: verl.workers.config.DistillationConfig
   enabled: false
   use_actor_loss: true
+  fuse_final_teacher_scoring: false
   distillation_loss:
     _target_: verl.workers.config.DistillationLossConfig
     loss_mode: k3
@@ -910,6 +912,7 @@ distillation:
     heatmap_interval: 10
     heatmap_history_steps: 80
     log_wandb_heatmap: true
+    archive_heatmaps: false
     high_gap_threshold: 1.0
     collect_intervention_metrics: true
     collect_intervention_boundary_metrics: false
@@ -976,7 +979,6 @@ trainer:
   experiment_name: gsm8k
   logger:
   - console
-  - wandb
   metric_logging:
     mode: full
     resume_policy: strict

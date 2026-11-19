@@ -127,8 +127,8 @@ trainer:
   # Experiment name for run identification in tracking tools
   experiment_name: gsm8k
 
-  # Logging backends to use: "console", "wandb", etc.
-  logger: ["console", "wandb"]
+  # Logging backends. Project launchers select offline SwanLab.
+  logger: ["console"]
 
   # Controls whether metrics are logged in full or split between live backends and a detailed archive
   metric_logging:

@@ -193,8 +193,6 @@ METRIC_LOGGING_RESUME_POLICY=${METRIC_LOGGING_RESUME_POLICY:-strict}
 METRIC_LOGGING_LIVE_KEY_WARNING_THRESHOLD=${METRIC_LOGGING_LIVE_KEY_WARNING_THRESHOLD:-250}
 METRIC_LOGGING_ARCHIVE_ENABLED=${METRIC_LOGGING_ARCHIVE_ENABLED:-True}
 METRIC_LOGGING_ARCHIVE_LOCAL_DIR=${METRIC_LOGGING_ARCHIVE_LOCAL_DIR:-null}
-METRIC_LOGGING_ARCHIVE_UPLOAD_TO_WANDB=${METRIC_LOGGING_ARCHIVE_UPLOAD_TO_WANDB:-auto}
-METRIC_LOGGING_ARCHIVE_FINISH_TIMEOUT_SECONDS=${METRIC_LOGGING_ARCHIVE_FINISH_TIMEOUT_SECONDS:-60}
 METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS=${METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS:-}
 if [[ -z "$METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS" ]]; then
     if [[ "$SAVE_FREQ" =~ ^[1-9][0-9]*$ ]]; then
@@ -224,6 +222,11 @@ if [[ "$TRAIN_DATASET" == "nemotron_cascade_2_rl_mopd" ]]; then
 else
     TOP_K_STRATEGY=${TOP_K_STRATEGY:-only_stu}
 fi
+default_fuse_final_teacher_scoring=False
+if [[ "$ADV_ESTIMATOR" == "token_reward_direct" && "$TOP_K_STRATEGY" == "only_stu_rethinking_style" &&
+    "$DISTILLATION_USE_ACTOR_LOSS" == [Ff]alse ]]; then
+    default_fuse_final_teacher_scoring=True
+fi
 REWARD_WEIGHT_MODE=${REWARD_WEIGHT_MODE:-student_p}
 DISTILLATION_USE_TASK_REWARDS=${DISTILLATION_USE_TASK_REWARDS:-False}
 DISTILLATION_USE_POLICY_GRADIENT=${DISTILLATION_USE_POLICY_GRADIENT:-True}
@@ -250,7 +253,7 @@ OPD_DIAGNOSTICS_TOPK_LOG_INTERVAL=${OPD_DIAGNOSTICS_TOPK_LOG_INTERVAL:-1}
 OPD_DIAGNOSTICS_ASYNC_METRICS=${OPD_DIAGNOSTICS_ASYNC_METRICS:-False}
 OPD_DIAGNOSTICS_HEATMAP_INTERVAL=${OPD_DIAGNOSTICS_HEATMAP_INTERVAL:-1}
 OPD_DIAGNOSTICS_HEATMAP_HISTORY_STEPS=${OPD_DIAGNOSTICS_HEATMAP_HISTORY_STEPS:-8}
-OPD_DIAGNOSTICS_LOG_WANDB_HEATMAP=${OPD_DIAGNOSTICS_LOG_WANDB_HEATMAP:-False}
+OPD_DIAGNOSTICS_LOG_HEATMAP=${OPD_DIAGNOSTICS_LOG_HEATMAP:-False}
 OPD_DIAGNOSTICS_HIGH_GAP_THRESHOLD=${OPD_DIAGNOSTICS_HIGH_GAP_THRESHOLD:-1.0}
 OPD_DIAGNOSTICS_BAD_TAIL_MIN_POSITION=${OPD_DIAGNOSTICS_BAD_TAIL_MIN_POSITION:-12000}
 OPD_DIAGNOSTICS_BAD_TAIL_DEEP_POSITION=${OPD_DIAGNOSTICS_BAD_TAIL_DEEP_POSITION:-16000}
@@ -338,27 +341,12 @@ case "$IN_TRAIN_EVALUATION" in
 esac
 LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-0}
 LOG_TEST_GENERATIONS=${LOG_TEST_GENERATIONS:-0}
-TRAINER_LOGGER=${TRAINER_LOGGER:-'["console"]'}
+TRAINER_LOGGER=${TRAINER_LOGGER:-'["console","swanlab"]'}
 PROJECT_NAME=${PROJECT_NAME:-DMPD-debug}
-WANDB_MODE=${WANDB_MODE:-disabled}
-WANDB_DISABLED=${WANDB_DISABLED:-true}
-WANDB_DIR=${WANDB_DIR:-}
-WANDB_DATA_DIR=${WANDB_DATA_DIR:-}
-WANDB_CACHE_DIR=${WANDB_CACHE_DIR:-}
-WANDB_ENTITY=${WANDB_ENTITY:-}
-WANDB_CONFIG_MODE=${WANDB_CONFIG_MODE:-full}
-WANDB_RUN_ID=${WANDB_RUN_ID:-}
+SWANLAB_MODE=${SWANLAB_MODE:-offline}
 RESUME_REQUIRED=${RESUME_REQUIRED:-False}
 case "$RESUME_REQUIRED" in
-    True)
-        if [[ "$WANDB_MODE" == "offline" || "$WANDB_MODE" == "disabled" || -z "$WANDB_RUN_ID" ]]; then
-            unset WANDB_RESUME
-        else
-            WANDB_RESUME=must
-            export WANDB_RESUME
-        fi
-        ;;
-    False) unset WANDB_RESUME ;;
+    True | False) ;;
     *)
         echo "RESUME_REQUIRED must be True or False, got: $RESUME_REQUIRED" >&2
         exit 1
@@ -373,12 +361,7 @@ if [[ "$ENABLE_TOOL_CALL" == "True" ]]; then
 else
     DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-"/tmp/verl_debug/${EXPERIMENT_FULL_NAME}"}
 fi
-if [[ -z "$WANDB_DATA_DIR" && -n "$WANDB_DIR" ]]; then
-    WANDB_DATA_DIR="${WANDB_DIR%/}/wandb-data/${EXPERIMENT_FULL_NAME}"
-fi
-if [[ -z "$WANDB_CACHE_DIR" && -n "$WANDB_DIR" ]]; then
-    WANDB_CACHE_DIR="${WANDB_DIR%/}/wandb-cache/${EXPERIMENT_FULL_NAME}"
-fi
+SWANLAB_LOG_DIR=${SWANLAB_LOG_DIR:-$DEFAULT_LOCAL_DIR/swanlog}
 
 case "$DEBUG_MODE" in
     vanilla | opd)
@@ -556,8 +539,6 @@ COMMON_OVERRIDES=(
     "trainer.metric_logging.archive.enabled=${METRIC_LOGGING_ARCHIVE_ENABLED}"
     "trainer.metric_logging.archive.local_dir=${METRIC_LOGGING_ARCHIVE_LOCAL_DIR}"
     "trainer.metric_logging.archive.shard_interval_steps=${METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS}"
-    "trainer.metric_logging.archive.upload_to_wandb=${METRIC_LOGGING_ARCHIVE_UPLOAD_TO_WANDB}"
-    "trainer.metric_logging.archive.finish_timeout_seconds=${METRIC_LOGGING_ARCHIVE_FINISH_TIMEOUT_SECONDS}"
     "trainer.project_name=${PROJECT_NAME}"
     "trainer.experiment_name=${EXPERIMENT_FULL_NAME}"
     "trainer.n_gpus_per_node=${STUDENT_GPUS}"
@@ -579,6 +560,7 @@ COMMON_OVERRIDES=(
     "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}"
     "distillation.enabled=True"
     "distillation.use_actor_loss=${DISTILLATION_USE_ACTOR_LOSS}"
+    "distillation.fuse_final_teacher_scoring=${FUSE_FINAL_TEACHER_SCORING:-$default_fuse_final_teacher_scoring}"
     "distillation.n_gpus_per_node=${TEACHER_GPUS}"
     "distillation.nnodes=${TEACHER_NNODES}"
     "distillation.teacher_models.teacher_model.model_path=${TEACHER_MODEL}"
@@ -615,7 +597,7 @@ COMMON_OVERRIDES=(
     "distillation.diagnostics.async_metrics=${OPD_DIAGNOSTICS_ASYNC_METRICS}"
     "distillation.diagnostics.heatmap_interval=${OPD_DIAGNOSTICS_HEATMAP_INTERVAL}"
     "distillation.diagnostics.heatmap_history_steps=${OPD_DIAGNOSTICS_HEATMAP_HISTORY_STEPS}"
-    "distillation.diagnostics.log_wandb_heatmap=${OPD_DIAGNOSTICS_LOG_WANDB_HEATMAP}"
+    "distillation.diagnostics.archive_heatmaps=${OPD_DIAGNOSTICS_LOG_HEATMAP}"
     "distillation.diagnostics.high_gap_threshold=${OPD_DIAGNOSTICS_HIGH_GAP_THRESHOLD}"
     "distillation.diagnostics.bad_tail_min_position=${OPD_DIAGNOSTICS_BAD_TAIL_MIN_POSITION}"
     "distillation.diagnostics.bad_tail_deep_position=${OPD_DIAGNOSTICS_BAD_TAIL_DEEP_POSITION}"
@@ -675,10 +657,6 @@ fi
 
 REMOTE_CMD='set -euo pipefail
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-unset WANDB_RUN_ID WANDB_RESUME
-export WANDB_MODE='"$WANDB_MODE"'
-export WANDB_DISABLED='"$WANDB_DISABLED"'
-export WANDB_CONFIG_MODE='"$WANDB_CONFIG_MODE"'
 export HYDRA_FULL_ERROR=1
 export RAY_DEDUP_LOGS=0
 export RAY_USAGE_STATS_ENABLED=0
@@ -738,32 +716,21 @@ echo \"[debug] sandbox pid=\$SANDBOX_PID\"
 "
 fi
 
-if [[ -n "$WANDB_DIR" ]]; then
-    REMOTE_CMD+="export WANDB_DIR=$(printf "%q" "$WANDB_DIR")
-mkdir -p $(printf "%q" "$WANDB_DIR")
+REMOTE_CMD+="export SWANLAB_MODE=$(printf "%q" "$SWANLAB_MODE")
+export SWANLAB_LOG_DIR=$(printf "%q" "$SWANLAB_LOG_DIR")
+"
+if [[ -n "${SWANLAB_WORKSPACE:-}" ]]; then
+    REMOTE_CMD+="export SWANLAB_WORKSPACE=$(printf "%q" "$SWANLAB_WORKSPACE")
 "
 fi
-if [[ -n "$WANDB_DATA_DIR" ]]; then
-    REMOTE_CMD+="export WANDB_DATA_DIR=$(printf "%q" "$WANDB_DATA_DIR")
-mkdir -p $(printf "%q" "$WANDB_DATA_DIR")
-"
-fi
-if [[ -n "$WANDB_CACHE_DIR" ]]; then
-    REMOTE_CMD+="export WANDB_CACHE_DIR=$(printf "%q" "$WANDB_CACHE_DIR")
-mkdir -p $(printf "%q" "$WANDB_CACHE_DIR")
-"
-fi
-if [[ -n "$WANDB_ENTITY" ]]; then
-    REMOTE_CMD+="export WANDB_ENTITY=$(printf "%q" "$WANDB_ENTITY")
-"
-fi
-if [[ -n "$WANDB_RUN_ID" ]]; then
-    REMOTE_CMD+="export WANDB_RUN_ID=$(printf "%q" "$WANDB_RUN_ID")
-"
-fi
-if [[ -n "${WANDB_RESUME:-}" ]]; then
-    REMOTE_CMD+="export WANDB_RESUME=$(printf "%q" "$WANDB_RESUME")
-"
+if [[ "$RESUME_REQUIRED" == "True" ]]; then
+    REMOTE_CMD+="checkpoint_dir=$(printf "%q" "$DEFAULT_LOCAL_DIR")
+"'
+tracker_file="$checkpoint_dir/latest_checkpointed_iteration.txt"
+test -s "$tracker_file" || { echo "Missing checkpoint tracker: $tracker_file" >&2; exit 2; }
+latest_step=$(cat "$tracker_file")
+test -d "$checkpoint_dir/global_step_$latest_step" || { echo "Missing checkpoint step: $latest_step" >&2; exit 2; }
+'
 fi
 
 if [[ "$RUN_PREFLIGHT" == "1" ]]; then
@@ -795,9 +762,8 @@ cat <<EOF
   max lengths:  prompt ${MAX_PROMPT_LENGTH}, response ${MAX_RESPONSE_LENGTH}, rollout model ${ROLLOUT_MAX_MODEL_LEN}, teacher model ${TEACHER_MAX_MODEL_LEN}
   chat template:${CHAT_TEMPLATE_MODEL:-disabled}
   attention:    ${ATTN_IMPLEMENTATION}, vllm backend ${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}
+  logs:         ${TRAINER_LOGGER}, SwanLab mode=${SWANLAB_MODE}, directory=${SWANLAB_LOG_DIR}
   diagnostics:  log every ${OPD_DIAGNOSTICS_LOG_INTERVAL}, topk every ${OPD_DIAGNOSTICS_TOPK_LOG_INTERVAL}, repetition=${OPD_DIAGNOSTICS_COLLECT_REPETITION}, async=${OPD_DIAGNOSTICS_ASYNC_METRICS}
-  metric logs:  mode=${METRIC_LOGGING_MODE}, archive=${METRIC_LOGGING_ARCHIVE_ENABLED}, shard_interval=${METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS}, upload=${METRIC_LOGGING_ARCHIVE_UPLOAD_TO_WANDB}
-  wandb/ckpt:   WANDB_MODE=${WANDB_MODE}, WANDB_DIR=${WANDB_DIR:-default}, WANDB_DATA_DIR=${WANDB_DATA_DIR:-default}, WANDB_CACHE_DIR=${WANDB_CACHE_DIR:-default}, run_id=${WANDB_RUN_ID:-unset}, resume=${WANDB_RESUME:-unset}, save_freq=${SAVE_FREQ}
   train eval:   enabled=${IN_TRAIN_EVALUATION}, val_before=${VAL_BEFORE_TRAIN}, test_before=${TEST_BEFORE_TRAIN}, teacher_val_before=${TEACHER_VAL_BEFORE_TRAIN}, val_freq=${TEST_FREQ}, benchmark_freq=${TEST_BENCHMARKS_FREQ}
   val logging:  test_freq=${TEST_FREQ}, samples=${VAL_MAX_SAMPLES}, table_preview_rows=${LOG_VAL_GENERATIONS}
   benchmarks:   before_train=${TEST_BEFORE_TRAIN}, freq=${TEST_BENCHMARKS_FREQ}, seed=${TEST_BENCHMARK_SEED}, names=${TEST_BENCHMARKS}, suite=${TEST_BENCHMARK_SUITE:-legacy}

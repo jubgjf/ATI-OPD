@@ -77,6 +77,7 @@ extras_require = {
     "sglang": SGLANG_REQUIRES,
     "trl": TRL_REQUIRES,
     "mcore": MCORE_REQUIRES,
+    "swanlab": ["swanlab>=0.10.3", "huggingface_hub", "matplotlib"],
     "trtllm": TRTLLM_REQUIRES,
     "transferqueue": TRANSFERQUEUE_REQUIRES,
 }

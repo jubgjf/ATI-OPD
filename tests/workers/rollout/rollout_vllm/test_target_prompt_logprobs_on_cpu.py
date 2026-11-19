@@ -33,7 +33,9 @@ def _load_target_prompt_logprobs_module():
 
 _TARGET_MODULE = _load_target_prompt_logprobs_module()
 VERL_TARGET_PROMPT_TOKEN_IDS_KEY = _TARGET_MODULE.VERL_TARGET_PROMPT_TOKEN_IDS_KEY
+VERL_TEACHER_PROMPT_TOPK_KEY = _TARGET_MODULE.VERL_TEACHER_PROMPT_TOPK_KEY
 _build_target_logprob_rows = _TARGET_MODULE._build_target_logprob_rows
+extract_fused_target_prompt_logprobs = _TARGET_MODULE.extract_fused_target_prompt_logprobs
 patch_vllm_model_runner_target_prompt_logprobs = _TARGET_MODULE.patch_vllm_model_runner_target_prompt_logprobs
 _sync_model_runner_device = _TARGET_MODULE._sync_model_runner_device
 _validate_completed_token_ids = _TARGET_MODULE._validate_completed_token_ids
@@ -187,6 +189,49 @@ def test_vllm_target_prompt_patch_accumulates_chunked_prefill_on_cpu():
     torch.testing.assert_close(output.logprobs[:, 1:], expected_logprobs)
     torch.testing.assert_close(output.selected_token_ranks, torch.tensor([3, 3, 3], dtype=torch.int32))
     assert runner._verl_target_prompt_token_ids_tensors == {}
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_fused_prompt_scores_survive_overlaps_and_vllm_serialization_on_cpu(chunked):
+    runner, target_ids = _target_runner()
+    request = runner.requests["target"]
+    request.sampling_params.extra_args[VERL_TEACHER_PROMPT_TOPK_KEY] = 2
+    runner.input_batch.num_prompt_logprobs["target"] = 4
+    patch_vllm_model_runner_target_prompt_logprobs(runner, logprobs_tensors_cls=_FakeLogprobsTensors, vocab_size=5)
+    logits = torch.tensor([[0.2, 2.0, -0.5, 0.1, 1.1], [1.0, -0.5, 0.3, 0.1, 2.0], [-0.2, 0.4, 0.5, 1.4, 0.0]])
+    if chunked:
+        assert runner._get_prompt_logprobs_dict(logits[:2], {"target": 2}) == {}
+        request.num_computed_tokens = 2
+        output = runner._get_prompt_logprobs_dict(logits[2:], {"target": 2})["target"]
+    else:
+        output = runner._get_prompt_logprobs_dict(logits, {"target": 4})["target"]
+    rows = [None]
+    for ids, scores, sampled_rank in zip(
+        output.logprob_token_ids.tolist(), output.logprobs.tolist(), output.selected_token_ranks.tolist(), strict=True
+    ):
+        rows.append(
+            {
+                token_id: SimpleNamespace(logprob=score, rank=rank)
+                for token_id, score, rank in zip(ids, scores, [sampled_rank, 1, 2, 3, 4], strict=True)
+            }
+        )
+    decoded = extract_fused_target_prompt_logprobs(
+        SimpleNamespace(prompt_token_ids=request.prompt_token_ids, prompt_logprobs=rows),
+        target_ids=target_ids,
+        teacher_topk=2,
+    )
+    logprobs = torch.log_softmax(logits, dim=-1)
+    topk_logprobs, topk_ids = logprobs.topk(2, dim=-1)
+    sampled_ids = torch.tensor(request.prompt_token_ids[1:]).unsqueeze(-1)
+    assert decoded["prompt_ids"][:-1] == target_ids[:-1]
+    assert decoded["teacher_topk_prompt_ids"][:-1] == topk_ids.tolist()
+    assert decoded["sampled_prompt_ids"][:-1] == sampled_ids.tolist()
+    torch.testing.assert_close(
+        torch.tensor(decoded["prompt_logprobs"][:-1]), logprobs.gather(1, torch.tensor(target_ids[:-1]))
+    )
+    torch.testing.assert_close(torch.tensor(decoded["teacher_topk_prompt_logprobs"][:-1]), topk_logprobs)
+    torch.testing.assert_close(torch.tensor(decoded["sampled_prompt_logprobs"][:-1]), logprobs.gather(1, sampled_ids))
+    assert decoded["prompt_logprobs"][-1] == decoded["teacher_topk_prompt_logprobs"][-1] == [0.0, 0.0]
 
 
 def test_vllm_target_prompt_patch_rejects_prefix_cache_hits_on_cpu():

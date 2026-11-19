@@ -74,6 +74,27 @@ def test_tracking_rejects_diagnostics_logged_to_a_different_step_on_cpu():
     assert backend.calls == []
 
 
+def test_swanlab_offline_uses_the_persistent_directory_without_login_on_cpu(monkeypatch, tmp_path):
+    calls = []
+    swanlab = ModuleType("swanlab")
+    swanlab.init = lambda **kwargs: calls.append(kwargs)
+    swanlab.login = lambda *_args: pytest.fail("offline tracking must not authenticate")
+    swanlab.finish = lambda: None
+    monkeypatch.setitem(sys.modules, "swanlab", swanlab)
+    monkeypatch.setenv("SWANLAB_MODE", "offline")
+    monkeypatch.setenv("SWANLAB_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("SWANLAB_API_KEY", "fixture")
+
+    tracking = Tracking(project_name="ATI-OPD", experiment_name="qwen3", default_backend=["swanlab"])
+    tracking.finish()
+
+    assert list(tracking.logger) == ["swanlab"]
+    assert len(calls) == 1
+    assert calls[0]["project"] == "ATI-OPD"
+    assert calls[0]["mode"] == "offline"
+    assert calls[0]["logdir"] == str(tmp_path)
+
+
 def test_validation_wandb_table_can_be_deferred_into_the_main_step_log_on_cpu(monkeypatch):
     logged = []
 

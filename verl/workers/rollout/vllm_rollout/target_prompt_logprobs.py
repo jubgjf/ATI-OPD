@@ -36,6 +36,7 @@ import torch
 from verl.utils.device import get_torch_device
 
 VERL_TARGET_PROMPT_TOKEN_IDS_KEY = "verl_target_prompt_token_ids"
+VERL_TEACHER_PROMPT_TOPK_KEY = "verl_teacher_prompt_topk"
 _PATCHED_ATTRIBUTE = "_verl_target_prompt_logprobs_patched"
 
 
@@ -44,6 +45,7 @@ def _build_target_logprob_rows(
     normalized_logprobs: torch.Tensor,
     target_token_ids: torch.Tensor,
     sampled_token_ids: torch.Tensor,
+    teacher_topk: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build vLLM ``LogprobsTensors`` rows for exact target token ids.
 
@@ -53,11 +55,10 @@ def _build_target_logprob_rows(
     ``selected_token_ranks`` tensor is one-dimensional: it contains only the
     full-vocabulary rank of the actual prompt token.
 
-    We put the K per-position student targets in columns ``1..K`` and use
-    ``K + 1`` as a sentinel selected-token rank.  If the actual prompt token
-    is also a student target, vLLM's dict conversion overwrites the duplicate
-    column-zero entry with its synthetic rank in ``1..K``.  Otherwise the
-    sentinel keeps the extra actual-token entry outside the K target ranks.
+    Student candidates follow the prompt token. Optional teacher Top-K entries
+    come last, so vLLM's dict conversion preserves their ranks even when the
+    same ID appears in another block. The consumer looks up student candidates
+    and the prompt token by ID and recovers teacher ranks from the last block.
     """
     if normalized_logprobs.ndim != 2:
         raise ValueError(
@@ -81,21 +82,73 @@ def _build_target_logprob_rows(
     # or ``max().item()`` here: this function runs once per request per
     # chunk, and each scalar read would serialize the entire NPU stream.
     target_logprobs = normalized_logprobs.gather(dim=-1, index=target_token_ids)
-    target_width = target_token_ids.shape[-1]
     sampled_logprobs = normalized_logprobs.gather(dim=-1, index=sampled_token_ids.unsqueeze(-1))
+    ids = [sampled_token_ids.unsqueeze(-1), target_token_ids]
+    scores = [sampled_logprobs, target_logprobs]
+    if teacher_topk:
+        teacher_logprobs, teacher_ids = normalized_logprobs.topk(teacher_topk, dim=-1)
+        ids.append(teacher_ids)
+        scores.append(teacher_logprobs)
     # ``LogprobsTensors.empty_cpu`` stores token ids as int32.  Match that
     # dtype on device before the non-blocking D2H copy below.  In particular,
     # older torch-npu releases can expose an uninitialized CPU-side cast
     # result for a mixed-dtype ``int64 NPU -> int32 CPU`` asynchronous copy.
-    output_ids = torch.cat((sampled_token_ids.unsqueeze(-1), target_token_ids), dim=-1).to(torch.int32)
-    output_logprobs = torch.cat((sampled_logprobs, target_logprobs), dim=-1)
+    output_ids = torch.cat(ids, dim=-1).to(torch.int32)
+    output_logprobs = torch.cat(scores, dim=-1)
     selected_token_ranks = torch.full(
         (target_token_ids.shape[0],),
-        target_width + 1,
+        output_ids.shape[-1],
         dtype=torch.int32,
         device=target_token_ids.device,
     )
     return output_ids, output_logprobs, selected_token_ranks
+
+
+def extract_fused_target_prompt_logprobs(
+    output: Any, *, target_ids: list[list[int]], teacher_topk: int
+) -> dict[str, list]:
+    """Decode all three views of prompt scoring after vLLM deduplicates IDs."""
+    prompt_ids = output.prompt_token_ids
+    rows = output.prompt_logprobs
+    if prompt_ids is None or rows is None or len(prompt_ids) != len(rows) or len(rows) != len(target_ids):
+        raise RuntimeError("Fused teacher prompt scores must cover the entire token-ID prompt.")
+
+    target_width = len(target_ids[0])
+    exact_logprobs, sampled_logprobs, teacher_ids, teacher_logprobs = [], [], [], []
+    for position, (row, actual_id, candidates) in enumerate(
+        zip(rows[1:], prompt_ids[1:], target_ids[:-1], strict=True), start=1
+    ):
+        if not row:
+            raise RuntimeError(f"Fused teacher prompt logprobs are missing at position {position}.")
+        try:
+            sampled_logprobs.append([row[actual_id].logprob])
+            exact_logprobs.append([row[token_id].logprob for token_id in candidates])
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Fused teacher prompt score for token {exc} is missing at position {position}."
+            ) from exc
+
+        ranked_ids = [None] * teacher_topk
+        ranked_logprobs = [0.0] * teacher_topk
+        for token_id, score in row.items():
+            if score.rank is not None and target_width < score.rank <= target_width + teacher_topk:
+                column = score.rank - target_width - 1
+                ranked_ids[column] = int(token_id)
+                ranked_logprobs[column] = score.logprob
+        if None in ranked_ids:
+            raise RuntimeError(f"Fused teacher Top-{teacher_topk} ranks are incomplete at position {position}.")
+        teacher_ids.append(ranked_ids)
+        teacher_logprobs.append(ranked_logprobs)
+
+    # Row r predicts token r+1. Preserve the last dummy row of the legacy API.
+    return {
+        "prompt_ids": [*target_ids[:-1], [0] * target_width],
+        "prompt_logprobs": [*exact_logprobs, [0.0] * target_width],
+        "sampled_prompt_ids": [[token_id] for token_id in [*prompt_ids[1:], 0]],
+        "sampled_prompt_logprobs": [*sampled_logprobs, [0.0]],
+        "teacher_topk_prompt_ids": [*teacher_ids, [0] * teacher_topk],
+        "teacher_topk_prompt_logprobs": [*teacher_logprobs, [0.0] * teacher_topk],
+    }
 
 
 def _num_scheduled_tokens_by_request(scheduling_state: Any) -> dict[str, int]:
@@ -272,6 +325,8 @@ def patch_vllm_model_runner_target_prompt_logprobs(
             sampling_params = request.sampling_params
             extra_args = sampling_params.extra_args or {}
             target_rows = extra_args[VERL_TARGET_PROMPT_TOKEN_IDS_KEY]
+            teacher_topk = extra_args.get(VERL_TEACHER_PROMPT_TOPK_KEY, 0)
+            request_width = int(request_widths[request_id])
             target_tensor = target_tensor_cache.get(request_id)
             if target_tensor is None:
                 # Validate on CPU before the non-blocking device copy. Besides
@@ -289,11 +344,12 @@ def patch_vllm_model_runner_target_prompt_logprobs(
                         f"got target_rows={target_tensor_cpu.shape[0]}, prompt_len={len(prompt_token_ids_list)} "
                         f"for request {request_id!r}."
                     )
-                expected_width = int(request_widths[request_id])
+                expected_width = request_width - teacher_topk
                 if target_tensor_cpu.shape[1] != expected_width:
                     raise ValueError(
-                        "Target prompt token-id width must equal prompt_logprobs, "
-                        f"got target_width={target_tensor_cpu.shape[1]}, prompt_logprobs={expected_width} "
+                        "Target width plus teacher Top-K must equal prompt_logprobs, "
+                        f"got target_width={target_tensor_cpu.shape[1]}, teacher_topk={teacher_topk}, "
+                        f"prompt_logprobs={request_width} "
                         f"for request {request_id!r}."
                     )
 
@@ -315,7 +371,6 @@ def patch_vllm_model_runner_target_prompt_logprobs(
                 self.device, non_blocking=True
             )
             prompt_len = len(prompt_token_ids_list)
-            target_width = target_tensor.shape[-1]
             logprobs_tensors = in_progress.get(request_id)
             if not logprobs_tensors:
                 if request.num_computed_tokens > 0:
@@ -325,7 +380,7 @@ def patch_vllm_model_runner_target_prompt_logprobs(
                         "only_stu_rethinking_style teacher. "
                         f"request={request_id!r}, cached_prefix_tokens={request.num_computed_tokens}."
                     )
-                logprobs_tensors = logprobs_tensors_cls.empty_cpu(prompt_len - 1, target_width + 1)
+                logprobs_tensors = logprobs_tensors_cls.empty_cpu(prompt_len - 1, request_width + 1)
                 # vLLM allocates this buffer with ``torch.empty``.  A sentinel
                 # makes any scheduler/copy hole deterministic and lets the
                 # completion check reject it before tokenizer decoding.
@@ -355,6 +410,7 @@ def patch_vllm_model_runner_target_prompt_logprobs(
                 normalized_logprobs=normalized_logprobs,
                 target_token_ids=target_ids,
                 sampled_token_ids=sampled_ids,
+                teacher_topk=teacher_topk,
             )
 
             chunk = slice(start_index, start_index + num_logits)

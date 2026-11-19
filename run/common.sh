@@ -42,11 +42,6 @@ _check_resume_required() {
         return 0
     fi
 
-    if [[ -z "${WANDB_RUN_ID:-}" ]]; then
-        echo "RESUME_REQUIRED=True requires WANDB_RUN_ID to resume the same W&B run." >&2
-        return 1
-    fi
-
     local tracker_file="$default_local_dir/latest_checkpointed_iteration.txt"
     if [[ ! -f "$tracker_file" ]]; then
         echo "RESUME_REQUIRED=True but checkpoint tracker is missing: $tracker_file" >&2
@@ -60,86 +55,6 @@ _check_resume_required() {
         return 1
     fi
     echo "Resume preflight passed: $latest_ckpt"
-}
-
-_configure_wandb_storage() {
-    local training_dataset_dir=${1%/}
-    local training_workspace=${2%/}
-    local run_name=$3
-    local wandb_mode=$4
-    local portable_workspace=
-
-    if [[ "$wandb_mode" == "offline" || "$wandb_mode" == "dryrun" ]]; then
-        # Offline .wandb files retain absolute Artifact staging paths. Spell those paths as the
-        # jump host sees them, and expose the same spelling inside the NPU container via a symlink.
-        local portable_dataset_dir=${WANDB_PORTABLE_DATASET_DIR:-/home/ma-user/work/dataset/jnguan}
-        portable_dataset_dir=${portable_dataset_dir%/}
-        if [[ -z "${WANDB_DIR:-}" || -z "${WANDB_DATA_DIR:-}" ]]; then
-            if [[ "$portable_dataset_dir" != "$training_dataset_dir" ]]; then
-                if [[ -e "$portable_dataset_dir" || -L "$portable_dataset_dir" ]]; then
-                    if [[ ! "$portable_dataset_dir" -ef "$training_dataset_dir" ]]; then
-                        echo "WANDB_PORTABLE_DATASET_DIR exists but does not resolve to the NPU dataset mount:" >&2
-                        echo "  portable=$portable_dataset_dir" >&2
-                        echo "  npu=$training_dataset_dir" >&2
-                        return 1
-                    fi
-                else
-                    portable_parent=$(dirname -- "$portable_dataset_dir")
-                    sudo mkdir -p "$portable_parent"
-                    if ! sudo ln -s "$training_dataset_dir" "$portable_dataset_dir"; then
-                        if [[ ! "$portable_dataset_dir" -ef "$training_dataset_dir" ]]; then
-                            echo "Failed to create a portable W&B path for the NPU dataset mount:" >&2
-                            echo "  portable=$portable_dataset_dir" >&2
-                            echo "  npu=$training_dataset_dir" >&2
-                            return 1
-                        fi
-                    fi
-                fi
-            fi
-            case "$training_workspace" in
-                "$training_dataset_dir"/*)
-                    portable_workspace="$portable_dataset_dir/${training_workspace#"$training_dataset_dir"/}"
-                    ;;
-                *)
-                    echo "Training workspace must be below the dataset mount for portable offline W&B storage:" >&2
-                    echo "  workspace=$training_workspace" >&2
-                    echo "  dataset_mount=$training_dataset_dir" >&2
-                    return 1
-                    ;;
-            esac
-        fi
-        WANDB_DIR=${WANDB_DIR:-$portable_workspace/wandb_logs}
-        WANDB_DATA_DIR=${WANDB_DATA_DIR:-$portable_workspace/wandb_logs/wandb-data/$run_name}
-    else
-        WANDB_DIR=${WANDB_DIR:-$training_workspace/wandb_logs}
-        WANDB_DATA_DIR=${WANDB_DATA_DIR:-$training_workspace/wandb_logs/wandb-data/$run_name}
-    fi
-    WANDB_CACHE_DIR=${WANDB_CACHE_DIR:-${WANDB_DIR%/}/wandb-cache/$run_name}
-
-    case "$WANDB_DIR" in
-        /*) ;;
-        *)
-            echo "WANDB_DIR must be an absolute path, got: $WANDB_DIR" >&2
-            return 1
-            ;;
-    esac
-    case "$WANDB_DATA_DIR" in
-        /*) ;;
-        *)
-            echo "WANDB_DATA_DIR must be an absolute path, got: $WANDB_DATA_DIR" >&2
-            return 1
-            ;;
-    esac
-    case "$WANDB_CACHE_DIR" in
-        /*) ;;
-        *)
-            echo "WANDB_CACHE_DIR must be an absolute path, got: $WANDB_CACHE_DIR" >&2
-            return 1
-            ;;
-    esac
-
-    mkdir -p "$WANDB_DIR" "$WANDB_DATA_DIR" "$WANDB_CACHE_DIR"
-    export WANDB_DIR WANDB_DATA_DIR WANDB_CACHE_DIR
 }
 
 _configure_in_training_evaluation() {
@@ -283,7 +198,11 @@ run_npu_opd_job() {
     conda activate verl
 
     cd "$WORKSPACE"
-    pip install -e .
+    python3 -m pip config set global.index-url http://repo.myhuaweicloud.com/repository/pypi/simple/ || exit 1
+    python3 -m pip config set global.trusted-host repo.myhuaweicloud.com || exit 1
+    python3 -m pip config set global.timeout 120 || exit 1
+    python3 -m pip install swanlab==0.10.3 || exit 1
+    python3 -m pip install -e . matplotlib || exit 1
     echo ============================
 
     export NODE_RANK=${NODE_RANK:-${VC_TASK_INDEX:-0}}
@@ -529,12 +448,11 @@ run_npu_opd_job() {
     enable_gradient_checkpointing=${ENABLE_GRADIENT_CHECKPOINTING:-True}
     rollout_name=${ROLLOUT_NAME:-vllm}
     reward_manager_name=${REWARD_MANAGER_NAME:-naive}
-    trainer_logger=${TRAINER_LOGGER:-'["console","wandb"]'}
+    trainer_logger=${TRAINER_LOGGER:-'["console","swanlab"]'}
     trainer_device=${TRAINER_DEVICE:-npu}
     _configure_in_training_evaluation || exit 1
     distillation_enabled=${DISTILLATION_ENABLED:-True}
-
-    project_name=${PROJECT_NAME:-DMPD}
+    project_name=${PROJECT_NAME:-ATI-OPD}
     experiment_timestamp=${EXPERIMENT_TIMESTAMP:-$(date +"%Y%m%d-%H%M%S")}
     experiment_base_name=${EXPERIMENT_NAME:-${DEFAULT_EXPERIMENT_NAME:-opd}}
     experiment_name=${EXPERIMENT_FULL_NAME:-"${experiment_base_name}-${experiment_timestamp}"}
@@ -546,8 +464,6 @@ run_npu_opd_job() {
     metric_logging_live_key_warning_threshold=${METRIC_LOGGING_LIVE_KEY_WARNING_THRESHOLD:-250}
     metric_logging_archive_enabled=${METRIC_LOGGING_ARCHIVE_ENABLED:-True}
     metric_logging_archive_local_dir=${METRIC_LOGGING_ARCHIVE_LOCAL_DIR:-null}
-    metric_logging_archive_upload_to_wandb=${METRIC_LOGGING_ARCHIVE_UPLOAD_TO_WANDB:-auto}
-    metric_logging_archive_finish_timeout_seconds=${METRIC_LOGGING_ARCHIVE_FINISH_TIMEOUT_SECONDS:-60}
     metric_logging_archive_shard_interval_steps=${METRIC_LOGGING_ARCHIVE_SHARD_INTERVAL_STEPS:-}
     if [[ -z "$metric_logging_archive_shard_interval_steps" ]]; then
         if [[ "$save_freq" =~ ^[1-9][0-9]*$ ]]; then
@@ -564,32 +480,22 @@ run_npu_opd_job() {
     log_test_generations=${LOG_TEST_GENERATIONS:-0}
     resume_required=${RESUME_REQUIRED:-False}
 
-    export WANDB_MODE=${WANDB_MODE:-offline}
-    export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
-    _configure_wandb_storage "$DATASET_DIR" "$WORKSPACE" "$experiment_name" "$WANDB_MODE" || exit 1
     case "$resume_required" in
-        True)
-            if [[ "$WANDB_MODE" == "offline" || "$WANDB_MODE" == "disabled" ]]; then
-                unset WANDB_RESUME
-            else
-                export WANDB_RESUME=must
-            fi
-            ;;
-        False) unset WANDB_RESUME ;;
+        True | False) ;;
         *)
             echo "RESUME_REQUIRED must be True or False, got: $resume_required" >&2
             exit 1
             ;;
     esac
+    export SWANLAB_MODE=${SWANLAB_MODE:-offline}
+    export SWANLAB_LOG_DIR=${SWANLAB_LOG_DIR:-$default_local_dir/swanlog}
 
-    echo "Metric logging: mode=$metric_logging_mode, archive=$metric_logging_archive_enabled, shard_interval=$metric_logging_archive_shard_interval_steps, upload=$metric_logging_archive_upload_to_wandb"
+    echo "Metric logging: logger=$trainer_logger, swanlab_mode=$SWANLAB_MODE, log_dir=$SWANLAB_LOG_DIR, archive=$metric_logging_archive_enabled, shard_interval=$metric_logging_archive_shard_interval_steps"
     echo "In-training evaluation: enabled=$in_train_evaluation, val_before=$val_before_train, test_before=$test_before_train, teacher_val_before=$teacher_val_before_train, val_freq=$test_freq, benchmark_freq=$test_benchmarks_freq"
     echo "Sequence lengths: prompt=$max_prompt_length, response=$max_response_length, rollout_model=$rollout_max_model_len, teacher_model=$teacher_max_model_len"
     echo "Chat template: source=$CHAT_TEMPLATE_MODEL, enable_thinking=$enable_thinking"
     echo "Tool style: enabled=$enable_tool_call, sod=$sod_style, function=${function_tool_path:-null}, system_prompt=${tool_system_prompt_path:-null}, user_suffix=${tool_user_prompt_suffix_path:-null}"
     echo "Benchmarks: seed=$test_benchmark_seed, names=$test_benchmarks, suite=${test_benchmark_suite:-legacy}"
-    echo "W&B resume: mode=$WANDB_MODE, required=$resume_required, run_id=${WANDB_RUN_ID:-unset}, resume=${WANDB_RESUME:-unset}"
-    echo "W&B storage: run_root=$WANDB_DIR, upload_staging_root=$WANDB_DATA_DIR, cache_root=$WANDB_CACHE_DIR"
 
     if [[ "$enable_tool_call" == "True" ]]; then
         local turn_limit
@@ -803,6 +709,7 @@ _submit_npu_verl_job() {
         "actor_rollout_ref.rollout.temperature=${rollout_temperature}"
         "actor_rollout_ref.rollout.top_p=${rollout_top_p}"
         "actor_rollout_ref.rollout.top_k=${rollout_top_k}"
+        "actor_rollout_ref.rollout.stop_token_ids=${ROLLOUT_STOP_TOKEN_IDS:-[]}"
         "actor_rollout_ref.rollout.do_sample=${rollout_do_sample}"
         "actor_rollout_ref.rollout.max_model_len=${rollout_max_model_len}"
         "actor_rollout_ref.rollout.max_num_batched_tokens=${rollout_max_num_batched_tokens}"
@@ -838,8 +745,6 @@ _submit_npu_verl_job() {
         "trainer.metric_logging.archive.enabled=${metric_logging_archive_enabled}"
         "trainer.metric_logging.archive.local_dir=${metric_logging_archive_local_dir}"
         "trainer.metric_logging.archive.shard_interval_steps=${metric_logging_archive_shard_interval_steps}"
-        "trainer.metric_logging.archive.upload_to_wandb=${metric_logging_archive_upload_to_wandb}"
-        "trainer.metric_logging.archive.finish_timeout_seconds=${metric_logging_archive_finish_timeout_seconds}"
         "trainer.project_name=${project_name}"
         "trainer.experiment_name=${experiment_name}"
         "trainer.n_gpus_per_node=${STUDENT_NGPUS_PER_NODE}"
@@ -899,7 +804,7 @@ _submit_npu_verl_job() {
         "distillation.diagnostics.async_metrics=${opd_diagnostics_async_metrics}"
         "distillation.diagnostics.heatmap_interval=${opd_diagnostics_heatmap_interval}"
         "distillation.diagnostics.heatmap_history_steps=${opd_diagnostics_heatmap_history_steps}"
-        "distillation.diagnostics.log_wandb_heatmap=${opd_diagnostics_log_heatmap}"
+        "distillation.diagnostics.archive_heatmaps=${opd_diagnostics_log_heatmap}"
         "distillation.diagnostics.high_gap_threshold=${opd_diagnostics_high_gap_threshold}"
         "distillation.diagnostics.collect_intervention_boundary_metrics=${opd_diagnostics_collect_intervention_boundary_metrics}"
         "distillation.diagnostics.intervention_boundary_text_samples_per_step=${opd_diagnostics_intervention_boundary_text_samples_per_step}"
@@ -935,61 +840,45 @@ _submit_npu_verl_job() {
     fi
 
     hydra_args+=("${METHOD_HYDRA_OVERRIDES[@]}")
+    local scoring_distillation=$distillation_enabled scoring_actor_loss=$distillation_use_actor_loss
+    local scoring_adv_estimator=$adv_estimator scoring_top_k_strategy=$top_k_strategy
+    local method_override fuse_final_teacher_scoring=False
+    for method_override in "${METHOD_HYDRA_OVERRIDES[@]}"; do
+        case "$method_override" in
+            distillation.enabled=*) scoring_distillation=${method_override#*=} ;;
+            distillation.use_actor_loss=*) scoring_actor_loss=${method_override#*=} ;;
+            algorithm.adv_estimator=*) scoring_adv_estimator=${method_override#*=} ;;
+            distillation.distillation_loss.top_k_strategy=*) scoring_top_k_strategy=${method_override#*=} ;;
+        esac
+    done
+    if [[ "$scoring_distillation" == [Tt][Rr][Uu][Ee] && "$scoring_actor_loss" == [Ff][Aa][Ll][Ss][Ee] &&
+        "$scoring_adv_estimator" == "token_reward_direct" && "$scoring_top_k_strategy" == "only_stu_rethinking_style" ]]; then
+        fuse_final_teacher_scoring=True
+    fi
+    hydra_args+=("distillation.fuse_final_teacher_scoring=${FUSE_FINAL_TEACHER_SCORING:-$fuse_final_teacher_scoring}")
     hydra_args+=("++data.apply_chat_template_kwargs.enable_thinking=${enable_thinking}")
 
     local runtime_env_json
-    if [[ -n "${WANDB_RUN_ID:-}" && -n "${WANDB_RESUME:-}" ]]; then
-        runtime_env_json='{
-            "working_dir": "./",
-            "excludes": ["/.git/"],
-            "env_vars": {
-                "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
-                "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-                "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
-                "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
-                "WANDB_MODE": "'"$WANDB_MODE"'",
-                "WANDB_DIR": "'"$WANDB_DIR"'",
-                "WANDB_DATA_DIR": "'"$WANDB_DATA_DIR"'",
-                "WANDB_RUN_ID": "'"$WANDB_RUN_ID"'",
-                "WANDB_RESUME": "'"$WANDB_RESUME"'",
-                "PYTHON_SANDBOX_URL": "'"$python_sandbox_url"'",
-                "PYTHON_SANDBOX_TIMEOUT": "'"${PYTHON_SANDBOX_TIMEOUT:-10}"'"
-            }
-        }'
-    elif [[ -n "${WANDB_RUN_ID:-}" ]]; then
-        runtime_env_json='{
-            "working_dir": "./",
-            "excludes": ["/.git/"],
-            "env_vars": {
-                "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
-                "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-                "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
-                "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
-                "WANDB_MODE": "'"$WANDB_MODE"'",
-                "WANDB_DIR": "'"$WANDB_DIR"'",
-                "WANDB_DATA_DIR": "'"$WANDB_DATA_DIR"'",
-                "WANDB_RUN_ID": "'"$WANDB_RUN_ID"'",
-                "PYTHON_SANDBOX_URL": "'"$python_sandbox_url"'",
-                "PYTHON_SANDBOX_TIMEOUT": "'"${PYTHON_SANDBOX_TIMEOUT:-10}"'"
-            }
-        }'
-    else
-        runtime_env_json='{
-            "working_dir": "./",
-            "excludes": ["/.git/"],
-            "env_vars": {
-                "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
-                "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-                "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
-                "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
-                "WANDB_MODE": "'"$WANDB_MODE"'",
-                "WANDB_DIR": "'"$WANDB_DIR"'",
-                "WANDB_DATA_DIR": "'"$WANDB_DATA_DIR"'",
-                "PYTHON_SANDBOX_URL": "'"$python_sandbox_url"'",
-                "PYTHON_SANDBOX_TIMEOUT": "'"${PYTHON_SANDBOX_TIMEOUT:-10}"'"
-            }
-        }'
-    fi
+    runtime_env_json=$(python3 - "$python_sandbox_url" "${PYTHON_SANDBOX_TIMEOUT:-10}" <<'PYTHON'
+import json
+import os
+import sys
+
+env_vars = {
+    "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
+    "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
+    "PYTHON_SANDBOX_URL": sys.argv[1],
+    "PYTHON_SANDBOX_TIMEOUT": sys.argv[2],
+}
+for key in ("SWANLAB_MODE", "SWANLAB_LOG_DIR", "SWANLAB_WORKSPACE"):
+    if os.environ.get(key):
+        env_vars[key] = os.environ[key]
+
+print(json.dumps({"working_dir": "./", "excludes": ["/.git/"], "env_vars": env_vars}))
+PYTHON
+    ) || return 1
 
     ray job submit \
         --address="http://127.0.0.1:$DASHBOARD_PORT" \

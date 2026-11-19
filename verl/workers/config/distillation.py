@@ -16,7 +16,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 from verl.utils.config import omega_conf_to_dataclass
@@ -37,6 +37,26 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 RETHINKING_TARGET_PROMPT_LOGPROBS_CONFIG_KEY = "_verl_enable_target_prompt_logprobs"
+
+
+def teacher_prompt_logprobs(distillation_config: Any, adv_estimator: Any) -> int:
+    """Width of ordinary teacher prompt scores, excluding exact student candidates."""
+    loss = getattr(distillation_config, "distillation_loss", None)
+    diagnostics = getattr(distillation_config, "diagnostics", None)
+    width = int(loss.topk) if getattr(getattr(loss, "loss_settings", None), "use_topk", False) else 0
+    strategy = getattr(loss, "top_k_strategy", "only_stu")
+    if loss is not None and str(getattr(adv_estimator, "value", adv_estimator)) == "token_reward_direct":
+        if strategy == "only_stu_teacher_topk":
+            width = max(width, int(loss.teacher_topk or 0))
+        elif strategy == "only_stu":
+            width = max(width, int(loss.topk or 0))
+    if getattr(diagnostics, "collect_topk_overlap", False) or getattr(
+        diagnostics, "collect_rethinking_opd_metrics", False
+    ):
+        width = max(width, int(getattr(diagnostics, "topk", 64) or 64))
+    if getattr(diagnostics, "collect_source_position_metrics", False):
+        width = max(width, 16)
+    return width
 
 
 @dataclass
@@ -528,6 +548,7 @@ class DistillationDiagnosticsConfig(BaseConfig):
     heatmap_interval: int = 10
     heatmap_history_steps: int = 80
     log_wandb_heatmap: bool = True
+    archive_heatmaps: bool = False
     high_gap_threshold: float = 1.0
     collect_intervention_metrics: bool = True
     collect_intervention_boundary_metrics: bool = False
@@ -754,6 +775,7 @@ class DistillationConfig(BaseConfig):
 
     enabled: bool = False
     use_actor_loss: bool = True
+    fuse_final_teacher_scoring: bool = False
     n_gpus_per_node: int = 0
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
@@ -763,6 +785,15 @@ class DistillationConfig(BaseConfig):
     diagnostics: DistillationDiagnosticsConfig = field(default_factory=DistillationDiagnosticsConfig)
 
     def __post_init__(self):
+        if self.fuse_final_teacher_scoring and (
+            not self.enabled
+            or self.use_actor_loss
+            or self.distillation_loss.top_k_strategy != "only_stu_rethinking_style"
+        ):
+            raise ValueError(
+                "distillation.fuse_final_teacher_scoring requires enabled distillation, use_actor_loss=false, "
+                "and top_k_strategy='only_stu_rethinking_style'."
+            )
         if not self.enabled:
             return
 
@@ -779,7 +810,18 @@ class DistillationConfig(BaseConfig):
             logprob_topk = max(int(logprob_topk or 0), int(self.diagnostics.topk))
         if self.diagnostics.collect_source_position_metrics:
             logprob_topk = max(int(logprob_topk or 0), 16)
+        if self.fuse_final_teacher_scoring:
+            target_width = int(self.distillation_loss.topk or 0)
+            if target_width <= 0:
+                raise ValueError("Fused teacher scoring requires distillation_loss.topk > 0.")
+            if self.diagnostics.enabled and self.diagnostics.collect_rethinking_opd_metrics:
+                target_width = max(target_width, int(self.diagnostics.topk))
+            logprob_topk = max(
+                int(logprob_topk or 0), target_width + teacher_prompt_logprobs(self, "token_reward_direct")
+            )
         for teacher_model in self.teacher_models.values():
+            if self.fuse_final_teacher_scoring and str(teacher_model.inference.name).lower() != "vllm":
+                raise ValueError("distillation.fuse_final_teacher_scoring requires vLLM teachers.")
             teacher_model.validate_and_prepare_for_distillation(
                 use_topk=logprob_topk is not None and logprob_topk > 0,
                 topk=logprob_topk,

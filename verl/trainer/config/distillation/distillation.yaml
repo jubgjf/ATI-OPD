@@ -17,6 +17,9 @@ enabled: false
 # ADV_ESTIMATOR=token_reward_direct, where distillation enters as token rewards.
 use_actor_loss: true
 
+# Return exact student candidates and teacher diagnostics from one final-trajectory forward.
+fuse_final_teacher_scoring: false
+
 # distillation loss config
 distillation_loss:
 
@@ -213,6 +216,7 @@ diagnostics:
   heatmap_interval: 10
   heatmap_history_steps: 80
   log_wandb_heatmap: true
+  archive_heatmaps: false
   high_gap_threshold: 1.0
   collect_intervention_metrics: true
   # Collect repair-boundary diagnostics exclusively from tensors and scoring

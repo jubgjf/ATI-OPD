@@ -46,6 +46,7 @@ class TeacherLogprobScoringResult:
     nonfinite_count: int = 0
     nonfinite_sequence_positions: list[int] | None = None
     replacement_value: float = DEFAULT_NONFINITE_LOGPROB_REPLACEMENT
+    ordinary_scores: Optional["TeacherLogprobScoringResult"] = None
 
     def __iter__(self) -> Iterator[torch.Tensor]:
         # Backward-compatible unpacking for older call sites/tests that expect (ids, logprobs).
@@ -396,6 +397,7 @@ class AsyncTeacherLLMServerManager:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
         request_id: Optional[str] = None,
+        teacher_prompt_topk: Optional[int] = None,
     ) -> TeacherLogprobScoringResult:
         """Score a different fixed token-id set at every sequence position.
 
@@ -404,6 +406,9 @@ class AsyncTeacherLLMServerManager:
         candidates for output prompt-logprob row ``row``; the final row is a
         contract-preserving dummy because no prompt token follows the final
         hidden state.
+
+        If teacher_prompt_topk is set, also return the ordinary scoring view
+        from this pass. A value of zero requests only the sampled prompt scores.
         """
         if not sequence_ids:
             raise ValueError("compute_teacher_logprobs_for_target_ids_single received an empty sequence.")
@@ -435,7 +440,7 @@ class AsyncTeacherLLMServerManager:
         sampling_params = _get_teacher_sampling_params(
             teacher_model_config,
             self.distillation_loss_config,
-            prompt_logprobs=target_width,
+            prompt_logprobs=target_width + (teacher_prompt_topk or 0),
         )
         teacher_output = await client.generate(
             request_id=resolved_request_id,
@@ -447,6 +452,7 @@ class AsyncTeacherLLMServerManager:
             audio_data=multi_modal_data.get("audios"),
             mm_processor_kwargs=mm_processor_kwargs,
             target_prompt_token_ids=target_ids,
+            **({"teacher_prompt_topk": teacher_prompt_topk} if teacher_prompt_topk else {}),
         )
         extra_fields = teacher_output.extra_fields or {}
         missing_keys = {"prompt_ids", "prompt_logprobs"} - set(extra_fields)
@@ -512,6 +518,7 @@ class AsyncTeacherLLMServerManager:
             teacher_logprobs,
             replacement=replacement_value,
         )
+        sampled_nonfinite_positions = []
         if sampled_teacher_logprobs is not None:
             sampled_teacher_logprobs, sampled_nonfinite_positions = _sanitize_nonfinite_teacher_logprobs(
                 sampled_teacher_logprobs,
@@ -524,6 +531,39 @@ class AsyncTeacherLLMServerManager:
                 f"teacher={teacher_key!r}, request_id={resolved_request_id!r}, "
                 f"max_logprob={teacher_logprobs.max().item():.6f}."
             )
+        ordinary_scores = None
+        if teacher_prompt_topk is not None:
+            expected_sampled_ids = torch.tensor(sequence_ids[1:], dtype=torch.int32)
+            if sampled_teacher_ids is None or not torch.equal(sampled_teacher_ids[:-1, 0], expected_sampled_ids):
+                raise RuntimeError(
+                    f"Fused teacher sampled scores are missing or misaligned for {resolved_request_id!r}."
+                )
+            ordinary_ids, ordinary_logprobs = sampled_teacher_ids, sampled_teacher_logprobs
+            ordinary_nonfinite_positions = sampled_nonfinite_positions
+            if teacher_prompt_topk:
+                ordinary_ids = torch.as_tensor(extra_fields.get("teacher_topk_prompt_ids", []), dtype=torch.int32)
+                ordinary_logprobs = torch.as_tensor(extra_fields.get("teacher_topk_prompt_logprobs", []))
+                expected_shape = (len(sequence_ids), teacher_prompt_topk)
+                if ordinary_ids.shape != expected_shape or ordinary_logprobs.shape != expected_shape:
+                    raise RuntimeError(
+                        f"Fused teacher Top-K requires paired fields with shape {expected_shape} "
+                        f"for request {resolved_request_id!r}."
+                    )
+                ordinary_logprobs, topk_nonfinite_positions = _sanitize_nonfinite_teacher_logprobs(
+                    ordinary_logprobs, replacement=replacement_value
+                )
+                ordinary_nonfinite_positions = sorted(set(sampled_nonfinite_positions) | set(topk_nonfinite_positions))
+            if ordinary_logprobs.max().item() > 1e-6 or sampled_teacher_logprobs.max().item() > 1e-6:
+                raise RuntimeError(f"Fused teacher scoring returned positive logprobs for {resolved_request_id!r}.")
+            ordinary_scores = TeacherLogprobScoringResult(
+                ids=ordinary_ids,
+                logprobs=ordinary_logprobs,
+                sampled_ids=sampled_teacher_ids,
+                sampled_logprobs=sampled_teacher_logprobs,
+                nonfinite_count=len(ordinary_nonfinite_positions),
+                nonfinite_sequence_positions=ordinary_nonfinite_positions,
+                replacement_value=replacement_value,
+            )
         return TeacherLogprobScoringResult(
             ids=teacher_ids,
             logprobs=teacher_logprobs,
@@ -532,6 +572,7 @@ class AsyncTeacherLLMServerManager:
             nonfinite_count=len(nonfinite_sequence_positions),
             nonfinite_sequence_positions=nonfinite_sequence_positions,
             replacement_value=replacement_value,
+            ordinary_scores=ordinary_scores,
         )
 
     async def generate_teacher_segment_single(

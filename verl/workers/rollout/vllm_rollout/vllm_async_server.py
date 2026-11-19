@@ -44,6 +44,11 @@ from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.request_usage import RequestTokenUsage
 from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
+from verl.workers.rollout.vllm_rollout.target_prompt_logprobs import (
+    VERL_TARGET_PROMPT_TOKEN_IDS_KEY,
+    VERL_TEACHER_PROMPT_TOPK_KEY,
+    extract_fused_target_prompt_logprobs,
+)
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -468,6 +473,7 @@ class vLLMHttpServer:
         priority: int = 0,
         target_prompt_token_ids: Optional[list[list[int]]] = None,
         collect_request_usage: bool = False,
+        teacher_prompt_topk: int = 0,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         prompt_ids = normalize_token_ids(prompt_ids)
@@ -503,11 +509,9 @@ class vLLMHttpServer:
         )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        if teacher_prompt_topk < 0 or (teacher_prompt_topk and target_prompt_token_ids is None):
+            raise ValueError("teacher_prompt_topk must be non-negative and requires target_prompt_token_ids.")
         if target_prompt_token_ids is not None:
-            from verl.workers.rollout.vllm_rollout.target_prompt_logprobs import (
-                VERL_TARGET_PROMPT_TOKEN_IDS_KEY,
-            )
-
             if len(target_prompt_token_ids) != len(prompt_ids):
                 raise ValueError(
                     "target_prompt_token_ids must contain one row per prompt token, "
@@ -520,10 +524,11 @@ class vLLMHttpServer:
                     f"got row widths={sorted(target_widths)}."
                 )
             target_width = next(iter(target_widths))
-            if sampling_params.get("prompt_logprobs") != target_width:
+            if sampling_params.get("prompt_logprobs") != target_width + teacher_prompt_topk:
                 raise ValueError(
-                    "Target prompt scoring requires prompt_logprobs to equal the target width, "
-                    f"got prompt_logprobs={sampling_params.get('prompt_logprobs')!r}, target_width={target_width}."
+                    "Target prompt scoring requires prompt_logprobs to equal the target width plus teacher Top-K, "
+                    f"got prompt_logprobs={sampling_params.get('prompt_logprobs')!r}, "
+                    f"target_width={target_width}, teacher_prompt_topk={teacher_prompt_topk}."
                 )
             if "extra_args" not in inspect.signature(SamplingParams).parameters:
                 raise RuntimeError(
@@ -531,11 +536,12 @@ class vLLMHttpServer:
                     "(vLLM >= 0.9). Upgrade the teacher inference backend or use the legacy only_stu strategy."
                 )
             extra_args = dict(sampling_params.get("extra_args") or {})
-            if VERL_TARGET_PROMPT_TOKEN_IDS_KEY in extra_args:
-                raise ValueError(
-                    f"sampling_params.extra_args already contains reserved key {VERL_TARGET_PROMPT_TOKEN_IDS_KEY!r}."
-                )
+            reserved = {VERL_TARGET_PROMPT_TOKEN_IDS_KEY, VERL_TEACHER_PROMPT_TOPK_KEY} & extra_args.keys()
+            if reserved:
+                raise ValueError(f"sampling_params.extra_args already contains reserved keys {sorted(reserved)}.")
             extra_args[VERL_TARGET_PROMPT_TOKEN_IDS_KEY] = target_prompt_token_ids
+            if teacher_prompt_topk:
+                extra_args[VERL_TEACHER_PROMPT_TOPK_KEY] = teacher_prompt_topk
             sampling_params["extra_args"] = extra_args
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
@@ -612,11 +618,20 @@ class vLLMHttpServer:
 
         finish_reason = final_res.outputs[0].finish_reason
         extra_fields = {"global_steps": self.global_steps, "finish_reason": finish_reason}
-        extract_prompt_logprobs(
-            output=final_res,
-            num_prompt_logprobs=sampling_params.prompt_logprobs,
-            result_dict=extra_fields,
-        )
+        if teacher_prompt_topk:
+            if list(final_res.prompt_token_ids or ()) != prompt_ids:
+                raise RuntimeError("Fused teacher scoring returned a different prompt token sequence.")
+            extra_fields.update(
+                extract_fused_target_prompt_logprobs(
+                    final_res, target_ids=target_prompt_token_ids, teacher_topk=teacher_prompt_topk
+                )
+            )
+        else:
+            extract_prompt_logprobs(
+                output=final_res,
+                num_prompt_logprobs=sampling_params.prompt_logprobs,
+                result_dict=extra_fields,
+            )
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:

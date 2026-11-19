@@ -97,7 +97,7 @@ def get_ppo_ray_runtime_env():
     for key in WANDB_RAY_ENV_PASSTHROUGH:
         if key not in job_env_vars and (value := os.environ.get(key)) is not None:
             runtime_env["env_vars"][key] = value
-    for key in TOOL_RAY_ENV_PASSTHROUGH:
+    for key in (*TOOL_RAY_ENV_PASSTHROUGH, "SWANLAB_MODE", "SWANLAB_LOG_DIR", "SWANLAB_WORKSPACE"):
         if key not in job_env_vars and (value := os.environ.get(key)) is not None:
             runtime_env["env_vars"][key] = value
     return runtime_env

@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -32,7 +34,7 @@ LAUNCHERS = {
 }
 
 
-def _run_submitted_method(tmp_path, method, seed, *, rank=0, method_env=None):
+def _run_submitted_method(tmp_path, method, seed, *, rank=0, method_env=None, train_config_extra=""):
     algorithm = tmp_path / "algorithm"
     wrapper = algorithm / "DMPD" / "run" / LAUNCHERS[method]
     wrapper.parent.mkdir(parents=True)
@@ -42,9 +44,10 @@ def _run_submitted_method(tmp_path, method, seed, *, rank=0, method_env=None):
         f"DATA_SHUFFLE=True\nDATA_SEED={seed}\n"
         "TOTAL_EPOCHS=1\nTOTAL_TRAINING_STEPS=217\nSAVE_FREQ=10\n"
         "OPD_DIAGNOSTICS_COLLECT_ROLLOUT_COSTS=True\nOPD_DIAGNOSTICS_COLLECT_SOURCE_POSITION=True\n"
-        "EXPERIMENT_TIMESTAMP=20261109-120000\nWANDB_MODE=disabled\n"
+        "EXPERIMENT_TIMESTAMP=20261109-120000\n"
         f"WORKSPACE={shlex.quote(str(tmp_path))}\nTMPDIR={shlex.quote(str(tmp_path / 'ray'))}\n"
         "CONFIG_LOADS=$(( ${CONFIG_LOADS:-0} + 1 ))\n"
+        f"{train_config_extra}"
     )
     # Run the real launcher through Ray submission with all hardware and
     # service commands stubbed. Shared-storage writes stay inside tmp_path.
@@ -61,7 +64,14 @@ conda() { unset LD_PRELOAD; }
 npu-smi() { :; }
 python() { :; }
 ls() { :; }
-pip() { :; }
+python3() {
+    if [[ "$1" == "-m" && "$2" == "pip" ]]; then
+        shift 2
+        printf 'PIP_COMMAND=%s\\n' "$*"
+        return 0
+    fi
+    command python3 "$@"
+}
 sleep() { :; }
 pkill() { :; }
 rm() { :; }
@@ -83,7 +93,12 @@ ray() {
             bash -c 'for key in TOTAL_TRAINING_STEPS "$@"; do
                 printf "DRIVER_ENV=%s=%s\\n" "$key" "${!key}"
             done' bash OPD_DIAGNOSTICS_COLLECT_ROLLOUT_COSTS OPD_DIAGNOSTICS_COLLECT_SOURCE_POSITION
-            while [[ "$#" -gt 0 && "$1" != "verl.trainer.main_ppo" ]]; do shift; done
+            while [[ "$#" -gt 0 && "$1" != "verl.trainer.main_ppo" ]]; do
+                if [[ "$1" == --runtime-env-json=* ]]; then
+                    printf 'RUNTIME_ENV=%s\\n' "${1#*=}"
+                fi
+                shift
+            done
             shift || return 1
             printf 'HYDRA_ARG=%s\n' "$@"
             ;;
@@ -96,7 +111,7 @@ ray() {
     return subprocess.run(
         ["bash", str(wrapper)],
         env={
-            "PATH": "/usr/bin:/bin",
+            "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
             "TRAIN_CONFIG_PATH": str(config),
             "BASH_ENV": str(bootstrap),
             "DATA_SEED": "99",
@@ -121,6 +136,15 @@ def test_opd_launcher_config_composes_without_accelerators(tmp_path, monkeypatch
     result = _run_submitted_method(tmp_path, method, seed)
     assert result.returncode == 0, result.stderr
     assert "CONFIG_LOADS=1" in result.stdout
+    assert [
+        line.removeprefix("PIP_COMMAND=") for line in result.stdout.splitlines() if line.startswith("PIP_COMMAND=")
+    ] == [
+        "config set global.index-url http://repo.myhuaweicloud.com/repository/pypi/simple/",
+        "config set global.trusted-host repo.myhuaweicloud.com",
+        "config set global.timeout 120",
+        "install swanlab==0.10.3",
+        "install -e . matplotlib",
+    ]
     overrides = [
         line.removeprefix("HYDRA_ARG=") for line in result.stdout.splitlines() if line.startswith("HYDRA_ARG=")
     ]
@@ -141,6 +165,17 @@ def test_opd_launcher_config_composes_without_accelerators(tmp_path, monkeypatch
         config = compose(config_name="ppo_trainer", overrides=overrides)
     validate_distillation_intervention_training_config(config)
     distillation = omega_conf_to_dataclass(config.distillation)
+    runtime = next(
+        line.removeprefix("RUNTIME_ENV=") for line in result.stdout.splitlines() if line.startswith("RUNTIME_ENV=")
+    )
+    env_vars = json.loads(runtime)["env_vars"]
+    assert env_vars["SWANLAB_MODE"] == "offline"
+    assert env_vars["SWANLAB_LOG_DIR"] == f"{config.trainer.default_local_dir}/swanlog"
+    assert not any(key.startswith("WANDB_") for key in env_vars)
+    assert list(config.trainer.logger) == ["console", "swanlab"]
+    assert config.trainer.project_name == "ATI-OPD"
+    assert distillation.fuse_final_teacher_scoring is (method != "relay")
+    assert distillation.diagnostics.archive_heatmaps
     assert config.data.shuffle and config.data.seed == seed
     assert config.trainer.total_training_steps == 217
     assert config.trainer.save_freq == 10
@@ -165,6 +200,7 @@ def test_opd_launcher_config_composes_without_accelerators(tmp_path, monkeypatch
     "method,setting,override",
     [
         ("ati", "TEACHER_INTERVENTION_GAP_THRESHOLD=0.23", "distillation.intervention.gap_threshold=0.23"),
+        ("opd", "FUSE_FINAL_TEACHER_SCORING=False", "distillation.fuse_final_teacher_scoring=False"),
         ("relay", "TEACHER_INTERVENTION_MAX_COUNT=1", "distillation.intervention.max_interventions_per_sample=1"),
         (
             "selection",
@@ -177,6 +213,37 @@ def test_method_accepts_inherited_environment_overrides(tmp_path, method, settin
     result = _run_submitted_method(tmp_path, method, 42, method_env=dict([setting.split("=", 1)]))
     assert result.returncode == 0, result.stderr
     assert f"HYDRA_ARG={override}" in result.stdout.splitlines()
+
+
+@pytest.mark.parametrize("method", ["opd", "ati"])
+def test_qwen3_launcher_composes_fused_teacher_scores_and_shared_stops(tmp_path, method):
+    result = _run_submitted_method(
+        tmp_path,
+        method,
+        42,
+        train_config_extra=(
+            'TEACHER_MODEL="$DATASET_DIR/models/Qwen/Qwen3-1.7B"\n'
+            'STUDENT_MODEL="$DATASET_DIR/models/Qwen/Qwen3-1.7B-Base"\n'
+            "ROLLOUT_STOP_TOKEN_IDS='[151643,151645]'\n"
+        ),
+    )
+    assert result.returncode == 0, result.stderr
+    overrides = [
+        line.removeprefix("HYDRA_ARG=") for line in result.stdout.splitlines() if line.startswith("HYDRA_ARG=")
+    ]
+    with initialize_config_dir(config_dir=str(ROOT / "verl" / "trainer" / "config"), version_base=None):
+        config = compose(config_name="ppo_trainer", overrides=overrides)
+    validate_distillation_intervention_training_config(config)
+    distillation = omega_conf_to_dataclass(config.distillation)
+    assert distillation.fuse_final_teacher_scoring
+    assert distillation.distillation_loss.topk == 16
+    (teacher,) = distillation.teacher_models.values()
+    assert teacher.inference.engine_kwargs["vllm"]["max_logprobs"] == 32
+    assert config.actor_rollout_ref.model.chat_template_from_model == teacher.model_path
+    assert teacher.model_path == "/opt/huawei/dataset/jnguan/models/Qwen/Qwen3-1.7B"
+    assert config.actor_rollout_ref.model.path == "/opt/huawei/dataset/jnguan/models/Qwen/Qwen3-1.7B-Base"
+    assert config.data.apply_chat_template_kwargs.enable_thinking is True
+    assert list(config.actor_rollout_ref.rollout.stop_token_ids) == [151643, 151645]
 
 
 def test_method_launches_as_ray_worker_on_nonzero_platform_rank(tmp_path):

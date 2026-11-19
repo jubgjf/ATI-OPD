@@ -68,6 +68,7 @@ from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
 from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.distillation.diagnostics import compute_rewrite_overlap_metrics
+from verl.trainer.distillation.teacher_target_scoring import DEFERRED_INTERVENTION_SCORE_KEY
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
@@ -89,6 +90,7 @@ from verl.workers.config import (
     HFModelConfig,
     RolloutConfig,
 )
+from verl.workers.config.distillation import teacher_prompt_logprobs
 from verl.workers.rollout.llm_server import LLMServerClient
 from verl.workers.rollout.request_usage import collect_request_usage
 
@@ -276,6 +278,17 @@ class _PruneFutureCalibrationSnapshot:
     source: str
     count: int
     version: int
+
+
+@dataclass(frozen=True)
+class DeferredFinalInterventionScore:
+    """Rollout inputs needed to finish a committed repair's scoring in the trainer."""
+
+    intervention_index: int
+    after_intervention_start: int
+    eligibility_mask: torch.Tensor
+    rollout_logprobs: torch.Tensor
+    calibration: _PruneFutureCalibrationSnapshot | None
 
 
 class _GlobalPruneFutureCalibration:
@@ -1172,20 +1185,27 @@ def _store_teacher_scoring_result(
     prompt_len: int,
     response_len: int,
 ) -> None:
-    nonfinite_positions = _response_relative_nonfinite_positions(
-        result,
-        prompt_len=prompt_len,
-        response_len=response_len,
-    )
     output.extra_fields["teacher_ids"] = result.ids
     output.extra_fields["teacher_logprobs"] = result.logprobs
     if result.sampled_ids is not None:
         output.extra_fields["teacher_sampled_ids"] = result.sampled_ids
     if result.sampled_logprobs is not None:
         output.extra_fields["teacher_sampled_logprobs"] = result.sampled_logprobs
-    output.extra_fields["teacher_logprob_nonfinite_count"] = len(nonfinite_positions)
-    output.extra_fields["teacher_logprob_nonfinite_positions"] = nonfinite_positions
-    output.extra_fields["teacher_logprob_nonfinite_replacement"] = result.replacement_value
+    output.extra_fields.update(teacher_scoring_metadata(result, prompt_len=prompt_len, response_len=response_len))
+
+
+def teacher_scoring_metadata(
+    result: TeacherLogprobScoringResult, *, prompt_len: int, response_len: int
+) -> dict[str, Any]:
+    """Report sanitized teacher positions relative to the unpadded response."""
+    nonfinite_positions = _response_relative_nonfinite_positions(
+        result, prompt_len=prompt_len, response_len=response_len
+    )
+    return {
+        "teacher_logprob_nonfinite_count": len(nonfinite_positions),
+        "teacher_logprob_nonfinite_positions": nonfinite_positions,
+        "teacher_logprob_nonfinite_replacement": result.replacement_value,
+    }
 
 
 def _select_intervention_segment(
@@ -1786,6 +1806,63 @@ def _mark_local_effect_unavailable(metadata: dict[str, Any], reason: str) -> Non
     metadata["local_effect_pair_available"] = False
     metadata.setdefault("local_effect_after_intervention_tokens", 0)
     metadata["local_effect_unavailable_reason"] = reason
+
+
+def finalize_deferred_intervention_score(
+    pending: DeferredFinalInterventionScore,
+    teacher_result: TeacherLogprobScoringResult,
+    interventions: list[dict[str, Any]],
+    intervention_config: DistillationInterventionConfig,
+    *,
+    prompt_len: int,
+    response_len: int,
+) -> None:
+    """Apply the final gap score to diagnostics and the adaptive cutoff after rollout."""
+    teacher_logprobs = _teacher_response_logprobs(
+        teacher_logprobs=_teacher_gap_logprobs(teacher_result), prompt_len=prompt_len, response_len=response_len
+    )
+    if pending.rollout_logprobs.shape != teacher_logprobs.shape or len(pending.eligibility_mask) != response_len:
+        raise RuntimeError("Deferred intervention scoring is not aligned with the final response.")
+    score_result = _compose_intervention_score(
+        student_logprobs=pending.rollout_logprobs,
+        teacher_logprobs=teacher_logprobs,
+        metric=intervention_config.gap_metric,
+        teacher_rejection_token_cap=intervention_config.teacher_rejection_token_cap,
+    )
+    nonfinite_positions = _response_relative_nonfinite_positions(
+        teacher_result, prompt_len=prompt_len, response_len=response_len
+    )
+    gap_mask = pending.eligibility_mask.int().tolist()
+    for position in nonfinite_positions:
+        gap_mask[position] = 0
+    for position, logprob in enumerate(teacher_logprobs.tolist()):
+        if logprob > 1e-6:
+            gap_mask[position] = 0
+
+    record = interventions[pending.intervention_index]
+    teacher_end = pending.after_intervention_start
+    if record["start"] + record["teacher_tokens"] != teacher_end:
+        raise RuntimeError("Deferred intervention scoring does not match the committed teacher segment.")
+    _finalize_local_effect_metadata(
+        metadata=record,
+        score_result=score_result,
+        response_mask=gap_mask,
+        after_intervention_start=teacher_end,
+        segment_length=intervention_config.student_segment_length,
+        gap_aggregation=intervention_config.gap_aggregation,
+        teacher_nonfinite_positions=nonfinite_positions,
+    )
+    if pending.calibration is not None:
+        record.update(
+            _compute_prune_future_horizon_metadata(
+                scores=score_result.active_scores,
+                eligibility_mask=gap_mask,
+                teacher_end=teacher_end,
+                intervention_config=intervention_config,
+                calibration=pending.calibration,
+                nonfinite_positions=nonfinite_positions,
+            )
+        )
 
 
 def _validate_intervention_state(
@@ -2442,33 +2519,14 @@ class AgentLoopWorker:
         return adjusted_start, adjusted_end
 
     def _teacher_prompt_logprobs(self) -> int:
-        distillation_config = getattr(self, "distillation_config", None)
-        loss_config = getattr(distillation_config, "distillation_loss", None)
-        loss_settings = getattr(loss_config, "loss_settings", None)
-        prompt_logprobs = 0
-        if loss_config is not None and getattr(loss_settings, "use_topk", False):
-            prompt_logprobs = max(prompt_logprobs, int(loss_config.topk))
-        config = getattr(self, "config", None)
-        algorithm_config = getattr(config, "algorithm", None)
-        adv_estimator = getattr(algorithm_config, "adv_estimator", "")
-        adv_estimator = getattr(adv_estimator, "value", adv_estimator)
-        top_k_strategy = getattr(loss_config, "top_k_strategy", "only_stu")
-        if (
-            loss_config is not None
-            and str(adv_estimator) == "token_reward_direct"
-            and top_k_strategy in {"only_stu", "only_stu_teacher_topk"}
-        ):
-            strategy_topk = loss_config.teacher_topk if top_k_strategy == "only_stu_teacher_topk" else loss_config.topk
-            prompt_logprobs = max(prompt_logprobs, int(strategy_topk or 0))
-        diagnostics_config = getattr(distillation_config, "diagnostics", None)
-        if diagnostics_config is not None and (
-            getattr(diagnostics_config, "collect_topk_overlap", False)
-            or getattr(diagnostics_config, "collect_rethinking_opd_metrics", False)
-        ):
-            prompt_logprobs = max(prompt_logprobs, int(getattr(diagnostics_config, "topk", 64) or 64))
-        if getattr(diagnostics_config, "collect_source_position_metrics", False):
-            prompt_logprobs = max(prompt_logprobs, 16)
-        return prompt_logprobs
+        algorithm = getattr(getattr(self, "config", None), "algorithm", None)
+        return teacher_prompt_logprobs(
+            getattr(self, "distillation_config", None), getattr(algorithm, "adv_estimator", "")
+        )
+
+    def _rollout_eos_token_ids(self) -> set[int]:
+        stop_ids = getattr(getattr(self, "rollout_config", None), "stop_token_ids", ())
+        return _tokenizer_eos_token_ids(self.tokenizer).union(stop_ids)
 
     def _intervention_prompt_logprobs(self) -> int:
         prompt_logprobs = AgentLoopWorker._teacher_prompt_logprobs(self)
@@ -2756,6 +2814,8 @@ class AgentLoopWorker:
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs or intervention_active or (selection_only and not validate),
         )
+        if getattr(config, "stop_token_ids", None):
+            sampling_params["stop_token_ids"] = list(config.stop_token_ids)
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
             params["top_p"] = 1.0
@@ -3763,7 +3823,7 @@ class AgentLoopWorker:
             return_exceptions=True,
         )
 
-        eos_token_ids = _tokenizer_eos_token_ids(self.tokenizer)
+        eos_token_ids = AgentLoopWorker._rollout_eos_token_ids(self)
         candidates: list[_TeacherRepairCandidate] = []
         generation_failures: dict[int, str] = {}
         for candidate_index, raw_result in enumerate(generation_results):
@@ -4114,7 +4174,7 @@ class AgentLoopWorker:
         suffix_ids, suffix_logprobs, eos_truncated = _truncate_generation_at_eos(
             suffix_ids,
             suffix_logprobs,
-            eos_token_ids=_tokenizer_eos_token_ids(self.tokenizer),
+            eos_token_ids=AgentLoopWorker._rollout_eos_token_ids(self),
         )
         nonfinite_logprob_offsets = tuple(offset for offset in nonfinite_logprob_offsets if offset < len(suffix_ids))
         if not nonfinite_logprob_offsets:
@@ -4162,7 +4222,7 @@ class AgentLoopWorker:
         budget = min(response_limit, int((sampling_params or {}).get("max_tokens", response_limit)))
         routing_key = self._teacher_routing_key(sample_kwargs)
         base_id = output.extra_fields.get("rollout_request_id") or uuid4().hex
-        eos_ids = _tokenizer_eos_token_ids(self.tokenizer)
+        eos_ids = AgentLoopWorker._rollout_eos_token_ids(self)
         committed: list[int] = []
 
         for attempt in range(config.max_interventions_per_sample):
@@ -4453,7 +4513,7 @@ class AgentLoopWorker:
         routing_key = self._teacher_routing_key(sample_kwargs)
         base_request_id = output.extra_fields.get("rollout_request_id") or uuid4().hex
         cached_teacher_result = None
-        eos_token_ids = _tokenizer_eos_token_ids(self.tokenizer)
+        eos_token_ids = AgentLoopWorker._rollout_eos_token_ids(self)
         pending_local_effect: Optional[tuple[dict[str, Any], int]] = None
         pending_future_gap: Optional[_PendingFutureGapConfirmation] = None
         stopped_after_correct_repair = False
@@ -4462,8 +4522,29 @@ class AgentLoopWorker:
         # suffix. This prevents a later repair from jumping backwards and
         # erasing an earlier teacher intervention and its tool observation.
         intervention_search_start = 0
+        defer_final_score = getattr(
+            getattr(self, "distillation_config", None), "fuse_final_teacher_scoring", False
+        ) and not _uses_intervention_distribution_gap(intervention_config.gap_metric)
 
         for attempt in range(intervention_config.max_interventions_per_sample + 1):
+            if (
+                defer_final_score
+                and pending_local_effect is not None
+                and pending_future_gap is None
+                and len(interventions) >= intervention_config.max_interventions_per_sample
+            ):
+                _, after_intervention_start = pending_local_effect
+                output.extra_fields[DEFERRED_INTERVENTION_SCORE_KEY] = DeferredFinalInterventionScore(
+                    intervention_index=len(interventions) - 1,
+                    after_intervention_start=after_intervention_start,
+                    eligibility_mask=torch.tensor(gap_mask, dtype=torch.bool),
+                    rollout_logprobs=torch.tensor(response_logprobs, dtype=torch.float32),
+                    calibration=(
+                        AgentLoopWorker._prune_future_calibration_state(self) if adaptive_future_prune else None
+                    ),
+                )
+                pending_local_effect = None
+                break
             teacher_result = await self._score_sequence_for_intervention(
                 request_id=f"{base_request_id}:teacher-score:{attempt}",
                 prompt_ids=prompt_ids,
@@ -5513,7 +5594,12 @@ class AgentLoopWorker:
             cached_teacher_result = pending_future_gap.raw_teacher_result
             pending_future_gap = None
 
-        if adaptive_future_prune and interventions and "prune_future_cutoff" not in interventions[0]:
+        if (
+            adaptive_future_prune
+            and interventions
+            and "prune_future_cutoff" not in interventions[0]
+            and DEFERRED_INTERVENTION_SCORE_KEY not in output.extra_fields
+        ):
             raise RuntimeError(
                 "Adaptive prune committed a teacher intervention without scoring the final repaired suffix."
             )
@@ -5601,6 +5687,21 @@ class AgentLoopWorker:
     ) -> None:
         """Compute teacher logprobs for single sample."""
         if self.distillation_enabled and not validate:
+            if getattr(getattr(self, "distillation_config", None), "fuse_final_teacher_scoring", False):
+                # All final scoring tensors are now assembled by the trainer
+                # after it has computed the student candidates.
+                output.extra_fields.setdefault(DEFERRED_INTERVENTION_SCORE_KEY, None)
+                for field in (
+                    "teacher_ids",
+                    "teacher_logprobs",
+                    "teacher_sampled_ids",
+                    "teacher_sampled_logprobs",
+                    "teacher_logprob_nonfinite_count",
+                    "teacher_logprob_nonfinite_positions",
+                    "teacher_logprob_nonfinite_replacement",
+                ):
+                    output.extra_fields.pop(field, None)
+                return
             prompt_logprobs = AgentLoopWorker._teacher_prompt_logprobs(self)
             expected_width = max(prompt_logprobs, 1)
             existing_ids = output.extra_fields.get("teacher_ids")
