@@ -413,6 +413,7 @@ run_npu_opd_job() {
     opd_diagnostics_enabled=${OPD_DIAGNOSTICS_ENABLED:-True}
     opd_diagnostics_collect_topk_overlap=${OPD_DIAGNOSTICS_COLLECT_TOPK_OVERLAP:-True}
     opd_diagnostics_collect_rethinking_opd=${OPD_DIAGNOSTICS_COLLECT_RETHINKING_OPD:-True}
+    opd_diagnostics_collect_rank_metrics=${OPD_DIAGNOSTICS_COLLECT_RANK_METRICS:-False}
     opd_diagnostics_collect_repetition=${OPD_DIAGNOSTICS_COLLECT_REPETITION:-True}
     opd_diagnostics_collect_train_text_zlib_repetition=${OPD_DIAGNOSTICS_COLLECT_TRAIN_TEXT_ZLIB_REPETITION:-True}
     opd_diagnostics_topk=${OPD_DIAGNOSTICS_TOPK:-16}
@@ -792,6 +793,7 @@ _submit_npu_verl_job() {
         "distillation.diagnostics.enabled=${opd_diagnostics_enabled}"
         "distillation.diagnostics.collect_topk_overlap=${opd_diagnostics_collect_topk_overlap}"
         "distillation.diagnostics.collect_rethinking_opd_metrics=${opd_diagnostics_collect_rethinking_opd}"
+        "distillation.diagnostics.collect_rank_metrics=${opd_diagnostics_collect_rank_metrics}"
         "distillation.diagnostics.collect_repetition_metrics=${opd_diagnostics_collect_repetition}"
         "distillation.diagnostics.collect_train_text_zlib_repetition=${opd_diagnostics_collect_train_text_zlib_repetition}"
         "distillation.diagnostics.topk=${opd_diagnostics_topk}"

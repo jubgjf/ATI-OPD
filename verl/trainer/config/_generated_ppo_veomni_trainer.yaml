@@ -894,6 +894,7 @@ distillation:
     outcome_case_samples_per_transition: 8
     collect_topk_overlap: false
     collect_rethinking_opd_metrics: false
+    collect_rank_metrics: ${oc.decode:${oc.env:OPD_DIAGNOSTICS_COLLECT_RANK_METRICS,false}}
     collect_rollout_costs: ${oc.decode:${oc.env:OPD_DIAGNOSTICS_COLLECT_ROLLOUT_COSTS,false}}
     collect_source_position_metrics: ${oc.decode:${oc.env:OPD_DIAGNOSTICS_COLLECT_SOURCE_POSITION,false}}
     collect_repetition_metrics: true

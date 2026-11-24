@@ -37,7 +37,7 @@ import random
 import time
 from abc import ABC, abstractmethod
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -4224,6 +4224,11 @@ class AgentLoopWorker:
         base_id = output.extra_fields.get("rollout_request_id") or uuid4().hex
         eos_ids = AgentLoopWorker._rollout_eos_token_ids(self)
         committed: list[int] = []
+        diagnostics = getattr(getattr(self, "distillation_config", None), "diagnostics", None)
+        collect_rank_metrics = bool(
+            getattr(diagnostics, "enabled", False) and getattr(diagnostics, "collect_rank_metrics", False)
+        )
+        teacher_score_width = max(1, AgentLoopWorker._teacher_prompt_logprobs(self)) if collect_rank_metrics else 1
 
         for attempt in range(config.max_interventions_per_sample):
             prefix = output.prompt_ids + committed
@@ -4234,7 +4239,7 @@ class AgentLoopWorker:
                     response_ids=candidate,
                     output=output,
                     routing_key=routing_key,
-                    prompt_logprobs=1,
+                    prompt_logprobs=teacher_score_width,
                 ),
                 self._score_student_sequence_for_intervention(
                     request_id=f"{base_id}:relay-student-score:{attempt}",
@@ -4245,7 +4250,11 @@ class AgentLoopWorker:
                 ),
             )
             trigger = first_reflection_trigger(
-                teacher=teacher,
+                # Additional diagnostic candidates must not enter Relay's
+                # top-1 trigger rule or require a separate final scoring call.
+                teacher=replace(teacher, ids=teacher.ids[:, :1], logprobs=teacher.logprobs[:, :1])
+                if collect_rank_metrics
+                else teacher,
                 student=student,
                 prefix_len=len(prefix),
                 candidate=candidate,
@@ -4257,7 +4266,11 @@ class AgentLoopWorker:
                 interventions[-1]["student_suffix_tokens"] = keep
                 interventions[-1]["student_suffix_finish_reason"] = finish_reason if trigger is None else None
             if trigger is None:
-                if AgentLoopWorker._teacher_prompt_logprobs(self) == 0:
+                if collect_rank_metrics:
+                    _store_teacher_scoring_result(
+                        output, teacher, prompt_len=len(output.prompt_ids), response_len=len(committed)
+                    )
+                elif AgentLoopWorker._teacher_prompt_logprobs(self) == 0:
                     # The scorer already returned the actual-token scores on
                     # exactly the final sequence as a separate field.
                     _store_teacher_scoring_result(

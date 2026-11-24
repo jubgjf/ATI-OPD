@@ -56,6 +56,8 @@ def teacher_prompt_logprobs(distillation_config: Any, adv_estimator: Any) -> int
         width = max(width, int(getattr(diagnostics, "topk", 64) or 64))
     if getattr(diagnostics, "collect_source_position_metrics", False):
         width = max(width, 16)
+    if getattr(diagnostics, "enabled", False) and getattr(diagnostics, "collect_rank_metrics", False):
+        width = max(width, int(getattr(diagnostics, "topk", 64) or 64), 2)
     return width
 
 
@@ -558,6 +560,7 @@ class DistillationDiagnosticsConfig(BaseConfig):
     outcome_case_samples_per_transition: int = 8
     collect_topk_overlap: bool = False
     collect_rethinking_opd_metrics: bool = False
+    collect_rank_metrics: bool = False
     collect_rollout_costs: bool = False
     collect_source_position_metrics: bool = False
     collect_repetition_metrics: bool = True
@@ -810,12 +813,16 @@ class DistillationConfig(BaseConfig):
             logprob_topk = max(int(logprob_topk or 0), int(self.diagnostics.topk))
         if self.diagnostics.collect_source_position_metrics:
             logprob_topk = max(int(logprob_topk or 0), 16)
+        if self.diagnostics.enabled and self.diagnostics.collect_rank_metrics:
+            logprob_topk = max(int(logprob_topk or 0), int(self.diagnostics.topk), 2)
         if self.fuse_final_teacher_scoring:
             target_width = int(self.distillation_loss.topk or 0)
             if target_width <= 0:
                 raise ValueError("Fused teacher scoring requires distillation_loss.topk > 0.")
             if self.diagnostics.enabled and self.diagnostics.collect_rethinking_opd_metrics:
                 target_width = max(target_width, int(self.diagnostics.topk))
+            if self.diagnostics.enabled and self.diagnostics.collect_rank_metrics:
+                target_width = max(target_width, int(self.diagnostics.topk), 2)
             logprob_topk = max(
                 int(logprob_topk or 0), target_width + teacher_prompt_logprobs(self, "token_reward_direct")
             )

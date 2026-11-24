@@ -29,6 +29,7 @@ from verl.experimental.agent_loop.agent_loop import (
     _PruneFutureCalibrationSnapshot,
 )
 from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
+from verl.trainer.distillation.rank_diagnostics import RANK_TEACHER_LOGPROBS_KEY
 from verl.trainer.distillation.teacher_target_scoring import (
     assemble_teacher_target_logprobs,
     build_teacher_target_scoring_requests,
@@ -100,7 +101,11 @@ def test_teacher_target_result_is_verified_and_repadded_on_cpu():
 
 
 @pytest.mark.parametrize(("diagnostics_topk", "adaptive"), [(0, False), (2, False), (2, True)])
-def test_trainer_fused_teacher_scores_preserve_rewards_and_apply_prune_on_cpu(diagnostics_topk, adaptive):
+@pytest.mark.parametrize("rank_metrics", [False, True])
+@pytest.mark.parametrize("log_prob_min_clamp", [None, -2.0])
+def test_trainer_fused_teacher_scores_preserve_rewards_and_apply_prune_on_cpu(
+    diagnostics_topk, adaptive, rank_metrics, log_prob_min_clamp
+):
     # Rows predict the next token. The last two emitted tokens have large K3 against the teacher.
     logprobs = torch.log_softmax(
         torch.tensor([[0.1, 0.9, 1.0, 0.2, -1.0], [0, 3, 1, 2, 0.5], [4, 3, -8, 0, 1], [4, 3, 0, 1, -8]]),
@@ -123,7 +128,9 @@ def test_trainer_fused_teacher_scores_preserve_rewards_and_apply_prune_on_cpu(di
                 return [*values.tolist(), [0.0] * len(ids[0])]
 
             sampled_ids = [[token_id] for token_id in [*sequence_ids[1:], 0]]
-            width = teacher_prompt_topk or diagnostics_topk
+            width = teacher_prompt_topk or (
+                sampling_params["prompt_logprobs"] if target_prompt_token_ids is None else diagnostics_topk
+            )
             top_ids = [*logprobs.topk(width, dim=-1).indices.tolist(), [0] * width] if width else sampled_ids
             ids = target_prompt_token_ids or top_ids
             extra = {
@@ -141,7 +148,10 @@ def test_trainer_fused_teacher_scores_preserve_rewards_and_apply_prune_on_cpu(di
     for fused in (False, True):
         cpu_teacher = _CpuTeacher()
         loss = SimpleNamespace(
-            topk=2, top_k_strategy="only_stu_rethinking_style", reward_weight_mode="student_p", log_prob_min_clamp=None
+            topk=2,
+            top_k_strategy="only_stu_rethinking_style",
+            reward_weight_mode="student_p",
+            log_prob_min_clamp=log_prob_min_clamp,
         )
         intervention = DistillationInterventionConfig(
             enabled=adaptive,
@@ -157,7 +167,14 @@ def test_trainer_fused_teacher_scores_preserve_rewards_and_apply_prune_on_cpu(di
             use_actor_loss=False,
             teacher_key="data_source",
             distillation_loss=loss,
-            diagnostics=SimpleNamespace(collect_topk_overlap=bool(diagnostics_topk), topk=diagnostics_topk),
+            diagnostics=SimpleNamespace(
+                enabled=True,
+                collect_topk_overlap=bool(diagnostics_topk),
+                collect_rank_metrics=rank_metrics,
+                topk=diagnostics_topk or 2,
+                log_interval=1,
+                topk_log_interval=10,
+            ),
             intervention=intervention,
         )
         manager = object.__new__(AsyncTeacherLLMServerManager)
@@ -168,6 +185,7 @@ def test_trainer_fused_teacher_scores_preserve_rewards_and_apply_prune_on_cpu(di
         manager.distillation_loss_config = loss
         trainer = object.__new__(RayPPOTrainer)
         trainer.distillation_config = config
+        trainer.global_steps = 10
         trainer.config = OmegaConf.create(
             {"algorithm": {"adv_estimator": "token_reward_direct"}, "distillation": {"enabled": True}}
         )
@@ -220,8 +238,15 @@ def test_trainer_fused_teacher_scores_preserve_rewards_and_apply_prune_on_cpu(di
 
         scores, _ = trainer._compute_token_reward_direct_scores(batch, deferred_intervention_scores=pending)
         rewards.append(scores)
+        assert (RANK_TEACHER_LOGPROBS_KEY in batch.batch) is rank_metrics
+        if rank_metrics:
+            exact = batch.batch[RANK_TEACHER_LOGPROBS_KEY]
+            assert exact.min() < -10  # Raw diagnostic scores survive the optional -2 loss clamp.
+            torch.testing.assert_close(exact[0, :3], logprobs[1:].gather(1, batch.batch["student_topk_ids"][0, :3]))
         if fused:
-            assert cpu_teacher.calls == [("teacher_target_score", 2 + diagnostics_topk)]
+            assert cpu_teacher.calls == [
+                ("teacher_target_score", 2 + (max(2, diagnostics_topk) if rank_metrics else diagnostics_topk))
+            ]
             assert not output.extra_fields.get("teacher_sampled_ids")
             torch.testing.assert_close(
                 trainer._extract_teacher_response_logprobs_for_diagnostics(batch)[0, :3],
@@ -233,7 +258,10 @@ def test_trainer_fused_teacher_scores_preserve_rewards_and_apply_prune_on_cpu(di
                 torch.testing.assert_close(teacher_ids[0, :3], expected_ids.to(teacher_ids.dtype))
                 torch.testing.assert_close(teacher_logprobs[0, :3], expected_logprobs)
         else:
-            assert cpu_teacher.calls == [("teacher_score", diagnostics_topk), ("teacher_target_score", 2)]
+            assert cpu_teacher.calls == [
+                ("teacher_score", max(2, diagnostics_topk) if rank_metrics else diagnostics_topk),
+                ("teacher_target_score", 2),
+            ]
         if adaptive:
             assert batch.non_tensor_batch["teacher_interventions"][0][0]["prune_future_cutoff"] == 1
             assert batch.batch["distillation_loss_mask"].tolist() == [[1, 0, 0, 0]]

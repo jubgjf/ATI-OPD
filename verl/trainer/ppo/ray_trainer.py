@@ -65,6 +65,7 @@ from verl.trainer.distillation.diagnostics import (
     resolve_special_token_ids,
 )
 from verl.trainer.distillation.losses import is_distillation_enabled, is_teacher_segment_sft_enabled
+from verl.trainer.distillation.rank_diagnostics import RANK_TEACHER_LOGPROBS_KEY
 from verl.trainer.distillation.teacher_target_scoring import (
     DEFERRED_INTERVENTION_SCORE_KEY,
     assemble_teacher_target_logprobs,
@@ -3325,6 +3326,8 @@ class RayPPOTrainer:
                 diagnostics_student_topk,
                 int(diagnostics_config.topk or self.distillation_config.distillation_loss.topk or 64),
             )
+        if self._rank_diagnostics_due(global_steps):
+            diagnostics_student_topk = max(diagnostics_student_topk, int(diagnostics_config.topk or 64), 2)
         tu.assign_non_tensor(
             batch_td,
             calculate_entropy=True,
@@ -3423,6 +3426,32 @@ class RayPPOTrainer:
         actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
 
         return actor_output
+
+    def _rank_diagnostics_due(self, global_steps: int | None = None) -> bool:
+        diagnostics = getattr(getattr(self, "distillation_config", None), "diagnostics", None)
+        step = global_steps if global_steps is not None else getattr(self, "global_steps", None)
+        return bool(
+            diagnostics is not None
+            and getattr(diagnostics, "enabled", False)
+            and getattr(diagnostics, "collect_rank_metrics", False)
+            and is_distillation_enabled(self.config.get("distillation"))
+            and step is not None
+            and step % diagnostics.log_interval == 0
+            and step % diagnostics.topk_log_interval == 0
+        )
+
+    def _release_opd_diagnostics_tensors(self, batch: DataProto) -> None:
+        """Release diagnostics after snapshotting, retaining only training candidates."""
+        batch.batch.pop(RANK_TEACHER_LOGPROBS_KEY, None)
+        training_topk = self._token_reward_direct_topk()
+        for key in ("student_topk_ids", "student_topk_logprobs"):
+            if key not in batch.batch:
+                continue
+            if training_topk:
+                # Diagnostics can request a wider support than the PPO loss.
+                batch.batch[key] = batch.batch[key][..., :training_topk]
+            else:
+                batch.batch.pop(key)
 
     def _distillation_diagnostics_config(self):
         if self.distillation_config is None:
@@ -3676,6 +3705,9 @@ class RayPPOTrainer:
                 if deferred_intervention_scores is not None:
                     options["deferred_intervention_scores"] = deferred_intervention_scores
                 teacher_on_student_topk_logprobs = self._compute_rethinking_teacher_on_student_topk(batch, **options)
+            if self._rank_diagnostics_due():
+                # Keep the real, unclamped target scores only through diagnostics.
+                batch.batch[RANK_TEACHER_LOGPROBS_KEY] = teacher_on_student_topk_logprobs.detach()
             prune_metrics = {}
             if self._defers_adaptive_prune_mask():
                 prune_metrics = apply_intervention_prune_mask(
@@ -3872,13 +3904,16 @@ class RayPPOTrainer:
             or getattr(diagnostics_config, "collect_rethinking_opd_metrics", False)
             or getattr(diagnostics_config, "collect_source_position_metrics", False)
         ) and global_steps % diagnostics_config.topk_log_interval == 0
+        collect_rank_diagnostics = self._rank_diagnostics_due(global_steps)
         collect_boundary_diagnostics = bool(
             diagnostics_config.collect_intervention_metrics
             and getattr(diagnostics_config, "collect_intervention_boundary_metrics", False)
         )
         teacher_response_logprobs = self._extract_teacher_response_logprobs_for_diagnostics(batch)
         teacher_response_topk_ids, teacher_response_topk_logprobs = (
-            self._extract_teacher_response_topk_for_diagnostics(batch) if collect_topk_diagnostics else (None, None)
+            self._extract_teacher_response_topk_for_diagnostics(batch)
+            if collect_topk_diagnostics or collect_rank_diagnostics
+            else (None, None)
         )
         collect_student_only = getattr(diagnostics_config, "collect_source_position_metrics", False)
         if collect_student_only and (
@@ -3910,8 +3945,8 @@ class RayPPOTrainer:
             "student_topk_logprobs": batch.batch.get("student_topk_logprobs", None)
             if collect_topk_diagnostics
             else None,
-            "teacher_topk_ids": teacher_response_topk_ids,
-            "teacher_topk_logprobs": teacher_response_topk_logprobs,
+            "teacher_topk_ids": teacher_response_topk_ids if collect_topk_diagnostics else None,
+            "teacher_topk_logprobs": teacher_response_topk_logprobs if collect_topk_diagnostics else None,
             "teacher_logprob_nonfinite_positions": teacher_logprob_nonfinite_positions,
             "entropy": entropy,
             "response_mask": response_mask,
@@ -3955,6 +3990,23 @@ class RayPPOTrainer:
             diagnostics_kwargs["student_only_interventions"] = (
                 self._non_tensor_to_list(spans) if spans is not None else [None] * len(batch)
             )
+        if collect_rank_diagnostics:
+            required = ("student_topk_ids", "student_topk_logprobs")
+            if any(key not in batch.batch for key in required) or teacher_response_topk_ids is None:
+                raise RuntimeError("Ranking diagnostics require real student and teacher top-k tensors.")
+            spans = batch.non_tensor_batch.get("teacher_interventions")
+            intervention_enabled = bool(getattr(self.distillation_config.intervention, "enabled", False))
+            if spans is None and intervention_enabled and "trajectory_spans" not in batch.non_tensor_batch:
+                raise RuntimeError("Ranking student-only diagnostics require teacher source spans for intervention.")
+            diagnostics_kwargs["rank_inputs"] = {
+                "student_topk_ids": batch.batch["student_topk_ids"],
+                "student_topk_logprobs": batch.batch["student_topk_logprobs"],
+                "teacher_topk_ids": teacher_response_topk_ids,
+                "teacher_topk_logprobs": teacher_response_topk_logprobs,
+                "teacher_on_student_topk_logprobs": batch.batch.pop(RANK_TEACHER_LOGPROBS_KEY, None),
+                "topk": int(diagnostics_config.topk or self.distillation_config.distillation_loss.topk or 64),
+                "interventions": self._non_tensor_to_list(spans) if spans is not None else [None] * len(batch),
+            }
         intervention_kwargs = None
         boundary_kwargs = None
 
@@ -5084,9 +5136,7 @@ class RayPPOTrainer:
                                 batch=batch,
                                 global_steps=self.global_steps,
                             )
-                        for diagnostics_key in ("student_topk_ids", "student_topk_logprobs"):
-                            if diagnostics_key in batch.batch and not self._uses_token_reward_direct():
-                                batch.batch.pop(diagnostics_key)
+                        self._release_opd_diagnostics_tensors(batch)
 
                         # Compute rollout correction while old_log_probs is still the sampled-token
                         # [B, T] proximal-policy logprob. token_reward_direct later swaps old_log_probs

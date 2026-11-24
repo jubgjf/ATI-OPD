@@ -62,6 +62,19 @@ _TOPK_RE = re.compile(r"(?:^|[/_])top(?P<topk>\d+)(?=[/_]|$)")
 _OPD_OVERLAP_TOPK_RE = re.compile(r"^opd/overlap/top(?P<topk>\d+)(?:_|/)")
 _LOW_K_SUFFIX_RE = re.compile(r"_top(?P<topk>\d+)(?=/|$)")
 _BOOTSTRAP_STAT_RE = re.compile(r"(?:^|/)(?:mean|std|best|worst|maj)@\d+(?:/(?:mean|std))?$")
+_RANK_SUMMARY_RE = re.compile(
+    r"^opd/rank/student_only/(?P<basis>[^/]+)/top(?P<topk>\d+)/(?P<metric>[^/]+)/(?P<stat>mean|valid_fraction)$"
+)
+_LIVE_RANK_MEANS = {
+    ("lists", "top1_agreement"),
+    ("lists", "topk_overlap"),
+    ("intersection", "kendall_tau_b"),
+    ("intersection", "spearman_rho"),
+    ("student_topk_exact", "kendall_tau_b"),
+    ("student_topk_exact", "spearman_rho"),
+    ("student_topk_exact", "tv_residual_bucket"),
+    ("student_topk_exact", "js_residual_bucket"),
+}
 
 _ALWAYS_ARCHIVE_PREFIXES = (
     "bucket/bin/",
@@ -1576,6 +1589,22 @@ def _coerce_numeric(value: Any) -> tuple[float, str] | None:
 
 
 def _should_archive_metric(metric_key: str, configured_topk: int | None) -> bool:
+    if metric_key.startswith("opd/rank/"):
+        if metric_key in {"opd/rank/compute_seconds", "opd/rank/exact_scores_available", "opd/rank/available_topk"}:
+            return False
+        match = _RANK_SUMMARY_RE.fullmatch(metric_key)
+        if match is None or int(match.group("topk")) != configured_topk:
+            return True
+        pair = (match.group("basis"), match.group("metric"))
+        return pair not in _LIVE_RANK_MEANS or (
+            match.group("stat") == "valid_fraction"
+            and pair
+            not in {
+                ("lists", "topk_overlap"),
+                ("intersection", "kendall_tau_b"),
+                ("student_topk_exact", "kendall_tau_b"),
+            }
+        )
     if metric_key.startswith(("opd_cost/", "opd/student_only/")):
         return True
     if metric_key.startswith("opd_intervention/"):
@@ -1619,6 +1648,7 @@ def _is_redundant_summary_metric(metric_key: str) -> bool:
 
 def _infer_configured_topk(metrics: Mapping[str, Any]) -> int | None:
     values = [int(match.group("topk")) for key in metrics if (match := _OPD_OVERLAP_TOPK_RE.match(key)) is not None]
+    values.extend(int(match.group("topk")) for key in metrics if (match := _RANK_SUMMARY_RE.fullmatch(key)) is not None)
     return max(values, default=None)
 
 

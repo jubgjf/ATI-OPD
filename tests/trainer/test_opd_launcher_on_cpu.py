@@ -132,8 +132,11 @@ ray() {
 @pytest.mark.parametrize(
     "method,seed", [("opd", 42), ("opd", 0), ("ati", 42), ("ati", 0), ("relay", 42), ("selection", 42)]
 )
-def test_opd_launcher_config_composes_without_accelerators(tmp_path, monkeypatch, method, seed):
-    result = _run_submitted_method(tmp_path, method, seed)
+@pytest.mark.parametrize("rank_metrics", [False, True])
+def test_opd_launcher_config_composes_without_accelerators(tmp_path, monkeypatch, method, seed, rank_metrics):
+    result = _run_submitted_method(
+        tmp_path, method, seed, train_config_extra=f"OPD_DIAGNOSTICS_COLLECT_RANK_METRICS={rank_metrics}\n"
+    )
     assert result.returncode == 0, result.stderr
     assert "CONFIG_LOADS=1" in result.stdout
     assert [
@@ -185,6 +188,7 @@ def test_opd_launcher_config_composes_without_accelerators(tmp_path, monkeypatch
     )
     assert config.trainer.experiment_name == f"{Path(LAUNCHERS[method]).stem}-20261109-120000"
     assert distillation.diagnostics.collect_rollout_costs
+    assert distillation.diagnostics.collect_rank_metrics is rank_metrics
     if method == "ati":
         assert distillation.intervention.prune_mode == "adaptive_future"
         assert distillation.diagnostics.outcome_case_samples_per_transition == 8

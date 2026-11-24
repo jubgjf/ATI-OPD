@@ -15,6 +15,7 @@
 from typing import Any
 
 from verl.trainer.distillation.losses import is_distillation_enabled
+from verl.trainer.distillation.rank_diagnostics import MAX_RANK_TOPK
 
 
 def _get_nested(config: Any, *keys: str, default: Any = None) -> Any:
@@ -77,6 +78,29 @@ def validate_distillation_intervention_training_config(config: Any) -> None:
             raise ValueError("Selection-only and Relay require distillation.enabled=true.")
         return
     diagnostics_enabled = bool(_get_nested(distillation_config, "diagnostics", "enabled", default=False))
+    if _get_nested(distillation_config, "diagnostics", "collect_rank_metrics", default=False):
+        if not diagnostics_enabled:
+            raise ValueError("Ranking diagnostics require distillation.diagnostics.enabled=true.")
+        rank_topk = int(
+            _get_nested(distillation_config, "diagnostics", "topk")
+            or _get_nested(distillation_config, "distillation_loss", "topk")
+            or 64
+        )
+        if rank_topk > MAX_RANK_TOPK:
+            raise ValueError(f"Ranking diagnostics require topk <= {MAX_RANK_TOPK} for bounded pairwise memory.")
+        if _get_nested(config, "algorithm", "rollout_correction", "bypass_mode", default=False):
+            raise ValueError("Ranking diagnostics require rollout_correction.bypass_mode=false for student top-k.")
+        actor = _get_nested(config, "actor_rollout_ref", "actor")
+        if _get_nested(actor, "strategy") not in {"fsdp", "fsdp2"}:
+            raise ValueError("Ranking diagnostics require an fsdp/fsdp2 actor with student top-k output support.")
+        for config_node in (
+            actor,
+            _get_nested(actor, "engine"),
+            _get_nested(actor, "fsdp_config"),
+            _get_nested(config, "actor_rollout_ref", "model"),
+        ):
+            if _get_nested(config_node, "use_fused_kernels", default=False):
+                raise ValueError("Ranking diagnostics require use_fused_kernels=false to access student logits.")
     collect_intervention_metrics = bool(
         _get_nested(distillation_config, "diagnostics", "collect_intervention_metrics", default=True)
     )

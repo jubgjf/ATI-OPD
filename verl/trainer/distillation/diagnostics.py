@@ -23,6 +23,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
+from verl.trainer.distillation.rank_diagnostics import compute_rank_diagnostics
 from verl.trainer.ppo.metric_utils import (
     compute_text_repetition_and_truncation_metrics_with_flags,
     compute_token_repetition_and_truncation_metrics,
@@ -1983,6 +1984,7 @@ def compute_opd_diagnostics_metrics(
     allow_multiple_thinking_blocks: bool = False,
     trajectory_spans: Optional[list[Any]] = None,
     student_only_interventions: Optional[list[Any]] = None,
+    rank_inputs: Optional[dict[str, Any]] = None,
     collect_repetition_metrics: bool = True,
     collect_train_text_zlib_repetition: bool = False,
     repetition_tail_chars: int = 10000,
@@ -2005,6 +2007,36 @@ def compute_opd_diagnostics_metrics(
 
     response_mask = response_mask.bool()
     metrics: dict[str, float] = {}
+    if rank_inputs is not None:
+        ranking = dict(rank_inputs)
+        rank_student_mask = _student_source_mask(response_mask, ranking.pop("interventions"))
+        if trajectory_spans is not None:
+            if len(trajectory_spans) != response_mask.size(0):
+                raise ValueError("Ranking trajectory spans must align to the batch.")
+            for row, spans in enumerate(trajectory_spans):
+                for span in spans or ():
+                    if span.get("source") == "teacher":
+                        start, end = int(span["start"]), int(span["end"])
+                        if not 0 <= start <= end <= response_mask.size(1):
+                            raise ValueError("Ranking teacher trajectory span is outside the response.")
+                        rank_student_mask[row, start:end] = False
+        invalid_rank_positions = (
+            positions_to_event_mask(
+                teacher_logprob_nonfinite_positions, response_mask, context="ranking_teacher_scores"
+            )
+            if teacher_logprob_nonfinite_positions is not None
+            else None
+        )
+        metrics.update(
+            compute_rank_diagnostics(
+                response_mask=response_mask,
+                student_only_mask=rank_student_mask,
+                topk_values=compute_topk_ladder(ranking.pop("topk")),
+                bin_size=bin_size,
+                invalid_position_mask=invalid_rank_positions,
+                **ranking,
+            )
+        )
     response_lens = response_mask.sum(dim=1).detach().float().cpu()
     max_response_length = int(max_response_length or response_mask.shape[1])
     metrics.update(compute_bucket_denominator_metrics(response_mask, bin_size=bin_size))

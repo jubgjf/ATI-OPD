@@ -102,19 +102,22 @@ def test_relay_vetoes_emitted_or_student_top5_reflection():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scenario", ["none", "one", "two", "teacher_eos"])
-async def test_relay_commits_only_causal_tokens_and_hands_off_at_paragraph_boundary(scenario):
+@pytest.mark.parametrize("rank_metrics", [False, True])
+async def test_relay_commits_only_causal_tokens_and_hands_off_at_paragraph_boundary(scenario, rank_metrics):
     worker = make_worker(
         DistillationInterventionConfig(
             enabled=True, strategy="relay", train_on_teacher_segments=True, max_interventions_per_sample=2
         )
     )
     output = make_output([1, 2, 3, 99])
+    worker.distillation_config.diagnostics = SimpleNamespace(enabled=True, collect_rank_metrics=rank_metrics, topk=16)
     prompt = output.prompt_ids.copy()
     expected_prefix = prompt + [1, 70, 12, 13, 12, 14, 12]
 
     async def score_teacher(*, prompt_ids, response_ids, **kwargs):
         trigger = 1 if (prompt_ids == prompt and scenario != "none") or scenario == "two" else None
-        return make_scores(prompt_ids, response_ids, 1, teacher_position=trigger)
+        assert kwargs["prompt_logprobs"] == (16 if rank_metrics else 1)
+        return make_scores(prompt_ids, response_ids, kwargs["prompt_logprobs"], teacher_position=trigger)
 
     async def score_student(*, prompt_ids, response_ids, **kwargs):
         assert kwargs["prompt_logprobs"] == 5
@@ -138,7 +141,8 @@ async def test_relay_commits_only_causal_tokens_and_hands_off_at_paragraph_bound
         assert output.response_ids == [1, 2, 3, 99]
         assert output.reward_score == 1.0
         teacher_generate.assert_not_awaited()
-        assert output.extra_fields["teacher_ids"][len(prompt) - 1 : -1, 0].tolist() == output.response_ids
+        sampled_key = "teacher_sampled_ids" if rank_metrics else "teacher_ids"
+        assert output.extra_fields[sampled_key][len(prompt) - 1 : -1, 0].tolist() == output.response_ids
     else:
         assert teacher_generate.await_args_list[0].kwargs["prefix_ids"] == prompt + [1, 70]
         assert teacher_generate.await_args_list[0].kwargs["max_tokens"] == 256
@@ -162,9 +166,27 @@ async def test_relay_commits_only_causal_tokens_and_hands_off_at_paragraph_bound
             assert output.extra_fields["teacher_intervention_count"] == 2
             assert output.extra_fields["finish_reason"] == "length"
 
+    def final_scores(*, sequence_ids, prompt_logprobs, **kwargs):
+        assert sequence_ids == prompt + output.response_ids
+        result = make_scores(prompt, output.response_ids, max(1, prompt_logprobs))
+        if prompt_logprobs == 0:
+            result.ids, result.logprobs = result.sampled_ids, result.sampled_logprobs
+        return result
+
+    worker.teacher_server_manager.compute_teacher_logprobs_single.side_effect = final_scores
+    await worker._compute_teacher_logprobs(output, prompt, output.response_ids, False)
+    # Both configurations reuse an already scored final candidate. Only a
+    # trajectory ending with a new teacher segment needs the existing final call.
+    assert worker.teacher_server_manager.compute_teacher_logprobs_single.await_count == int(
+        scenario in {"two", "teacher_eos"}
+    )
+    if rank_metrics:
+        assert output.extra_fields["teacher_ids"].shape[-1] == 16
+
 
 @pytest.mark.asyncio
-async def test_selection_only_reuses_scoring_and_keeps_raw_trajectory():
+@pytest.mark.parametrize("rank_metrics", [False, True])
+async def test_selection_only_reuses_scoring_and_keeps_raw_trajectory(rank_metrics):
     config = DistillationInterventionConfig(
         prune=True,
         prune_mode="selection_only",
@@ -175,11 +197,14 @@ async def test_selection_only_reuses_scoring_and_keeps_raw_trajectory():
         prune_future_calibration_min_blocks=2,
     )
     worker = make_worker(config)
+    worker.distillation_config.diagnostics = SimpleNamespace(enabled=True, collect_rank_metrics=rank_metrics, topk=16)
     output = make_output([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 99])
     original_ids = output.response_ids.copy()
     teacher_logprobs = [-1.0] * 4 + [-3.0] * 2 + [-1.0] * 4 + [-3.0] * 2
     worker._score_sequence_for_intervention = AsyncMock(
-        return_value=make_scores(output.prompt_ids, output.response_ids, 1, response_logprobs=teacher_logprobs)
+        return_value=make_scores(
+            output.prompt_ids, output.response_ids, 16 if rank_metrics else 1, response_logprobs=teacher_logprobs
+        )
     )
     await worker._select_student_supervision(output, sample_kwargs={})
     await worker._compute_teacher_logprobs(output, output.prompt_ids, output.response_ids, False)
