@@ -15,8 +15,13 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other mpain.
 """
 
+import json
+import logging
 import os
 import socket
+import tempfile
+from contextlib import suppress
+from pathlib import Path
 
 import hydra
 import ray
@@ -29,6 +34,11 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
+from verl.utils.ray_utils import RayJobResources
+
+logger = logging.getLogger(__name__)
+OPD_CLEANUP_TIMEOUT = 300
+OPD_RESOURCE_TIMEOUT = 30
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -95,13 +105,70 @@ def run_ppo(config, task_runner_class=None) -> None:
         runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
     else:
         runner = task_runner_class.remote()
-    ray.get(runner.run.remote(config))
+    managed = os.environ.get("VERL_OPD_MANAGED_TRAINING") == "1"
+    try:
+        last_step = ray.get(runner.run.remote(config))
+    except BaseException:
+        if managed:
+            try:
+                _finish_managed_training(runner, interrupted=True)
+            except Exception:
+                logger.exception("Additional failure cleaning up the OPD training job")
+        raise
+    if managed:
+        _finish_managed_training(runner, interrupted=False)
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
     # This file is used for performance analysis
     timeline_json_file = config.ray_kwargs.get("timeline_json_file", None)
     if timeline_json_file:
         ray.timeline(filename=timeline_json_file)
+
+    handoff = os.environ.get("VERL_OPD_CHECKPOINT_HANDOFF")
+    if managed and handoff:
+        _write_checkpoint_handoff(config, last_step, Path(handoff))
+
+
+def _finish_managed_training(runner, *, interrupted: bool) -> None:
+    ray.get(runner.finish_training.remote(interrupted), timeout=OPD_CLEANUP_TIMEOUT)
+    # A graceful Ray actor exit completes its termination RPC with RayActorError.
+    with suppress(ray.exceptions.RayActorError):
+        ray.get(runner.__ray_terminate__.remote(), timeout=OPD_RESOURCE_TIMEOUT)
+
+
+def _write_checkpoint_handoff(config, last_step: int | None, handoff: Path) -> None:
+    if last_step is None or last_step <= 0:
+        raise RuntimeError("Automatic evaluation requires a final checkpoint written by this training attempt.")
+    root = Path(config.trainer.default_local_dir).expanduser().resolve()
+    checkpoint = root / f"global_step_{last_step}"
+    tracked_step = (root / "latest_checkpointed_iteration.txt").read_text().strip()
+    if tracked_step != str(last_step) or not (checkpoint / "actor").is_dir():
+        raise RuntimeError(f"The final student checkpoint at step {last_step} was not committed.")
+    if config.trainer.get("metric_logging", {}).get("mode") == "balanced":
+        from verl.trainer.ppo.metric_archive import METRIC_COMMIT_FILENAME
+
+        if not (checkpoint / METRIC_COMMIT_FILENAME).is_file():
+            raise RuntimeError(f"The metrics for final step {last_step} were not committed.")
+    with tempfile.NamedTemporaryFile(mode="w", dir=handoff.parent, encoding="utf-8", delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            json.dump({"step": last_step, "checkpoint": str(checkpoint)}, output)
+            output.close()
+            temporary.replace(handoff)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def _validate_managed_training(config) -> None:
+    backends = config.trainer.logger
+    backends = [backends] if isinstance(backends, str) else backends
+    if {"wandb", "tracking", "vemlp_wandb"}.intersection(backends):
+        raise ValueError('Use TRAINER_LOGGER=["console","swanlab"] for managed OPD training.')
+    if os.environ.get("VERL_OPD_CHECKPOINT_HANDOFF"):
+        if config.trainer.save_freq <= 0 or config.actor_rollout_ref.actor.checkpoint.get("async_save", False):
+            raise ValueError("POST_TRAIN_EVAL requires a positive save frequency and synchronous checkpoints.")
+        if config.trainer.get("val_only", False):
+            raise ValueError("Set POST_TRAIN_EVAL=False for validation-only runs.")
 
 
 class TaskRunner:
@@ -118,6 +185,8 @@ class TaskRunner:
     def __init__(self):
         self.role_worker_mapping = {}
         self.mapping = {}
+        self._opd_trainer = None
+        self._opd_resources = None
 
     def add_actor_rollout_worker(self, config):
         """Add actor rollout worker using the unified model engine implementation."""
@@ -236,6 +305,9 @@ class TaskRunner:
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+        managed = os.environ.get("VERL_OPD_MANAGED_TRAINING") == "1"
+        if managed:
+            _validate_managed_training(config)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
@@ -306,14 +378,32 @@ class TaskRunner:
             collate_fn=collate_fn,
             train_sampler=train_sampler,
         )
-        # Initialize W&B before CUDA/vLLM-heavy workers are created. In Ray jobs,
-        # starting the W&B service after worker initialization can stall offline runs.
+        if managed:
+            self._opd_trainer = trainer
+            self._opd_resources = RayJobResources()
+            with self._opd_resources.track():
+                trainer.init_logger()
+                trainer.init_workers()
+                return trainer.fit(defer_cleanup=True)
+
+        # Initialize the logger before the accelerator workers.
         trainer.init_logger()
         # Initialize the workers of the trainer.
         trainer.init_workers()
 
         # Start the training process.
-        trainer.fit()
+        return trainer.fit()
+
+    def finish_training(self, interrupted: bool) -> None:
+        """Finish a managed OPD run before relinquishing its Ray resources."""
+        if self._opd_trainer is None or self._opd_resources is None:
+            return
+        trainer, self._opd_trainer = self._opd_trainer, None
+        resources, self._opd_resources = self._opd_resources, None
+        try:
+            trainer.finish_training(interrupted=interrupted, strict=True)
+        finally:
+            resources.close(interrupted=interrupted, timeout=OPD_RESOURCE_TIMEOUT)
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):

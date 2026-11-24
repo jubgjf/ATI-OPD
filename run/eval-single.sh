@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Standalone math evaluation in the existing Ascend/verl environment; results use stdout only.
+# Standalone math evaluation in the existing Ascend/verl environment.
 #
 # Required: MODEL_PATH=/path/to/global_step_N, its actor or actor/huggingface,
 # or a complete HF model. Relative paths are resolved from the launch directory.
@@ -9,13 +9,14 @@
 # Set EVAL_FORCE_MERGE=True to regenerate existing HF weights from FSDP shards.
 # EVAL_ALL=0 (default): HMMT Feb 2026 and Nov 2025. EVAL_ALL=1 additionally evaluates
 # AIME24, AIME25, AMC23 and the 39-question AMO-Bench-P subset, in that order.
+# EVAL_SUITE=math-all selects the six benchmarks and the same per-draw seeds
+# as the OPD launcher. Set EVAL_RECORDS_PATH to save results and draw records.
 # Optional: TEST_BENCHMARK_ROOT (default: $DATASET_DIR/datasets), CHAT_TEMPLATE_MODEL,
 # Provider directories, flat layouts and the older datasets/MathArena root are supported.
 # ENABLE_THINKING=True, TEST_TEMPERATURE=0.7, TEST_TOP_P=0.95, TEST_TOP_K=-1,
 # TEST_BENCHMARK_N=16, TEST_BENCHMARKS_MAX_RESPONSE_LENGTH=23552, STUDENT_TP=2.
 # For a smoke test, set TEST_BENCHMARK_MAX_SAMPLES=1 and TEST_BENCHMARK_N=2.
-# Results are printed only; checkpoint conversion writes actor/huggingface,
-# and vLLM/Ascend may still create their own runtime caches.
+# Checkpoint conversion writes actor/huggingface. vLLM/Ascend may create runtime caches.
 
 set -x
 

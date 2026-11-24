@@ -74,7 +74,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import simple_timer
-from verl.utils.ray_utils import auto_await, get_event_loop
+from verl.utils.ray_utils import auto_await, get_event_loop, track_ray_actor
 from verl.utils.reward_score.reward_extra import collate_reward_extra_infos
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
@@ -6065,19 +6065,18 @@ class AgentLoopManager:
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
-            self.agent_loop_workers.append(
-                self.agent_loop_workers_class.options(
-                    name=f"agent_loop_worker_{i}" + f"_{uuid4().hex[:8]}",
-                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                        node_id=node_id, soft=True
-                    ),
-                ).remote(
-                    self.config,
-                    self.llm_client,
-                    self.teacher_client,
-                    self.reward_loop_worker_handles,
-                )
+            worker = self.agent_loop_workers_class.options(
+                name=f"agent_loop_worker_{i}" + f"_{uuid4().hex[:8]}",
+                scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                    node_id=node_id, soft=True
+                ),
+            ).remote(
+                self.config,
+                self.llm_client,
+                self.teacher_client,
+                self.reward_loop_worker_handles,
             )
+            self.agent_loop_workers.append(track_ray_actor(worker))
 
     @auto_await
     async def generate_sequences(self, prompts: DataProto) -> DataProto:

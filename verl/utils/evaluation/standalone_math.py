@@ -21,11 +21,13 @@ EVAL_FORCE_MERGE=True to rebuild existing weights.
 Megatron checkpoints already exported under model/huggingface are loaded directly.
 Framework runtime caches are allowed.
 By default only HMMT is evaluated; EVAL_ALL=1 adds AIME24/25, AMC23 and AMO-Bench-P.
+EVAL_SUITE=math-all selects all six benchmarks with per-draw seeds.
 EVAL_SUITE=math5 selects the five math benchmarks. EVAL_RECORDS_PATH exports per-draw scores.
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
@@ -34,10 +36,10 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from verl.trainer.ppo.metric_utils import process_validation_metrics
 from verl.utils.chat_template import apply_chat_template
@@ -52,6 +54,9 @@ from verl.utils.evaluation.multi_domain_benchmark import stable_int_seed
 from verl.utils.reward_score import default_compute_score
 from verl.utils.reward_score.reward_extra import collate_reward_extra_infos
 from verl.utils.tokenizer import hf_tokenizer, normalize_token_ids
+
+if TYPE_CHECKING:
+    from verl.utils.evaluation.ray_math import RayEvaluationTopology
 
 BENCHMARKS = ("hmmt_feb_2026", "hmmt_nov_2025")
 BENCHMARK_PATHS = {
@@ -118,7 +123,7 @@ class EvaluationConfig:
         """Keep HMMT first, optionally followed by the four training math benchmarks."""
         if self.suite == "math5":
             return MATH5_BENCHMARKS
-        return tuple(BENCHMARK_PATHS) if self.eval_all else BENCHMARKS
+        return tuple(BENCHMARK_PATHS) if self.eval_all or self.suite == "math-all" else BENCHMARKS
 
     def __post_init__(self) -> None:
         for name in (
@@ -148,8 +153,8 @@ class EvaluationConfig:
             raise ValueError("TEST_BENCHMARK_MAX_SAMPLES must be -1 (all questions) or positive.")
         if not 0 <= self.seed < 2**32:
             raise ValueError("EVAL_SEED must be in [0, 2**32).")
-        if self.suite not in {None, "math5"} or (self.suite is not None and self.eval_all):
-            raise ValueError("EVAL_SUITE supports 'math5' and cannot be combined with EVAL_ALL.")
+        if self.suite not in {None, "math5", "math-all"} or (self.suite is not None and self.eval_all):
+            raise ValueError("EVAL_SUITE supports 'math5' and 'math-all' and cannot be combined with EVAL_ALL.")
 
     @classmethod
     def from_environment(cls, env: Mapping[str, str] | None = None) -> EvaluationConfig:
@@ -586,6 +591,113 @@ def aggregate_metrics(uids: list[str], benchmark: str, infos: list[dict[str, Any
     return metrics
 
 
+class DrawRequest(NamedTuple):
+    """Token input and sampling parameters for one identified draw."""
+
+    key: tuple[str, int]
+    prompt_ids: list[int]
+    sampling: dict[str, Any]
+
+
+class DrawCompletion(NamedTuple):
+    """Token output from a completed draw."""
+
+    key: tuple[str, int]
+    token_ids: list[int]
+    finish_reason: str
+
+
+class ScoredDraw(NamedTuple):
+    """A draw's score and output metadata."""
+
+    key: tuple[str, int]
+    info: dict[str, Any]
+    token_count: int
+    finish_reason: str
+
+
+def _draw_requests(config: EvaluationConfig, tokenizer, rows: list[PreparedSample]) -> list[DrawRequest]:
+    requests = []
+    for row in rows:
+        for draw in range(config.rollout_n):
+            sampling = sampling_kwargs(config, row.max_tokens, eos_token_id=tokenizer.eos_token_id)
+            if config.suite is not None:
+                sampling["seed"] = stable_int_seed(config.seed, row.uid, draw, config.suite)
+            requests.append(DrawRequest((row.uid, draw), row.prompt_ids, sampling))
+    return requests
+
+
+def generate_draws(engine, sampling_params_cls, requests: list[DrawRequest]) -> list[DrawCompletion]:
+    """Run token-in/token-out inference and validate vLLM's ordered output."""
+    outputs = engine.generate(
+        [{"prompt_token_ids": list(request.prompt_ids)} for request in requests],
+        [sampling_params_cls(**request.sampling) for request in requests],
+        use_tqdm=False,
+    )
+    if len(outputs) != len(requests):
+        raise RuntimeError(f"Expected {len(requests)} request outputs, got {len(outputs)}.")
+    completed = []
+    for request, output in zip(requests, outputs, strict=True):
+        if output.prompt_token_ids != request.prompt_ids or not output.finished or len(output.outputs) != 1:
+            raise RuntimeError(f"Invalid or mismatched generation output for {request.key}.")
+        completion = output.outputs[0]
+        token_ids = normalize_token_ids(completion.token_ids)
+        completed.append(DrawCompletion(request.key, token_ids, completion.finish_reason))
+    return completed
+
+
+def _score_draws(tokenizer, requests, completions, rows, scored) -> None:
+    expected = {request.key: request for request in requests}
+    for completion in completions:
+        key = completion.key
+        if key in scored or key not in expected:
+            raise RuntimeError(f"Duplicate or unexpected evaluation output for {key}.")
+        request = expected.pop(key)
+        if completion.finish_reason not in {"stop", "length"}:
+            raise RuntimeError(f"Generation failed for {key}: finish_reason={completion.finish_reason!r}.")
+        if len(completion.token_ids) > request.sampling["max_tokens"]:
+            raise RuntimeError(f"Generation exceeded its token budget for {key}.")
+        info = score_response(tokenizer, completion.token_ids, rows[key[0]].sample)
+        scored[key] = ScoredDraw(key, info, len(completion.token_ids), completion.finish_reason)
+    if expected:
+        raise RuntimeError(f"Missing evaluation outputs for {sorted(expected)}.")
+
+
+def _summarize_draws(config, rows, scored, records):
+    ordered = [scored[row.uid, draw] for row in rows for draw in range(config.rollout_n)]
+    benchmark = rows[0].sample.benchmark
+    if records is not None:
+        for result in ordered:
+            uid, draw = result.key
+            acc = result.info["acc"]
+            if acc not in (0, 1):
+                raise ValueError(f"Expected binary math accuracy for {uid}, got {acc!r}.")
+            records.append(
+                dict(
+                    benchmark=benchmark,
+                    uid=uid,
+                    draw=draw,
+                    acc=int(acc),
+                    response_tokens=result.token_count,
+                    finish_reason=result.finish_reason,
+                )
+            )
+    lengths = [result.token_count for result in ordered]
+    return (
+        [result.key[0] for result in ordered],
+        [result.info for result in ordered],
+        dict(
+            questions=len(rows),
+            responses=len(ordered),
+            response_tokens_mean=sum(lengths) / len(lengths),
+            response_tokens_min=min(lengths),
+            response_tokens_max=max(lengths),
+            length_finish_rate=sum(result.finish_reason == "length" for result in ordered) / len(ordered),
+            context_capped_questions=sum(row.max_tokens < config.generation_max_tokens for row in rows),
+        ),
+    )
+
+
 def evaluate_benchmark(
     config: EvaluationConfig,
     tokenizer,
@@ -595,77 +707,41 @@ def evaluate_benchmark(
     *,
     records: list[dict[str, Any]] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
-    """Generate and score in memory; reject incomplete, reordered, or aborted engine responses."""
-    benchmark = rows[0].sample.benchmark
-    uids, infos, lengths = [], [], []
-    length_finishes = 0
+    """Generate and score the given benchmark with a local vLLM engine."""
+    rows_by_uid = {row.uid: row for row in rows}
+    scored: dict[tuple[str, int], ScoredDraw] = {}
     for start in range(0, len(rows), config.batch_size):
         batch = rows[start : start + config.batch_size]
-        requests = [(row, draw) for row in batch for draw in range(config.rollout_n)]
-        params = []
-        for row, draw in requests:
-            sampling = sampling_kwargs(config, row.max_tokens, eos_token_id=tokenizer.eos_token_id)
-            if config.suite == "math5":
-                sampling["seed"] = stable_int_seed(config.seed, row.uid, draw, config.suite)
-            params.append(sampling_params_cls(**sampling))
-        outputs = engine.generate(
-            [{"prompt_token_ids": list(row.prompt_ids)} for row, _ in requests],
-            params,
-            use_tqdm=False,
-        )
-        if len(outputs) != len(requests):
-            raise RuntimeError(f"{benchmark}: expected {len(requests)} request outputs, got {len(outputs)}.")
-        for (row, draw), output in zip(requests, outputs, strict=True):
-            if output.prompt_token_ids != row.prompt_ids or not output.finished or len(output.outputs) != 1:
-                raise RuntimeError(f"Invalid or mismatched generation output for {row.uid}.")
-            completion = output.outputs[0]
-            if completion.finish_reason not in {"stop", "length"}:
-                raise RuntimeError(f"Generation failed for {row.uid}: finish_reason={completion.finish_reason!r}.")
-            token_ids = normalize_token_ids(completion.token_ids)
-            if len(token_ids) > row.max_tokens:
-                raise RuntimeError(f"Generation exceeded its token budget for {row.uid}.")
-            info = score_response(tokenizer, token_ids, row.sample)
-            infos.append(info)
-            if records is not None:
-                acc = info["acc"]
-                if acc not in (0, 1):
-                    raise ValueError(f"Expected binary math accuracy for {row.uid}, got {acc!r}.")
-                records.append(
-                    dict(
-                        benchmark=benchmark,
-                        uid=row.uid,
-                        draw=draw,
-                        acc=int(acc),
-                        response_tokens=len(token_ids),
-                        finish_reason=completion.finish_reason,
-                    )
-                )
-            uids.append(row.uid)
-            lengths.append(len(token_ids))
-            length_finishes += completion.finish_reason == "length"
-        del outputs
+        requests = _draw_requests(config, tokenizer, batch)
+        completions = generate_draws(engine, sampling_params_cls, requests)
+        _score_draws(tokenizer, requests, completions, rows_by_uid, scored)
         print(
-            f"[eval] {benchmark}: scored {min(start + len(batch), len(rows))}/{len(rows)} questions "
-            f"({len(infos)} responses).",
+            f"[eval] {rows[0].sample.benchmark}: scored {start + len(batch)}/{len(rows)} questions "
+            f"({len(scored)} responses).",
             flush=True,
         )
-    return (
-        uids,
-        infos,
-        dict(
-            questions=len(rows),
-            responses=len(infos),
-            response_tokens_mean=sum(lengths) / len(lengths),
-            response_tokens_min=min(lengths),
-            response_tokens_max=max(lengths),
-            length_finish_rate=length_finishes / len(lengths),
-            context_capped_questions=sum(row.max_tokens < config.generation_max_tokens for row in rows),
-        ),
-    )
+    return _summarize_draws(config, rows, scored, records)
+
+
+def _evaluate_with_ray(config, tokenizer, prepared, records, topology):
+    from verl.utils.evaluation.ray_math import ray_draw_batches
+
+    rows = [row for benchmark_rows in prepared.values() for row in benchmark_rows]
+    rows_by_uid = {row.uid: row for row in rows}
+    if len(rows_by_uid) != len(rows):
+        raise ValueError("Duplicate question identity in distributed evaluation.")
+    requests = _draw_requests(config, tokenizer, rows)
+    scored: dict[tuple[str, int], ScoredDraw] = {}
+    with ray_draw_batches(config, topology, requests) as batches:
+        for batch, completions in batches:
+            _score_draws(tokenizer, batch, completions, rows_by_uid, scored)
+    if len(scored) != len(requests):
+        raise RuntimeError(f"Scored {len(scored)} draws out of {len(requests)} scheduled.")
+    return {name: _summarize_draws(config, rows, scored, records) for name, rows in prepared.items()}
 
 
 def _write_evaluation_records(
-    config: EvaluationConfig, checkpoint: str, prepared, tokenizer, records: list[dict[str, Any]]
+    config: EvaluationConfig, checkpoint: str, prepared, tokenizer, records: list[dict[str, Any]], *, result=None
 ) -> None:
     # Include the rendered inputs and grading metadata in the protocol identity,
     # independent of local dataset paths or checkpoint filenames.
@@ -686,23 +762,22 @@ def _write_evaluation_records(
         sampling=sampling_kwargs(config, config.generation_max_tokens, eos_token_id=tokenizer.eos_token_id),
         question_hashes=question_hashes,
     )
+    payload = dict(schema_version=1, checkpoint=checkpoint, protocol=protocol, records=records)
+    if result is not None:
+        payload.update(metrics=result["metrics"], benchmarks=result["benchmarks"])
     path = Path(config.records_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, encoding="utf-8", delete=False) as output:
         temporary = Path(output.name)
         try:
-            json.dump(
-                dict(schema_version=1, checkpoint=checkpoint, protocol=protocol, records=records),
-                output,
-                allow_nan=False,
-            )
+            json.dump(payload, output, allow_nan=False)
             output.close()
             temporary.replace(path)
         finally:
             temporary.unlink(missing_ok=True)
 
 
-def run_evaluation(config: EvaluationConfig) -> dict[str, Any]:
+def run_evaluation(config: EvaluationConfig, *, ray_topology: RayEvaluationTopology | None = None) -> dict[str, Any]:
     """Evaluate the selected suite and print a final JSON result only after every benchmark completes."""
     for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE", "VLLM_NO_USAGE_STATS"):
         os.environ[name] = "1"
@@ -741,19 +816,20 @@ def run_evaluation(config: EvaluationConfig) -> dict[str, Any]:
             flush=True,
         )
 
-    from vllm import LLM, SamplingParams
-
-    engine = LLM(**engine_kwargs(config))
-    scores = {}
     records = [] if config.records_path is not None else None
-    try:
-        for name, rows in prepared.items():
-            if records is None:
-                scores[name] = evaluate_benchmark(config, tokenizer, engine, SamplingParams, rows)
-            else:
-                scores[name] = evaluate_benchmark(config, tokenizer, engine, SamplingParams, rows, records=records)
-    finally:
-        del engine
+    if ray_topology is None:
+        from vllm import LLM, SamplingParams
+
+        engine = LLM(**engine_kwargs(config))
+        try:
+            scores = {
+                name: evaluate_benchmark(config, tokenizer, engine, SamplingParams, rows, records=records)
+                for name, rows in prepared.items()
+            }
+        finally:
+            del engine
+    else:
+        scores = _evaluate_with_ray(config, tokenizer, prepared, records, ray_topology)
 
     result = {"profile": "legacy", "config": resolved, "benchmarks": {}, "metrics": {}}
     for name, (uids, infos, summary) in scores.items():
@@ -773,12 +849,12 @@ def run_evaluation(config: EvaluationConfig) -> dict[str, Any]:
             if key.startswith(f"{METRIC_PREFIX}-core/{name}/acc/"):
                 print(f"{key} = {value:.8f}", flush=True)
     if records is not None:
-        _write_evaluation_records(config, checkpoint, prepared, tokenizer, records)
+        _write_evaluation_records(config, checkpoint, prepared, tokenizer, records, result=result)
     print("EVAL_RESULT_JSON=" + json.dumps(result, sort_keys=True, allow_nan=False), flush=True)
     return result
 
 
-def main() -> int:
+def main(argv: Sequence[str] = ()) -> int:
     """Read environment configuration and return a nonzero status on any evaluation failure."""
     try:
         node_rank = _env_value(os.environ, "NODE_RANK", "VC_TASK_INDEX", default="0")
@@ -787,7 +863,20 @@ def main() -> int:
         if int(node_rank) != 0:
             print(f"[eval] Skipping standalone evaluation on NODE_RANK={node_rank}; only node 0 evaluates.", flush=True)
             return 0
-        run_evaluation(EvaluationConfig.from_environment())
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("--ray-address")
+        parser.add_argument("--nodes", type=int)
+        parser.add_argument("--npus-per-node", type=int)
+        parser.add_argument("--startup-timeout", type=int, default=600)
+        args = parser.parse_args(argv)
+        config = EvaluationConfig.from_environment()
+        if args.ray_address:
+            from verl.utils.evaluation.ray_math import RayEvaluationTopology
+
+            topology = RayEvaluationTopology(args.ray_address, args.nodes, args.npus_per_node, args.startup_timeout)
+            run_evaluation(config, ray_topology=topology)
+        else:
+            run_evaluation(config)
     except Exception as exc:
         print(f"[eval] ERROR: {exc}", file=sys.stderr, flush=True)
         return 1
@@ -795,4 +884,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

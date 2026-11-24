@@ -64,6 +64,12 @@ class _UvicornServerAutoPort(uvicorn.Server):
 
 
 async def run_uvicorn(app: FastAPI, server_args, server_address) -> tuple[int, asyncio.Task]:
+    port, _, task = await start_uvicorn(app, server_args, server_address)
+    return port, task
+
+
+async def start_uvicorn(app: FastAPI, server_args, server_address) -> tuple[int, uvicorn.Server, asyncio.Task]:
+    """Start a server and return its control handle for graceful shutdown."""
     app.server_args = server_args
     config = uvicorn.Config(app, host=server_address, port=0, log_level="warning")
     server = _UvicornServerAutoPort(config)
@@ -76,7 +82,7 @@ async def run_uvicorn(app: FastAPI, server_args, server_address) -> tuple[int, a
         # Fails on unexpected situation.
         raise RuntimeError("Unexpected: HTTP server started without reporting listened port")
     logger.info(f"HTTP server started on port {server_port}")
-    return server_port, server_task
+    return server_port, server, server_task
 
 
 async def ensure_async_iterator(iterable):

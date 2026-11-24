@@ -4761,9 +4761,11 @@ class RayPPOTrainer:
         finally:
             writer.close(interrupted=interrupted)
 
-    def fit(self):
+    def fit(self, *, defer_cleanup: bool = False):
         """Run training with deterministic logger and diagnostics cleanup."""
-        logger = self.init_logger()
+        logger = self.logger = self.init_logger()
+        if defer_cleanup:
+            return self._fit_impl(logger)
         exit_code = 0
         try:
             return self._fit_impl(logger)
@@ -4771,11 +4773,22 @@ class RayPPOTrainer:
             exit_code = 1
             raise
         finally:
+            self.finish_training(interrupted=exit_code != 0)
+
+    def finish_training(self, *, interrupted: bool, strict: bool = False):
+        """Wait for diagnostics and close the training archive and logger."""
+        try:
             self._shutdown_opd_diagnostics_executor()
-            try:
-                self._finalize_metric_logging(logger, interrupted=exit_code != 0)
-            finally:
-                logger.finish(exit_code=exit_code)
+        finally:
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                try:
+                    self._finalize_metric_logging(logger, interrupted=interrupted)
+                finally:
+                    if strict:
+                        logger.finish(exit_code=int(interrupted), raise_on_error=True)
+                    else:
+                        logger.finish(exit_code=int(interrupted))
 
     def _fit_impl(self, logger):
         """
@@ -5366,7 +5379,7 @@ class RayPPOTrainer:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     pprint(f"Final test benchmark metrics: {last_test_benchmark_metrics}")
                     progress_bar.close()
-                    return
+                    return self.global_steps - 1
 
                 # this is experimental and may be changed/removed in the future
                 # in favor of a general-purpose data buffer pool

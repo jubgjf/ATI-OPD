@@ -20,7 +20,7 @@ from omegaconf import DictConfig
 
 from verl.single_controller.ray.base import RayResourcePool, split_resource_pool
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.ray_utils import auto_await
+from verl.utils.ray_utils import auto_await, track_ray_actor
 from verl.workers.config import DistillationConfig, DistillationTeacherModelConfig, HFModelConfig
 from verl.workers.rollout.llm_server import LLMServerClient
 from verl.workers.rollout.replica import get_rollout_replica_class
@@ -173,8 +173,8 @@ class TeacherModelManager:
     def _initialize_load_balancer_handle(self):
         from verl.workers.rollout.llm_server import GlobalRequestLoadBalancer
 
-        self.load_balancer_handle = GlobalRequestLoadBalancer.remote(
-            servers=dict(zip(self.server_addresses, self.server_handles, strict=True))
+        self.load_balancer_handle = track_ray_actor(
+            GlobalRequestLoadBalancer.remote(servers=dict(zip(self.server_addresses, self.server_handles, strict=True)))
         )
 
 

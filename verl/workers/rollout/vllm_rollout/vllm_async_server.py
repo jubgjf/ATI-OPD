@@ -16,6 +16,7 @@ import asyncio
 import inspect
 import json
 import logging
+import multiprocessing
 import os
 from pprint import pprint
 from typing import Any, Callable, Optional
@@ -38,12 +39,13 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
+from verl.utils.ray_utils import track_ray_actor
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.request_usage import RequestTokenUsage
-from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
+from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, start_uvicorn
 from verl.workers.rollout.vllm_rollout.target_prompt_logprobs import (
     VERL_TARGET_PROMPT_TOKEN_IDS_KEY,
     VERL_TEACHER_PROMPT_TOPK_KEY,
@@ -145,6 +147,12 @@ class vLLMHttpServer:
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
+        self._http_server = None
+        self._server_task = None
+        self._closing = False
+        self._headless_process = None
+        self._headless_monitor = None
+        self.engine = None
 
         # used for controlling vllm server profiler
         profiler_config = self.config.profiler
@@ -399,6 +407,7 @@ class vLLMHttpServer:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
+        self.engine = engine_client
 
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
@@ -435,12 +444,25 @@ class vLLMHttpServer:
         if self.replica_rank == 0 and self.node_rank == 0:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
-        self.engine = engine_client
-        self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
+        self._server_port, self._http_server, self._server_task = await start_uvicorn(app, args, self._server_address)
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
         args.api_server_count = 0
+        if os.environ.get("VERL_OPD_MANAGED_TRAINING") == "1":
+            # The upstream headless server installs signal handlers on its main thread.
+            process = multiprocessing.get_context("spawn").Process(target=run_headless, args=(args,))
+            process.start()
+            self._headless_process = process
+            self._headless_monitor = asyncio.create_task(asyncio.to_thread(process.join))
+
+            def check_headless_exit(_task):
+                if not self._closing:
+                    logger.error("Headless vLLM exited unexpectedly with status %s.", process.exitcode)
+                    os._exit(1)
+
+            self._headless_monitor.add_done_callback(check_headless_exit)
+            return
 
         def run_headless_wrapper():
             with SuppressSignalInThread():
@@ -461,6 +483,39 @@ class vLLMHttpServer:
         self.task = asyncio.create_task(asyncio.to_thread(run_headless_wrapper))
         self.task.add_done_callback(on_run_headless_done)
 
+    async def drain_for_shutdown(self, interrupted: bool) -> None:
+        """Close the inference entry points and drain requests before engine shutdown."""
+        self._closing = True
+        if self._http_server is not None:
+            self._http_server.should_exit = True
+        if interrupted:
+            return
+        if self._server_task is not None:
+            await asyncio.shield(self._server_task)
+        if self.engine is not None:
+            await self.wait_for_requests_to_drain()
+
+    async def shutdown_engine(self) -> None:
+        """Release the vLLM engine and wait for its headless subprocess, if any."""
+        if self.engine is not None:
+            engine, self.engine = self.engine, None
+            engine.shutdown()
+        process = self._headless_process
+        if process is not None:
+            if process.is_alive():
+                process.terminate()
+            try:
+                await asyncio.wait_for(asyncio.shield(self._headless_monitor), timeout=15)
+            except TimeoutError:
+                if process.is_alive():
+                    process.kill()
+                await asyncio.wait_for(asyncio.shield(self._headless_monitor), timeout=5)
+                raise
+            finally:
+                if not process.is_alive():
+                    process.close()
+                    self._headless_process = None
+
     async def generate(
         self,
         prompt_ids: list[int],
@@ -476,6 +531,8 @@ class vLLMHttpServer:
         teacher_prompt_topk: int = 0,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
+        if self._closing:
+            raise RuntimeError("The vLLM rollout server is shutting down.")
         prompt_ids = normalize_token_ids(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space
@@ -1073,7 +1130,7 @@ class vLLMReplica(RolloutReplica):
                 nnodes=nnodes,
                 cuda_visible_devices=node_cuda_visible_devices,
             )
-            self.servers.append(server)
+            self.servers.append(track_ray_actor(server, vllm=True))
 
         # launch http server in each node
         master_address, master_port, dp_rpc_port = await self.servers[0].get_master_address.remote()

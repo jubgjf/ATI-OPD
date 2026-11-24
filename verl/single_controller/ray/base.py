@@ -30,6 +30,7 @@ from verl.single_controller.base import ClassWithInitArgs, ResourcePool, Worker,
 from verl.single_controller.base.decorator import MAGIC_ATTR, Dispatch
 from verl.utils.device import get_device_name, is_torch_npu_available
 from verl.utils.py_functional import temp_env_var
+from verl.utils.ray_utils import track_ray_actor, track_ray_placement_group
 
 __all__ = ["Worker"]
 
@@ -150,7 +151,9 @@ class RayResourcePool(ResourcePool):
         lifetime = "detached" if self.detached else None
 
         pgs = [
-            placement_group(bundles=bundles, strategy=strategy, name=pg_name_prefix + str(idx), lifetime=lifetime)
+            track_ray_placement_group(
+                placement_group(bundles=bundles, strategy=strategy, name=pg_name_prefix + str(idx), lifetime=lifetime)
+            )
             for idx, bundles in enumerate(pg_scheme)
         ]
 
@@ -677,7 +680,7 @@ class RayWorkerGroup(WorkerGroup):
             num_gpus=num_gpus,
             device_name=self.device_name,
         )
-        self._workers.append(worker)
+        self._workers.append(track_ray_actor(worker, distributed=True))
         self._worker_names.append(name)
 
     @property

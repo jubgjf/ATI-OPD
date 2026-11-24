@@ -19,10 +19,137 @@ import asyncio
 import concurrent.futures
 import functools
 import inspect
+import logging
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
+from multiprocessing.process import BaseProcess
 from typing import Any, Optional
 
 import ray
+
+
+class RayJobResources:
+    """Track and release the Ray resources created by a managed training task."""
+
+    def __init__(self):
+        self.actors: set[ray.actor.ActorHandle] = set()
+        self.distributed_workers: set[ray.actor.ActorHandle] = set()
+        self.vllm_servers: set[ray.actor.ActorHandle] = set()
+        self.placement_groups: list = []
+        self.processes: list[BaseProcess] = []
+
+    @contextmanager
+    def track(self):
+        """Capture resources as soon as they are created, including on partial startup."""
+        token = _job_resources.set(self)
+        try:
+            yield
+        finally:
+            _job_resources.reset(token)
+
+    def close(self, *, interrupted: bool, timeout: int):
+        """Close engines and workers before removing their placement groups."""
+        log = logging.getLogger(__name__)
+        errors = []
+
+        def wait(stage, calls, *, terminating=False):
+            if not calls:
+                return
+            ready, pending = ray.wait(list(calls), num_returns=len(calls), timeout=timeout)
+            for ref in ready:
+                try:
+                    ray.get(ref)
+                except ray.exceptions.RayActorError as exc:
+                    if not terminating:
+                        errors.append((stage, exc))
+                except Exception as exc:
+                    errors.append((stage, exc))
+            if pending:
+                errors.append((stage, TimeoutError(f"{len(pending)} RPCs exceeded {timeout}s")))
+                if terminating:
+                    for ref in pending:
+                        ray.kill(calls[ref], no_restart=True)
+
+        try:
+            for process in self.processes:
+                if process.is_alive():
+                    process.terminate()
+            for process in self.processes:
+                process.join(timeout=timeout)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+                    errors.append(("local process shutdown", TimeoutError(f"PID {process.pid} did not exit")))
+
+            wait(
+                "vLLM request drain",
+                {server.drain_for_shutdown.remote(interrupted): server for server in self.vllm_servers},
+            )
+            wait("vLLM engine shutdown", {server.shutdown_engine.remote(): server for server in self.vllm_servers})
+            wait(
+                "distributed worker shutdown",
+                {
+                    worker.__ray_call__.remote(_destroy_worker_process_group): worker
+                    for worker in self.distributed_workers
+                },
+            )
+            wait(
+                "Ray actor exit",
+                {actor.__ray_terminate__.remote(): actor for actor in self.actors},
+                terminating=True,
+            )
+        finally:
+            for group in self.placement_groups:
+                ray.util.remove_placement_group(group)
+            self.actors.clear()
+            self.distributed_workers.clear()
+            self.vllm_servers.clear()
+            self.placement_groups.clear()
+            self.processes.clear()
+
+        if errors:
+            for stage, error in errors:
+                log.error("%s failed: %s", stage, error)
+            stage, error = errors[0]
+            raise RuntimeError(f"{stage} failed during training cleanup") from error
+
+
+_job_resources: ContextVar[RayJobResources | None] = ContextVar("ray_job_resources", default=None)
+
+
+def track_ray_actor(actor, *, distributed: bool = False, vllm: bool = False):
+    """Register a newly created actor with the current managed job."""
+    resources = _job_resources.get()
+    if resources is not None:
+        resources.actors.add(actor)
+        if distributed:
+            resources.distributed_workers.add(actor)
+        if vllm:
+            resources.vllm_servers.add(actor)
+    return actor
+
+
+def track_ray_placement_group(group):
+    """Register a newly created placement group with the current managed job."""
+    resources = _job_resources.get()
+    if resources is not None:
+        resources.placement_groups.append(group)
+    return group
+
+
+def track_ray_local_process(process: BaseProcess) -> None:
+    """Register a subprocess owned by the current managed Ray task."""
+    resources = _job_resources.get()
+    if resources is not None:
+        resources.processes.append(process)
+
+
+def _destroy_worker_process_group(_worker):
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def ray_noset_visible_devices(env_vars=os.environ):
@@ -133,7 +260,7 @@ def auto_await(func):
         # Case 3: Running loop -> run coro in thread pool
         # (cannot block the loop thread without deadlock)
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, coro)
+            future = pool.submit(copy_context().run, asyncio.run, coro)
             return future.result()
 
     return wrapper

@@ -27,7 +27,7 @@ from verl.single_controller.ray.base import RayResourcePool
 from verl.trainer.ppo.reward import load_reward_manager, resolve_reward_manager_cls
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
-from verl.utils.ray_utils import get_event_loop
+from verl.utils.ray_utils import get_event_loop, track_ray_actor
 from verl.utils.reward_score.reward_extra import collate_reward_extra_infos
 
 from .reward_model import RewardModelManager
@@ -310,15 +310,14 @@ class RewardLoopManager:
             # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
 
-            self.reward_loop_workers.append(
-                self.reward_loop_workers_class.options(
-                    name=f"reward_loop_worker_{i}",
-                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                        node_id=node_id,
-                        soft=True,
-                    ),
-                ).remote(self.config, self.reward_router_address)
-            )
+            worker = self.reward_loop_workers_class.options(
+                name=f"reward_loop_worker_{i}",
+                scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                    node_id=node_id,
+                    soft=True,
+                ),
+            ).remote(self.config, self.reward_router_address)
+            self.reward_loop_workers.append(track_ray_actor(worker))
 
     def compute_rm_score(self, data: DataProto) -> DataProto:
         if self.reward_model_manager is not None:

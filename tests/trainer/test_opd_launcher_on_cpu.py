@@ -70,6 +70,27 @@ python3() {
         printf 'PIP_COMMAND=%s\\n' "$*"
         return 0
     fi
+    if [[ "$1" == "-u" && "${2##*/}" == "opd_ray.py" ]]; then
+        printf 'RAY_ROLE=%s\\n' "$3"
+        [[ "$3" == "head" ]] || return 0
+        shift 3
+        printf 'CONFIG_LOADS=%s\\n' "$CONFIG_LOADS"
+        bash -c 'for key in TOTAL_TRAINING_STEPS "$@"; do
+            printf "DRIVER_ENV=%s=%s\\n" "$key" "${!key}"
+        done' bash OPD_DIAGNOSTICS_COLLECT_ROLLOUT_COSTS OPD_DIAGNOSTICS_COLLECT_SOURCE_POSITION
+        while [[ "$#" -gt 0 && "$1" != "--" ]]; do
+            case "$1" in
+                --checkpoint-root) shift ;;
+                --train-runtime-env) printf 'RUNTIME_ENV=%s\\n' "$2"; shift ;;
+                --eval-env) printf 'POST_TRAIN_EVAL=enabled\\n' ;;
+                *) printf 'EVAL_ARG=%s\\n' "$1" ;;
+            esac
+            shift
+        done
+        shift
+        printf 'HYDRA_ARG=%s\\n' "$@"
+        return 0
+    fi
     command python3 "$@"
 }
 sleep() { :; }
@@ -77,35 +98,7 @@ pkill() { :; }
 rm() { :; }
 df() { :; }
 ifconfig() { printf 'inet 127.0.0.1\n'; }
-grep() {
-    if [[ "$1" == "-oP" ]]; then
-        awk -F/ '{ print $2 + 0 }'
-    else
-        command grep "$@"
-    fi
-}
-ray() {
-    case "$1" in
-        start) printf 'RAY_START=%s\n' "$*" ;;
-        status) printf '0.0/%s.0 NPU\n' "$((VC_WORKER_NUM * 8))" ;;
-        job)
-            printf 'CONFIG_LOADS=%s\n' "$CONFIG_LOADS"
-            bash -c 'for key in TOTAL_TRAINING_STEPS "$@"; do
-                printf "DRIVER_ENV=%s=%s\\n" "$key" "${!key}"
-            done' bash OPD_DIAGNOSTICS_COLLECT_ROLLOUT_COSTS OPD_DIAGNOSTICS_COLLECT_SOURCE_POSITION
-            while [[ "$#" -gt 0 && "$1" != "verl.trainer.main_ppo" ]]; do
-                if [[ "$1" == --runtime-env-json=* ]]; then
-                    printf 'RUNTIME_ENV=%s\\n' "${1#*=}"
-                fi
-                shift
-            done
-            shift || return 1
-            printf 'HYDRA_ARG=%s\n' "$@"
-            ;;
-        stop) return 0 ;;
-        *) return 1 ;;
-    esac
-}
+ray() { [[ "$1" == "stop" ]]; }
 """
     )
     return subprocess.run(
@@ -115,7 +108,7 @@ ray() {
             "TRAIN_CONFIG_PATH": str(config),
             "BASH_ENV": str(bootstrap),
             "DATA_SEED": "99",
-            "VC_WORKER_NUM": "5",
+            "VC_WORKER_NUM": "4",
             "VC_TASK_INDEX": str(rank),
             "MA_CURRENT_IP": "127.0.0.1",
             "MA_VJ_NAME": "opd",
@@ -182,10 +175,18 @@ def test_opd_launcher_config_composes_without_accelerators(tmp_path, monkeypatch
     assert config.data.shuffle and config.data.seed == seed
     assert config.trainer.total_training_steps == 217
     assert config.trainer.save_freq == 10
-    assert (
-        config.trainer.nnodes * config.trainer.n_gpus_per_node + distillation.nnodes * distillation.n_gpus_per_node
-        == 40
+    assert config.trainer.nnodes == distillation.nnodes == 2
+    (teacher,) = distillation.teacher_models.values()
+    assert teacher.num_replicas == 8
+    eval_env = dict(
+        line.removeprefix("EVAL_ARG=").split("=", 1)
+        for line in result.stdout.splitlines()
+        if line.startswith("EVAL_ARG=")
     )
+    assert eval_env["CHAT_TEMPLATE_MODEL"] == config.actor_rollout_ref.model.chat_template_from_model
+    assert eval_env["ENABLE_THINKING"] == "True"
+    assert eval_env["STUDENT_TP"] == "2"
+    assert eval_env["TEST_BENCHMARK_N"] == "16"
     assert config.trainer.experiment_name == f"{Path(LAUNCHERS[method]).stem}-20261109-120000"
     assert distillation.diagnostics.collect_rollout_costs
     assert distillation.diagnostics.collect_rank_metrics is rank_metrics
@@ -253,5 +254,50 @@ def test_qwen3_launcher_composes_fused_teacher_scores_and_shared_stops(tmp_path,
 def test_method_launches_as_ray_worker_on_nonzero_platform_rank(tmp_path):
     result = _run_submitted_method(tmp_path, "relay", 42, rank=1)
     assert result.returncode == 0, result.stderr
-    assert "RAY_START=start --address=opd-train-0.opd:6167" in result.stdout
+    assert "RAY_ROLE=worker" in result.stdout
     assert "HYDRA_ARG=" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "nodes,overrides,expected",
+    [
+        (2, {}, (1, 1)),
+        (8, {}, (4, 4)),
+        (4, {"STUDENT_NNODES": "3"}, (3, 1)),
+        (4, {"TEACHER_NNODES": "3"}, (1, 3)),
+        (4, {"STUDENT_NNODES": "1", "TEACHER_NNODES": "3"}, (1, 3)),
+    ],
+)
+def test_opd_node_split_defaults_and_overrides(tmp_path, nodes, overrides, expected):
+    result = _run_submitted_method(tmp_path, "opd", 42, method_env={"NNODES": str(nodes), **overrides})
+    assert result.returncode == 0, result.stderr
+    students, teachers = expected
+    assert f"HYDRA_ARG=trainer.nnodes={students}\n" in result.stdout
+    assert f"HYDRA_ARG=distillation.nnodes={teachers}\n" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "env,message",
+    [
+        ({"VC_WORKER_NUM": "3", "STUDENT_NNODES": "2", "TEACHER_NNODES": "1"}, "even NNODES"),
+        ({"NNODES": "0"}, "even NNODES"),
+        ({"STUDENT_NNODES": "4"}, "must be positive and sum"),
+        ({"STUDENT_NNODES": "2", "TEACHER_NNODES": "1"}, "must be positive and sum"),
+        ({"POST_TRAIN_EVAL": "also"}, "POST_TRAIN_EVAL must be True or False"),
+    ],
+)
+def test_invalid_opd_topology_or_switch_fails_before_setup(tmp_path, env, message):
+    result = _run_submitted_method(tmp_path, "opd", 42, method_env=env)
+    assert result.returncode == 2
+    assert message in result.stderr
+    assert "PIP_COMMAND=" not in result.stdout
+    assert "RAY_ROLE=" not in result.stdout
+
+
+def test_post_train_evaluation_can_be_disabled_for_checkpoint_free_runs(tmp_path):
+    result = _run_submitted_method(
+        tmp_path, "opd", 42, train_config_extra="SAVE_FREQ=-1\nPOST_TRAIN_EVAL=False\nSTUDENT_TP=3\n"
+    )
+    assert result.returncode == 0, result.stderr
+    assert "HYDRA_ARG=trainer.save_freq=-1" in result.stdout
+    assert "EVAL_ARG=" not in result.stdout

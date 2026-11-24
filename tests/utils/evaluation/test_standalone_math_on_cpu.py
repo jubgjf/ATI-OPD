@@ -20,6 +20,7 @@ import json
 import os
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.utils.dataset.math_benchmark_dataset import MathBenchmarkDataset
+from verl.utils.evaluation import ray_math
 from verl.utils.evaluation import standalone_math as evaluation
 from verl.utils.evaluation.math_benchmark import EvalSample, build_math_chat_messages
 from verl.utils.reward_score import default_compute_score
@@ -1194,3 +1196,134 @@ def test_failure_in_last_benchmark_prints_no_formal_results_on_cpu(inputs, monke
     captured = capsys.readouterr()
     assert "last benchmark failed" in captured.err
     assert "[result]" not in captured.out and "EVAL_RESULT_JSON=" not in captured.out
+
+
+def _mock_distributed_inference(monkeypatch, tokenizer, failure):
+    from verl.utils import ray_utils
+
+    class Ref:
+        def __init__(self, result):
+            self.result = result
+
+    def method(function):
+        return SimpleNamespace(remote=lambda *args: Ref(function(*args)))
+
+    nodes = [f"{i:056x}" for i in range(1, 5)]
+    placements = Counter()
+    replicas = []
+
+    def create_remote_class(*, num_cpus, resources):
+        assert num_cpus == 1 and resources == {"NPU": 2}
+
+        def wrap(cls):
+            def options(*, scheduling_strategy, runtime_env):
+                assert not scheduling_strategy.soft
+                assert runtime_env["env_vars"]["HF_HUB_OFFLINE"] == "1"
+                node = scheduling_strategy.node_id
+                group = placements[node]
+                placements[node] += 1
+
+                def spawn(engine_options):
+                    context = SimpleNamespace(
+                        get_node_id=lambda: node,
+                        get_accelerator_ids=lambda: {"NPU": [2 * group, 2 * group + 1]},
+                    )
+                    mock_ray.get_runtime_context = lambda: context
+                    replica = cls(engine_options)
+                    replicas.append(replica)
+
+                    def generate(batch):
+                        result = replica.generate(batch)
+                        if failure == "missing":
+                            return result[:-1]
+                        if failure == "duplicate":
+                            return result + result[:1]
+                        return result
+
+                    return Handle(replica, generate)
+
+                return SimpleNamespace(remote=spawn)
+
+            return SimpleNamespace(options=options)
+
+        return wrap
+
+    class Handle:
+        def __init__(self, replica, generate):
+            self.ready = method(replica.ready)
+            self.generate = method(generate)
+            self.close = method(replica.close)
+            self.__ray_terminate__ = method(lambda: None)
+
+    def get(refs, **_kwargs):
+        if isinstance(refs, list):
+            return [ref.result for ref in refs]
+        return refs.result
+
+    mock_ray = SimpleNamespace(
+        nodes=lambda: [{"Alive": True, "NodeID": node, "Resources": {"NPU": 8}} for node in nodes],
+        available_resources=lambda: {"NPU": 32},
+        remote=create_remote_class,
+        init=lambda **_: None,
+        shutdown=lambda: None,
+        wait=lambda refs, num_returns, **_: (refs[-num_returns:], refs[:-num_returns]),
+        get=get,
+        exceptions=ray_utils.ray.exceptions,
+    )
+    monkeypatch.setattr(ray_math, "ray", mock_ray)
+    monkeypatch.setattr(ray_utils, "ray", mock_ray)
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    engines = []
+
+    def build_engine(**kwargs):
+        assert kwargs["skip_tokenizer_init"] is True
+        engine = _Engine(tokenizer)
+        engine.stopped = False
+        engine.shutdown = lambda: setattr(engine, "stopped", True)
+        engines.append(engine)
+        return engine
+
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=build_engine, SamplingParams=SimpleNamespace))
+    return placements, engines
+
+
+@pytest.mark.parametrize("failure", [None, "missing", "duplicate"])
+def test_ray_math_all_uses_all_nodes_and_matches_standalone_draws(inputs, tmp_path, monkeypatch, failure):
+    config, tokenizer = inputs
+    _write_suite(Path(config.dataset_root))
+    config = replace(config, suite="math-all", rollout_n=4, max_samples=1, enable_thinking=False)
+    placements, engines = _mock_distributed_inference(monkeypatch, tokenizer, failure)
+    monkeypatch.setattr(evaluation, "default_compute_score", _score)
+    topology = ray_math.RayEvaluationTopology("head:6167", 4, 8, 5)
+    records_path = tmp_path / "ray.json"
+    distributed = replace(config, records_path=str(records_path))
+    if failure:
+        with pytest.raises(RuntimeError, match="Missing evaluation outputs|Duplicate or unexpected"):
+            evaluation.run_evaluation(distributed, ray_topology=topology)
+        assert not records_path.exists()
+        assert len(engines) == 16 and all(engine.stopped for engine in engines)
+        return
+
+    results = evaluation.run_evaluation(distributed, ray_topology=topology)
+    ray_engines = list(engines)
+    assert len(placements) == 4 and all(count == 4 for count in placements.values())
+    assert len(ray_engines) == 16 and all(engine.calls and engine.stopped for engine in ray_engines)
+    standalone_path = tmp_path / "standalone.json"
+    standalone = evaluation.run_evaluation(replace(config, records_path=str(standalone_path)))
+    assert results["metrics"] == standalone["metrics"]
+    saved = json.loads(records_path.read_text())
+    assert saved == json.loads(standalone_path.read_text())
+    assert len(saved["records"]) == 24
+    assert set(saved["benchmarks"]) == set(SUITE_COUNTS)
+
+    def requests(replicas):
+        return {
+            param.seed: (prompt["prompt_token_ids"], vars(param))
+            for engine in replicas
+            for prompts, params in engine.calls
+            for prompt, param in zip(prompts, params, strict=True)
+        }
+
+    assert len(requests(ray_engines)) == 24
+    assert requests(ray_engines) == requests([engines[-1]])

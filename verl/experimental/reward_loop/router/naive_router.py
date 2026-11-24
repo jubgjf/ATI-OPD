@@ -26,6 +26,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
+from verl.utils.ray_utils import track_ray_local_process
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -67,6 +68,7 @@ def launch_router_process(
     )
     router_process.daemon = True
     router_process.start()
+    track_ray_local_process(router_process)
     time.sleep(3)
     assert router_process.is_alive()
 

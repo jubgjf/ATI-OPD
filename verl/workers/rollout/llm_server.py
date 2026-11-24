@@ -29,7 +29,7 @@ from cachetools import LRUCache
 from omegaconf import DictConfig
 
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
-from verl.utils.ray_utils import auto_await
+from verl.utils.ray_utils import auto_await, track_ray_actor
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import RolloutReplica, TokenOutput, get_rollout_replica_class
 from verl.workers.rollout.request_usage import active_request_usage
@@ -392,9 +392,11 @@ class LLMServerManager:
             update_prometheus_config(self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name)
 
     async def _init_global_load_balancer(self) -> None:
-        self.global_load_balancer = GlobalRequestLoadBalancer.remote(
-            servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
-            max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
+        self.global_load_balancer = track_ray_actor(
+            GlobalRequestLoadBalancer.remote(
+                servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
+                max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
+            )
         )
 
     def get_client(self, client_cls=LLMServerClient, **kwargs) -> LLMServerClient:

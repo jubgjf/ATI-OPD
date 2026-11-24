@@ -607,10 +607,11 @@ class Tracking:
             last_steps[default_backend] = normalized_step
         self._last_step = normalized_step if self._last_step is None else max(self._last_step, normalized_step)
 
-    def finish(self, exit_code=0):
+    def finish(self, exit_code=0, *, raise_on_error: bool = False):
         if getattr(self, "_finished", False):
             return
         self._finished = True
+        first_error = None
         for backend, logger_instance in list(getattr(self, "logger", {}).items()):
             try:
                 if backend in {"wandb", "vemlp_wandb"}:
@@ -618,7 +619,11 @@ class Tracking:
                 elif backend != "mlflow" and hasattr(logger_instance, "finish"):
                     logger_instance.finish()
             except Exception as exc:
-                logger.warning("Ignoring tracking backend shutdown error for %s: %s", backend, exc)
+                logger.warning("Tracking backend shutdown failed for %s: %s", backend, exc)
+                if first_error is None:
+                    first_error = exc
+        if raise_on_error and first_error is not None:
+            raise RuntimeError("Tracking shutdown failed") from first_error
 
     def __del__(self):
         try:

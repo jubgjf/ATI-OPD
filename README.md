@@ -129,6 +129,17 @@ verl is fast with:
 - [PPO Example Architecture](https://verl.readthedocs.io/en/latest/examples/ppo_code_architecture.html)
 - [Config Explanation](https://verl.readthedocs.io/en/latest/examples/config.html)
 
+**Ascend OPD launchers (`run/`)**
+
+- Use an even `NNODES` (defaults to `VC_WORKER_NUM`). The default split assigns half to the student
+  and half to the teacher. Set `STUDENT_NNODES` or `TEACHER_NNODES` to override the split.
+- After the final synchronous checkpoint and SwanLab logs are written, the launcher evaluates the student on every node.
+  The six offline benchmarks are AIME24, AIME25, AMC23, AMO-Bench-P, HMMT Feb 2026 and HMMT Nov 2025.
+  Set `POST_TRAIN_EVAL=False` for training-only jobs.
+- The report is stored under `evaluations/math-all-step_<N>.json` in the experiment output directory.
+  If evaluation fails, rerun it with `MODEL_PATH=/path/to/global_step_N EVAL_SUITE=math-all bash run/eval-single.sh`
+  and the same chat template and sampling settings. Set `EVAL_RECORDS_PATH` to save the standalone report.
+
 **Reproducible algorithm baselines:**
 
 - [RL performance on coding, math](https://verl.readthedocs.io/en/latest/algo/baseline.html)

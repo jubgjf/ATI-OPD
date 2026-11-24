@@ -8,7 +8,57 @@ fi
 _COMMON_SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=run/python_sandbox_helper.sh
 . "$_COMMON_SCRIPT_DIR/python_sandbox_helper.sh"
-unset _COMMON_SCRIPT_DIR
+
+_configure_opd_nodes() {
+    NNODES=${NNODES:-${VC_WORKER_NUM:-}}
+    if [[ ! "$NNODES" =~ ^[1-9][0-9]*$ ]] || ((NNODES < 2 || NNODES % 2 != 0)); then
+        echo "OPD requires an even NNODES of at least 2, got: $NNODES" >&2
+        return 2
+    fi
+
+    STUDENT_NNODES=${STUDENT_NNODES:-}
+    TEACHER_NNODES=${TEACHER_NNODES:-}
+    if [[ -z "$STUDENT_NNODES" && -z "$TEACHER_NNODES" ]]; then
+        STUDENT_NNODES=$((NNODES / 2))
+        TEACHER_NNODES=$STUDENT_NNODES
+    elif [[ -z "$STUDENT_NNODES" && "$TEACHER_NNODES" =~ ^[1-9][0-9]*$ ]]; then
+        STUDENT_NNODES=$((NNODES - TEACHER_NNODES))
+    elif [[ -z "$TEACHER_NNODES" && "$STUDENT_NNODES" =~ ^[1-9][0-9]*$ ]]; then
+        TEACHER_NNODES=$((NNODES - STUDENT_NNODES))
+    fi
+    if [[ ! "$STUDENT_NNODES" =~ ^[1-9][0-9]*$ || ! "$TEACHER_NNODES" =~ ^[1-9][0-9]*$ ]] ||
+        ((STUDENT_NNODES + TEACHER_NNODES != NNODES)); then
+        echo "STUDENT_NNODES and TEACHER_NNODES must be positive and sum to NNODES=$NNODES" >&2
+        return 2
+    fi
+
+    NODE_RANK=${NODE_RANK:-${VC_TASK_INDEX:-0}}
+    if [[ ! "$NODE_RANK" =~ ^(0|[1-9][0-9]*)$ ]] || ((NODE_RANK >= NNODES)); then
+        echo "NODE_RANK must be in [0, $NNODES), got: $NODE_RANK" >&2
+        return 2
+    fi
+    export NNODES NODE_RANK
+}
+
+_configure_post_train_eval() {
+    # The head evaluates the final student checkpoint on the same cluster.
+    post_train_eval=${POST_TRAIN_EVAL:-True}
+    save_freq=${SAVE_FREQ:-20}
+    case "$post_train_eval" in
+        False | false | 0) post_train_eval=False ;;
+        True | true | 1)
+            post_train_eval=True
+            if [[ ! "$save_freq" =~ ^[1-9][0-9]*$ ]]; then
+                echo "POST_TRAIN_EVAL requires a positive SAVE_FREQ, got: $save_freq" >&2
+                return 2
+            fi
+            ;;
+        *)
+            echo "POST_TRAIN_EVAL must be True or False, got: $post_train_eval" >&2
+            return 2
+            ;;
+    esac
+}
 
 _load_external_train_config() {
     local train_config_path=${TRAIN_CONFIG_PATH:-/opt/huawei/algorithm/train.config}
@@ -182,6 +232,8 @@ run_npu_opd_job() {
     WORKSPACE=$DATASET_DIR/code/DMPD
 
     _load_external_train_config || exit 1
+    _configure_opd_nodes || exit $?
+    _configure_post_train_eval || exit $?
 
     npu-smi info
 
@@ -204,8 +256,6 @@ run_npu_opd_job() {
     python3 -m pip install swanlab==0.10.3 || exit 1
     python3 -m pip install -e . matplotlib || exit 1
     echo ============================
-
-    export NODE_RANK=${NODE_RANK:-${VC_TASK_INDEX:-0}}
 
     export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-3600}
     export HCCL_LOG_LEVEL=${HCCL_LOG_LEVEL:-0}
@@ -316,9 +366,6 @@ run_npu_opd_job() {
     train_files=${TRAIN_FILES:-"['$default_train_file']"}
     valid_files=${VALID_FILES:-"['$default_valid_file']"}
 
-    NNODES=${NNODES:-$VC_WORKER_NUM}
-    STUDENT_NNODES=${STUDENT_NNODES:-$((VC_WORKER_NUM - 1))}
-    TEACHER_NNODES=${TEACHER_NNODES:-1}
     STUDENT_NGPUS_PER_NODE=${STUDENT_NGPUS_PER_NODE:-8}
     TEACHER_NGPUS_PER_NODE=${TEACHER_NGPUS_PER_NODE:-8}
     student_tp=${STUDENT_TP:-2}
@@ -458,8 +505,10 @@ run_npu_opd_job() {
     experiment_base_name=${EXPERIMENT_NAME:-${DEFAULT_EXPERIMENT_NAME:-opd}}
     experiment_name=${EXPERIMENT_FULL_NAME:-"${experiment_base_name}-${experiment_timestamp}"}
     default_local_dir=${DEFAULT_LOCAL_DIR:-$WORKSPACE/outputs/${experiment_name}}
+    if [[ "$default_local_dir" != /* ]]; then
+        default_local_dir=$PWD/$default_local_dir
+    fi
     total_epochs=${TOTAL_EPOCHS:-1}
-    save_freq=${SAVE_FREQ:-20}
     metric_logging_mode=${METRIC_LOGGING_MODE:-balanced}
     metric_logging_resume_policy=${METRIC_LOGGING_RESUME_POLICY:-strict}
     metric_logging_live_key_warning_threshold=${METRIC_LOGGING_LIVE_KEY_WARNING_THRESHOLD:-250}
@@ -550,6 +599,14 @@ run_npu_opd_job() {
     export MASTER_PORT=${MASTER_PORT:-6167}
     export DASHBOARD_PORT=${DASHBOARD_PORT:-8191}
     export NPUS_PER_NODE=${NPUS_PER_NODE:-8}
+    if [[ ! "$NPUS_PER_NODE" =~ ^[1-9][0-9]*$ || ! "$student_tp" =~ ^[1-9][0-9]*$ ]]; then
+        echo "NPUS_PER_NODE and STUDENT_TP must be positive integers" >&2
+        exit 2
+    fi
+    if [[ "$post_train_eval" == "True" ]] && ((NPUS_PER_NODE % student_tp != 0)); then
+        echo "POST_TRAIN_EVAL requires STUDENT_TP=$student_tp to divide NPUS_PER_NODE=$NPUS_PER_NODE" >&2
+        exit 2
+    fi
     export WORLD_SIZE=$((NPUS_PER_NODE * NNODES))
 
     SOCKET_IFNAME=${SOCKET_IFNAME:-eth0}
@@ -579,91 +636,28 @@ run_npu_opd_job() {
     export RAY_USAGE_STATS_ENABLED=${RAY_USAGE_STATS_ENABLED:-0}
 
     if [ "$NODE_RANK" -eq 0 ]; then
-        _run_npu_head_node
+        _launch_npu_verl_job
     else
-        _run_npu_worker_node
+        _run_opd_ray_supervisor worker
     fi
 }
 
-_run_npu_head_node() {
-    echo "Starting Ray HEAD node on $CURRENT_IP..."
-    ray start --head \
-        --node-ip-address="$MA_CURRENT_IP" \
-        --port="$MASTER_PORT" \
-        --dashboard-host=0.0.0.0 \
-        --dashboard-port="$DASHBOARD_PORT" \
-        --resources='{"NPU": '"$NPUS_PER_NODE"'}' \
-        --block &
-    local ray_head_pid=$!
-
-    echo "Waiting 10s for GCS to initialize..."
-    sleep "${RAY_GCS_INIT_SLEEP_SECONDS:-10}"
-
-    echo "Waiting for worker nodes to join..."
-    target_npus=$((NNODES * NPUS_PER_NODE))
-
-    while true; do
-        ray_status_output=$(ray status 2>&1)
-        current_total_npus=$(echo "$ray_status_output" | grep -oP '(?<=/)\d+\.\d+(?=\s*NPU)' | awk '{s+=$1} END {print int(s)}')
-        if [ -z "$current_total_npus" ]; then current_total_npus=0; fi
-
-        echo "Check Resources: Found $current_total_npus / $target_npus NPUs"
-
-        if [ "$current_total_npus" -ge "$target_npus" ]; then
-            echo "Ray cluster is READY! (Found $current_total_npus NPUs)."
-            break
-        else
-            echo "Waiting for workers... Retrying in 5s..."
-            sleep 5
-        fi
-    done
-
-    local job_exit_code=0
-    local errexit_was_set=0
-    case "$-" in
-        *e*) errexit_was_set=1 ;;
-    esac
-    set +e
-    _submit_npu_verl_job
-    job_exit_code=$?
-    if [[ "$errexit_was_set" -eq 1 ]]; then
-        set -e
-    else
-        set +e
+_run_opd_ray_supervisor() {
+    local supervisor_pid status=0
+    python3 -u "$_COMMON_SCRIPT_DIR/opd_ray.py" "$@" &
+    supervisor_pid=$!
+    trap 'kill -TERM "$supervisor_pid" 2>/dev/null || true' TERM
+    trap 'kill -INT "$supervisor_pid" 2>/dev/null || true' INT
+    wait "$supervisor_pid" || status=$?
+    # A signal can interrupt wait before the supervisor finishes cleanup.
+    if ((status >= 128)); then
+        wait "$supervisor_pid" 2>/dev/null || true
     fi
-
-    echo "Ray job finished with exit code: $job_exit_code"
-    echo "Check Dashboard at http://$CURRENT_IP:$DASHBOARD_PORT"
-    df -h || true
-    echo "Stopping Ray cluster before exiting head node..."
-    ray stop --force || true
-    wait "$ray_head_pid" 2>/dev/null || true
-    exit "$job_exit_code"
+    trap - INT TERM
+    return "$status"
 }
 
-_run_npu_worker_node() {
-    echo "Starting Ray WORKER node connecting to $MASTER_ADDR..."
-
-    local restart_on_exit=${RAY_WORKER_RESTART_ON_EXIT:-False}
-    while true; do
-        echo "Attempting to connect to Ray Head ($MASTER_ADDR:$MASTER_PORT) from $MA_CURRENT_IP..."
-
-        ray start --address="$MASTER_ADDR:$MASTER_PORT" \
-            --node-ip-address="$MA_CURRENT_IP" \
-            --resources='{"NPU": '"$NPUS_PER_NODE"'}' \
-            --block
-
-        EXIT_CODE=$?
-        echo "Ray worker exited with code $EXIT_CODE."
-        if [[ "$restart_on_exit" != "True" && "$restart_on_exit" != "true" && "$restart_on_exit" != "1" ]]; then
-            exit "$EXIT_CODE"
-        fi
-        echo "RAY_WORKER_RESTART_ON_EXIT=${restart_on_exit}; retrying in 15s..."
-        sleep 15
-    done
-}
-
-_submit_npu_verl_job() {
+_launch_npu_verl_job() {
     _check_resume_required || return 1
 
     local -a hydra_args=(
@@ -882,9 +876,33 @@ print(json.dumps({"working_dir": "./", "excludes": ["/.git/"], "env_vars": env_v
 PYTHON
     ) || return 1
 
-    ray job submit \
-        --address="http://127.0.0.1:$DASHBOARD_PORT" \
-        --runtime-env-json="$runtime_env_json" \
-        -- \
-        python3 -m verl.trainer.main_ppo "${hydra_args[@]}"
+    local -a eval_args=()
+    if [[ "$post_train_eval" == "True" ]]; then
+        eval_args=(--eval-env
+            "TEST_BENCHMARK_ROOT=$test_benchmark_root"
+            "CHAT_TEMPLATE_MODEL=$CHAT_TEMPLATE_MODEL"
+            "ENABLE_THINKING=$enable_thinking"
+            "TEST_BENCHMARK_N=$test_benchmark_n"
+            "TEST_TEMPERATURE=$test_temperature"
+            "TEST_TOP_P=$test_top_p"
+            "TEST_TOP_K=$test_top_k"
+            "TEST_DO_SAMPLE=$test_do_sample"
+            "MAX_PROMPT_LENGTH=$max_prompt_length"
+            "MAX_RESPONSE_LENGTH=$max_response_length"
+            "TEST_BENCHMARKS_MAX_RESPONSE_LENGTH=$test_benchmarks_max_response_length"
+            "TEST_BENCHMARK_BATCH_SIZE=$test_benchmark_batch_size"
+            "TEST_BENCHMARK_MAX_SAMPLES=$test_benchmark_max_samples"
+            "STUDENT_TP=$student_tp"
+            "STUDENT_GPU_MEM_UTIL=$student_gpu_mem_util"
+            "ROLLOUT_MAX_MODEL_LEN=$rollout_max_model_len"
+            "ROLLOUT_MAX_NUM_BATCHED_TOKENS=$rollout_max_num_batched_tokens"
+            "ROLLOUT_MAX_NUM_SEQS=$rollout_max_num_seqs"
+            "ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-False}"
+            "EVAL_SEED=${EVAL_SEED:-0}"
+        )
+    fi
+
+    _run_opd_ray_supervisor head \
+        --checkpoint-root "$default_local_dir" --train-runtime-env "$runtime_env_json" \
+        "${eval_args[@]}" -- "${hydra_args[@]}"
 }
